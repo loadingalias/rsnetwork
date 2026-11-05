@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# The pre-commit hook. It checks only what the commit records, in milliseconds:
+#   1. The staged diff has no conflict markers and no whitespace errors.
+#   2. Each staged Rust file is formatted. rustfmt reads the staged content,
+#      so unstaged edits cannot hide a failure or cause one.
+# It compiles nothing, runs no tests, and never stashes or stages files.
+# Enable it once in each clone: git config core.hooksPath .githooks
+set -euo pipefail
+export RUSTUP_AUTO_INSTALL=0
+unset RUSTUP_TOOLCHAIN
+cd "$(git rev-parse --show-toplevel)"
+
+git diff --cached --check
+
+unformatted=0
+while IFS= read -r -d '' path; do
+  if ! cmp -s <(git show ":$path") <(git show ":$path" | rustfmt --config-path rustfmt.toml --emit stdout); then
+    echo "error: the staged $path is not formatted. Run \`cargo xtask fix\`, then stage the file." >&2
+    unformatted=1
+  fi
+done < <(git diff --cached --name-only -z --diff-filter=ACMR -- '*.rs')
+exit "$unformatted"

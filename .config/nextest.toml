@@ -1,0 +1,22 @@
+# cargo-nextest runs the unit and integration tests. `cargo xtask test` runs
+# the doctests separately. Retries stay at zero: a flaky test is a defect.
+nextest-version = { required = "0.9.150", recommended = "0.9.150" }
+
+[profile.default]
+retries = 0
+flaky-result = "fail"
+success-output = "never"
+failure-output = "immediate-final"
+fail-fast = true
+
+# The CI gate: the same test semantics, reporting every failure.
+[profile.ci]
+inherits = "default"
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
+store-success-output = false
+store-failure-output = true
+report-skipped = "none"
+flaky-fail-status = "failure"

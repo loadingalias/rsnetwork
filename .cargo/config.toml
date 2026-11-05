@@ -1,0 +1,5 @@
+[alias]
+# The command front door. `--locked`: building xtask never changes Cargo.lock.
+xtask = ["run", "--quiet", "--locked", "--package", "xtask", "--"]
+# Zed runs contextual tests through Nextest with this name (.zed/settings.json).
+nextest-run = ["nextest", "run"]

@@ -1,0 +1,8 @@
+# Private unsafe functions have safety contracts too.
+check-private-items = true
+
+# Panics and captured output give useful failure information in tests.
+# Production code remains strict.
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+allow-print-in-tests = true

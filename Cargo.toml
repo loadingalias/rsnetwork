@@ -1,7 +1,141 @@
 [package]
 name = "rsnetwork"
 version = "0.1.0-alpha.1"
-edition = "2024"
-description = "Currently being migrated."
-license = "MIT"
+description = "Sans-I/O HTTP/1.1, HTTP/2, HTTP/3, and QUIC for clients and servers, with optional runtime bindings."
 repository = "https://github.com/loadingalias/rsnetwork"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[workspace]
+resolver = "3"
+members = [".", "xtask"]
+
+# No `rust-version`: development requires the nightly pinned in
+# rust-toolchain.toml, which a release number cannot express.
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+# Private during stealth. Publication is a later, separate decision.
+publish = false
+
+[workspace.lints.cargo]
+unknown_lints = "deny"
+unused_workspace_dependencies = "deny"
+
+[workspace.lints.rust]
+warnings = "deny"
+ambiguous_negative_literals = "deny"
+c_void_returns = "deny"
+invalid_runtime_symbol_definitions = "deny"
+raw_borrows_via_references = "deny"
+suspicious_runtime_symbol_definitions = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+# Unsafe code is denied everywhere. Each necessary unsafe region is the
+# smallest private module or item, with a reasoned `#[expect(unsafe_code)]`.
+unsafe_code = "deny"
+# Library documentation and `Debug` coverage.
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+# Visibility says what is API: nothing `pub` that the crate root cannot reach.
+unreachable_pub = "deny"
+
+[workspace.lints.clippy]
+# The complete production-ready default set. The negative priority lets every
+# individually reviewed lint below take precedence.
+all = { level = "deny", priority = -1 }
+
+# Concurrency and async correctness.
+arc_with_non_send_sync = "deny"
+await_holding_invalid_type = "deny"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+non_send_fields_in_send_ty = "deny"
+significant_drop_in_scrutinee = "deny"
+
+# Production panics and incomplete control flow.
+panic = "deny"
+panic_in_result_fn = "deny"
+string_slice = "deny"
+todo = "deny"
+unchecked_time_subtraction = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unwrap_used = "deny"
+
+# Dropped work, errors, and weak test diagnostics.
+assertions_on_result_states = "deny"
+let_underscore_must_use = "deny"
+unused_result_ok = "deny"
+
+# Numeric conversions and literals must make loss and sign changes explicit.
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+checked_conversions = "deny"
+fn_to_numeric_cast_any = "deny"
+invalid_upcast_comparisons = "deny"
+lossy_float_literal = "deny"
+
+# API clarity and maintainability.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+dbg_macro = "deny"
+enum_glob_use = "deny"
+expl_impl_clone_on_copy = "deny"
+iter_not_returning_iterator = "deny"
+same_functions_in_if_condition = "deny"
+
+# Import from `core` when the item is there; it keeps a later `no_std` split open.
+alloc_instead_of_core = "deny"
+std_instead_of_core = "deny"
+
+# Libraries report through return values, not direct output. xtask, the one
+# command-line tool, carries a reasoned `expect`.
+print_stderr = "deny"
+print_stdout = "deny"
+
+# Cargo semantics. Do not enable clippy::cargo wholesale.
+negative_feature_names = "deny"
+wildcard_dependencies = "deny"
+
+# High-signal nursery lints selected individually.
+coerce_container_to_any = "deny"
+collection_is_never_read = "deny"
+debug_assert_with_mut_call = "deny"
+literal_string_with_formatting_args = "deny"
+or_fun_call = "deny"
+path_buf_push_overwrite = "deny"
+read_zero_byte_vec = "deny"
+redundant_clone = "deny"
+suspicious_operation_groupings = "deny"
+trait_duplication_in_bounds = "deny"
+transmute_undefined_repr = "deny"
+uninhabited_references = "deny"
+volatile_composites = "deny"
+
+# Unsafe-code proof obligations and destructor correctness.
+as_ptr_cast_mut = "deny"
+as_pointer_underscore = "deny"
+borrow_as_ptr = "deny"
+cast_ptr_alignment = "deny"
+mem_forget = "deny"
+missing_safety_doc = "deny"
+ptr_as_ptr = "deny"
+ptr_cast_constness = "deny"
+ref_as_ptr = "deny"
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+
+# Integer overflow is a defect in every profile. Intentional modular or
+# saturating arithmetic uses explicit operations.
+[profile.release]
+overflow-checks = true
