@@ -1,18 +1,20 @@
 //! Repository commands. Run them as `cargo xtask <command>`.
 //!
-//! Each command runs Cargo from the toolchain that `rust-toolchain.toml` pins,
-//! in the workspace root, without ambient compiler overrides. Local work and CI
-//! use the same commands. This package has no dependencies.
+//! Each Cargo command runs Cargo from the toolchain that `rust-toolchain.toml`
+//! pins, in the workspace root, without ambient compiler overrides. The model
+//! command runs the TLA+ checkers that `machine update all` installs. Local work
+//! and CI use the same commands. This package has no dependencies.
 
 #![expect(
     clippy::print_stderr,
     reason = "xtask is a command-line tool, and standard error is its report channel"
 )]
 
+use core::iter;
 use std::{
     env,
     ffi::OsStr,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     process::{Command, ExitCode},
     time::Instant,
@@ -25,8 +27,16 @@ Commands
   fix [Cargo args]     Apply Clippy fixes, format, then fail on the lints that remain (local only)
   check [Cargo args]   Check formatting, lints, and rustdoc, and change no file (the CI gate)
   test [Nextest args]  Run the tests; with no arguments, also run the doctests
+  model [model[/file]] Check the TLA+ models in models/; with no argument, every profile
 
 With no Cargo arguments, fix and check select the whole workspace.
+
+A model is a directory in models/. In it, each <M>.cfg beside <M>.tla is a TLC
+profile, and each <M>.apalache beside <M>.tla is an Apalache profile that holds
+the apalache-mc arguments, one a line. A profile whose name ends in `_bad` is a
+known-bad variant: it passes only when the checker finds a violation. The
+checkers are the ones that `machine update all` installs under ~/.local/opt,
+and their output goes to target/model/.
 ";
 
 /// Environment variables that change compilation without notice. Each command
@@ -60,6 +70,7 @@ fn main() -> ExitCode {
         "fix" => Repo::open().and_then(|repo| repo.fix(rest)),
         "check" => Repo::open().and_then(|repo| repo.check(rest)),
         "test" => Repo::open().and_then(|repo| repo.test(rest)),
+        "model" => Repo::open().and_then(|repo| repo.model(rest)),
         other => Err(Failure::new(format!("unknown command `{other}`\n\n{USAGE}"))),
     };
     match result {
@@ -169,6 +180,222 @@ impl Repo {
             "doctest",
             &mut self.cargo(&["test", "--locked", "--doc", "--workspace", "--quiet"]),
         )
+    }
+
+    /// Runs each selected model profile with its checker. A selection with no
+    /// profile fails, because an empty selection is not a pass.
+    fn model(&self, args: &[String]) -> Result<(), Failure> {
+        let selection = match args {
+            [] => None,
+            [one] => Some(one.as_str()),
+            _ => return Err(Failure::new(format!("model takes at most one argument\n\n{USAGE}"))),
+        };
+        let profiles = profiles(&self.root.join("models"), selection)?;
+        if profiles.is_empty() {
+            return Err(Failure::new(format!(
+                "no model profile matches `{}`; an empty selection is not a pass",
+                selection.unwrap_or("models/")
+            )));
+        }
+        let checkers = Checkers::find()?;
+        eprintln!("checkers: {}", checkers.versions);
+        for profile in &profiles {
+            checkers.run(profile, &self.root.join("target/model").join(&profile.name))?;
+        }
+        Ok(())
+    }
+}
+
+/// A checker run: a model module and the file that configures the run.
+struct Profile {
+    /// `<model>/<file name>`, for example `operation-ownership/MC.cfg`.
+    name: String,
+    dir: PathBuf,
+    module: String,
+    file: PathBuf,
+    apalache: bool,
+    known_bad: bool,
+}
+
+/// The profiles in `models/` that `selection` names, in name order: all of them,
+/// those of one model, or one file.
+fn profiles(models: &Path, selection: Option<&str>) -> Result<Vec<Profile>, Failure> {
+    let (model, file) = match selection.map(|text| text.split_once('/')) {
+        None => (None, None),
+        Some(None) => (selection, None),
+        Some(Some((model, file))) => (Some(model), Some(file)),
+    };
+    let mut found = Vec::new();
+    for dir in sorted_entries(models)? {
+        let Some(model_name) = dir.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if !dir.is_dir() || model.is_some_and(|model| model != model_name) {
+            continue;
+        }
+        for path in sorted_entries(&dir)? {
+            let (Some(stem), Some(extension), Some(file_name)) = (
+                path.file_stem().map(|stem| stem.to_string_lossy().into_owned()),
+                path.extension(),
+                path.file_name().map(|name| name.to_string_lossy().into_owned()),
+            ) else {
+                continue;
+            };
+            let apalache = match extension.to_str() {
+                Some("cfg") => false,
+                Some("apalache") => true,
+                _ => continue,
+            };
+            let module = format!("{stem}.tla");
+            if !dir.join(&module).is_file() || file.is_some_and(|file| file != file_name) {
+                continue;
+            }
+            found.push(Profile {
+                name: format!("{model_name}/{file_name}"),
+                dir: dir.clone(),
+                known_bad: stem.ends_with("_bad"),
+                module,
+                file: path,
+                apalache,
+            });
+        }
+    }
+    Ok(found)
+}
+
+/// The entries of `dir` in name order; none when `dir` does not exist.
+fn sorted_entries(dir: &Path) -> Result<Vec<PathBuf>, Failure> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(Failure::new(format!("{}: {error}", dir.display()))),
+    };
+    let mut paths = entries
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| Failure::new(format!("{}: {error}", dir.display())))?;
+    paths.sort();
+    Ok(paths)
+}
+
+/// The model checkers that `machine update all` installs, one version of each,
+/// under `~/.local/opt/<name>/<version>`.
+struct Checkers {
+    java_bin: PathBuf,
+    tla2tools: PathBuf,
+    apalache: PathBuf,
+    versions: String,
+}
+
+impl Checkers {
+    fn find() -> Result<Self, Failure> {
+        let home = env::var_os("HOME").ok_or_else(|| Failure::new("HOME is not set".to_owned()))?;
+        let opt = Path::new(&home).join(".local/opt");
+        let (jre, jre_version) = installed(&opt, "temurin-jre")?;
+        let (tla2tools, tla2tools_version) = installed(&opt, "tla2tools")?;
+        let (apalache, apalache_version) = installed(&opt, "apalache")?;
+        // A macOS JRE keeps its home in a bundle; a Linux JRE is the home.
+        let bundle = jre.join("Contents/Home");
+        let java_home = if bundle.is_dir() { bundle } else { jre };
+        Ok(Self {
+            java_bin: java_home.join("bin"),
+            tla2tools: tla2tools.join("tla2tools.jar"),
+            apalache: apalache.join("bin/apalache-mc"),
+            versions: format!("temurin-jre {jre_version}, tla2tools {tla2tools_version}, apalache {apalache_version}"),
+        })
+    }
+
+    /// Runs `profile` with its output in `out`, which starts empty. TLC reports
+    /// a violation with an exit code from 10 to 14, and Apalache with 12. TLC
+    /// runs with no search limit, so a pass is a completed search.
+    fn run(&self, profile: &Profile, out: &Path) -> Result<(), Failure> {
+        let output_error = |error: io::Error| Failure::new(format!("{}: {error}", out.display()));
+        match fs::remove_dir_all(out) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(output_error(error)),
+            _ => fs::create_dir_all(out).map_err(output_error)?,
+        }
+        let mut command = if profile.apalache {
+            let text = fs::read_to_string(&profile.file)
+                .map_err(|error| Failure::new(format!("{}: {error}", profile.file.display())))?;
+            // apalache-mc runs the first `java` on the path.
+            let path = env::var_os("PATH").unwrap_or_default();
+            let path = env::join_paths(iter::once(self.java_bin.clone()).chain(env::split_paths(&path)))
+                .map_err(|error| Failure::new(format!("PATH: {error}")))?;
+            let mut command = Command::new(&self.apalache);
+            command
+                .args(text.lines().map(str::trim).filter(|line| !line.is_empty()))
+                .arg(format!("--out-dir={}", out.display()))
+                .env("PATH", path);
+            command
+        } else {
+            let mut command = Command::new(self.java_bin.join("java"));
+            command
+                .args(["-XX:+UseParallelGC", "-cp"])
+                .arg(&self.tla2tools)
+                .args(["tlc2.TLC", "-workers", "auto", "-noGenerateSpecTE", "-metadir"])
+                .arg(out.join("states"))
+                .args(["-dumpTrace", "json"])
+                .arg(out.join("trace.json"))
+                .arg("-config")
+                .arg(&profile.file);
+            command
+        };
+        command.arg(&profile.module).current_dir(&profile.dir);
+
+        let checker = if profile.apalache { "apalache" } else { "tlc" };
+        eprintln!("── {checker} {}", profile.name);
+        let started = Instant::now();
+        let status = command
+            .status()
+            .map_err(|error| Failure::new(format!("{}: cannot start {checker}: {error}", profile.name)))?;
+        let code = status.code();
+        let violation = if profile.apalache {
+            code == Some(12)
+        } else {
+            matches!(code, Some(10..=14))
+        };
+        let seconds = started.elapsed().as_secs_f64();
+        match (profile.known_bad, violation) {
+            (true, true) => {
+                eprintln!("   violation found, as the known-bad variant requires, in {seconds:.2}s");
+                Ok(())
+            }
+            (true, false) if status.success() => Err(Failure::new(format!(
+                "{}: the known-bad variant found no violation",
+                profile.name
+            ))),
+            (false, _) if status.success() => {
+                eprintln!("   ok in {seconds:.2}s");
+                Ok(())
+            }
+            _ => Err(Failure {
+                message: format!("{} failed ({status}); the output is in {}", profile.name, out.display()),
+                code: code
+                    .and_then(|code| u8::try_from(code).ok())
+                    .filter(|code| *code != 0)
+                    .unwrap_or(1),
+            }),
+        }
+    }
+}
+
+/// The one installed version of `name` under `opt`: its directory and version.
+fn installed(opt: &Path, name: &str) -> Result<(PathBuf, String), Failure> {
+    let dir = opt.join(name);
+    let mut versions = sorted_entries(&dir)?;
+    versions.retain(|path| path.is_dir());
+    match (versions.pop(), versions.is_empty()) {
+        (Some(path), true) => {
+            let version = path
+                .file_name()
+                .map(|version| version.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Ok((path, version))
+        }
+        _ => Err(Failure::new(format!(
+            "{}: expected one installed version; run `machine update all`",
+            dir.display()
+        ))),
     }
 }
 
