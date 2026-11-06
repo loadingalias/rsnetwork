@@ -1,0 +1,12 @@
+# RunsOn runner catalog: a runner name, then its AWS shape and image. Workflows
+# select a runner by name only; the size is set here. This is the linux-x64-ci
+# class of top-secret. Required CI uses on-demand capacity, so a Spot reclaim
+# cannot fail a run.
+runners:
+  linux-x64-ci:
+    family: [c7a.xlarge, c8a.xlarge]
+    cpu: 4
+    ram: 8
+    image: ubuntu24-minimal-x64
+    spot: false
+    volume: 40gb:gp3

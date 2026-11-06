@@ -1,0 +1,110 @@
+# The CI gate: `cargo xtask check` on each push to main.
+#
+# Each version comes from a file that `machine update all` writes:
+# rust-toolchain.toml, .config/nextest.toml, and Cargo.lock. A pin change
+# reaches CI with the next commit, and it changes the cache keys.
+#
+# `cargo xtask test` joins this job with the first test: Nextest fails a run
+# that has no tests.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_AUTO_INSTALL: "0"
+
+jobs:
+  check:
+    name: check
+    # .github/runs-on.yml sets the runner size. extras=s3-cache selects Magic
+    # Cache: actions/cache keeps its entries in the S3 bucket of the stack.
+    runs-on: runs-on=${{ github.run_id }}/runner=linux-x64-ci/env=production/extras=s3-cache
+    timeout-minutes: 20
+    steps:
+      # Magic Cache needs this step before the first cache step.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The shell calculates the keys, as in top-secret: hashFiles() does not
+      # work on the RunsOn minimal images.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          sum() { cat "$@" | sha256sum | cut -c1-16; }
+          toolchain=$(sum rust-toolchain.toml)
+          {
+            echo "tooling=tooling-$RUNNER_ARCH-$(sum rust-toolchain.toml .config/nextest.toml)"
+            echo "build=build-$RUNNER_ARCH-$toolchain-$(sum Cargo.lock)"
+            echo "build-prefix=build-$RUNNER_ARCH-$toolchain-"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore Rust and cargo-nextest
+        id: tooling
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/bin
+          key: ${{ steps.keys.outputs.tooling }}
+
+      # The image is the pin for system packages.
+      - name: System packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(build-essential ca-certificates curl)
+          dpkg -s "${packages[@]}" > /dev/null 2>&1 && exit 0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends "${packages[@]}"
+
+      # rustup as `machine install` installs it, the toolchain of
+      # rust-toolchain.toml, and cargo-nextest at the version of
+      # .config/nextest.toml from its crates.io source with --locked.
+      - name: Install Rust and cargo-nextest
+        if: steps.tooling.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          "$HOME/.cargo/bin/rustup" toolchain install
+          version=$(sed -nE 's/^nextest-version = \{ required = "([^"]+)".*/\1/p' .config/nextest.toml)
+          test -n "$version"
+          # A separate Cargo home keeps the sources of cargo-nextest out of the build cache.
+          CARGO_HOME="$RUNNER_TEMP/tool-home" "$HOME/.cargo/bin/cargo" install \
+            --locked --root "$HOME/.cargo" "cargo-nextest@$version"
+
+      - name: Put Cargo on the path
+        shell: bash
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore the Cargo registry and the target directory
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.keys.outputs.build }}
+          restore-keys: ${{ steps.keys.outputs.build-prefix }}
+
+      - name: cargo xtask check
+        shell: bash
+        run: cargo xtask check
