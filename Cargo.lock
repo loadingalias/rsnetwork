@@ -3,9 +3,18 @@
 version = 4
 
 [[package]]
+name = "rscrypto"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e708a799aaf045099fc91c80bb60a63e8e3da710a6a17953d97afc5ecb192861"
+
+[[package]]
 name = "rsnetwork"
 version = "0.1.0-alpha.1"
 
 [[package]]
 name = "xtask"
 version = "0.0.0"
+dependencies = [
+ "rscrypto",
+]
