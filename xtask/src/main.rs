@@ -844,7 +844,9 @@ impl Checkers {
     /// Build the native TLC command that is retained in the run manifest.
     fn tlc_command(&self, out: &Path, profile: &Path, module: &str, memory: Option<TlcMemory>) -> Command {
         let mut command = Command::new(self.java_bin.join("java"));
-        command.env_clear().arg("-XX:+UseParallelGC");
+        command
+            .env_clear()
+            .args(["-XX:+UseParallelGC", "-XX:+ExitOnOutOfMemoryError"]);
         if let Some(memory) = memory {
             command
                 .arg(format!("-Xmx{}m", memory.heap_mib))

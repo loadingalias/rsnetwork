@@ -35,7 +35,7 @@ By default, the command uses the JVM and TLC memory defaults. To set memory for 
 search, give both sizes in MiB. For example, on a 32 GiB host:
 
 ```sh
-cargo xtask model --tlc-heap-mib=8192 --tlc-fp-mib=8192 \
+cargo xtask model --tlc-heap-mib=20480 --tlc-fp-mib=4096 \
   attached-datagram/AttachedDatagram.FaultySender.cfg
 ```
 
@@ -51,6 +51,11 @@ With the pair, each TLC run also retains `gc.log` beside `run.txt`. The GC log h
 and no file rotation, so it keeps the whole run. The manifest records the exact JVM options.
 Without the pair, the command keeps the default memory policy and adds no GC log. These options
 change resources only; every selected profile still needs its complete check.
+
+Every TLC command also sets `-XX:+ExitOnOutOfMemoryError`. The pinned
+[liveness index](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/NodePtrTable.java)
+can retry with mismatched arrays after a heap allocation fails. The selected JDK exits with
+status 3 before that Java handler can recover. Such a run is incomplete, never a pass.
 
 The command prints the digest of the model files, then one result for each profile:
 
@@ -85,12 +90,13 @@ check. Init and Safety stay unfiltered; the matrix rejects narrower filters and 
 The 2026-11-09 model took about 25 minutes on its 16-vCPU evidence host. Those timings do not
 size the revised model. Its README records the current results and any unfinished boundary.
 
-The 2026-11-11 check is blocked with 35 of 43 profiles complete. `FaultySender` repeated a
-resource failure on the 16-vCPU, 32 GiB host with default memory and then with the explicit
-8,192 MiB heap and fingerprint settings above. Eight positive profiles remain unverified.
-The [blocked evidence record](../../models/attached-datagram/README.md#blocked-positive-searches)
-retains both incomplete searches, their logs, and the completed results. The proposed equivalent
-recurrence formulas remain unimplemented and unmeasured; no further check is part of this attempt.
+The 2026-11-11 gate is blocked with 33 current profiles complete and all ten positive profiles
+open. The small profiles pass. `FaultySender` reached the one-hour command cap on the 16-vCPU,
+32 GiB host with a 20 GiB heap and 4 GiB fingerprint storage; its queue remained nonempty.
+The other nine positives did not start. Its native manifest has no final checker exit or verdict;
+the supervising command exited 137. The [current evidence record](../../models/attached-datagram/README.md#current-evidence)
+retains the exact inputs, results, cap, cleanup, and prior attempts. No further check is part of
+this attempt.
 
 Each profile must finish within one hour on a 16-vCPU host, so that a run of every profile after a
 change stays short. Use the first 10 minutes of a capped run to estimate its full size from the

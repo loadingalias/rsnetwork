@@ -285,7 +285,9 @@ SendData(o) ==
     /\ p <= MaxPN
     /\ Cardinality(Flight) < cwnd
     /\ \A q \in Flight : q + Range > p
-    /\ \E x \in (IF FaultySender THEN Payloads ELSE {"good"}) :
+    \* A terminal receiver cannot reopen or inspect a new payload. Keep all
+    \* earlier payloads; choose one value only for this new send (README).
+    /\ \E x \in (IF FaultySender /\ rEnd = "open" THEN Payloads ELSE {"good"}) :
           /\ sLog' = Append(sLog, [off |-> o, pay |-> x])
           /\ net' = net \cup {[cid |-> 1, pn |-> p, off |-> o, pay |-> x]}
     /\ UNCHANGED <<ends, pathVars, sAcked, sLost, sCredit, receiverVars, faults>>
@@ -715,8 +717,12 @@ OutcomeStable ==
 \* reset and no parent end, an honest transfer completes. The consumer's read
 \* is a caller event, so it is the condition of the property, not a
 \* fairness of the specification.
-Progress == (WF_vars(Read) /\ <>[](mig = "none")) => <>BothDone
-ValidationEnds == [](mig # "none" => <>(mig = "none" \/ ~parentLive))
+\* BothDone is absorbing, including in LateReset: no action reopens an end.
+\* Thus <>BothDone equals []<>BothDone. If validation is not pending, its
+\* target already holds, so the response property also equals recurrence.
+\* These forms avoid tableaux without changing fairness (README).
+Progress == (WF_vars(Read) /\ <>[](mig = "none")) => []<>BothDone
+ValidationEnds == []<>(mig = "none" \/ ~parentLive)
 
 -----------------------------------------------------------------------------
 (* Reachability targets. Each witness profile checks the negation of one   *)
