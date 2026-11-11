@@ -73,17 +73,24 @@ seconds. These profiles take more time (measured on 16 vCPUs, 64 GiB, 2026-11-08
 | `AttachedDatagram.Cap3Range3Window3.cfg` | 12.4 million | 4 minutes on 10 cores |
 | `AttachedDatagram.Paths3.cfg`, `Cap3.cfg`, `Bytes5.cfg` | 7.8 to 9.5 million | 2 minutes |
 
-Each profile must finish within one hour on a 16-vCPU host. Before you run a new large profile in
-full, run it for 10 minutes, and estimate its full size from the growth of the distinct states and
-the queue. A profile that cannot finish in that time needs a smaller model, not a larger host.
+Each profile must finish within one hour on a 16-vCPU host, so that a run of every profile after a
+change stays short. Before you run a new large profile in full, run it for 10 minutes, and estimate
+its full size from the growth of the distinct states and the queue. A profile that does not finish
+in that time gives no result, and a larger host does not change the limit. Make the model smaller
+only in a way that keeps the result sound: symmetry over identical processes, a bound that the
+model proves, or an inductive proof. Each such change needs a known-bad variant that still fails
+under it. A smaller bound must still reach each failure that the model names, and it needs a
+profile with that bound raised by one.
 
 On a smaller host, select the profiles that your change touches, and run the whole model before
 you record evidence.
 
 ## When a profile fails
 
-- A main profile reports a violation. The trace in `trace.json` is a counterexample to a design
-  rule. The design changes first, and then the model.
+- A main profile reports a violation. The trace in `trace.json` starts at an initial state.
+  Compare each step with the design's transitions. If the model follows the design, the trace is
+  a counterexample to a design rule: the design changes first, and then the model. If the model
+  does not follow the design, correct the model.
 - A `_bad` profile reports "no violation". The variant no longer breaks its property, so the
   property or the module changed. Find which one changed before you change the profile.
 - A profile reports a violation of a property other than its own. The variant fails for another
