@@ -4,29 +4,19 @@ rsnetwork has a TLA+ model of the datagram form of attached channels:
 [`models/attached-datagram/`](../../models/attached-datagram/README.md). It checks that the
 consumer reads only the bytes that the sender sent, that an acknowledgement means that the
 receiver holds the bytes, that the receiver's replay state stays bounded, and that the channel
-ends when loss is fair and the consumer reads. The network loses, duplicates, and reorders
-datagrams, the parent migrates, and an on-path attacker reads and injects datagrams. The model
+ends under the declared loss budget when the consumer reads and the path eventually stays
+stable. It checks lossy ordinary ACKs, delayed final-size arrival, independent endpoint outcomes,
+and repeated migration attempts. Each validation must end even if attempts continue. The model
 checks the design, not the Rust code. Change the model when you change one of these rules or the
 wire format that they constrain.
 
-## Install the checkers
+## Checker requirements
 
-The model command uses the Rust toolchain that `rust-toolchain.toml` pins and three checkers. Put
-one version of each checker under `~/.local/opt/<name>/<version>/`:
-
-| Name | Version of the recorded evidence | Source | Path that the command uses |
-| --- | --- | --- | --- |
-| `temurin-jre` | 21.0.13+9 | [Eclipse Temurin](https://adoptium.net/temurin/releases/?version=21) JRE 21 | `bin/java` (on macOS, `Contents/Home/bin/java`) |
-| `tla2tools` | 1.8.0 (TLC2 Version 2026.11.06.005304, rev 3ec1cc4) | [TLA+ release v1.8.0](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0) | `tla2tools.jar` |
-| `apalache` | 0.62.4 | [Apalache release v0.62.4](https://github.com/apalache-mc/apalache/releases/tag/v0.62.4), `apalache-0.62.4.tgz` without its top directory | `bin/apalache-mc` |
-
-Compare each download with the SHA-256 that its release publishes. The TLA+ project builds the
-v1.8.0 release again from its main branch, so its `tla2tools.jar` changes in place. A newer build
-can give other state counts, but it must give the same verdicts. Each evidence record names the
-`TLC2 Version` line of its build. This model uses only TLC, but the command needs all three.
-
-The command does not install anything. If a checker is missing, or two versions of one are
-present, it stops and names the directory.
+The model command uses the pinned Rust toolchain and the checkers under `~/.local/opt/`:
+`temurin-jre`, `tla2tools`, and `apalache`. `~/machine` owns their versions through
+`machine update all`; installation or updates need maintainer approval. The command installs
+nothing. If a checker is missing, or more than one version is present, it stops and names the
+directory. Each evidence record keeps the checker versions and file identities.
 
 ## Run the model
 
@@ -37,19 +27,41 @@ cargo xtask model attached-datagram                                  # every pro
 cargo xtask model attached-datagram/AttachedDatagram.NoTagSquat_bad.cfg # one profile
 ```
 
-You can give several selections to one command. One model run at a time holds the host lock;
-another run waits for it.
+You can give several selections to one command. The command freezes the selected model files
+before it starts a checker, and each checker reads its retained source copy. One model run at a
+time holds the host lock; another run waits for it.
+
+By default, the command uses the JVM and TLC memory defaults. To set memory for a larger TLC
+search, give both sizes in MiB. For example, on a 32 GiB host:
+
+```sh
+cargo xtask model --tlc-heap-mib=8192 --tlc-fp-mib=8192 \
+  attached-datagram/AttachedDatagram.FaultySender.cfg
+```
+
+The first size sets the Java heap with `-Xmx`; the second sets separate fingerprint storage with
+`-XX:MaxDirectMemorySize`. The pair selects the pinned TLC `OffHeapDiskFPSet`, as defined by its
+[memory configuration](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/fp/FPSetConfiguration.java).
+Choose sizes that leave memory for the OS, file cache, and other native allocations. Each size
+must be a positive whole number of MiB, at most 4294967295. A missing member of the pair,
+duplicate option, or invalid value fails before a checker starts. The options apply to TLC;
+a selection that contains only Apalache profiles rejects them.
+
+With the pair, each TLC run also retains `gc.log` beside `run.txt`. The GC log has time stamps
+and no file rotation, so it keeps the whole run. The manifest records the exact JVM options.
+Without the pair, the command keeps the default memory policy and adds no GC log. These options
+change resources only; every selected profile still needs its complete check.
 
 The command prints the digest of the model files, then one result for each profile:
 
 ```text
-files of .../models/attached-datagram: sha256:<digest> (<count> files)
+files of .../target/model/inputs/<run>/attached-datagram: sha256:<digest> (<count> files)
 ── tlc attached-datagram/AttachedDatagram.NoTagSquat_bad.cfg
    `AckMeansHeld` is violated: as the known-bad variant requires, in 0.63s (exit status: 12)
 ```
 
 - A main profile passes with `ok` and exit status 0: a complete search with no violation. The
-  command reads the checker's own summary: TLC must report 0 states left on the queue, and
+  command reads the checker's own summary: TLC must report a completed search with 0 states left on the queue, and
   Apalache the outcome `NoError` with no timed-out query. A search that stopped early fails as
   inconclusive, also when the checker exits with 0. The command removes the JVM option variables
   (`JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`, `JVM_ARGS`) from each checker run.
@@ -59,24 +71,32 @@ files of .../models/attached-datagram: sha256:<digest> (<count> files)
   target.
 
 The command exits 0 when every selected profile passes. The output of each profile goes to
-`target/model/attached-datagram/<profile>/`: `checker.log`, and `trace.json` for a violation.
+`target/model/attached-datagram/<profile>/<run>/`: the input closure in `source/`,
+`run.txt` with commands and identities, `checker.log`, `stderr.log`, and `trace.json` for a violation.
+Runs have separate directories; a later run does not replace an earlier result.
+
+In an Apalache induction matrix, a Step profile can use
+`--tuning-options=search.invariantFilter=1->.*` when its initializer already includes `IndInv`.
+This checks every invariant clause at the successor state and omits the redundant initial-state
+check. Init and Safety stay unfiltered; the matrix rejects narrower filters and transition filters.
 
 ## Large profiles
 
-The whole model takes about 25 minutes on a 16-core host. The main profile takes about 30
-seconds. These profiles take more time (measured on 16 vCPUs, 64 GiB, 2026-11-08):
+The 2026-11-09 model took about 25 minutes on its 16-vCPU evidence host. Those timings do not
+size the revised model. Its README records the current results and any unfinished boundary.
 
-| Profile | Distinct states | Time |
-| --- | --- | --- |
-| `AttachedDatagram.MaxPN7.cfg` | 45.0 million | 10 minutes |
-| `AttachedDatagram.FaultySender.cfg` | 23.3 million | 4.5 minutes |
-| `AttachedDatagram.Cap3Range3Window3.cfg` | 12.4 million | 4 minutes on 10 cores |
-| `AttachedDatagram.Paths3.cfg`, `Cap3.cfg`, `Bytes5.cfg` | 7.8 to 9.5 million | 2 minutes |
+The 2026-11-11 check is blocked with 35 of 43 profiles complete. `FaultySender` repeated a
+resource failure on the 16-vCPU, 32 GiB host with default memory and then with the explicit
+8,192 MiB heap and fingerprint settings above. Eight positive profiles remain unverified.
+The [blocked evidence record](../../models/attached-datagram/README.md#blocked-positive-searches)
+retains both incomplete searches, their logs, and the completed results. The proposed equivalent
+recurrence formulas remain unimplemented and unmeasured; no further check is part of this attempt.
 
 Each profile must finish within one hour on a 16-vCPU host, so that a run of every profile after a
-change stays short. Before you run a new large profile in full, run it for 10 minutes, and estimate
-its full size from the growth of the distinct states and the queue. A profile that does not finish
-in that time gives no result, and a larger host does not change the limit. Make the model smaller
+change stays short. Use the first 10 minutes of a capped run to estimate its full size from the
+growth of the distinct states and the queue. If it can finish within the cap, continue that run;
+do not restart it only to repeat the sample. A profile that does not finish within its cap gives
+no result, and a larger host does not change the limit. Make the model smaller
 only in a way that keeps the result sound: symmetry over identical processes, a bound that the
 model proves, or an inductive proof. Each such change needs a known-bad variant that still fails
 under it. A smaller bound must still reach each failure that the model names, and it needs a

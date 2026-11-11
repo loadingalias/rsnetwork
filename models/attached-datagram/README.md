@@ -1,281 +1,463 @@
 # Attached channel: datagram form
 
-This is the design model of task N000. It checks the rules of the datagram form of attached
-channels (`docs/specs/networking.md`, "Attached Channels" and "Datagram Form") before the N603
-wire format is fixed. `AttachedDatagram.tla` models the design that was selected on 2026-11-07:
-each side datagram carries an AES-GMAC tag, the receiver slides its own replay window, each
-acknowledgement frame names packet numbers and the consumer's read point, and the side flow
-follows the parent's path through migration, also through a spurious one.
+This is the design model of task N000. It checks the rules of attached datagram channels in
+`docs/specs/networking.md`, through the decisions of 2026-11-11, before N603 fixes the wire
+format. The [statechart](statechart.md) shows its control states.
 
-**Status (2026-11-09): complete.** Every profile passes at the declared bounds, and each argued bound passes raised by one, in one command at the final digest ([Evidence host record of the final files](#evidence-host-record-of-the-final-files)).
-The design as first written had a defect, packet-number squatting. The [Decisions](#decisions)
-section gives the defect, the selected design, and each rejected option.
+**Status (2026-11-11): N000 is blocked; 35 of 43 profiles are complete.** All 33 known-bad and
+reachability profiles pass, as do the base and `NoOnPath` positive profiles. Eight positive
+profiles remain unverified. `FaultySender` repeated the resource failure with explicit memory
+settings, so checking stopped under the repeated-failure rule. The [current evidence](#current-evidence)
+retains both attempts. Earlier evidence cannot qualify the changed rules. The
+[pending recurrence form](#pending-recurrence-form) is unimplemented and unmeasured.
 
 ## Promise
 
-A sender sends a stream of bytes to a receiver in side datagrams. The parent QUIC connection
-carries all control in authenticated frames. Each side datagram has a tag that gives it integrity
-and no confidentiality. The promise is:
+Each side datagram carries a tag that gives integrity and no confidentiality. The parent carries
+authenticated control frames. The model checks these rules:
 
-- The receiver holds only the bytes that the sender sent, at the offsets where the sender sent
-  them. With an honest sender, the network and an on-path attacker cannot end the channel.
-- An acknowledgement means that the receiver's transport holds the bytes. Only the read point
-  means that the consumer read them.
-- Only a datagram that passes its tag moves the receiver's replay window, and the receiver's
-  replay state stays inside its window.
-- When loss is fair, the parent stays alive, and the consumer keeps reading, the channel ends.
-  Without a reset or a parent end, it completes, also after a genuine or a spurious migration and
-  with the on-path attacker. A spurious migration costs the side flow what it costs the parent.
+- The receiver holds bytes that the sender sent at their offsets. An acknowledgement of an
+  offset below the final size means that its bytes are held or read. Only the final read-point
+  frame completes the sender.
+- Credit admits only bounded receive storage. Only an accepted datagram moves the bounded replay
+  window. A final-size frame discards unread excess. A final size below the read point gives
+  integrity at that endpoint.
+- Each endpoint keeps its first terminal outcome. A later terminal frame ends an open peer.
+  Completion can cross reset, or the parent can fail before notification, so the outcomes can
+  differ.
+- Each validation ends by success, abandonment, or parent failure. Migration attempts have no
+  finite count. With finite loss inside the packet budget, eventual path stability, a live
+  parent, and a consumer that keeps reading, both endpoints end. Without reset or parent
+  failure, an honest transfer completes.
 
-A concrete failure, in the design before 2026-11-07: an on-path attacker sends one datagram with
-a packet number that the sender uses next. The receiver accepts it. The sender then sends other
-bytes with that packet number, and the acknowledgement of that number makes the sender count
-bytes that the receiver never got. The consumer waits for them forever.
+A concrete failure is the loss of the last ordinary ACK. If the sender does not run loss
+recovery for that packet, its send window can stay full while the receiver waits for more data.
+A reliable-ACK assumption would hide this failure. `NoAckRecovery_bad` must expose it.
 
 ## Run it
 
 ```sh
-cargo xtask model attached-datagram                                  # every profile
-cargo xtask model attached-datagram/AttachedDatagram.cfg             # the design
+cargo xtask model attached-datagram
+cargo xtask model attached-datagram/AttachedDatagram.NoAckRecovery_bad.cfg
 ```
 
-The output of a profile goes to `target/model/attached-datagram/<file>/`: `checker.log` has the
-checker output, and on a violation `trace.json` has the trace. [Check the design
-models](../../docs/content/design-models.md) tells how to install the checkers and what a
-failure means.
+[Check the design models](../../docs/content/design-models.md) gives the tool requirements,
+budget, and verdict rules. Each run retains its input closure, command, source and tool
+identities, checker output, exit status, and any trace under
+`target/model/attached-datagram/<profile>/<run>/`. A known-bad or reachability profile checks one
+property and passes only when that property is violated.
 
-## Files and profiles
+## Correspondence and atomicity
 
-`AttachedDatagram.tla` is the only module. Each profile is `AttachedDatagram.<name>.cfg`; the
-constant `Bug` selects a known-bad variant, and `"none"` is the design. A `_bad` profile is a
-known-bad variant and a `_reach` profile is a reachability witness. Each of them checks one
-property, and it passes only when TLC reports a violation of that property.
+N603 and N604 have no implementation yet. This table maps actions to the design's contract rows;
+the wire-element and production-transition mapping must be added when that code exists.
 
-| Profile | Checks | Must |
-| --- | --- | --- |
-| `AttachedDatagram.cfg` | The design, the on-path attacker, an honest sender: every property and `Progress` | Pass |
-| `AttachedDatagram.NoOnPath.cfg` | The same without the on-path attacker. The two state counts show what the attacker adds | Pass |
-| `AttachedDatagram.FaultySender.cfg` | The design with a faulty sender that can send other bytes, and the attacker: every property except `NoNetworkIntegrity`, and `Progress` | Pass |
-| `AttachedDatagram.<Bound>.cfg` | The attacker profile with one argued bound raised by one (rule 4 of [FP Design Models]): `Paths3`, `Cap3`, `Range3`, `MaxPN7` (three faults), `Bytes5` (with `MaxPN = 7`, so two faults), and `Cap3Range3Window3` (the window can bind only when the credit and the spread bound also allow three in flight) | Pass |
-| `AttachedDatagram.NoTag_bad.cfg` | No tag check | Violate `HeldAreSenderBytes` |
-| `AttachedDatagram.NoTagSquat_bad.cfg` | No tag check: the squatting trace | Violate `AckMeansHeld` |
-| `AttachedDatagram.NoTagEnd_bad.cfg` | No tag check | Violate `NoNetworkIntegrity` |
-| `AttachedDatagram.SlideBeforeTag_bad.cfg` | The window moves before the tag check | Violate `WindowAfterTag` |
-| `AttachedDatagram.ReusePN_bad.cfg` | A retransmission reuses its packet number | Violate `Progress` |
-| `AttachedDatagram.CompleteAtAck_bad.cfg` | Completion at acknowledgement, without the read | Violate `CompletionSound` |
-| `AttachedDatagram.CreditBeyond_bad.cfg` | Credit one byte beyond admitted capacity | Violate `CreditBound` |
-| `AttachedDatagram.NoWindowBound_bad.cfg` | The receiver has no window | Violate `PNStateBound` |
-| `AttachedDatagram.LateReset_bad.cfg` | A reset after a terminal outcome | Violate `OutcomeStable` |
-| `AttachedDatagram.NoAbandon_bad.cfg` | The design as written before 2026-11-07: the side flow pauses while the parent validates, and nothing abandons a validation | Violate `Progress` |
-| `AttachedDatagram.<Target>_reach.cfg` | Each terminal outcome (`Completed`, `Reset`, `ParentEnd`, `Partial`, `Refused`, `Integrity`), `Resumed`, `Abandoned`, `CompletedAfterAbandon`, `WindowPassed`, and `ReplayAccepted` | Reach the target |
-
-## Model
-
-The model has one sender, one receiver, the parent's paths, the network, and an on-path
-attacker. Each datagram carries one byte. A payload is `"good"` when it is the sender's correct
-byte at the datagram's offset, and `"bad"` when it is not. The application's tags cover the
-channel and the position, so the consumer's read rejects a `"bad"` byte. The model computes no
-tags: a datagram passes the tag only when it is a datagram that the sender sent (`Authentic`).
-
-The parent's frames (acknowledgements with the read point, credit, final size, and reset) are
-reliable and authenticated, because the design puts them in the parent. They can arrive late and
-in a different order. The model keeps one outcome for the channel: the first terminal event at
-either end sets it, and the model merges the parent frame that tells the other end. The final
-size is fixed at `Bytes`, because its frame is in the parent.
-
-| Action | Contract row | Atomicity |
-| --- | --- | --- |
-| `Init` | Explicit profile: the open succeeds or refuses | Initial state |
-| `SendData(o)` | Packet numbers and replay; Receive credit; Congestion and loss; Migration; Path and routing; Retransmission | The sender builds and sends one datagram with the next packet number and its tag |
-| `Deliver(d)` | Tag; Packet numbers and replay; Receive credit; Injection: one arrival and the full receive procedure (`RecvState`) | One step. A later copy is a duplicate, so the model delivers each datagram once |
-| `Replay(p)` | Injection: the on-path attacker sends again a datagram that the sender sent | One step: send and arrival |
-| `Lose(d)` | Network loss | One step, inside the fault bound |
-| `DeclareLost(p)` | Congestion and loss: the RFC 9002 thresholds and a congestion event of the shared window | One step. With no clock it can come too early, inside the fault bound |
-| `DeliverAck(p)` | Control; Packet numbers and replay: a packet-number acknowledgement in a parent frame; a never-sent packet number shows a faulty peer | The sender processes one packet number |
-| `DeliverCredit(c)` | Receive credit: a credit frame arrives | One step |
-| `Read` | Receive credit; Integrity (Attached Channels): the consumer reads one byte, its application tag is checked, and the read admits capacity and grants credit | One step |
-| `Complete` | Terminal outcomes: the consumer read to the final size, and the frame that names that read point arrives at the sender | One step |
-| `Reset`, `ParentEnd` | Terminal outcomes; Lifetime; partial delivery at a parent end | One step |
-| `ParentLoss` | Congestion and loss: a parent loss on the parent's validated path reduces the shared window | One step. During a validation, the parent's packets count for the new path's controller, which success resets and an abandon discards |
-| `MigrateStart` | Migration: the peer moves, and the parent starts to validate the new address on a new path and connection ID | One step. A peer event |
-| `Spoof` | Migration: the attacker's copy of a parent packet with a spoofed address arrives first (RFC 9000 sections 9.3.2 and 9.3.3) | One step. An attacker event; its validation cannot succeed |
-| `Validated` | Migration; Path and routing: the PATH_RESPONSE arrives; the side flow follows the parent to the new path and its connection ID, with initial congestion state | One step |
-| `Abandon` | Migration: the validation timer expires or the last validated address returns (RFC 9000 sections 8.2.4 and 9.3.2); the side flow returns with the parent to the last validated path and its congestion state | One step |
-| `Done` | A terminal state stays as it is | Stuttering step, so the deadlock check stays on |
-| `Forge(d)`, `GrantBeyond`, `ResendSamePN(p)` | Known-bad variants only: a datagram that the tag would refuse, credit beyond capacity, a reused packet number | One step each |
-
-A datagram whose tag fails changes no state, so the design has no step for it. The receiver accepts
-a side datagram on each connection ID that it issued for the channel; the model retires none. An
-off-path attacker has no connection ID, so its datagram also fails the window check. The N603 wire element
-and the N604 transition columns are added when that code exists.
-
-### Properties
-
-| Task property | Model property | Kind |
-| --- | --- | --- |
-| The receiver holds only bytes that the sender sent at that offset | `HeldAreSenderBytes` | Invariant. No step checks it; only the tag makes it hold |
-| No data beyond granted credit is accepted; credit only for admitted capacity | `CreditBound` | Invariant |
-| The receiver's replay state stays inside its declared window | `PNStateBound` | Invariant |
-| The window moves only when the receiver accepts a datagram whose tag passed | `WindowAfterTag` | Action property |
-| An acknowledgement means that the receiver's transport holds the bytes | `AckMeansHeld` | Invariant |
-| Completion needs the consumer's read to the final size | `CompletionSound` | Invariant |
-| With an honest sender, nothing from the network ends the channel with integrity | `NoNetworkIntegrity` | Invariant |
-| The terminal outcomes stay distinct | `OutcomeStable`; one value for each outcome | Action property |
-| Progress when loss is fair, the parent stays alive, and the consumer keeps reading | `Progress`: `WF_vars(Read) => <>(outcome # "open")`. The consumer's read is a caller event, so it is the condition of the property, not a fairness of the specification. Reset and parent end have no fairness, so a run without them must complete | Liveness |
-| No state deadlocks | TLC's deadlock check, with `Done` in terminal states | Deadlock |
-
-`TypeOK` is an invariant of each passing profile. The application's tag check at the read is an
-assumption of the model ([NET Attached Channels], "Integrity"), not a checked property. The
-earlier properties `ReadsSenderBytes` and `JunkInert` restated the read step and the discard rule,
-so `HeldAreSenderBytes` and `PNStateBound` replace them (selected on 2026-11-07).
-
-### Bounds, faults, and fairness
-
-- Bounds: one channel, `Bytes = 4`, `MaxPN = 6`, `Paths = 2` (one migration attempt, genuine or
-  spurious; each attempt takes a new path and connection ID), one injected
-  datagram at a time, `Cap = 2`, `Window = 2`, and a replay window of `Range = 2` packet
-  numbers. The design sizes the window from the packet rate and the declared reordering time; the
-  model's window is small so that the window passes packet numbers (`WindowPassed_reach`).
-- Faults: loss, duplication, reordering and delay (`net` is a set), early loss declarations, a
-  genuine migration whose validation can fail, a spurious migration, the on-path attacker
-  (`OnPath = TRUE`), and a faulty sender (`FaultySender = TRUE`, one profile).
-- Fault bound: a loss or an early declaration happens only while the sender
-  keeps a packet number to send each affected byte again (`Spent <= Budget`, `Budget = MaxPN -
-  Bytes`, so two faults). The `ReusePN` variant counts its faults in `faults`, because a reuse
-  takes a packet number out of `sLost`.
-- Fairness: weak fairness on the sender's send and its loss declaration of a doomed packet; on
-  each delivery of a datagram and of a parent frame; on completion, when the frame with the read
-  point arrives; and on the end of a validation, `Validated \/ Abandon`, because its timer bounds
-  it. Success alone has no fairness: only the peer can answer. Loss, early declarations, the
-  attacker, spurious migrations, the consumer's read, reset, parent end, parent loss, and
-  migration starts have no fairness.
-
-## Physical assumptions
-
-Each assumption about the world outside the two ends, with its primary source and its fairness.
-The family policy ([FP Design Models]) gives a peer, an attacker, or a caller no fairness unless
-the design bounds the event.
-
-| Assumption | Source | In the model | Fairness, and why |
-| --- | --- | --- | --- |
-| The network loses, duplicates, reorders, and delays each datagram with no bound for one datagram | [RFC 8085 section 3.3](https://www.rfc-editor.org/rfc/rfc8085#section-3.3) | `Lose`, a set `net` with any delivery order, `Replay` for a late copy | No fairness on any one loss. Delivery of a datagram that is not lost is fair: loss is fair, the claim of `Progress` |
-| An on-path attacker reads each side datagram and injects datagrams, but does not drop them. RFC 9000 calls this an off-path active attacker, or a limited on-path attacker when its copies arrive first | [RFC 9000 section 21.1.3.2](https://www.rfc-editor.org/rfc/rfc9000#section-21.1.3.2), [21.1.3.3](https://www.rfc-editor.org/rfc/rfc9000#section-21.1.3.3) | `Replay(p)`: it sends again any sent datagram. An attacker that drops datagrams can stop any channel, as it can stop the parent | None |
-| The attacker cannot forge a GMAC tag, except with a probability of about l / 2^128 for each attempt on a datagram of l blocks of 16 bytes. The receiver counts each failed tag and ends the channel at 2^52 failures, which keeps the total forgery chance at or below 2^-57 | [RFC 9001 section 6.6](https://www.rfc-editor.org/rfc/rfc9001#section-6.6), [Appendix B.1.2](https://www.rfc-editor.org/rfc/rfc9001#appendix-B.1.2); [RFC 4543](https://www.rfc-editor.org/rfc/rfc4543) | The model abstracts a forgery below that limit as impossible: a datagram passes the tag only when the sender sent it (`Authentic`). The variants `NoTag` and `SlideBeforeTag` let the attacker send any datagram (`Forge`) | None |
-| A packet number is never reused under one key. The space is finite (2^62), so the channel ends before reuse. A reused number is a reused GMAC nonce, which discloses the hash key | [RFC 9000 section 12.3](https://www.rfc-editor.org/rfc/rfc9000#section-12.3); [NIST SP 800-38D](https://csrc.nist.gov/pubs/sp/800/38/d/final) section 8 | `MaxPN` bounds the packet numbers; `ReusePN` shows the progress failure of a reuse. The nonce failure is not modeled: the model computes no tags | Not an event |
-| RTT and the RFC 9002 loss thresholds come from real clocks, and delay has no bound, so a loss declaration can be early | [RFC 9002 sections 5 and 6.1](https://www.rfc-editor.org/rfc/rfc9002#section-6.1) | The model has no clock. `DeclareLost` can come at any time, inside the fault bound | Fair only for a doomed packet: one in flight, not accepted, and with no copy in the network. An early declaration has no fairness |
-| One congestion controller and pacer admit the parent's packets and the side datagrams on a path | [RFC 9002 section 7](https://www.rfc-editor.org/rfc/rfc9002#section-7); [RFC 9221 section 5.4](https://www.rfc-editor.org/rfc/rfc9221#section-5.4) | One window `cwnd` for both flows. A loss in either flow halves it, with no recovery period, which is conservative for `Progress` because the window stays at least 1 | `ParentLoss` has no fairness |
-| The parent stays alive and delivers its frames, which it sends again until they are acknowledged | [RFC 9000 section 13.3](https://www.rfc-editor.org/rfc/rfc9000#section-13.3) | `DeliverAck`, `DeliverCredit`, `Complete` | Fair: the claim of `Progress` is for a parent that stays alive. `ParentEnd` has no fairness |
-| A path validation succeeds only when the peer answers its PATH_CHALLENGE. The parent abandons it on a timer: "A value of three times the larger of the current PTO or the PTO for the new path ... is RECOMMENDED" (section 8.2.4). "An endpoint MUST revert to using the last validated peer address when validation of a new peer address fails" (section 9.3.2) | [RFC 9000 sections 8.2.4](https://www.rfc-editor.org/rfc/rfc9000#section-8.2.4), [9.3.2](https://www.rfc-editor.org/rfc/rfc9000#section-9.3.2) | `Validated` for a genuine migration only; `Abandon` for each | Fair on the end of a validation, `Validated \/ Abandon`, because the timer bounds it. No fairness on `Validated` alone |
-| A peer migrates, and an on-path attacker causes a spurious migration "by copying and forwarding a packet with a spoofed address such that it arrives before the original packet" (section 9.3.2). Each attempt uses a new connection ID (section 9.5) | [RFC 9000 sections 9.3.2](https://www.rfc-editor.org/rfc/rfc9000#section-9.3.2), [9.3.3](https://www.rfc-editor.org/rfc/rfc9000#section-9.3.3), [9.5](https://www.rfc-editor.org/rfc/rfc9000#section-9.5) | `MigrateStart`, `Spoof`, each on a new path; `Paths` bounds the attempts | None: peer and attacker events |
-| An attacker that keeps forwarding can make the path through itself the parent's path: "This places the attacker on-path, giving it the ability to observe or drop all subsequent packets" (section 9.3.3) | [RFC 9000 section 9.3.3](https://www.rfc-editor.org/rfc/rfc9000#section-9.3.3) | Outside the fault model: an attacker that drops can stop any channel, as it can stop the parent | Not modeled |
-| Until the parent validates a new peer address, it "limits the amount of data it sends to that address" (section 9.3.1), and a return to a previously validated path can restore "loss detection and congestion state" (section 9.3) | [RFC 9000 sections 8](https://www.rfc-editor.org/rfc/rfc9000#section-8), [9.3](https://www.rfc-editor.org/rfc/rfc9000#section-9.3), [9.3.1](https://www.rfc-editor.org/rfc/rfc9000#section-9.3.1), [9.4](https://www.rfc-editor.org/rfc/rfc9000#section-9.4) | No side data during a validation (reduction 5); `Abandon` keeps `cwnd`, and `Validated` sets it to its initial value | Not an event |
-| The consumer reads the bytes that the receiver holds | [NET Attached Channels], "Lifetime" (backpressure) | `Read` | None. `Progress` states it as its condition: a consumer that stops reading stops the channel by backpressure, and reset or the parent's lifetime then ends it |
-
-Each fairness condition names the failure that it could hide, and a known-bad variant with that
-failure still fails under it:
-
-| Fairness condition | The failure it could hide | Known-bad variant that still fails |
-| --- | --- | --- |
-| The sender sends (`SendData`) | A sender that sends again and never makes progress | `ReusePN_bad`: `Progress` fails |
-| The network delivers each datagram that it does not lose (`Deliver`) | A delivered datagram that the receiver must discard forever | `ReusePN_bad`: each copy of packet number 2 arrives and is discarded below the window |
-| A doomed packet is declared lost (`DeclareLost`) | Loss detection that never stops the cycle | `ReusePN_bad`: the declaration repeats, and `Progress` fails |
-| The parent delivers its frames and the sender completes (`DeliverAck`, `DeliverCredit`, `Complete`) | A completion that does not depend on the read | `CompleteAtAck_bad`: `CompletionSound` fails |
-| A validation ends (`Validated \/ Abandon`) | A validation that never ends while the side flow waits; the fairness on success alone, before 2026-11-07, hid it | `NoAbandon_bad`: a spurious migration pauses the side flow for good, and `Progress` fails |
-
-## Reductions
-
-Each reduction removes behaviors that no property can tell apart, or that another behavior of the
-model covers. After them, each known-bad variant still fails its own property.
-
-1. One delivery for each datagram. A later copy of a datagram is a duplicate or old, which changes
-   no state. The attacker's `Replay` covers the late copy of a lost datagram.
-2. The attacker sends again only a datagram that the receiver did not accept and that is not in
-   flight. A copy of an accepted datagram is a duplicate or old; a copy of a datagram in flight is
-   the same as its early delivery.
-3. The packets in flight span fewer than `Range` packet numbers (`SendData`). This is a bound of
-   the model, not a design rule. A datagram that falls below the receiver's window is discarded
-   with no state change and leaves the network, which is the same change as `Lose`. So the model
-   lets the window pass only a packet number that the sender settled, and `Lose` under the fault
-   bound covers the discard of one that it did not. The failure that this reduction could hide is
-   a discard below the window that the sender never recovers from: `ReusePN_bad` sends outside
-   the bound, its copies fall below the window, and `Progress` fails. `WindowPassed_reach` shows
-   that the window passes packet numbers in the design.
-4. The tag accepts a sent datagram with any connection ID, and the attacker's copy carries the
-   current path's connection ID. The real tag covers the connection ID, so this only adds
-   behaviors; the receiver accepts each issued connection ID in both cases.
-5. No side data while the parent validates a new peer address (`SendData` needs `mig = "none"`).
-   In the design, the side flow sends to that address within the parent's anti-amplification
-   limit, after the parent's control frames, which have priority. Each such datagram either
-   reaches the receiver, which accepts it on its issued connection ID, as a datagram that the
-   model sends after the validation ends, or it is lost, as `Lose` does inside the fault bound.
-   The parent's control frames have priority, so the side data cannot delay the validation. So
-   the reduction removes no failure. The failure that it could hide is a validation that never
-   ends while the side flow waits: `NoAbandon_bad` still fails `Progress` under it.
-
-## Known-bad variants and their counterexamples
-
-Each counterexample is from the evidence run below, as actions and observations.
-
-- `NoTag_bad`, `HeldAreSenderBytes`: `SendData(1)` sends offset 1 in packet number 1. `Forge`
-  sends packet number 1 with other bytes at offset 0, and the receiver accepts it. It holds bytes
-  that the sender never sent.
-- `NoTagSquat_bad`, `AckMeansHeld`, the squatting trace: `Forge` takes packet number 1, with other
-  bytes at offset 0, before the sender uses it, and the receiver accepts it. `SendData(1)` sends
-  offset 1 in packet number 1; that datagram will be a duplicate. `DeliverAck(1)` arrives, and the
-  sender counts offset 1 as acknowledged; the receiver does not hold offset 1. In the design as
-  first written, this squat made the channel stay open with no outcome.
-- `NoTagEnd_bad`, `NoNetworkIntegrity`: `Forge` puts other bytes at offset 0 in packet number 1,
-  and `DeliverAck(1)` of that never-sent packet number ends the channel with the integrity
-  outcome. Without the tag, one datagram ends the channel.
-- `SlideBeforeTag_bad`, `WindowAfterTag`: `Forge` sends a datagram with packet number 1 whose tag
-  fails. The receiver moves its window to 1 and then discards the datagram.
-- `ReusePN_bad`, `Progress`: offset 0 goes in packet number 1, and a genuine migration starts and
-  is abandoned. The sender sends offset 2 in packet number 2, declares it lost early, and that
-  datagram is lost. Offsets 1 and 3 go in packet numbers 3 and 4, and the receiver accepts them,
-  so its window passes 2. Then the loop: the sender sends offset 2 again with the reused packet
-  number 2, the receiver discards it below the window, and the sender declares 2 lost again. The
-  consumer waits for offset 2 forever.
-- `NoAbandon_bad`, `Progress`: offset 0 goes in packet number 1, arrives, and the consumer reads
-  it; the sender declares packet number 1 lost early, and its acknowledgement arrives later.
-  `Spoof` starts a validation of a spoofed address. That validation cannot succeed, and nothing
-  abandons it, so the side flow never sends offset 1, the consumer has nothing to read, and the
-  channel stays open: the stuttering lasso.
-- `CompleteAtAck_bad`, `CompletionSound`: each byte is acknowledged and the channel completes
-  before the consumer reads to the end.
-- `CreditBeyond_bad`, `CreditBound`: the receiver grants credit one byte beyond the admitted
-  capacity, and it holds a byte there.
-- `NoWindowBound_bad`, `PNStateBound`: the receiver keeps each accepted packet number, and its
-  replay state passes the window.
-- `LateReset_bad`, `OutcomeStable`: a reset changes a terminal outcome.
-
-## Reachability
-
-| Profile | Target |
+| Action | Contract row and one atomic step |
 | --- | --- |
-| `Completed_reach`, `Reset_reach`, `ParentEnd_reach`, `Partial_reach`, `Refused_reach` | Each terminal outcome, with an honest sender |
-| `Integrity_reach` | A faulty sender's other bytes reach the consumer, and the application tag ends the channel |
-| `Resumed_reach` | A migration completes, and a side datagram is in flight on the new path |
-| `Abandoned_reach` | The parent abandons a validation and returns to its last validated path |
-| `CompletedAfterAbandon_reach` | The channel completes after the parent abandoned a validation |
-| `WindowPassed_reach` | The window passes a packet number that the receiver did not accept |
-| `ReplayAccepted_reach` | The receiver accepts a datagram that the attacker sent again |
+| `Init` | Explicit profile: open succeeds or refuses at both endpoints |
+| `SendData(o)` | Packet numbers and replay; Receive credit; Congestion and loss; Retransmission; Path and routing: build and send one byte with a fresh packet number |
+| `Deliver(d)` | Tag; Packet numbers and replay; Receive credit; Injection: arrival and the local receive procedure |
+| `Replay(p)` | Injection: arrival of a sent datagram whose original copy did not arrive |
+| `Lose(d)` | Network loss of one data copy, inside the packet budget |
+| `DeclareLost(p)` | Congestion and loss: one loss declaration and shared-window reduction; an early declaration is allowed |
+| `DeliverAck` | Control; Packet numbers and replay: process all packet numbers in one authenticated ordinary ACK frame |
+| `LoseAck` | Control: lose the current ordinary ACK; a new accepted datagram replaces it with current receive state |
+| `DeliverCredit(c)` | Receive credit: one credit frame arrives |
+| `DeliverFinalSize` | Receive credit; Terminal outcomes: the final-size frame arrives, removes unread excess, and checks the read point |
+| `Read` | Receive credit; Integrity: read one byte, check its application tag, release its storage, and grant new credit |
+| `Complete` | Terminal outcomes: the receiver completes after the consumer reads the known final size |
+| `DeliverReceiverEnd`, `DeliverSenderEnd` | Terminal outcomes: a terminal frame arrives at an open peer; receiver completion carries the final read point |
+| `Reset(side)` | Terminal outcomes: a local reset at one endpoint |
+| `ParentEnd` | Lifetime; Terminal outcomes: the parent ends; each open endpoint reports its local result |
+| `ParentLoss` | Congestion and loss: a parent loss reduces the shared window |
+| `MigrateStart`, `Spoof` | Migration: start a genuine or spurious validation of another abstract path |
+| `Validated` | Migration: PATH_RESPONSE arrives, selects the candidate path, and resets its congestion state |
+| `Abandon` | Migration: the timer or the last validated address ends the attempt; retain the old path and its congestion state |
+| `Done` | Stuttering when both endpoints have ended |
 
-## Limits
+`Forge`, `GrantBeyond`, `ResendSamePN`, and `CompleteAtAck` exist only in known-bad variants.
+Other variants change the named production transition. `OldPacketReuse.tla` imports this
+protocol unchanged and adds only the `NoAckLoss` action constraint for its canary. The complete
+receive procedure is one local transition; network arrivals, consumer reads, and parent-frame
+arrivals are separate.
 
-- Data at or past a known final size (gap 2c): the model fixes the final size at `Bytes` and caps
-  credit there. A model of the rule needs one offset past the end and a final-size frame step.
-- Migration: the side data within the anti-amplification limit during a validation (reduction 5),
-  the retirement of connection IDs, and an attacker that becomes on path through forwarding and
-  then drops datagrams.
-- The parent's own packets in the shared window and the scheduler share of gap 2d: the model's
-  weak fairness on `SendData` states only that the side flow gets a share whenever the window has
-  room.
-- The tag's computation, its key derivation, and the nonce failure of a reused packet number: the
-  model computes no tags. N603 vectors and N604 tests cover them.
-- The model gives each acknowledgement frame the receiver's state at arrival, and it merges the
-  read-point frame into `Complete`. The state only grows, so an older frame names less.
-- The model proves no Rust code. When N603 and N604 exist, the correspondence table gets their
-  wire elements and transitions, and a change to either side reopens this check.
+The data domain has one byte per datagram. `good` means the correct application byte at that
+offset, and `bad` means a byte its application tag rejects. `Authentic` accepts only a datagram
+that the sender sent. A faulty sender can authenticate bad bytes and bytes beyond its later
+final size. The receiver keeps the first accepted bytes at each offset.
+
+## Properties and profiles
+
+| Property | Claim | Known-bad check |
+| --- | --- | --- |
+| `HeldAreSenderBytes` | Held bytes came from the sender at that offset | `NoTag_bad` |
+| `CreditBound` | Held bytes stay inside granted credit and admitted capacity | `CreditBeyond_bad` |
+| `PNStateBound` | Replay state stays inside the window | `NoWindowBound_bad` |
+| `WindowAfterTag` | The window moves only on an accepted packet number | `SlideBeforeTag_bad` |
+| `AckMeansHeld` | Acknowledged offsets below the final size are held or read | `NoTagSquat_bad` |
+| `CompletionSound` | Receiver completion needs the known final read point; sender completion needs receiver completion | `CompleteAtAck_bad` |
+| `FinalSizeBound` | No unread excess remains after final-size arrival | `FinalKeepsJunk_bad` |
+| `FinalReadIntegrity` | A final size below the read point reports integrity | `NoFinalIntegrity_bad` |
+| `NoNetworkIntegrity` | Network events do not cause integrity with an honest sender below the failed-tag limit | `NoTagEnd_bad` |
+| `OutcomeStable` | Each endpoint keeps its terminal outcome | `LateReset_bad` |
+| `Progress` | `WF_vars(Read) /\ <>[](mig = "none")` implies eventual termination of both endpoints | `ReusePN_bad`, `OldPacketReuse.Spread_bad`, `NoAckRecovery_bad`, `NoFinalNotice_bad` |
+| `ValidationEnds` | Each pending validation ends or the parent fails | `NoAbandon_bad` |
+
+The main, `NoOnPath`, and raised-bound profiles check all these properties and `TypeOK`.
+`FaultySender` and `Excess2` omit `NoNetworkIntegrity`: the faulty sender can cause integrity.
+The new existential final-size and endpoint profiles use one byte; `NoAckRecovery_bad` uses
+two bytes and a one-packet window. These smaller domains retain the named failures. They do not
+replace the positive profiles or their raised bounds.
+
+TLC also checks for deadlocks. `Done` keeps terminal states from being deadlocks.
+
+The witnesses cover each outcome (`Completed`, `Reset`, `ParentEnd`, `Partial`, `Refused`,
+`Integrity`); resumed sending, abandonment, completion after abandonment, and another attempt
+(`Resumed`, `Abandoned`, `CompletedAfterAbandon`, `RepeatedMigration`); a passed replay window
+and an accepted late copy (`WindowPassed`, `ReplayAccepted`); and the new boundaries (`Crossed`,
+`ParentInterrupted`, `FinalDelayed`, `LastAckLost`, `FinalBelowRead`, `JunkDiscarded`). The
+`LastAckLost`, `JunkDiscarded`, and `Resumed` action witnesses require the actual loss, discard,
+and send steps. `CompletedAfterAbandon` requires delivery of the final read-point frame after
+abandonment; both endpoints are then complete.
+
+## Bounds and fairness
+
+The base profile has `Bytes = 4`, `MaxPN = 6`, `Excess = 1`, `Paths = 2`, and
+`Cap = Range = Window = 2`. `Paths` counts reusable abstract identities, not attempts. Ordinary
+ACKs carry a set of accepted packet numbers; one arrival processes the frame together. The
+network is a set of data copies, so arrival order is arbitrary.
+
+The packet budget is `MaxPN - Bytes`. `Spent` counts declared losses, packets whose data or ACK
+can no longer arrive, and excess-byte transmissions. A fault is allowed only while enough packet
+numbers remain to send the required bytes again. Accepted data with no pending ACK is eligible
+for fair loss detection. `NoAckRecovery` removes that timer obligation without changing the
+fault budget. This is a finite-loss model; it does not prove progress for an arbitrary
+unbounded fair-loss network. `ReusePN` counts faults separately because it reuses packet numbers.
+
+Each argued bound has a raised profile: `Bytes5` (with seven packet numbers to keep two faults),
+`MaxPN7`, `Paths3`, `Cap3`, `Range3`, `Cap3Range3Window3`, and `Excess2`. The congestion raise
+also raises credit and packet-number spread so three packets can be in flight. `Excess2` uses a
+faulty sender and permits two bytes beyond the final size.
+
+| Fair action | Why it is fair | Failure retained by a known-bad check |
+| --- | --- | --- |
+| `SendData` | The side flow gets a share when admission stays possible | `ReusePN_bad`: repeated sends do not complete |
+| `Deliver` | A copy that stays in the network eventually arrives, under the stated loss assumption | `OldPacketReuse.Spread_bad`: arrival below the window cannot repair reused numbers |
+| `DeclareLost` for `Doomed` packets | Loss detection runs when no data or ACK copy remains | `NoAckRecovery_bad`: received data whose ACK was lost still needs recovery |
+| `DeliverAck` | An ordinary ACK that stays pending eventually arrives; `LoseAck` can remove it | `NoAckRecovery_bad`: no fairness delivers a lost ACK |
+| `DeliverCredit`, `DeliverFinalSize`, `Complete`, terminal-frame arrival | Local processing and reliable control progress while the parent is alive | `CompleteAtAck_bad`, `FinalKeepsJunk_bad`, `NoFinalIntegrity_bad`, `NoFinalNotice_bad` |
+| `Validated \/ Abandon` | Validation ends by the peer response or a bounded timer | `NoAbandon_bad`: a spurious attempt cannot succeed and never ends without abandonment |
+
+The consumer's read is a condition of `Progress`, not specification fairness. Reset, parent
+failure, parent loss, early loss declarations, network loss, attackers, and migration starts have
+no fairness. Success alone has no fairness. `ValidationEnds` does not assume eventual path
+stability; it applies also when attempts repeat without end.
+
+## Reductions and limits
+
+1. One data delivery and one late replay suffice for copies: a later accepted copy is duplicate
+   or old and changes no protocol state. `ReplayAccepted_reach` shows a useful late replay;
+   `OldPacketReuse.Spread_bad` retains failure from repeated old copies.
+2. An ordinary ACK contains current accepted packet numbers. New data replaces its pending
+   state; arrival processes the whole frame. Older partial ACK frames and ACK range encoding
+   are not separate state. Missing or delayed information is represented by loss and loss
+   declarations. `NoAckRecovery_bad` still checks lost-last-ACK recovery. ACK encoding and
+   frame processing need N604 tests.
+3. In-flight packet numbers span fewer than `Range` values. This is a model bound, not a sender
+   rule. Discard below the receiver's window is represented by data loss under the packet
+   budget. `OldPacketReuse.Spread_bad` excludes ordinary ACK loss and must fail through reuse
+   below the window. Its `NoAckLoss` action constraint applies only to this counterexample
+   search; the resulting trace is also a behavior of the unconstrained bad variant.
+   `WindowPassed_reach` reaches a passed number in the design.
+4. A sent datagram can pass its tag with any issued connection ID. The real tag also covers the
+   ID, so this adds acceptance behaviors. Inside that abstraction, every issued ID has the same
+   `Fresh` and `Authentic` result. Store all issued IDs as 1 and unissued IDs as 0; keep `path`
+   and `tried` separately. Fresh packet numbers distinguish live copies, so this removes only
+   unused ID history. `Resumed_reach` requires an actual send on the selected path. The model
+   retires no ID and does not check ID issuance, address history, or restoration of an earlier
+   path after a successful migration. `NoTag_bad` and `NoTagSquat_bad` retain the authentication
+   failures; `ReusePN_bad` retains the reused-copy failure.
+5. Side sending pauses during validation. Production sends to the parent's non-probing address
+   within its anti-amplification limit. The model does not check that admission or its scheduler.
+   With repeated attempts, this pause can leave no send opportunity that stays enabled. Thus
+   `Progress` explicitly requires an eventually stable path; it makes no progress claim under
+   continuous migration. `ValidationEnds` and `RepeatedMigration_reach` check validation and
+   repeatability separately, and `NoAbandon_bad` retains an endless spurious validation.
+6. After both endpoints have ended and `mig = "none"`, parent failure only changes `parentLive`.
+   The model omits that step. Project an original behavior by deleting such a `ParentEnd` step
+   and keeping the earlier value of `parentLive`. No new migration can start because starts
+   require `BothOpen`. All original fair actions are disabled in this suffix. The remaining
+   optional ACK loss and the `LateReset` bug can still take their original steps or stutter.
+   Thus the projection satisfies the original fairness conditions.
+
+   The omitted step changes no byte, credit, replay, acknowledgement, read-point, or outcome
+   predicate. `TypeOK` still has a Boolean `parentLive`; `WindowAfterTag` and `OutcomeStable`
+   see no change. `Progress` is already satisfied. `ValidationEnds` has no pending or future
+   attempt. `ParentInterrupted` still requires the parent failure that ends an open sender;
+   a `partial` outcome cannot already exist while `parentLive = TRUE`. All other outcome and
+   action targets retain the same transitions. In particular, `LateReset_bad` still changes a
+   terminal outcome, and `NoAbandon_bad` still exposes pending validation after both endpoints
+   end. Parent failure during pending validation, `Validated`, and `Abandon` remain unchanged.
+
+   This removes at most one lifetime-state copy per terminal history with no pending validation.
+   It does not merge the distinct data histories or reduce any declared bound. Ordinary ACK
+   loss after termination remains: moving it before the final local outcome gives the same
+   destination state, so suppressing that step would mainly remove duplicate edges.
+
+The model assumes the application's tag check, ideal GMAC below its failed-tag limit, and
+protected parent frames. It does not prove cryptographic computation, nonce safety, wire parsing,
+parent packet scheduling, recovery periods, or arbitrary-size buffers. N603 and N604 own the
+wire and implementation evidence. It proves no Rust code.
+
+## Current evidence
+
+After the terminal-lifetime reduction on 2026-11-11, one command selected all 33 `_bad.cfg`
+and `_reach.cfg` profiles in name order. It was `RUSTUP_AUTO_INSTALL=0 cargo xtask model`
+with those 33 `attached-datagram/<file>` arguments. Command exit: 0, after 93.97 seconds,
+inside its five-minute cap. Each profile has its exact checker command, frozen input closure,
+source status, tool identities, and original exit in `run.txt`. All runs in this batch end in
+`-21984` below `target/model/attached-datagram/<profile>/`. The batch command and cap are in
+`focused-cap-1794385671916803000/` under that output root.
+
+- Source: uncommitted changes on `ca23158b35e212af6c53966f2bc6f7be77cc24c9`.
+  Model digest: `sha256:0f3549cd6571a57bad725860cd234a2fbc2e82cdab2fd9c75ce66d228b6802da`
+  (45 checked files). All 33 retained profile closures match the current inputs.
+- Checkers: Temurin JRE 21.0.13+9; TLC 1.8.0+d8fb231de4e4, version
+  2026.11.06.222357; Apalache 0.62.4 was present but not used.
+  Runner digest: `4f1571c48d3379384a62391eb0a1ddf10d6ddbb829d734908a134e63e0b19117`.
+  Each manifest records the checker-file digests and full arguments.
+- Host: macOS 27.2.1 arm64, ten cores, 16 GB; TLC used ten workers and a 3,641 MB heap.
+  Other work loaded this host. Durations are run records, not performance measurements.
+- SANY parsed both current modules with exit 0 before TLC. Its retained source and output are
+  in `target/model/attached-datagram/sany/1794385625781398000/`.
+- The final shared validator passed all 11 tests and the scoped formatting, Clippy, and rustdoc
+  checks before this run. Its two source-file hashes match the checked runner. No Rust input
+  changed for the terminal-lifetime reduction.
+
+A violation is the required result for these profiles. The reduction's boundary traces retain
+both endpoints reset with a pending spurious validation (`NoAbandon_bad`), a refused endpoint
+changed to reset (`LateReset_bad`), and parent failure while the sender still awaits the receiver's
+completion frame (`ParentInterrupted_reach`). The old-window canary still has a fair failure
+cycle with no pending ACK, as detailed below.
+
+| Profile | Property violated as required | Checker exit | Distinct states | Seconds |
+| --- | --- | --- | --- | --- |
+| `AttachedDatagram.Abandoned_reach.cfg` | `NotAbandoned` | 12 | 116 | 1.30 |
+| `AttachedDatagram.CompleteAtAck_bad.cfg` | `CompletionSound` | 12 | 333,507 | 7.28 |
+| `AttachedDatagram.CompletedAfterAbandon_reach.cfg` | `NotCompletedAfterAbandon` | 13 | 1,113 | 1.58 |
+| `AttachedDatagram.Completed_reach.cfg` | `NotCompleted` | 12 | 1,010,134 | 16.54 |
+| `AttachedDatagram.CreditBeyond_bad.cfg` | `CreditBound` | 12 | 1,964 | 1.36 |
+| `AttachedDatagram.Crossed_reach.cfg` | `NotCrossed` | 12 | 125 | 1.65 |
+| `AttachedDatagram.FinalBelowRead_reach.cfg` | `NotFinalBelowRead` | 12 | 4,511 | 1.54 |
+| `AttachedDatagram.FinalDelayed_reach.cfg` | `NotFinalDelayed` | 12 | 403,091 | 7.02 |
+| `AttachedDatagram.FinalKeepsJunk_bad.cfg` | `FinalSizeBound` | 12 | 196 | 1.31 |
+| `AttachedDatagram.Integrity_reach.cfg` | `NotIntegrity` | 12 | 332 | 1.30 |
+| `AttachedDatagram.JunkDiscarded_reach.cfg` | `NotJunkDiscarded` | 13 | 432 | 1.50 |
+| `AttachedDatagram.LastAckLost_reach.cfg` | `NotLastAckLost` | 13 | 279 | 1.57 |
+| `AttachedDatagram.LateReset_bad.cfg` | `OutcomeStable` | 13 | 191 | 1.59 |
+| `AttachedDatagram.NoAbandon_bad.cfg` | `ValidationEnds` | 13 | 865 | 1.65 |
+| `AttachedDatagram.NoAckRecovery_bad.cfg` | `Progress` | 13 | 8,607 | 3.04 |
+| `AttachedDatagram.NoFinalIntegrity_bad.cfg` | `FinalReadIntegrity` | 12 | 4,919 | 2.10 |
+| `AttachedDatagram.NoFinalNotice_bad.cfg` | `Progress` | 13 | 125 | 1.63 |
+| `AttachedDatagram.NoTagEnd_bad.cfg` | `NoNetworkIntegrity` | 12 | 410 | 1.61 |
+| `AttachedDatagram.NoTagSquat_bad.cfg` | `AckMeansHeld` | 12 | 713 | 1.50 |
+| `AttachedDatagram.NoTag_bad.cfg` | `HeldAreSenderBytes` | 12 | 32 | 1.39 |
+| `AttachedDatagram.NoWindowBound_bad.cfg` | `PNStateBound` | 12 | 7,145 | 1.42 |
+| `AttachedDatagram.ParentEnd_reach.cfg` | `NotParentEnd` | 12 | 558,496 | 10.11 |
+| `AttachedDatagram.ParentInterrupted_reach.cfg` | `NotParentInterrupted` | 12 | 129 | 1.22 |
+| `AttachedDatagram.Partial_reach.cfg` | `NotPartial` | 12 | 71 | 1.71 |
+| `AttachedDatagram.Refused_reach.cfg` | `NotRefused` | 12 | initial state | 1.44 |
+| `AttachedDatagram.RepeatedMigration_reach.cfg` | `NeverRepeatMigration` | 13 | 685 | 1.54 |
+| `AttachedDatagram.ReplayAccepted_reach.cfg` | `NeverReplayAccepted` | 13 | 243 | 1.46 |
+| `AttachedDatagram.Reset_reach.cfg` | `NotReset` | 12 | 47 | 1.62 |
+| `AttachedDatagram.Resumed_reach.cfg` | `NotResumed` | 13 | 319 | 1.67 |
+| `AttachedDatagram.ReusePN_bad.cfg` | `Progress` | 13 | 14,105 | 3.59 |
+| `AttachedDatagram.SlideBeforeTag_bad.cfg` | `WindowAfterTag` | 13 | 9 | 1.58 |
+| `AttachedDatagram.WindowPassed_reach.cfg` | `NotWindowPassed` | 12 | 4,057 | 1.74 |
+| `OldPacketReuse.Spread_bad.cfg` | `Progress` | 13 | 10,483 | 3.77 |
+
+`OldPacketReuse.Spread_bad.cfg` isolates the spread reduction from the lost-ACK duplicate
+failure in `ReusePN_bad`. Its current source, log, and trace are in
+`OldPacketReuse.Spread_bad.cfg/1794385762044512000-21984/` under the output root.
+The constraint can also exclude a duplicate-ACK arrival whose state change is identical to
+`LoseAck`. Thus the constrained verdict alone does not establish fairness in `ReuseSpec`.
+The retained trace gives this argument for the original specification:
+
+- The prefix declares packet number 1 at offset 1 lost early, charging one fault. Its copy
+  remains delayed in the network. Packet numbers 2 and 3 deliver offsets 0 and 2, and both ACK
+  frames arrive. The consumer reads offset 0, so `rRead = 1`.
+- States 13, 14, and 15 repeat `Deliver`, `DeclareLost(1)`, and `ResendSamePN(1)`.
+  The receiver discards each copy because `1 + Range = 3 <= rHigh = 3`. The missing byte is
+  never held. `ack = {}` throughout this cycle, so `LoseAck` is disabled and the constraint
+  excludes no cycle step.
+- Each original fair resend, data-delivery, and doomed-loss action occurs each cycle. New-byte
+  sending is disabled because all three offsets were sent. ACK delivery is disabled because
+  `ack = {}`; credit delivery because both limits are 3; completion because `rRead = 1`;
+  final-size delivery because `rFinal = TRUE`; terminal-frame delivery because both endpoints
+  are open; and validation completion because `mig = "none"`.
+- `Read` is disabled at the missing byte, so its weak-fairness condition holds. The path is
+  stable, the parent stays alive, and both endpoints stay open. Thus this is a fair behavior
+  of unconstrained `ReuseSpec` that violates `Progress`.
+
+The earlier 32-profile batch (`-67140`) and the earlier wrapper run
+(`OldPacketReuse.Spread_bad.cfg/1794381240450327000-75868/`) remain retained with their
+source closures and traces. They predate the terminal-lifetime reduction and do not qualify
+the changed module.
+
+The dedicated-host run `20261111T084109Z-31147` completed the current base and `NoOnPath`
+profiles. Both searches emptied the queue and completed both temporal-property branches.
+Each positive profile had a 3,600-second cap. `FaultySender` was stopped before its cap after
+its processing rate fell sharply; the remaining seven profiles did not start.
+
+- Source digest: `sha256:0f3549cd6571a57bad725860cd234a2fbc2e82cdab2fd9c75ce66d228b6802da`.
+  All three retained input closures match the current model files.
+- Host: dedicated EC2 c8g.4xlarge, 16 vCPUs, 32 GiB, Linux 7.0.0-1016-aws arm64.
+  TLC used 16 workers, `MSBDiskFPSet`, `DiskStateQueue`, and a 6,997 MB JVM heap.
+  The pinned checker versions and TLC digest are the same as above; the Linux JRE digest is
+  `360e5ff407299f11ec030ac45f87f4f5767d2c6fb0682c8a3d1ce08df5f69806`.
+  Runner digest: `50350aa56427bf5958ce3dc248bbcb88057457a35b256d189db67660873e0b14`.
+- No explicit heap or fingerprint size was set. The default on-heap fingerprint set uses
+  25% of the JVM heap; the printed 64 MB off-heap figure is not its limit. This follows the
+  pinned [TLC memory configuration](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/fp/FPSetConfiguration.java).
+- The maintainer checkout retains the native archive at
+  `target/model/remote-n000-20261111T084109Z-31147/node-1-artifacts.tar.gz`, SHA-256
+  `a8164f1cad11507cf17bccac7dc98b2a1941c8e8c506228a418fbfbed430f753`.
+  Artifact collection and teardown completed; `dev-machine status rsnetwork aws-linux-arm64-ubuntu2604`
+  reported no instance or volume.
+
+| Profile | Checker exit | Distinct states | Depth | Seconds | Result |
+| --- | --- | --- | --- | --- | --- |
+| `AttachedDatagram.cfg` | 0 | 33,436,881 | 36 | 1,259.61 | Complete pass |
+| `AttachedDatagram.NoOnPath.cfg` | 0 | 24,458,225 | 36 | 776.27 | Complete pass |
+| `AttachedDatagram.FaultySender.cfg` | 130 | 52,358,701 | 21 | 1,597.17 | Interrupted; no result |
+
+Their canonical run directories below the output root are
+`AttachedDatagram.cfg/1794386636648338486-15819/`,
+`AttachedDatagram.NoOnPath.cfg/1794387909648671270-20238/`, and
+`AttachedDatagram.FaultySender.cfg/1794388699314575360-22826/`.
+The last faulty-sender checkpoint still had 15,493,182 queued states. The lead sent SIGINT to
+the verified TLC process; this was not a completed search or a property violation.
+
+### Blocked positive searches
+
+Native run `20261111T101323Z-27234` tested whether explicit heap and fingerprint memory would
+remove the processing-rate collapse. It used the same c8g.4xlarge host type, 16 workers, model
+files, bounds, checker versions, and 3,600-second cap per positive profile. The command added
+`--tlc-heap-mib=8192 --tlc-fp-mib=8192`. Its manifests record:
+
+```text
+-XX:+UseParallelGC
+-Xmx8192m
+-XX:MaxDirectMemorySize=8192m
+-Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet
+-Xlog:gc*:file=../gc.log:time,uptime,level,tags:filecount=0
+```
+
+Both TLC headers confirm `OffHeapDiskFPSet`, 8,192 MB off-heap memory, and `DiskStateQueue`.
+They print 7,282 MB heap at startup; the command sets its maximum to 8,192 MiB.
+Native runner digest: `3bc80604e5238f72cbb178424b6a729896bf3a94c0a8fb1b3ceef36a04440876`.
+The runner passed all 13 tests and scoped format, Clippy, and rustdoc checks before this run.
+
+| Profile | Run | Checker exit | Distinct states | Seconds | Result |
+| --- | --- | --- | --- | --- | --- |
+| `NoAckRecovery_bad` | `1794392239107697262-15842` | 13 | 8,607 | 0.918258 | Required `Progress` violation |
+| `FaultySender` | `1794392253407944087-16207` | 130 | 62,392,409 | 1,351.250926 | Interrupted; no result |
+
+These runs are below `target/model/attached-datagram/AttachedDatagram.<profile>.cfg/`.
+The canary repeats one of the 33 completed small profiles; it adds no distinct completed profile.
+Both faulty-sender attempts have input-closure digest
+`sha256:6460a539c08e6d90cea2bd7ae21797d975970620bf3de742c6e4a6a20b1db2d5`.
+At the second attempt's final checkpoint, depth was 22 and 17,871,727 states remained queued.
+Only 206,732 states were processed over about 62 seconds. At that rate, the existing queue alone
+needed about 89 minutes, beyond the 38 minutes left in its cap. Full GC took about 2.3 seconds
+every 2.55 seconds, while retaining about 5.36 GiB. `early-stop.txt` and `gc.log` retain the
+observations. The lead sent SIGINT to verified TLC PID 16220 after the resource failure recurred.
+There was no completed search or property verdict. The remaining seven profiles did not start.
+
+The second native archive is retained in the maintainer checkout at
+`target/model/remote-n000-20261111T101323Z-27234/node-1-artifacts.tar.gz`, SHA-256
+`f5c5c2b2c3fc0f7c11f083d90533992be4fa771ece49323790e915d9d16f91d8`.
+Collection and teardown both exited 0; fresh native status reported no instance or EBS volume.
+
+The positive profiles still open are `FaultySender`, `Bytes5`, `MaxPN7`, `Paths3`, `Cap3`,
+`Range3`, `Cap3Range3Window3`, and `Excess2`. No positive result from an earlier model is reused
+for them. The 35 completed profiles retain matching current input closures and actual verdicts.
+Their audit is in `target/model/attached-datagram-evidence-index.json` and
+`target/model/attached-datagram-evidence-status.tsv`. No further checker run is part of this
+blocked attempt.
+
+All retained evidence except TLC state caches is also archived at
+`~/.local/state/model-evidence/rsnetwork/N000/20261111T104325Z-network-model-evidence.tar.gz`,
+with a duplicate under the maintainer checkout's `target/model/`: 1,423 files, 5,842,144 bytes,
+SHA-256 `9292ee4e73b6694ef70761fc86218d116546da615f136a61653e042e38714a47`.
+It preserves exact inputs, commands, exits, logs, traces, and GC evidence.
+
+### Pending recurrence form
+
+The following equivalent forms are a possible next change. They are not implemented, parsed,
+model-checked, or measured. The frozen source still uses `<>BothDone` and the pending-validation
+response formula.
+
+```tla
+Progress == (WF_vars(Read) /\ <>[](mig = "none")) => []<>BothDone
+ValidationEnds == []<>(mig = "none" \/ ~parentLive)
+```
+
+`BothDone` stays true once reached in every current variant. The actions that can assign
+`"open"` require that endpoint to be open; terminal-frame delivery changes only an open
+destination to a terminal value. `ParentEnd` preserves terminal endpoints. `LateReset` can
+change a terminal value to `"reset"`, but cannot reopen it. Other actions preserve outcomes
+or end an open endpoint. Thus `<>BothDone` and `[]<>BothDone` are equivalent for all current
+behaviors, including every known-bad variant. This uses the action guards, not `OutcomeStable`,
+which `LateReset` violates. A future reopening action would require a new argument.
+
+Let `Q == mig = "none" \/ ~parentLive`. Where `Q` holds, `<>Q` already holds; where it is
+false, `mig # "none"` holds. Thus the current `[](mig # "none" => <>Q)` is exactly `[]<>Q`,
+without an extra endpoint or parent assumption.
+
+The names, consumer fairness, eventual-stable-path condition, fair actions, transitions, and
+bounds stay the same. The unfinished cycles in `ReusePN`, `OldPacketReuse`, `NoAckRecovery`,
+and `NoFinalNotice` still violate `Progress`. The `NoAbandon` cycle still has pending validation
+and a live parent after both endpoints reset, so it violates either `ValidationEnds` form.
+The unconstrained fair-cycle argument for `OldPacketReuse.Spread_bad` above is unchanged;
+`NoAckLoss` remains inactive on that cycle.
+
+The pinned [TLC classifier](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/Liveness.java)
+leaves the current eventuality and response forms for tableau construction. From that source,
+the proposed recurrence forms should use its direct classification without a tableau. This is
+an inference, not a measured improvement. The ordinary
+[graph index](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/NodePtrTable.java)
+still grows on the Java heap. Resumed work needs independent review and new evidence for every
+affected profile; no speedup or completed positive result is claimed.
+
+### Earlier incomplete searches
+
+A base-profile run before the terminal-lifetime reduction used a 30-minute command cap, with
+a progress report at ten minutes.
+It stopped at that cap with SIGTERM to its TLC process. Checker and command exit: 143;
+checker duration: 1,799.01 seconds; command duration: 1,800.93 seconds. Its last checkpoint
+reported 14,886,070 distinct states, 3,220,864 queued states, and depth 24. The queue still grew.
+There was no completed positive verdict. This is functional evidence on a shared host, not a
+qualified timing measurement. The run was not restarted.
+
+- Command: `RUSTUP_AUTO_INSTALL=0 cargo xtask model attached-datagram/AttachedDatagram.cfg`.
+- Model digest: `sha256:49c87cba20e44690727c7f04c7bdddb1baba6dc7555325dcdbd3547f61f2d2a7`.
+  Profile closure: `sha256:447981639428ed76f93059e2b6c38070cbd94a2ded3f007efa18fae93a353230`.
+- Runner digest: `4f1571c48d3379384a62391eb0a1ddf10d6ddbb829d734908a134e63e0b19117`.
+  This final validator passed all 11 tests and the scoped formatting, Clippy, and rustdoc
+  checks before the run. Checker and host identities are unchanged.
+- Retained source, checker output, exit status, and stop reason:
+  `AttachedDatagram.cfg/1794383355736838000-57245/` under the output root. The command cap,
+  command output, elapsed time, and process identity are in `positive-cap-1794383353855807000/`.
+
+A ten-minute sizing run of the base positive profile was stopped with SIGTERM, checker and
+command exit 143, after 600.34 seconds. It used the earlier input digest
+`cd4949b8317811e895b9a94dfb2efcc2f95dfe634f86cac0e6643a347f4cdcf3`.
+Its last report had 8,326,074 distinct states, 2,185,760 queued states, and depth 22. The queue
+still grew. External CPU and memory load reduced its rate during the run, so it gives no reliable
+complete-size or quiet-host time estimate. It is not a pass. Its input, output, exit, and stop
+reason are retained in `AttachedDatagram.cfg/1794376829683335000-81756/` under the output root.
+The other stopped or failed development runs are retained beside their later results.
 
 ## Decisions
 
@@ -340,7 +522,7 @@ The rejected options, each rejected on 2026-11-07. Their proposal files were nev
   separate model. Rejected: it is the second encryption pass that attached channels exist to
   remove, and each retransmission needs a new ciphertext, which removes the zero-copy send.
 
-## Evidence record
+## Historical evidence
 
 ### Evidence host record of the final files
 
@@ -523,7 +705,7 @@ The raise of `Window` ran on the development host after the replacement, on 2026
 
 - Command: `cargo xtask model attached-datagram/AttachedDatagram.Cap3Range3Window3.cfg`. Exit
   status 0.
-- Source: the files of this directory as they are now. The xtask printed
+- Source: the files of this directory at that earlier revision. The xtask printed
   `9735eb8c9abe241f9b1d91b12d0c98b2400b3abc (31 files)`, a Git object ID. From 2026-11-08 the
   xtask prints a SHA-256 digest from rscrypto instead, and the same 31 files give
   `sha256:55f1ef3fc57619676746967e800b52232b4eec299cfca8b9089aaf5e17c5a79a`.
@@ -535,8 +717,8 @@ The raise of `Window` ran on the development host after the replacement, on 2026
 | `AttachedDatagram.Cap3Range3Window3.cfg` (raise) | 0 | 12,415,204 | 29 | 248.9 s | Pass |
 
 It has more states than `Cap3` (8,470,530), so the window binds there, and the raise tests it.
-Each argued bound of this model now has its complete raise-by-one search, and every profile of
-the model is complete at its bounds; nothing is pending.
+Each argued bound of that earlier model had its complete raise-by-one search. Those results do
+not qualify the revised model.
 
 The earlier records, of the design as first written (2026-11-06) and of the decision round
 (2026-11-07), checked files that are now deleted; the [Decisions](#decisions) section keeps

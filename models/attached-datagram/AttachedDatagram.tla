@@ -1,13 +1,13 @@
 -------------------------- MODULE AttachedDatagram --------------------------
 (***************************************************************************)
 (* The datagram form of an attached channel (networking.md, "Attached      *)
-(* Channels" and "Datagram Form"), as selected on 2026-11-07.              *)
+(* Channels" and "Datagram Form"), through the 2026-11-11 decisions.        *)
 (*                                                                         *)
 (* A sender sends a stream of Bytes bytes to a receiver in side datagrams. *)
 (* A side datagram carries a connection ID, a packet number, a stream      *)
 (* offset, payload bytes, and an AES-GMAC tag over all of them. The tag    *)
 (* gives integrity and no confidentiality. The receiver checks the tag     *)
-(* before any other step, and a datagram whose tag fails changes no state. *)
+(* before any state change; its read-only window check can come first.    *)
 (* The model computes no tags: a datagram passes the tag only when it is a *)
 (* datagram that the sender sent (Authentic). The receiver slides its own  *)
 (* replay window on the datagrams that it accepts, on any connection ID    *)
@@ -16,11 +16,9 @@
 (* on a timer or with success, and an abandoned validation returns to the  *)
 (* last validated path with its congestion state.                          *)
 (*                                                                         *)
-(* Acknowledgements, receive credit, the final size, and reset travel in   *)
-(* frames inside the parent QUIC connection. The model takes these frames  *)
-(* as reliable and authenticated, because the design puts them in the      *)
-(* parent, which encrypts, authenticates, and resends them. They can       *)
-(* arrive late and in a different order.                                   *)
+(* Ordinary ACK frames are authenticated, replaceable, and lossy. Their   *)
+(* last loss enables sender loss recovery. Credit, final size, and terminal *)
+(* frames have eventual delivery only while the parent remains alive.     *)
 (*                                                                         *)
 (* Each datagram carries one byte. A payload is "good" when it is the      *)
 (* sender's correct byte at the datagram's offset, and "bad" when it is    *)
@@ -29,9 +27,9 @@
 (* "good" bytes. A faulty sender (FaultySender) can send "bad" bytes, and  *)
 (* the tag passes for them, because the sender sent them.                  *)
 (*                                                                         *)
-(* The model keeps one outcome for the channel. The first terminal event   *)
-(* at either end sets it, and the parent's frames tell the other end. The  *)
-(* model merges that notification into the event.                          *)
+(* Each endpoint keeps its first local terminal outcome. Its notification *)
+(* is a later parent-frame arrival. Crossing events and parent failure can *)
+(* leave different stable outcomes at the two endpoints.                  *)
 (*                                                                         *)
 (* Bug selects one known-bad variant. "none" is the design.                *)
 (***************************************************************************)
@@ -40,7 +38,8 @@ EXTENDS Naturals, FiniteSets, Sequences
 CONSTANTS
     Bytes,         \* The final size. The stream has the offsets 0 .. Bytes - 1.
     MaxPN,         \* The highest packet number that the sender can use.
-    Paths,         \* The parent's paths: the first one and one new path for each migration attempt.
+    Excess,        \* Bytes past the final size that a faulty sender can send.
+    Paths,         \* Abstract path identities; repeated migration reuses them.
     Cap,           \* The receive capacity that the consumer admits after its read point.
     Range,         \* The receiver's window: the packet numbers that it keeps below its highest.
     Window,        \* The initial congestion window of a parent path, in datagrams.
@@ -49,11 +48,13 @@ CONSTANTS
     Bug            \* "none", or the known-bad variant.
 
 Bugs == {"none", "NoTag", "SlideBeforeTag", "ReusePN", "CompleteAtAck",
-         "CreditBeyond", "NoWindowBound", "LateReset", "NoAbandon"}
+         "CreditBeyond", "NoWindowBound", "LateReset", "NoAbandon",
+         "NoAckRecovery", "FinalKeepsJunk", "NoFinalNotice", "NoFinalIntegrity"}
 
 ASSUME
     /\ Bytes \in Nat \ {0}
     /\ MaxPN \in Nat /\ MaxPN >= Bytes
+    /\ Excess \in Nat \ {0}
     /\ Paths \in Nat \ {0}
     /\ Cap \in Nat \ {0}
     /\ Range \in Nat \ {0}
@@ -63,10 +64,14 @@ ASSUME
     /\ Bug \in Bugs
 
 VARIABLES
-    outcome,  \* "open", or the terminal outcome of the channel.
+    sEnd,     \* The sender's stable local outcome.
+    rEnd,     \* The receiver's stable local outcome.
+    parentLive, \* The parent can still deliver control frames.
+    ack,      \* Packet numbers in the pending, replaceable ACK frame.
+    rFinal,   \* The receiver received the final-size frame.
     path,     \* The parent's last validated path. The side flow sends on it.
     mig,      \* "none", or the kind of migration to path tried that the parent validates.
-    tried,    \* The highest path that the parent used or tried. Each attempt takes a new one.
+    tried,    \* The candidate path. Identities are reused; attempts have no finite bound.
     cwnd,     \* The congestion window that the side flow shares with the parent.
     net,      \* The side datagrams in flight.
     sLog,     \* sLog[p] is the offset and the payload that the sender sent in packet number p.
@@ -81,7 +86,13 @@ VARIABLES
     rCredit,  \* The credit limit that the receiver granted.
     faults    \* The faults of the ReusePN variant so far. It stays 0 in each other run.
 
-vars == <<outcome, path, mig, tried, cwnd, net, sLog, sAcked, sLost, sCredit,
+ends == <<sEnd, rEnd, parentLive>>
+controlVars == <<ack, rFinal>>
+BothOpen == sEnd = "open" /\ rEnd = "open"
+BothDone == sEnd # "open" /\ rEnd # "open"
+\* A projection for the single-outcome reachability targets only.
+outcome == IF sEnd # "open" THEN sEnd ELSE rEnd
+vars == <<ends, controlVars, path, mig, tried, cwnd, net, sLog, sAcked, sLost, sCredit,
           rAck, rHigh, rWin, rBuf, rRead, rCredit, faults>>
 senderVars == <<sLog, sAcked, sLost, sCredit>>
 receiverVars == <<rAck, rHigh, rWin, rBuf, rRead, rCredit>>
@@ -91,13 +102,16 @@ pathVars == <<path, mig, tried, cwnd>>
 (* Values *)
 
 Offsets == 0 .. Bytes - 1
+WireOffsets == 0 .. (Bytes + Excess - 1)
 PNs == 1 .. MaxPN
 Payloads == {"good", "bad"}
 Terminal == {"completed", "reset", "parentEnd", "partial", "integrity", "refused"}
-\* Connection ID 0 is one that the receiver did not issue. Connection ID i is
-\* the one that the receiver issued for the channel and the sender uses on
-\* path i (RFC 9000 section 9.5: a new connection ID for each path).
-Datagrams == [cid : 0 .. Paths, pn : PNs, off : Offsets, pay : Payloads]
+\* The receiver treats every issued, unretired ID alike. The tag already
+\* abstracts acceptance over those IDs. Keep 0 for an unissued ID and 1
+\* for any issued ID; stored data need no path-history label. Paths and
+\* migrations remain separate state. The design never reuses a packet
+\* number, so this projection cannot merge two live data copies.
+Datagrams == [cid : {0, 1}, pn : PNs, off : WireOffsets, pay : Payloads]
 
 Min(a, b) == IF a < b THEN a ELSE b
 Max(a, b) == IF a > b THEN a ELSE b
@@ -109,7 +123,7 @@ Max(a, b) == IF a > b THEN a ELSE b
 Flight == {p \in 1 .. Len(sLog) : p \notin sAcked \cup sLost}
 
 \* The offsets that the sender counts as acknowledged.
-AckedOffsets == {sLog[p].off : p \in sAcked \cap 1 .. Len(sLog)}
+AckedOffsets == {sLog[p].off : p \in sAcked \cap 1 .. Len(sLog)} \cap Offsets
 AllAcked == AckedOffsets = Offsets
 
 \* Offset o needs a transmission: no acknowledgement and no packet in flight.
@@ -141,7 +155,7 @@ Tagged(d) == Bug = "NoTag" \/ Authentic(d)
 \* one only discards a late copy, which is the same as its loss. The
 \* NoWindowBound variant has no window.
 Fresh(d) ==
-    /\ d.cid \in 1 .. Paths
+    /\ d.cid = 1
     /\ d.pn \notin rWin
     /\ Bug = "NoWindowBound" \/ d.pn + Range > rHigh
 
@@ -152,11 +166,17 @@ Fresh(d) ==
 (* The model therefore lets a fault happen only while the sender has a     *)
 (* packet number to send each byte again that the faults can cost. Spent   *)
 (* counts the packet numbers that losses used or will use. A packet is     *)
-(* doomed when it is in flight, the receiver did not accept it, and no     *)
-(* copy of it is in flight. A migration loses no datagram: the receiver    *)
+(* doomed when it has no data copy or ACK that can still arrive. A lost    *)
+(* ACK can cost another packet number even after the byte arrives. Each   *)
+(* excess byte from a faulty sender also uses this budget. A migration     *)
+(* loses no datagram by itself: the receiver                               *)
 (* accepts each issued connection ID, so a loss at a migration is a Lose.  *)
-Doomed(p) == p \in Flight /\ p \notin rAck /\ \A d \in net : d.pn # p
-Spent == Cardinality(sLost) + Cardinality({p \in Flight : Doomed(p)})
+Doomed(p) ==
+    /\ p \in Flight
+    /\ ((p \notin rAck /\ (\A d \in net : d.pn # p))
+        \/ (p \in rAck /\ p \notin ack))
+JunkPNs == {p \in 1 .. Len(sLog) : sLog[p].off >= Bytes}
+Spent == Cardinality(sLost \cup {p \in Flight : Doomed(p)} \cup JunkPNs)
 Budget == MaxPN - Bytes
 
 \* The ReusePN variant takes packet numbers out of sLost, so Spent no longer
@@ -191,7 +211,7 @@ Accept(d) ==
 \* The SlideBeforeTag variant moves the window to a higher packet number
 \* before it checks the tag.
 Slid(d) ==
-    IF Bug = "SlideBeforeTag" /\ d.cid \in 1 .. Paths /\ d.pn > rHigh
+    IF Bug = "SlideBeforeTag" /\ d.cid = 1 /\ d.pn > rHigh
     THEN [Unchanged EXCEPT !.high = d.pn, !.win = {q \in rWin : q + Range > d.pn}]
     ELSE Unchanged
 
@@ -200,7 +220,8 @@ Slid(d) ==
 \* receiver did not issue, and data beyond the credit change no state; the
 \* receiver discards and counts them.
 RecvState(d) ==
-    IF Tagged(d) /\ Fresh(d) /\ d.off < rCredit THEN Accept(d)
+    IF Tagged(d) /\ Fresh(d) /\ d.off < rCredit
+       /\ (~rFinal \/ d.off < Bytes) THEN Accept(d)
     ELSE IF ~Tagged(d) THEN Slid(d)
     ELSE Unchanged
 
@@ -210,6 +231,7 @@ Receive(d) ==
     /\ rHigh' = r.high
     /\ rWin' = r.win
     /\ rBuf' = r.buf
+    /\ ack' = IF r.ack # rAck THEN r.ack ELSE ack
 
 -----------------------------------------------------------------------------
 (* Actions. Each action is one atomic step. Its comment names the contract *)
@@ -218,7 +240,11 @@ Receive(d) ==
 Init ==
     \* [Explicit profile] The open refuses, for example when the parent did
     \* not negotiate the extension.
-    /\ outcome \in {"open", "refused"}
+    /\ sEnd \in {"open", "refused"}
+    /\ rEnd = sEnd
+    /\ parentLive = TRUE
+    /\ ack = {}
+    /\ rFinal = FALSE
     /\ path = 1
     /\ mig = "none"
     /\ tried = 1
@@ -227,13 +253,13 @@ Init ==
     /\ sLog = <<>>
     /\ sAcked = {}
     /\ sLost = {}
-    /\ sCredit = Min(Bytes, Cap)
+    /\ sCredit = Min(Bytes + Excess, Cap)
     /\ rAck = {}
     /\ rHigh = 0
     /\ rWin = {}
-    /\ rBuf = [o \in Offsets |-> "none"]
+    /\ rBuf = [o \in WireOffsets |-> "none"]
     /\ rRead = 0
-    /\ rCredit = Min(Bytes, Cap)
+    /\ rCredit = Min(Bytes + Excess, Cap)
     /\ faults = 0
 
 \* [Packet numbers and replay] [Receive credit] [Congestion and loss]
@@ -243,42 +269,47 @@ Init ==
 \* number. The sender stays inside the credit and the shared window. Two
 \* conditions are bounds of the model, not design rules (README,
 \* "Reductions"). While the parent validates a new peer address, the side
-\* flow sends nothing: in the design it sends there within the parent's
-\* anti-amplification limit, and each such datagram arrives as one that the
-\* model sends after the validation ends, or is lost. And the packets in
+\* flow sends nothing. Progress therefore assumes an eventually stable path;
+\* ValidationEnds separately checks each validation. Attempts can repeat.
+\* The packets in
 \* flight span fewer than Range packet numbers, so the window never
 \* discards a datagram that the sender still waits for; that discard changes
 \* no state and removes the datagram from the network, as Lose does.
 SendData(o) ==
     LET p == Len(sLog) + 1 IN
-    /\ outcome = "open"
+    /\ sEnd = "open" /\ parentLive
     /\ mig = "none"
     /\ Needs(o)
+    /\ o < Bytes \/ (FaultySender /\ ~Sent(o))
     /\ o < sCredit
     /\ p <= MaxPN
     /\ Cardinality(Flight) < cwnd
     /\ \A q \in Flight : q + Range > p
     /\ \E x \in (IF FaultySender THEN Payloads ELSE {"good"}) :
           /\ sLog' = Append(sLog, [off |-> o, pay |-> x])
-          /\ net' = net \cup {[cid |-> path, pn |-> p, off |-> o, pay |-> x]}
-    /\ UNCHANGED <<outcome, pathVars, sAcked, sLost, sCredit, receiverVars, faults>>
+          /\ net' = net \cup {[cid |-> 1, pn |-> p, off |-> o, pay |-> x]}
+    /\ UNCHANGED <<ends, pathVars, sAcked, sLost, sCredit, receiverVars, faults>>
+    /\ UNCHANGED controlVars
+    /\ Spent' <= Budget
 
 \* The network delivers datagram d once. A later copy is a duplicate, which
 \* changes no state.
 Deliver(d) ==
-    /\ outcome = "open"
+    /\ rEnd = "open" /\ parentLive
     /\ d \in net
     /\ net' = net \ {d}
     /\ Receive(d)
-    /\ UNCHANGED <<outcome, pathVars, senderVars, rRead, rCredit, faults>>
+    /\ UNCHANGED <<ends, pathVars, senderVars, rRead, rCredit, faults>>
+    /\ UNCHANGED rFinal
 
 \* The network loses datagram d.
 Lose(d) ==
-    /\ outcome = "open"
+    /\ BothOpen
     /\ d \in net
     /\ net' = net \ {d}
-    /\ UNCHANGED <<outcome, pathVars, senderVars, receiverVars>>
+    /\ UNCHANGED <<ends, pathVars, senderVars, receiverVars>>
     /\ CountFault(RecvState(d) # Unchanged)
+    /\ UNCHANGED controlVars
     /\ Spent' <= Budget
 
 \* [Injection] The on-path attacker sends again a datagram that the sender
@@ -289,11 +320,12 @@ Lose(d) ==
 \* datagram that the receiver did not accept and that is not in flight.
 Replay(p) ==
     /\ OnPath
-    /\ outcome = "open"
+    /\ rEnd = "open" /\ parentLive
     /\ p \in 1 .. Len(sLog) \ rAck
     /\ \A d \in net : d.pn # p
-    /\ Receive([cid |-> path, pn |-> p, off |-> sLog[p].off, pay |-> sLog[p].pay])
-    /\ UNCHANGED <<outcome, net, pathVars, senderVars, rRead, rCredit, faults>>
+    /\ Receive([cid |-> 1, pn |-> p, off |-> sLog[p].off, pay |-> sLog[p].pay])
+    /\ UNCHANGED <<ends, net, pathVars, senderVars, rRead, rCredit, faults>>
+    /\ UNCHANGED rFinal
 
 \* [Injection] In the variants without the tag check or with the slide
 \* before it, the on-path attacker sends any datagram with a connection ID
@@ -304,52 +336,58 @@ Replay(p) ==
 Forge(d) ==
     /\ OnPath
     /\ Bug \in {"NoTag", "SlideBeforeTag"}
-    /\ outcome = "open"
-    /\ d.cid \in 1 .. Paths
+    /\ rEnd = "open" /\ parentLive
+    /\ d.cid = 1
     /\ d.pay = "good" => SeenGood(d.off)
     /\ Receive(d)
-    /\ UNCHANGED <<outcome, net, pathVars, senderVars, rRead, rCredit, faults>>
+    /\ UNCHANGED <<ends, net, pathVars, senderVars, rRead, rCredit, faults>>
+    /\ UNCHANGED rFinal
 
 \* [Congestion and loss] The sender declares packet p lost by the RFC 9002
 \* packet or time threshold. The model has no clock, so a declaration can
 \* come at any time, also too early. A loss is a congestion event for the
 \* shared controller. The model does not keep recovery periods.
 DeclareLost(p) ==
-    /\ outcome = "open"
+    /\ sEnd = "open" /\ parentLive
     /\ p \in Flight
     /\ sLost' = sLost \cup {p}
     /\ cwnd' = Max(1, cwnd \div 2)
-    /\ UNCHANGED <<outcome, path, mig, tried, net, sLog, sAcked, sCredit, receiverVars>>
+    /\ UNCHANGED <<ends, path, mig, tried, net, sLog, sAcked, sCredit, receiverVars>>
     /\ CountFault(~Doomed(p))
+    /\ UNCHANGED controlVars
     /\ Spent' <= Budget
 
 \* [Control] [Packet numbers and replay] The sender processes the
-\* acknowledgement of packet number p in a parent frame and maps p to the
-\* offset that it sent in p. An acknowledgement of a packet number that the
+\* packet-number set in one parent frame and maps each number to the
+\* offset that it sent. An acknowledgement of a packet number that the
 \* sender never sent shows a faulty peer and ends the channel with
 \* integrity; with the tag, no datagram from the network causes one.
-DeliverAck(p) ==
-    /\ outcome = "open"
-    /\ p \in rAck \ sAcked
-    /\ sAcked' = sAcked \cup {p}
-    /\ outcome' = IF p > Len(sLog) THEN "integrity" ELSE "open"
-    /\ UNCHANGED <<pathVars, net, sLog, sLost, sCredit, receiverVars, faults>>
+DeliverAck ==
+    /\ sEnd = "open" /\ parentLive
+    /\ ack # {}
+    /\ ack' = {}
+    /\ sAcked' = sAcked \cup ack
+    /\ sEnd' = IF ack \subseteq 1 .. Len(sLog) THEN "open" ELSE "integrity"
+    /\ UNCHANGED <<rEnd, parentLive, pathVars, net, sLog, sLost, sCredit, receiverVars, faults>>
+    /\ UNCHANGED rFinal
 
 \* [Receive credit] A credit frame arrives at the sender.
 DeliverCredit(c) ==
-    /\ outcome = "open"
+    /\ sEnd = "open" /\ parentLive
     /\ c \in sCredit + 1 .. rCredit
     /\ sCredit' = c
-    /\ UNCHANGED <<outcome, pathVars, net, sLog, sAcked, sLost, receiverVars, faults>>
+    /\ UNCHANGED <<ends, pathVars, net, sLog, sAcked, sLost, receiverVars, faults>>
+    /\ UNCHANGED controlVars
 
 \* The CreditBeyond variant grants one byte of credit beyond the capacity
 \* that the consumer admitted.
 GrantBeyond ==
     /\ Bug = "CreditBeyond"
-    /\ outcome = "open"
-    /\ rCredit < Min(Bytes, rRead + Cap + 1)
-    /\ rCredit' = Min(Bytes, rRead + Cap + 1)
-    /\ UNCHANGED <<outcome, pathVars, net, senderVars, rAck, rHigh, rWin, rBuf, rRead, faults>>
+    /\ BothOpen
+    /\ rCredit < Min(Bytes + Excess, rRead + Cap + 1)
+    /\ rCredit' = Min(Bytes + Excess, rRead + Cap + 1)
+    /\ UNCHANGED <<ends, pathVars, net, senderVars, rAck, rHigh, rWin, rBuf, rRead, faults>>
+    /\ UNCHANGED controlVars
 
 \* [Receive credit] [Integrity] The consumer reads the byte at its read
 \* point. The application's tag accepts only the sender's correct byte at
@@ -357,42 +395,78 @@ GrantBeyond ==
 \* admits capacity, and the receiver grants credit only for admitted
 \* capacity.
 Read ==
-    /\ outcome = "open"
-    /\ rRead < Bytes
+    /\ rEnd = "open" /\ parentLive
+    /\ rRead < (IF rFinal THEN Bytes ELSE Bytes + Excess)
     /\ Held(rRead)
     /\ IF rBuf[rRead] = "good"
        THEN /\ rRead' = rRead + 1
             /\ rBuf' = [rBuf EXCEPT ![rRead] = "none"]
-            /\ rCredit' = Min(Bytes, rRead + 1 + Cap)
-            /\ UNCHANGED outcome
-       ELSE /\ outcome' = "integrity"
+            /\ rCredit' = Min(Bytes + Excess, rRead + 1 + Cap)
+            /\ UNCHANGED rEnd
+       ELSE /\ rEnd' = "integrity"
             /\ UNCHANGED <<rRead, rBuf, rCredit>>
-    /\ UNCHANGED <<pathVars, net, senderVars, rAck, rHigh, rWin, faults>>
+    /\ UNCHANGED <<sEnd, parentLive, pathVars, net, senderVars, rAck, rHigh, rWin, faults>>
+    /\ UNCHANGED controlVars
 
 \* [Terminal outcomes] The consumer has read to the end. The receiver's next
-\* acknowledgement frame names that read point, and the sender completes
-\* when the frame arrives; the model merges the frame into this step. The
+\* acknowledgement frame names that read point. DeliverReceiverEnd later
+\* gives that outcome to an open sender. The
 \* CompleteAtAck variant also completes when each byte is acknowledged,
 \* without the read.
 Complete ==
-    /\ outcome = "open"
-    /\ rRead = Bytes \/ (Bug = "CompleteAtAck" /\ AllAcked)
-    /\ outcome' = "completed"
-    /\ UNCHANGED <<pathVars, net, senderVars, receiverVars, faults>>
+    /\ rEnd = "open" /\ parentLive /\ rFinal
+    /\ rRead = Bytes
+    /\ rEnd' = "completed"
+    /\ UNCHANGED <<sEnd, parentLive, pathVars, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED controlVars
+
+CompleteAtAck ==
+    /\ Bug = "CompleteAtAck" /\ sEnd = "open" /\ AllAcked
+    /\ sEnd' = "completed"
+    /\ UNCHANGED <<rEnd, parentLive, pathVars, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED controlVars
+
+\* A terminal frame changes only an open endpoint. The parent's reliable
+\* delivery is conditional on its lifetime, including the final read point.
+DeliverReceiverEnd ==
+    /\ Bug # "NoFinalNotice" \/ rEnd # "completed"
+    /\ parentLive /\ rEnd \in Terminal /\ sEnd = "open"
+    /\ sEnd' = rEnd
+    /\ UNCHANGED <<rEnd, parentLive, pathVars, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED controlVars
+
+DeliverSenderEnd ==
+    /\ parentLive /\ sEnd \in Terminal /\ rEnd = "open"
+    /\ rEnd' = sEnd
+    /\ UNCHANGED <<sEnd, parentLive, pathVars, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED controlVars
 
 \* [Terminal outcomes] An application resets the channel with an error
 \* code. The LateReset variant also resets a channel that has ended.
-Reset ==
-    /\ outcome = "open" \/ (Bug = "LateReset" /\ outcome \in Terminal \ {"reset"})
-    /\ outcome' = "reset"
-    /\ UNCHANGED <<pathVars, net, senderVars, receiverVars, faults>>
+Reset(side) ==
+    /\ parentLive
+    /\ IF side = "sender"
+        THEN /\ sEnd = "open" \/ (Bug = "LateReset" /\ sEnd # "reset")
+             /\ sEnd' = "reset" /\ UNCHANGED rEnd
+        ELSE /\ rEnd = "open" \/ (Bug = "LateReset" /\ rEnd # "reset")
+             /\ rEnd' = "reset" /\ UNCHANGED sEnd
+    /\ UNCHANGED <<parentLive, pathVars, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED controlVars
 
 \* [Terminal outcomes] (Attached Channels: Lifetime) The parent ends. Bytes
 \* that are not acknowledged give the partial-delivery outcome.
 ParentEnd ==
-    /\ outcome = "open"
-    /\ outcome' = IF AllAcked THEN "parentEnd" ELSE "partial"
+    /\ parentLive
+    \* Omit parent failure after both endpoints and validation end. It only
+    \* changes an unused lifetime bit there (README, "Reductions"). Keep
+    \* failure during pending validation: ValidationEnds still observes it.
+    /\ ~BothDone \/ mig # "none"
+    /\ parentLive' = FALSE
+    /\ sEnd' = IF sEnd # "open" THEN sEnd ELSE IF AllAcked THEN "parentEnd" ELSE "partial"
+    /\ rEnd' = IF rEnd # "open" THEN rEnd
+                ELSE IF \A o \in Offsets : o < rRead \/ Held(o) THEN "parentEnd" ELSE "partial"
     /\ UNCHANGED <<pathVars, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED controlVars
 
 \* [Congestion and loss] A parent packet is lost on the parent's path: a
 \* congestion event for the shared controller. During a validation, the
@@ -400,22 +474,23 @@ ParentEnd ==
 \* controller (RFC 9000 section 9.4), which the model does not keep: success
 \* resets it, and an abandon discards it.
 ParentLoss ==
-    /\ outcome = "open"
+    /\ BothOpen
     /\ mig = "none"
     /\ cwnd > 1
     /\ cwnd' = cwnd \div 2
-    /\ UNCHANGED <<outcome, path, mig, tried, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED <<ends, path, mig, tried, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED controlVars
 
-\* [Migration] The peer moves to a new address, and the parent starts to
-\* validate it on a new path with a new connection ID (RFC 9000 sections
-\* 9.3 and 9.5). A peer event: no fairness.
+\* [Migration] The peer moves, and the parent starts to validate a different
+\* path (RFC 9000 section 9.3). Abstract identities can be used again.
+\* A peer event: no fairness and no finite attempt budget.
 MigrateStart ==
-    /\ outcome = "open"
+    /\ BothOpen
     /\ mig = "none"
-    /\ tried < Paths
-    /\ tried' = tried + 1
+    /\ tried' \in (1 .. Paths) \ {path}
     /\ mig' = "genuine"
-    /\ UNCHANGED <<outcome, path, cwnd, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED <<ends, path, cwnd, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED controlVars
 
 \* [Migration] A spurious migration: the on-path attacker forwards a copy of
 \* a parent packet with a spoofed address, and its copy arrives first (RFC
@@ -424,24 +499,25 @@ MigrateStart ==
 \* this validation cannot succeed. An attacker event: no fairness.
 Spoof ==
     /\ OnPath
-    /\ outcome = "open"
+    /\ BothOpen
     /\ mig = "none"
-    /\ tried < Paths
-    /\ tried' = tried + 1
+    /\ tried' \in (1 .. Paths) \ {path}
     /\ mig' = "spurious"
-    /\ UNCHANGED <<outcome, path, cwnd, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED <<ends, path, cwnd, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED controlVars
 
 \* [Migration] The validation succeeds: the PATH_RESPONSE arrives (RFC 9000
 \* section 8.2). The side flow follows the parent to the new path and its
 \* connection ID, and the new path's congestion state starts at its
 \* initial values (section 9.4).
 Validated ==
-    /\ outcome = "open"
+    /\ parentLive
     /\ mig = "genuine"
     /\ path' = tried
     /\ mig' = "none"
     /\ cwnd' = Window
-    /\ UNCHANGED <<outcome, tried, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED <<ends, tried, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED controlVars
 
 \* [Migration] The validation timer expires (RFC 9000 section 8.2.4,
 \* three times the larger PTO), or a higher-numbered packet from the last
@@ -452,14 +528,15 @@ Validated ==
 \* variant, the design as written before 2026-11-07, has no such step.
 Abandon ==
     /\ Bug # "NoAbandon"
-    /\ outcome = "open"
+    /\ parentLive
     /\ mig # "none"
     /\ mig' = "none"
-    /\ UNCHANGED <<outcome, path, tried, cwnd, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED <<ends, path, tried, cwnd, net, senderVars, receiverVars, faults>>
+    /\ UNCHANGED controlVars
 
 \* A terminal state stays as it is.
 Done ==
-    /\ outcome \in Terminal
+    /\ BothDone
     /\ UNCHANGED vars
 
 -----------------------------------------------------------------------------
@@ -470,40 +547,59 @@ Done ==
 
 ResendSamePN(p) ==
     /\ Bug = "ReusePN"
-    /\ outcome = "open"
+    /\ sEnd = "open" /\ parentLive
     /\ mig = "none"
     /\ p \in sLost \ sAcked
     /\ Needs(sLog[p].off)
     /\ sLog[p].off < sCredit
     /\ Cardinality(Flight) < cwnd
     /\ sLost' = sLost \ {p}
-    /\ net' = net \cup {[cid |-> path, pn |-> p, off |-> sLog[p].off, pay |-> sLog[p].pay]}
-    /\ UNCHANGED <<outcome, pathVars, sLog, sAcked, sCredit, receiverVars, faults>>
+    /\ net' = net \cup {[cid |-> 1, pn |-> p, off |-> sLog[p].off, pay |-> sLog[p].pay]}
+    /\ UNCHANGED <<ends, pathVars, sLog, sAcked, sCredit, receiverVars, faults>>
+    /\ UNCHANGED controlVars
 
 -----------------------------------------------------------------------------
 (* The next-state relation and the fairness *)
 
-\* In the ReusePN variant, the first transmission of each offset is as in
-\* the design, and each retransmission reuses its packet number.
+\* Ordinary ACK frames may be lost. A later data arrival replaces their
+\* state. A lost last ACK also enables the sender's loss timer.
+LoseAck ==
+    /\ parentLive /\ ack # {}
+    /\ ack' = {}
+    /\ UNCHANGED <<ends, rFinal, pathVars, net, senderVars, receiverVars>>
+    /\ CountFault(ack \ sAcked # {})
+    /\ Spent' <= Budget
+
+\* Final-size arrival is separate from data. Unread excess is discarded.
+DeliverFinalSize ==
+    /\ parentLive /\ rEnd = "open" /\ ~rFinal
+    /\ rFinal' = TRUE
+    /\ rEnd' = IF rRead > Bytes /\ Bug # "NoFinalIntegrity" THEN "integrity" ELSE rEnd
+    /\ rBuf' = IF Bug = "FinalKeepsJunk" THEN rBuf
+                ELSE [o \in WireOffsets |-> IF o < Bytes THEN rBuf[o] ELSE "none"]
+    /\ UNCHANGED <<sEnd, parentLive, ack, pathVars, net, senderVars, rAck, rHigh, rWin, rRead, rCredit, faults>>
+
+\* The ReusePN variant keeps first sends and reuses the number on a retry.
 SendNext ==
     IF Bug = "ReusePN"
-    THEN \/ \E o \in Offsets : SendData(o) /\ ~Sent(o)
+    THEN \/ \E o \in WireOffsets : SendData(o) /\ ~Sent(o)
          \/ \E p \in PNs : ResendSamePN(p)
-    ELSE \E o \in Offsets : SendData(o)
+    ELSE \E o \in WireOffsets : SendData(o)
 
 Next ==
     \/ SendNext
     \/ \E d \in net : Deliver(d)
     \/ \E p \in PNs : Replay(p)
     \/ Bug \in {"NoTag", "SlideBeforeTag"} /\ \E d \in Datagrams : Forge(d)
-    \/ \E p \in PNs : DeliverAck(p)
+    \/ DeliverAck
     \/ \E d \in net : Lose(d)
     \/ \E p \in PNs : DeclareLost(p)
-    \/ \E c \in 1 .. Bytes : DeliverCredit(c)
+    \/ \E c \in 1 .. (Bytes + Excess) : DeliverCredit(c)
     \/ GrantBeyond
     \/ Read
-    \/ Complete
-    \/ Reset
+    \/ Complete \/ CompleteAtAck \/ DeliverReceiverEnd \/ DeliverSenderEnd
+    \/ LoseAck \/ DeliverFinalSize
+    \/ \E side \in {"sender", "receiver"} : Reset(side)
     \/ ParentEnd
     \/ ParentLoss
     \/ MigrateStart
@@ -521,17 +617,24 @@ Next ==
 (* read, reset, the parent's end, parent losses, and migration starts have *)
 (* no fairness. Progress states the consumer's read as its condition.      *)
 OtherFairness ==
-    /\ WF_vars(\E p \in PNs : DeliverAck(p))
+    /\ WF_vars(DeliverAck)
     /\ WF_vars(\E d \in net : Deliver(d))
-    /\ WF_vars(\E p \in PNs : Doomed(p) /\ DeclareLost(p))
-    /\ WF_vars(\E c \in 1 .. Bytes : DeliverCredit(c))
+    \* The bad timer omits accepted packets whose last ACK was lost. The
+    \* fault budget still charges those losses, as it does in the design.
+    /\ WF_vars(\E p \in PNs : Doomed(p)
+                              /\ (Bug # "NoAckRecovery" \/ p \notin rAck)
+                              /\ DeclareLost(p))
+    /\ WF_vars(\E c \in 1 .. (Bytes + Excess) : DeliverCredit(c))
     /\ WF_vars(Complete)
+    /\ WF_vars(DeliverFinalSize)
+    /\ WF_vars(DeliverReceiverEnd)
+    /\ WF_vars(DeliverSenderEnd)
     /\ WF_vars(Validated \/ Abandon)
 
 Spec ==
     /\ Init
     /\ [][Next]_vars
-    /\ WF_vars(\E o \in Offsets : SendData(o))
+    /\ WF_vars(\E o \in WireOffsets : SendData(o))
     /\ OtherFairness
 
 \* The ReusePN variant: the sender's fairness covers the first
@@ -539,7 +642,7 @@ Spec ==
 ReuseSpec ==
     /\ Init
     /\ [][Next]_vars
-    /\ WF_vars(\E o \in Offsets : SendData(o) /\ ~Sent(o))
+    /\ WF_vars(\E o \in WireOffsets : SendData(o) /\ ~Sent(o))
     /\ WF_vars(\E p \in PNs : ResendSamePN(p))
     /\ OtherFairness
 
@@ -547,35 +650,38 @@ ReuseSpec ==
 (* Properties *)
 
 TypeOK ==
-    /\ outcome \in {"open"} \cup Terminal
+    /\ sEnd \in {"open"} \cup Terminal
+    /\ rEnd \in {"open"} \cup Terminal
+    /\ parentLive \in BOOLEAN
+    /\ ack \subseteq PNs /\ ack \subseteq rAck
+    /\ rFinal \in BOOLEAN
     /\ path \in 1 .. Paths
     /\ mig \in {"none", "genuine", "spurious"}
     /\ tried \in 1 .. Paths
-    /\ path <= tried
     /\ cwnd \in 1 .. Window
     /\ net \subseteq Datagrams
-    /\ sLog \in Seq([off : Offsets, pay : Payloads]) /\ Len(sLog) <= MaxPN
+    /\ sLog \in Seq([off : WireOffsets, pay : Payloads]) /\ Len(sLog) <= MaxPN
     /\ sAcked \subseteq PNs
     /\ sLost \subseteq PNs
-    /\ sCredit \in 0 .. Bytes
+    /\ sCredit \in 0 .. (Bytes + Excess)
     /\ rAck \subseteq PNs
     /\ rHigh \in 0 .. MaxPN
     /\ rWin \subseteq PNs
-    /\ rBuf \in [Offsets -> {"none"} \cup Payloads]
-    /\ rRead \in 0 .. Bytes
-    /\ rCredit \in 0 .. Bytes
+    /\ rBuf \in [WireOffsets -> {"none"} \cup Payloads]
+    /\ rRead \in 0 .. (Bytes + Excess)
+    /\ rCredit \in 0 .. (Bytes + Excess)
     /\ faults \in 0 .. Budget
-    /\ outcome = "open" => Spent <= Budget
+    /\ BothOpen => Spent <= Budget
 
 \* The receiver holds only bytes that the sender sent at that offset. No
 \* step checks this; only the tag makes it hold.
 HeldAreSenderBytes ==
-    \A o \in Offsets :
+    \A o \in WireOffsets :
         Held(o) => \E p \in 1 .. Len(sLog) : sLog[p] = [off |-> o, pay |-> rBuf[o]]
 
 \* The receiver holds no data beyond the credit that it granted, and it
 \* granted credit only for capacity that the consumer admitted.
-CreditBound == \A o \in Offsets : Held(o) => o < rCredit /\ o < rRead + Cap
+CreditBound == \A o \in WireOffsets : Held(o) => o < rCredit /\ o < rRead + Cap
 
 \* The receiver's replay state stays inside its declared window.
 PNStateBound == \A q \in rWin : q + Range > rHigh
@@ -586,24 +692,31 @@ PNStateBound == \A q \in rWin : q + Range > rHigh
 AckMeansHeld == \A o \in AckedOffsets : o < rRead \/ Held(o)
 
 \* Completion needs the consumer's read to the final size.
-CompletionSound == outcome = "completed" => rRead = Bytes
+CompletionSound ==
+    /\ sEnd = "completed" => rEnd = "completed"
+    /\ rEnd = "completed" => rFinal /\ rRead = Bytes
+FinalSizeBound == rFinal => \A o \in WireOffsets \ Offsets : ~Held(o)
+FinalReadIntegrity == rFinal /\ rRead > Bytes => rEnd = "integrity"
 
 \* With an honest sender, no datagram from the network or from an attacker
 \* ends the channel with the integrity outcome.
-NoNetworkIntegrity == outcome # "integrity"
+NoNetworkIntegrity == sEnd # "integrity" /\ rEnd # "integrity"
 
 \* The window moves only when the receiver accepts a datagram, so only after
 \* the datagram's tag passes.
 WindowAfterTag == [][rHigh' # rHigh => rHigh' \in rAck' \ rAck]_vars
 
-\* A terminal outcome never changes.
-OutcomeStable == [][outcome # "open" => outcome' = outcome]_vars
+\* Each endpoint keeps its terminal outcome, including after a late frame.
+OutcomeStable ==
+    [][(sEnd # "open" => sEnd' = sEnd)
+       /\ (rEnd # "open" => rEnd' = rEnd)]_vars
 
-\* Progress: when the consumer keeps reading, the channel ends. With no
-\* reset and no parent end, the only end is completion. The consumer's read
+\* Progress: with a stable path and a reading consumer, both ends terminate. With no
+\* reset and no parent end, an honest transfer completes. The consumer's read
 \* is a caller event, so it is the condition of the property, not a
 \* fairness of the specification.
-Progress == WF_vars(Read) => <>(outcome # "open")
+Progress == (WF_vars(Read) /\ <>[](mig = "none")) => <>BothDone
+ValidationEnds == [](mig # "none" => <>(mig = "none" \/ ~parentLive))
 
 -----------------------------------------------------------------------------
 (* Reachability targets. Each witness profile checks the negation of one   *)
@@ -616,19 +729,34 @@ NotPartial == outcome # "partial"
 NotRefused == outcome # "refused"
 NotIntegrity == outcome # "integrity"
 
-\* A migration completes and a side datagram is in flight on the new path.
-NotResumed == ~(path > 1 /\ \E d \in net : d.cid = path)
+\* A migration completed and the sender sends on the selected path.
+NotResumed == [][~(path > 1 /\ (\E o \in WireOffsets : SendData(o)))]_vars
 
 \* The parent abandons a validation and returns to its last validated path.
-NotAbandoned == ~(mig = "none" /\ tried > path)
+NotAbandoned == ~(mig = "none" /\ tried # path)
 
-\* The channel completes after the parent abandoned a validation.
-NotCompletedAfterAbandon == ~(outcome = "completed" /\ tried > path)
+\* The sender receives the final read point after an abandoned validation.
+\* Both endpoints are complete after this step; abandonment cannot come later.
+NotCompletedAfterAbandon ==
+    [][~(mig = "none" /\ tried # path /\ rEnd = "completed" /\ DeliverReceiverEnd)]_vars
+
+\* An earlier attempt was abandoned; another genuine or spurious attempt
+\* starts. No history counter bounds the number of attempts.
+NeverRepeatMigration == [][~(mig = "none" /\ tried # path /\ (MigrateStart \/ Spoof))]_vars
 
 \* The window passes a packet number that the receiver did not accept.
 NotWindowPassed == ~(\E p \in 1 .. Len(sLog) : p + Range <= rHigh /\ p \notin rAck)
 
 \* The receiver accepts a datagram that the attacker sent again.
 NeverReplayAccepted == [][\A p \in PNs : ~(Replay(p) /\ rAck' # rAck)]_vars
+
+
+\* Witnesses of the split control and endpoint states.
+NotCrossed == ~(rEnd = "completed" /\ sEnd = "reset")
+NotParentInterrupted == ~(rEnd = "completed" /\ sEnd = "partial" /\ ~parentLive)
+NotFinalDelayed == ~(rRead = Bytes /\ ~rFinal /\ rEnd = "open")
+NotLastAckLost == [][~(LoseAck /\ ack \cap Flight # {})]_vars
+NotFinalBelowRead == ~(rFinal /\ rRead > Bytes /\ rEnd = "integrity")
+NotJunkDiscarded == [][~(DeliverFinalSize /\ Held(Bytes) /\ ~Held(Bytes)')]_vars
 
 =============================================================================
