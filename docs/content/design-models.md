@@ -93,16 +93,18 @@ size the revised model. Its README records the current results and any unfinishe
 The gate has resumed with an exact
 [retired payload view](../../models/attached-datagram/README.md#retired-payloads). It keeps sent
 offsets where old payload distinctions cannot affect a later step, and retains full payload
-evidence in the forgery variants. Ordinary actions, fairness, properties, and bounds stay
-unchanged. This revision awaits qualification. Both preceding revisions passed all 33
+evidence in the forgery variants. The [retired ACK view](../../models/attached-datagram/README.md#retired-ack-history)
+also omits obsolete acceptance identities while it keeps live loss/ACK membership and the
+passed-window observation. Four identity-sensitive variants keep full ACK sets. Ordinary
+actions, fairness, properties, and bounds stay unchanged. This revision awaits qualification. Both preceding revisions passed all 33
 known-bad and reachability profiles, but their positive searches stopped when progress did not
 support the one-hour cap including final temporal checking. All ten positives remain open.
 The [evidence record](../../models/attached-datagram/README.md#current-evidence) keeps the exact
 inputs, CPU sample, attempts, and completed host cleanup. Dependent implementation must wait
 for the complete-search gate.
 
-An edit that lets an omitted payload affect a guard, receive result, checked observation, or
-fair action requires a new view correspondence argument and all profile checks. The original
+An edit that lets omitted payload or ACK history affect a guard, receive result, checked
+observation, or fair action requires a new view correspondence argument and all profile checks. The original
 invariants still run; an assumed safety result cannot justify a smaller view.
 
 Each profile must finish within one hour on a 16-vCPU host, so that a run of every profile after a

@@ -791,11 +791,18 @@ SenderLedgerView ==
     IF Bug = "ReusePN" THEN <<sAcked, sLost, JunkPNs>>
     ELSE <<Flight, Cardinality(sLost \cup JunkPNs)>>
 
+\* Retired ACK identities affect only the passed-window witness. Keep full
+\* sets where forgery or revival needs them (README, "Retired ACK history").
+AckHistoryView ==
+    IF Bug \in {"NoTag", "SlideBeforeTag", "ReusePN", "NoWindowBound"}
+    THEN <<rAck, ack>>
+    ELSE <<rAck \cap Flight, ack \cap Flight, ack # {}, NotWindowPassed>>
+
 OpenView ==
-    <<ends, controlVars, pathVars, {d.pn : d \in net}, Len(sLog),
+    <<ends, rFinal, pathVars, {d.pn : d \in net}, Len(sLog),
       [p \in LiveLogPNs |-> sLog[p]], SentHistoryView,
       AckedOffsets, OffsetsOf(ack), OffsetsOf(rAck), SenderLedgerView,
-      sCredit, receiverVars, faults>>
+      sCredit, AckHistoryView, <<rHigh, rWin, rBuf, rRead, rCredit>>, faults>>
 
 \* Both terminal endpoints stay terminal. Only validation, parent failure,
 \* optional ACK loss, and LateReset can still change state. Keep their

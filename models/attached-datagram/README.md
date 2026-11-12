@@ -4,9 +4,10 @@ This is the design model of task N000. It checks the rules of attached datagram 
 `docs/specs/networking.md`, through the decisions of 2026-11-11, before N603 fixes the wire
 format. The [statechart](statechart.md) shows its control states.
 
-**Status (2026-11-12 UTC): N000 has resumed; retired payload history awaits qualification.**
+**Status (2026-11-12 UTC): N000 has resumed; retired history views await qualification.**
 The [state view](#state-view) merges retired sender-ledger histories and now omits
-[payload distinctions that cannot affect a later step](#retired-payloads). The ordinary actions,
+[payload distinctions](#retired-payloads) and [ACK identities](#retired-ack-history) that cannot
+affect a later step. The ordinary actions,
 weak fairness, properties, and bounds stay unchanged. Both preceding revisions completed all
 33 known-bad and reachability profiles, but their positive searches stopped when progress did
 not support completion within the one-hour cap. All ten positive obligations remain open.
@@ -246,8 +247,8 @@ mapping. Fully terminal states also retained each data history. `StateView` has 
 
 ### An endpoint is open
 
-`OpenView` retains endpoint, control, path, and receiver state. It retains the log length and
-these sender and network summaries:
+`OpenView` retains endpoint, path, final-size, credit, buffer, read, and replay-window state.
+It retains the log length and these history and network summaries:
 
 | Value | Use |
 | --- | --- |
@@ -256,6 +257,7 @@ these sender and network summaries:
 | `AckedOffsets` | Send admission, `AllAcked`, `ParentEnd`, and `AckMeansHeld` |
 | `OffsetsOf(ack)` and `OffsetsOf(rAck)` | The offsets that a pending or replacement ACK will add |
 | `SenderLedgerView` | `Flight` and the exact combined loss/excess charge; the full ledger in `ReusePN` |
+| `AckHistoryView` | ACK membership in `Flight`, pending-ACK presence, and the passed-window witness; full sets in the four variants below |
 | Every packet number in `net` | The enabled delivery and loss steps, including stale copies |
 
 A network entry is always the sole copy for its packet number, has connection ID 1, and has
@@ -291,7 +293,8 @@ For two reachable states with equal open views, the following correspondence hol
   is omitted.
 - `DeliverAck` adds `OffsetsOf(ack)` to the acknowledged offsets. A new receive replaces the
   ACK with `rAck` plus its newly accepted number; `OffsetsOf(rAck)` determines that update.
-  The receiver and pending-ACK sets stay exact, including unsent numbers in `NoTag`.
+  ACK membership in `Flight` stays exact. The four exceptions below keep full sets,
+  including unsent numbers in `NoTag`.
 - Reads, credit, final size, completion, notification, reset, parent failure, and migration
   use retained values. `HeldAreSenderBytes` uses full `SentEntries` in `NoTag` and has an
   inductive true value in the reduced variants, as shown below. The other safety and state
@@ -355,10 +358,9 @@ Their original action predicates and the other fair actions keep their enabledne
 occurrences. No action changes only an omitted sender-ledger value.
 
 The action witnesses keep their observations: `NotLastAckLost` uses exact `ack \cap Flight`;
-`NotResumed` uses the same send guard; replay acceptance and window movement use exact receiver
-state; migration and abandonment use exact path state; final-size discard and notification use
-exact receive, control, and endpoint state. `NotWindowPassed` still uses the unchanged `rAck`
-and log length. `NoAckLoss` and all original action/property definitions stay unchanged. The
+`NotResumed` uses the same send guard; replay acceptance and window movement use the retained receiver observations described
+below; migration and abandonment use exact path state; final-size discard and notification use
+exact buffer, control, and endpoint state. `NotWindowPassed` remains an explicit observation. `NoAckLoss` and all original action/property definitions stay unchanged. The
 ledger reduction therefore preserves the earlier fairness and terminal-view argument below,
 including the safety labels and ACK-loss observations on a transition into `ClosedView`.
 
@@ -415,11 +417,88 @@ the full-log `ReusePN` variant. `ClosedView` and its safety/ACK-loss observation
 including on transitions from these equal open views. Matching successors and fair occurrences
 preserve both finite observations and infinite fair behaviors.
 
+#### Retired ACK history
+
+`AckHistoryView` keeps full `rAck` and `ack` in `NoTag`, `SlideBeforeTag`, `ReusePN`, and
+`NoWindowBound`. Every other variant keeps `rAck \cap Flight`, `ack \cap Flight`, whether
+`ack` is nonempty, and `NotWindowPassed`. The original sets stay in the model; only their
+fingerprints change. The replay window and both ACK offset summaries remain in `OpenView`.
+
+The following facts follow directly from `Init` and the actions:
+
+- `ack` is empty or exactly `rAck`. Only `Accept` adds a receiver ACK; `Receive` then replaces
+  `ack` with the new `rAck`. `DeliverAck` and `LoseAck` clear it. All other actions preserve it.
+- Outside the four exceptions, acceptance requires `Authentic`. Thus `rAck` is a subset of
+  `LogPNs`, each member is at most `rHigh`, and `rHigh <= Len(sLog)`. Acceptance adds a sent
+  number and takes the maximum high point; other actions cannot invalidate these facts.
+- `rWin` is exactly the accepted numbers above the monotone replay floor. `Accept` preserves
+  this equality by union and filtering. A below-floor number can never be accepted later.
+
+These are transition inductions, not assumed positive results. Above the floor, `rWin`
+determines accepted membership. Below it, `Doomed` needs membership only for `Flight`, which
+is retained. Thus `LiveLogPNs` is also determined: its non-flight part is the above-floor
+logged numbers outside `rWin`. The original log/offset and ledger correspondence still holds.
+
+The actions have matching results:
+
+| Actions | Retained information and update |
+| --- | --- |
+| `SendData` | The same live entries, offsets, credit, window and budget admit the same append. Its new number is beyond every old receiver ACK. |
+| `Deliver`, `Replay` | A possible acceptance uses the same live entry, window, credit and buffer. It adds the same number to the window and live ACK projection, adds the same offset, and replaces the pending-ACK projections with those of `rAck`. A below-floor delivery removes the same network number. |
+| `Lose`, `DeclareLost` | The same flight membership, network numbers, live ACK membership and burned count give the same `Doomed`, post-budget and congestion updates. |
+| `DeliverAck` | The nonempty flag enables it. Remove exactly `ack \cap Flight` from flight, union `OffsetsOf(ack)` into acknowledged offsets, and clear the pending projections. Unsent-ACK integrity is impossible by the subset induction; `NoTag` keeps full sets. |
+| `LoseAck` | Clear the same pending projections and test the same resulting doomed-flight charge. `CountFault` observes ACK identity only in `ReusePN`, which keeps full sets. |
+| Other actions | Read, credit, final size, outcome and path actions use the same retained values. They do not add or remove ACK membership. `Forge` and `ResendSamePN` are disabled in reduced variants. |
+
+Replay of a retired number can be enabled in only one representative if the other accepted
+it earlier. Such a difference is below the floor: the replay is a full-state stutter. It has
+no fairness, and `[Next]_vars` already permits the matching stutter. It cannot replace a fair
+occurrence. Both forgery variants and both variants that can revive old entries keep full sets.
+
+`NotWindowPassed` becomes permanently false after a missing number falls below the floor:
+`rHigh` cannot decrease, and that number cannot be accepted. If the observation is still true
+when the high point increases, every newly crossed logged number was above the old floor,
+where `rWin` determines its prior accepted membership. The new accepted high number is not
+below its own floor. These facts determine the next observation. Appending a new number cannot
+create a below-floor hole because `rHigh` is at most the previous log length.
+
+`TypeOK`'s omitted ACK-set clauses follow the set inductions above; its other inputs remain
+determined. `WindowAfterTag` has the true value by the same direct action argument: only an
+acceptance raises `rHigh`, and its new high number exceeds every old `rAck` member. The original
+invariant and action property still run. `NeverReplayAccepted` agrees for every above-floor
+number; below the floor a replay never changes `rAck`, so that witness is false even if the
+optional stutter is absent. `NotLastAckLost` uses the exact retained `ack \cap Flight` and
+matching `LoseAck`. All other witnesses use the retained fields or matching actions already
+described. `NoAckLoss` applies only to `ReusePN`, whose sets stay exact.
+
+Every fair enabledness and nonstuttering occurrence is preserved. Send changes length,
+delivery changes network numbers, declaration changes flight, ACK arrival clears a true flag,
+and credit, read, final-size, outcome and validation change their retained values. Read's
+conditional fairness in `Progress` keeps the same buffer/read/end inputs and result.
+`ClosedView` is unchanged. Its safety observations and passed-window bit are determined as
+above. Its `ENABLED LoseAck` is determined by ACK presence, live memberships, network numbers,
+live entries and burned charge; its `ack \cap Flight` bit is explicit. This also proves the
+correspondence on entry to a terminal view.
+
+A concrete pair fits `FaultySender`'s existing bounds. Use good bytes. Both branches send PN 1
+at offset 0, lose it, and declare it lost. Send PN 2 at offset 0. Branch A accepts and reads
+it, loses its ACK, then declares it lost. Branch B loses PN 2 and declares it lost. Both send
+and accept PN 3 at offset 0; B reads it, while A already did. Both process the ACK and
+`DeliverCredit(3)`. Both send, accept, read and acknowledge PN 4 at offset 1, then
+`DeliverCredit(4)`. Both do the same for PN 5 at offset 2, then `DeliverCredit(5)`.
+
+Both states have the same log of length 5, `sLost = {1, 2}`, burned charge 2, empty flight,
+network, buffer and pending ACK, read point 3, high point 5, window `{4, 5}`, congestion window
+1, both credits 5, and sent and ACK offset summaries `{0, 1, 2}`. `NotWindowPassed` is false
+in both because PN 1 was never accepted. A has `rAck = {2, 3, 4, 5}`, B has `{3, 4, 5}`;
+`sAcked` differs in the same way, which the ledger view already omits. Their obsolete PN 2
+acceptance identities now have equal views. All steps fit the original packet and fault bounds.
+
 #### Type and action observations
 
 `OpenView` does not compute `TypeOK` again for fingerprinting. Equal open views already agree
-on it. The endpoint, control, path, sender-credit, receiver, and fault values keep
-their type inputs directly. `Len(sLog)` retains the log-length bound. Log entry typing follows
+on it. Endpoint, path, final-size, credit, buffer, replay-window, read, and fault values
+keep their type inputs directly. The ACK-set typing follows the preceding transition induction. `Len(sLog)` retains the log-length bound. Log entry typing follows
 from `Init` and `SendData`: every append selects a wire offset and an allowed payload, and no
 action changes an earlier entry. This also covers omitted retired payloads. By the network/log
 fact above, every network entry has connection ID 1 and the log's offset and payload at its
@@ -439,8 +518,8 @@ Each transition therefore has a matching transition with the same next view. Thi
 both directions. No fair action that changes the state becomes a view self-loop: a send changes
 the length; a delivery removes a number or changes receive state; a loss declaration removes
 a flight number; ACK arrival clears `ack`; credit, read, completion, notification, final size, and
-validation each change a retained value. A stale replay is a true stuttering step in both
-states, not a repeatable substitute for a fair delivery. Keeping every network number is
+validation each change a retained value. A stale replay matches a permitted stuttering step in the other state; it cannot replace
+a fair delivery. Keeping every network number is
 necessary here: removing a finite set of stale deliveries could otherwise create such a loop.
 
 ### Both endpoints have ended
@@ -514,8 +593,9 @@ completed positive result is claimed.
 
 ## Current evidence
 
-The retired payload view has no checker result yet. It needs SANY, independent source review,
-all 33 known-bad and reachability profiles, and all ten complete positive searches. Every
+The retired payload and ACK views have no model-checker result yet. Both modules passed
+SANY in 1.602129 seconds on the exact source and pinned tools. The source still needs independent
+review, all 33 known-bad and reachability profiles, and all ten complete positive searches. Every
 positive keeps its 3,600-second cap on a 16-vCPU host. Bounds and properties are unchanged.
 The retained runs below do not qualify the new module closure. This is the third and last
 cause-based implementation attempt in this continuation.
