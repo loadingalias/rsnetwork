@@ -4,13 +4,12 @@ This is the design model of task N000. It checks the rules of attached datagram 
 `docs/specs/networking.md`, through the decisions of 2026-11-11, before N603 fixes the wire
 format. The [statechart](statechart.md) shows its control states.
 
-**Status (2026-11-12 UTC): N000 remains blocked.** The current [state view](#state-view)
-completed all 33 known-bad and reachability profiles. `FaultySender` did not finish within its
-one-hour cap: 3,260,892 states remained queued. The other nine positive profiles did not start.
-All ten positive obligations remain open. The view removes unused packet mappings and terminal
-data histories without changing the declared actions, properties, or bounds. The
-[evidence record](#current-evidence) retains all three attempts; an incomplete search is not a
-pass.
+**Status (2026-11-12 UTC): N000 has resumed; the sender-ledger view awaits qualification.**
+The [state view](#state-view) now also merges retired sender-ledger histories. It changes no
+action, fairness condition, property, or bound. The preceding revision completed all 33 known-bad
+and reachability profiles, but `FaultySender` reached its one-hour cap with 3,260,892 states
+queued. The other nine positives did not start. Those results do not qualify this revision.
+The [evidence record](#current-evidence) keeps the exact preceding source and results.
 
 ## Promise
 
@@ -246,8 +245,8 @@ mapping. Fully terminal states also retained each data history. `StateView` has 
 
 ### An endpoint is open
 
-`OpenView` retains all endpoint, control, path, receive, loss, and acknowledgement state.
-It retains the log length and these data summaries:
+`OpenView` retains endpoint, control, path, and receiver state. It retains the log length and
+these sender and network summaries:
 
 | Value | Use |
 | --- | --- |
@@ -255,7 +254,7 @@ It retains the log length and these data summaries:
 | `SentEntries` | `Sent`, `SeenGood`, and the independent sender-byte witness in `HeldAreSenderBytes` |
 | `AckedOffsets` | Send admission, `AllAcked`, `ParentEnd`, and `AckMeansHeld` |
 | `OffsetsOf(ack)` and `OffsetsOf(rAck)` | The offsets that a pending or replacement ACK will add |
-| `JunkPNs` | The exact excess-packet contribution to `Spent` |
+| `SenderLedgerView` | `Flight` and the exact combined loss/excess charge; the full ledger in `ReusePN` |
 | Every packet number in `net` | The enabled delivery and loss steps, including stale copies |
 
 A network entry is always the sole copy for its packet number, has connection ID 1, and has
@@ -286,26 +285,94 @@ For two reachable states with equal open views, the following correspondence hol
   there, but both branches leave receive state unchanged. Current log entries and `SentEntries`
   determine every other tag and forgery result.
 - `Lose` has the same receive effect, packet removal, and fault charge. `Doomed`, `DeclareLost`,
-  and `Spent` use retained packet-number sets, network numbers, and `JunkPNs`. Their guards and
-  results are the same. Packet numbers remain visible even after their mapping is omitted.
+  and `Spent` use the retained flight, ACK and network numbers and the combined charge below.
+  Their guards and results are the same. Live packet numbers remain visible after old history
+  is omitted.
 - `DeliverAck` adds `OffsetsOf(ack)` to the acknowledged offsets. A new receive replaces the
   ACK with `rAck` plus its newly accepted number; `OffsetsOf(rAck)` determines that update.
-  The packet-number sets stay unchanged by the view, including unsent numbers in `NoTag`.
+  The receiver and pending-ACK sets stay exact, including unsent numbers in `NoTag`.
 - Reads, credit, final size, completion, notification, reset, parent failure, and migration
   use retained values. `HeldAreSenderBytes` uses `SentEntries`; the other safety and state
   targets use retained values or summaries. The retained values also determine `TypeOK`, as
   shown below.
 
+#### Sender ledger
+
+Except in `ReusePN`, `SenderLedgerView` keeps `Flight` and the count
+`B = Cardinality(sLost \cup JunkPNs)`. It omits which retired packet numbers are acknowledged,
+lost, or both. The preceding view kept these histories even when they had the same future
+effects. The reduction keeps the original sets in the model; it changes only their fingerprint.
+
+The following facts hold initially and each action preserves them:
+
+- `sLost \subseteq LogPNs` and `sAcked \subseteq PNs`. Only `DeclareLost` adds to `sLost`,
+  and its number is in `Flight`. Only `DeliverAck` adds to `sAcked`, from `ack \subseteq PNs`.
+  Log growth preserves earlier numbers; `ResendSamePN` only removes a lost number.
+- While `sEnd = "open"`, `sAcked \subseteq LogPNs`. A `DeliverAck` with any unsent number
+  ends that sender with `integrity`. No action reopens it. Thus a new `SendData` number is in
+  neither sender set, including in `NoTag`.
+- `Flight` is disjoint from `sLost`. Each flight entry remains in the retained live log, so
+  its excess-byte status is known. Therefore the following identity is exact:
+
+```tla
+Spent = B + Cardinality({p \in Flight : Doomed(p) /\ sLog[p].off < Bytes})
+```
+
+The guards and updates follow from these facts:
+
+| Action | Sender-ledger effect outside `ReusePN` |
+| --- | --- |
+| `SendData(o)` | Add the next number to `Flight`; increase `B` by one exactly when `o >= Bytes` |
+| `DeclareLost(p)` | Remove `p` from `Flight`; increase `B` by one exactly when its offset is below `Bytes` |
+| `DeliverAck` | Remove `ack` from `Flight`; union `OffsetsOf(ack)` into `AckedOffsets`; keep `B` |
+| Every other action | Keep `Flight`, `B`, and `AckedOffsets` |
+
+`DeclareLost` cannot count a prior loss twice because its number is in `Flight`. An excess
+packet is already in the union counted by `B`, so declaring it lost adds no charge. New packet
+numbers are outside both that union and `sAcked`. `Doomed` still sees exact flight, receiver-ACK,
+pending-ACK, and network membership. The identity above thus preserves each `Spent' <= Budget`
+guard, including ACK loss and an early declaration. `LoseAck` also tests `ack \ sAcked` through
+`CountFault`, but that argument affects a transition only in `ReusePN`; otherwise `faults`
+stays unchanged.
+
+In `NoTag`, packet-number squatting can put an unsent number in `rAck` or `ack`. Both sets stay
+exact. Sending that number before its ACK arrives puts it in `Flight` as usual, and the retained
+offset summaries update from the new log entry. Processing its ACK while it is still unsent
+ends the sender, exactly as before. Hidden unsent members of `sAcked` can then neither affect a
+new send nor be made sent later. A following ACK is disabled. Receiver actions and terminal
+notification use the retained state. This covers both orders of squatting and ACK arrival.
+
+`ReusePN` keeps `sAcked`, `sLost`, and `JunkPNs` exactly. Its resend can remove a lost number
+and return it to `Flight`, and `CountFault` observes acknowledged identity. Its current full-log
+view and both reused-number counterexamples are unchanged by this ledger reduction.
+
+For equal open views, the table gives matching transitions in both directions with the same
+next view. Fair loss declarations remove a visible flight number; ACK arrival clears a visible
+nonempty `ack`; sending changes the log length. None of these steps becomes a view self-loop.
+Their original action predicates and the other fair actions keep their enabledness and
+occurrences. No action changes only an omitted sender-ledger value.
+
+The action witnesses keep their observations: `NotLastAckLost` uses exact `ack \cap Flight`;
+`NotResumed` uses the same send guard; replay acceptance and window movement use exact receiver
+state; migration and abandonment use exact path state; final-size discard and notification use
+exact receive, control, and endpoint state. `NotWindowPassed` still uses the unchanged `rAck`
+and log length. `NoAckLoss` and all original action/property definitions stay unchanged. The
+ledger reduction therefore preserves the earlier fairness and terminal-view argument below,
+including the safety labels and ACK-loss observations on a transition into `ClosedView`.
+
+#### Type and action observations
+
 `OpenView` does not compute `TypeOK` again for fingerprinting. Equal open views already agree
-on it. The endpoint, control, path, sender-set, sender-credit, receiver, and fault values keep
+on it. The endpoint, control, path, sender-credit, receiver, and fault values keep
 their type inputs directly. `Len(sLog)` and `SentEntries` determine the log's length and entry
 types. By the network/log fact above, every network entry has connection ID 1 and the log's
 offset and payload at its packet number. Thus valid log entries and the retained network
 numbers determine network typing. If an entry in the log has a wrong type, log typing already
-makes `TypeOK` false. Finally, `BothOpen` and `Spent` use only retained endpoint values, log
-length, loss and ACK sets, network numbers, and `JunkPNs`. This determines the budget clause.
+makes `TypeOK` false. The omitted sender-set type clauses hold by the initial/step argument
+above; they are not an assumed positive result. `ReusePN` retains those sets directly.
+Finally, the retained endpoint values and the exact `Spent` identity determine the budget clause.
 
-The omission therefore leaves the open-state equivalence classes unchanged. Every positive
+Omitting the repeated type calculation adds no further state merging. Every positive
 profile still checks the original `TypeOK` invariant, and `ClosedView` still stores its type
 observation. The previous view evaluated the full type and budget predicate for each generated
 successor, then checked it again when the checker found a new state. The 35-minute sample had
@@ -314,8 +381,8 @@ no bound, transition, property, or observed result.
 
 Each transition therefore has a matching transition with the same next view. This applies in
 both directions. No fair action that changes the state becomes a view self-loop: a send changes
-the length; a delivery removes a number or changes receive state; a loss declaration changes
-`sLost`; ACK arrival clears `ack`; credit, read, completion, notification, final size, and
+the length; a delivery removes a number or changes receive state; a loss declaration removes
+a flight number; ACK arrival clears `ack`; credit, read, completion, notification, final size, and
 validation each change a retained value. A stale replay is a true stuttering step in both
 states, not a repeatable substitute for a fair delivery. Keeping every network number is
 necessary here: removing a finite set of stale deliveries could otherwise create such a loop.
@@ -390,6 +457,13 @@ still grows on the Java heap. The current positive searches remain incomplete; n
 completed positive result is claimed.
 
 ## Current evidence
+
+The sender-ledger reduction has no checker result yet. It needs SANY, independent source
+review, all 33 known-bad and reachability profiles, and all ten complete positive searches.
+Every existing positive keeps its 3,600-second cap on a 16-vCPU host. Bounds and properties
+are unchanged. The retained runs below do not qualify the new module closure.
+
+### Retained state-view result
 
 Native run `20261112T012118Z-28397` checked the final state view at model digest
 `sha256:d4103a23e1a548792ac2d74c34353257614a5ef3dbbb60327c50a772c6584b82` (45 files).

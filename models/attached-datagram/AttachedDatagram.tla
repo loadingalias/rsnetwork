@@ -780,11 +780,17 @@ LiveLogPNs ==
 SentEntries == {sLog[p] : p \in LogPNs}
 OffsetsOf(packets) == {sLog[p].off : p \in packets \cap LogPNs} \cap Offsets
 
+\* Normal sends never revive a retired number. Keep its budget charge, not
+\* whether that number was acknowledged, lost, or both. ReusePN can revive it.
+SenderLedgerView ==
+    IF Bug = "ReusePN" THEN <<sAcked, sLost, JunkPNs>>
+    ELSE <<Flight, Cardinality(sLost \cup JunkPNs)>>
+
 OpenView ==
     <<ends, controlVars, pathVars, {d.pn : d \in net}, Len(sLog),
       [p \in LiveLogPNs |-> sLog[p]], SentEntries,
-      AckedOffsets, OffsetsOf(ack), OffsetsOf(rAck), JunkPNs,
-      sAcked, sLost, sCredit, receiverVars, faults>>
+      AckedOffsets, OffsetsOf(ack), OffsetsOf(rAck), SenderLedgerView,
+      sCredit, receiverVars, faults>>
 
 \* Both terminal endpoints stay terminal. Only validation, parent failure,
 \* optional ACK loss, and LateReset can still change state. Keep their
