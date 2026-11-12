@@ -4,13 +4,13 @@ This is the design model of task N000. It checks the rules of attached datagram 
 `docs/specs/networking.md`, through the decisions of 2026-11-11, before N603 fixes the wire
 format. The [statechart](statechart.md) shows its control states.
 
-**Status (2026-11-12 UTC): N000 has resumed; fair enabledness awaits qualification.**
-The [state view](#state-view) merges retired sender-ledger histories. The source now also uses
-[derived enabled-state predicates](#fair-enabledness) in the same weak-fairness formula.
-Action relations, fairness meaning, properties, and bounds stay unchanged. The ledger revision
-completed all 33 known-bad and reachability profiles, but its positive search was stopped when
-progress did not support completion within the one-hour cap. All ten positive obligations remain
-open. The [evidence record](#current-evidence) retains those results; they do not qualify this source.
+**Status (2026-11-12 UTC): N000 has resumed; retired payload history awaits qualification.**
+The [state view](#state-view) merges retired sender-ledger histories and now omits
+[payload distinctions that cannot affect a later step](#retired-payloads). The ordinary actions,
+weak fairness, properties, and bounds stay unchanged. Both preceding revisions completed all
+33 known-bad and reachability profiles, but their positive searches stopped when progress did
+not support completion within the one-hour cap. All ten positive obligations remain open.
+The [evidence record](#current-evidence) retains those results; they do not qualify this source.
 
 ## Promise
 
@@ -154,82 +154,6 @@ failure, parent loss, early loss declarations, network loss, attackers, and migr
 no fairness. Success alone has no fairness. `ValidationEnds` does not assume eventual path
 stability; it applies also when attempts repeat without end.
 
-## Fair enabledness
-
-`Fair(E, A)` uses the weak-fairness formula with a derived state predicate:
-
-```tla
-Fair(E, A) == ([]<>~E) \/ []<><<A>>_vars
-```
-
-For each call, `E` equals `ENABLED <<A>>_vars` on reachable states. This is equivalent to
-the [pinned checker's expansion](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/Liveness.java)
-of `WF_vars(A)`. SANY requires the action to be inside its own `<>` term. The pinned
-[disjunction normalizer](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/LNDisj.java)
-joins the two recurrence terms into one `[]<>(~E \/ <<A>>_vars)` before the conjunction's
-branch expansion. The original action and its non-stuttering occurrence remain in the formula.
-The replacement avoids the checker's
-[successor construction for enabledness](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/LNStateEnabled.java).
-It changes no transition or fairness requirement. Each existential and `Validated \/ Abandon`
-keeps its original collective fairness; no member receives separate fairness.
-
-Each shared guard is next to its owning action and is used by that action. The following guards
-already suffice for a successor; the assignments are total under the model's inductive typing
-facts. These facts hold in the known-bad variants too and do not assume their safety properties.
-
-| Action or group | State predicate | Why every enabled step is non-stuttering |
-| --- | --- | --- |
-| `DeliverAck` | `DeliverAckGuard` | Clears a nonempty ACK. An unsent PN still enables the integrity outcome. |
-| `\E d \in net : Deliver(d)` | The same existential over `DeliverGuard(d)` | Removes `d`, including a discarded datagram. |
-| `\E c \in 1..(Bytes+Excess) : DeliverCredit(c)` | The same existential over `DeliverCreditGuard(c)` | Strictly increases sender credit. |
-| `Read` | `ReadGuard` | Increases `rRead` for a good byte or changes the open receiver to integrity. |
-| `Complete` | `CompleteGuard` | Changes the open receiver to completed. |
-| `DeliverFinalSize` | `DeliverFinalSizeGuard` | Sets `rFinal`, including in `FinalKeepsJunk` and `NoFinalIntegrity`. |
-| `DeliverReceiverEnd` | `DeliverReceiverEndGuard` | Changes the open sender to a terminal value; keeps the `NoFinalNotice` exception. |
-| `DeliverSenderEnd` | `DeliverSenderEndGuard` | Changes the open receiver to a terminal value. |
-| `Validated \/ Abandon` | `ValidatedGuard \/ AbandonGuard` | Changes `mig` to none. `NoAbandon` still permits genuine success but cannot end spurious validation. |
-| `\E p \in PNs : ResendSamePN(p)` | The same existential over `ResendSamePNGuard(p)` | Removes `p` from `sLost`, even if its network copy already exists. |
-
-`ResendSamePN` has no post-`Spent`, range, or fault-counter bound. Its guard adds none. This
-preserves the faulty reused-number cycles and the full-ledger exception in the state view.
-`Read` remains a premise of `Progress`, not an added assumption in `Spec`.
-
-`SendData` needs a separate post-budget derivation. Set `p = Len(sLog)+1`. The shared
-`SendDataGuard(o)` keeps every original admission condition. While the sender is open, `p` is
-outside both sender sets; an unsent ACK ends the sender and no action reopens it. The network
-contains only sent PNs. Appending `p` therefore changes the state, and its payload choice set
-is nonempty. Every old PN keeps its contribution to `Spent`. The new PN costs one exactly when
-it is excess or when the receiver accepted it and its ACK is absent:
-
-```tla
-SpentAfterSend = Spent + (IF o >= Bytes \/ p \in rAck \ ack THEN 1 ELSE 0)
-```
-
-The second term is necessary in `NoTag`: a forged PN can be accepted and its ACK lost before
-the real send. A new network copy does not clear that accepted-but-unacknowledged condition in
-`Doomed`. Excess plus missing ACK is one union member, not two charges. Each payload has the
-same charge. Thus `SendDataEnabled(o)` is exactly the shared guard and
-`SpentAfterSend <= Budget`. `Spec` keeps its existential over offsets. `ReuseSpec` adds the
-original `~Sent(o)` inside that existential for first sends.
-
-For the collective fair loss, `Doomed(p)` entails `p \in Flight`. Declaring it lost moves an
-already charged PN into `sLost`, so `Spent' = Spent`; `CountFault(FALSE)` also keeps `faults`.
-`DoomedLossEnabled` retains the original existential, the `NoAckRecovery` exclusion, and
-`DeclareLostGuard(p)`, then checks both `faults <= Budget` and `Spent <= Budget`. These bounds
-remain explicit when the receiver has ended. Adding `p` to `sLost` proves non-stuttering.
-Early loss declarations retain their original relation and receive no fairness.
-
-Every fair action changes an observation kept by `StateView`, so these equal state predicates
-also keep its reviewed fairness correspondence. `OldPacketReuse`'s `NoAckLoss` action constraint
-still filters the same edges. Original enabledness ignores that constraint; the derived
-predicates do too. Actions can overlap, so this argument does not rely on their names.
-`ClosedView` keeps its separate `ENABLED LoseAck` observation unchanged.
-
-A guard edit changes both the action and its enabledness input. An edit to assignments,
-post-state bounds, choice domains, or the variables that define non-stuttering reopens the
-adjacent equivalence proof. Review the constructive successor and variant exceptions again,
-then run all profiles. A smaller evaluation cost is not evidence of equivalent fairness.
-
 ## Reductions and limits
 
 1. One data delivery and one late replay suffice for copies: a later accepted copy is duplicate
@@ -328,7 +252,7 @@ these sender and network summaries:
 | Value | Use |
 | --- | --- |
 | Log entries in `LiveLogPNs` | Every packet in `Flight`, and each unaccepted packet at or above the replay floor |
-| `SentEntries` | `Sent`, `SeenGood`, and the independent sender-byte witness in `HeldAreSenderBytes` |
+| `SentHistoryView` | Sent offsets; full payload pairs in the two forgery variants |
 | `AckedOffsets` | Send admission, `AllAcked`, `ParentEnd`, and `AckMeansHeld` |
 | `OffsetsOf(ack)` and `OffsetsOf(rAck)` | The offsets that a pending or replacement ACK will add |
 | `SenderLedgerView` | `Flight` and the exact combined loss/excess charge; the full ledger in `ReusePN` |
@@ -359,8 +283,8 @@ For two reachable states with equal open views, the following correspondence hol
 - `Deliver` and `Replay` use a retained entry when a packet can pass the window. A removed
   entry always fails the window; its arrival only removes that network number, or stutters for
   replay. `Forge` at such a number cannot slide the window either. A tag comparison can differ
-  there, but both branches leave receive state unchanged. Current log entries and `SentEntries`
-  determine every other tag and forgery result.
+  there, but both branches leave receive state unchanged. Current log entries and the full
+  `SentEntries` retained in both forgery variants determine every other tag and forgery result.
 - `Lose` has the same receive effect, packet removal, and fault charge. `Doomed`, `DeclareLost`,
   and `Spent` use the retained flight, ACK and network numbers and the combined charge below.
   Their guards and results are the same. Live packet numbers remain visible after old history
@@ -369,9 +293,10 @@ For two reachable states with equal open views, the following correspondence hol
   ACK with `rAck` plus its newly accepted number; `OffsetsOf(rAck)` determines that update.
   The receiver and pending-ACK sets stay exact, including unsent numbers in `NoTag`.
 - Reads, credit, final size, completion, notification, reset, parent failure, and migration
-  use retained values. `HeldAreSenderBytes` uses `SentEntries`; the other safety and state
-  targets use retained values or summaries. The retained values also determine `TypeOK`, as
-  shown below.
+  use retained values. `HeldAreSenderBytes` uses full `SentEntries` in `NoTag` and has an
+  inductive true value in the reduced variants, as shown below. The other safety and state
+  targets use retained values or summaries. These values and the inductive typing facts also
+  determine `TypeOK`.
 
 #### Sender ledger
 
@@ -437,15 +362,69 @@ and log length. `NoAckLoss` and all original action/property definitions stay un
 ledger reduction therefore preserves the earlier fairness and terminal-view argument below,
 including the safety labels and ACK-loss observations on a transition into `ClosedView`.
 
+#### Retired payloads
+
+`SentHistoryView` keeps full `SentEntries` for `NoTag` and `SlideBeforeTag`. In every other
+variant it keeps only `{sLog[p].off : p \in LogPNs}`. The earlier view distinguished a past
+good payload from a past bad payload even after neither could affect a later receive.
+The source log, all actions, ordinary `WF_vars` clauses, and invariant checks stay unchanged.
+
+These are all uses of a historical payload:
+
+- `SeenGood(o)` controls `Forge` in both forgery variants. They retain the full pair set, so
+  every forgery keeps its original guard and result. `NoTagSquat` keeps the same false ACK claim.
+- `Authentic` and `Replay` use full entries while a packet can be accepted. Every such entry
+  remains in `LiveLogPNs`. An omitted entry is accepted or below the monotone replay floor and
+  cannot become fresh. Its delivery or replay still discards, with the same network removal
+  or stutter. `ReusePN` and `NoWindowBound` retain the complete log, so the pair set can already
+  be reconstructed there. The reused-number counterexamples lose no information.
+- `HeldAreSenderBytes` has the true value by the following direct initial/step argument in
+  every reduced variant. This is not an assumed safety result.
+
+Initially no byte is held. `Accept` can write a new held byte only after `Tagged` passes.
+Outside `NoTag`, this requires `Authentic`, which supplies the exact offset/payload witness
+in `sLog`. An existing held byte stays unchanged. `Read` and final-size arrival remove or
+preserve held bytes, including in `FinalKeepsJunk` and `NoFinalIntegrity`. Other actions preserve
+the buffer. `SendData` only appends, and no action changes an earlier log entry. Thus every
+held byte keeps its immutable witness. The original invariant still runs; no Boolean substitute
+replaces it. `NoTag` retains the full evidence and can still violate it.
+
+`Sent(o)` uses only offsets and is determined exactly by the new set. A send adds its offset
+to that set and appends the same payload choice to the live log. Other admission tests and
+fault charges use the retained live entries, receiver/ACK numbers, offset summaries, and exact
+ledger charge. Every subsequent loss, ACK, read, control, outcome, and path transition has the
+same enabledness and destination view. Retiring an entry can omit its payload, but it never
+changes the sent-offset set. The earlier matching-transition argument therefore holds in both
+directions with this smaller history.
+
+For a concrete pair in `FaultySender`, send a good PN 1 at offset 0, deliver it, and read it.
+Lose its ACK and declare the doomed PN 1 lost. Retry offset 0 as PN 2, once with `good` and
+once with `bad`. Deliver PN 2 below `rRead = 1`, then deliver the replacement ACK. Both states
+have open endpoints, log length 2, empty network and flight, `sLost = {1}`,
+`sAcked = rAck = {1, 2}`, empty `ack`, `rHigh = 2`, `rWin = {1, 2}`, an empty buffer,
+and burned charge 1. Both accepted entries are outside `LiveLogPNs`. The old pair sets differ,
+but both sent-offset sets are `{0}` and every future behavior matches. No assumption restricts
+the faulty sender to good bytes.
+
+Every fair action still changes a retained observation: send changes log length, delivery
+removes a network PN, declaration changes flight, ACK arrival clears `ack`, and read, credit,
+outcome, final-size, and validation steps change their original visible values. None changes
+only retired payload history. All action witnesses therefore keep their occurrences. Stale
+replays remain optional stutters; they cannot replace a fair action. `NoAckLoss` applies only to
+the full-log `ReusePN` variant. `ClosedView` and its safety/ACK-loss observations are unchanged,
+including on transitions from these equal open views. Matching successors and fair occurrences
+preserve both finite observations and infinite fair behaviors.
+
 #### Type and action observations
 
 `OpenView` does not compute `TypeOK` again for fingerprinting. Equal open views already agree
 on it. The endpoint, control, path, sender-credit, receiver, and fault values keep
-their type inputs directly. `Len(sLog)` and `SentEntries` determine the log's length and entry
-types. By the network/log fact above, every network entry has connection ID 1 and the log's
-offset and payload at its packet number. Thus valid log entries and the retained network
-numbers determine network typing. If an entry in the log has a wrong type, log typing already
-makes `TypeOK` false. The omitted sender-set type clauses hold by the initial/step argument
+their type inputs directly. `Len(sLog)` retains the log-length bound. Log entry typing follows
+from `Init` and `SendData`: every append selects a wire offset and an allowed payload, and no
+action changes an earlier entry. This also covers omitted retired payloads. By the network/log
+fact above, every network entry has connection ID 1 and the log's offset and payload at its
+packet number, so network typing follows too. The omitted sender-set type clauses hold by the
+initial/step argument
 above; they are not an assumed positive result. `ReusePN` retains those sets directly.
 Finally, the retained endpoint values and the exact `Spent` identity determine the budget clause.
 
@@ -499,8 +478,7 @@ unchanged.
 ## Recurrence form
 
 The source replaces `<>BothDone` and the pending-validation response formula with these
-equivalent recurrence semantics. `Fair(ReadGuard, Read)` equals the weak fairness below by
-the [enabledness argument](#fair-enabledness):
+equivalent recurrence semantics:
 
 ```tla
 Progress == (WF_vars(Read) /\ <>[](mig = "none")) => []<>BothDone
@@ -536,10 +514,46 @@ completed positive result is claimed.
 
 ## Current evidence
 
-The fair-enabledness representation has no checker result yet. It needs SANY, independent
-source review, all 33 known-bad and reachability profiles, and all ten complete positive
-searches. Every positive keeps its 3,600-second cap on a 16-vCPU host. Bounds and property
-meanings are unchanged. The retained runs below do not qualify the new module closure.
+The retired payload view has no checker result yet. It needs SANY, independent source review,
+all 33 known-bad and reachability profiles, and all ten complete positive searches. Every
+positive keeps its 3,600-second cap on a 16-vCPU host. Bounds and properties are unchanged.
+The retained runs below do not qualify the new module closure. This is the third and last
+cause-based implementation attempt in this continuation.
+
+### Retained enabledness result
+
+The second attempt is commit `590d09946da461e757d2c294147ac5fce3bceb19`, model digest
+`sha256:e3c18e38323b6ef78f91c4377b8e2cdea96a147556ea30bf899fca3b68f0d3fc` (45 files).
+It derived exact enabled-state predicates beside the actions and used an equivalent weak-fairness
+formula. Independent review cleared the action, fairness, and pinned-tool correspondence.
+The initial formula failed SANY's action syntax rule; the corrected recurrence form passed both
+modules in 0.561904 seconds. Both syntax records are retained.
+
+Native run `20261112T045122Z-74483` kept that corrected source fixed. All 33 bad/reach profiles
+gave their required violations once: 28.129050 seconds of native checker time, 43.556868 seconds
+for the batch, exit 0. Independent review checked all required progress/stall traces, the
+unconstrained and `NoAckLoss` reused-number cycles, and `NoTagSquat`.
+
+The ordinary `FaultySender` command began at 04:59:55 UTC with its original one-hour cap.
+No standalone diagnostic was repeated. At 05:10:12, ten minutes into the checker, it had
+60,004,992 generated states, 9,611,071 distinct states, 2,280,898 queued states, and depth 21.
+Recent processing was 694,427 states per minute, only 1.68% above the first attempt. Two
+graph-only fits gave 63.9 and 85.8 minutes; the shortest fitting window had no future drain root.
+This did not support graph search plus final temporal checking within the cap.
+
+The owned supervisor received SIGINT at 05:11:10.845 and exited 137 after its 30-second grace.
+The last record at 05:11:12 has 65,595,698 generated states, 10,363,751 distinct states,
+2,320,903 queued states, and depth 21. The native manifest remains `state=started`, with no
+violation, OOM, full GC, or final temporal verdict. The other nine positives did not start.
+The small measured gain did not justify the added enabledness code and proof obligations.
+The current source restores the ordinary actions and `WF_vars` clauses from the first attempt.
+The signed commit and its complete evidence remain retained.
+
+Collection and teardown returned 0, and native status confirmed no instance or EBS volume.
+The archive `~/.local/state/model-evidence/rsnetwork/N000/20261112-enabled-attempt2-evidence.tar.gz`
+has SHA-256 `ee49060c2f61f5faa2d86263b5c536ec1ee88aab08a412a262062c502081afe8`.
+Its 137 payloads retain the native output, exact source, syntax records, review, recipes,
+sizing, and the next quotient argument. Both archive copies were hash-checked.
 
 ### Retained sender-ledger result
 
@@ -557,7 +571,7 @@ no final verdict. Coverage counts evaluations, not CPU time. Of 55,158 Java samp
 The samples show successor construction, unchanged-variable checks, and context lookup under
 that caller. They do not identify an individual fair action. Some stacks are truncated, the
 instrumentation adds cost, and no final temporal-cycle check occurred. This supports the
-enabledness correction above; it does not establish its speedup or a positive result.
+enabledness correction tried in the second attempt; it does not establish its speedup or a positive result.
 
 The ordinary command began at 04:19:22 UTC, without diagnostic flags. At ten minutes it had
 9,473,224 distinct states and 2,257,864 queued states. At the next sizing decision, the

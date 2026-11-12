@@ -91,19 +91,19 @@ The 2026-11-09 model took about 25 minutes on its 16-vCPU evidence host. Those t
 size the revised model. Its README records the current results and any unfinished boundary.
 
 The gate has resumed with an exact
-[fair-enabledness calculation](../../models/attached-datagram/README.md#fair-enabledness).
-Shared action guards and proved post-budget expressions replace successor construction inside
-the same weak-fairness formula. Action relations, fair occurrences, properties, and bounds keep
-their meaning. This revision awaits qualification. The preceding sender-ledger revision passed
-all 33 known-bad and reachability profiles, but its `FaultySender` search was stopped when
-progress did not support the one-hour cap including final temporal checking. All ten positives
-remain open. The [evidence record](../../models/attached-datagram/README.md#current-evidence) keeps
-the exact inputs, CPU sample, attempts, and completed host cleanup. Dependent implementation
-must wait for the complete-search gate.
+[retired payload view](../../models/attached-datagram/README.md#retired-payloads). It keeps sent
+offsets where old payload distinctions cannot affect a later step, and retains full payload
+evidence in the forgery variants. Ordinary actions, fairness, properties, and bounds stay
+unchanged. This revision awaits qualification. Both preceding revisions passed all 33
+known-bad and reachability profiles, but their positive searches stopped when progress did not
+support the one-hour cap including final temporal checking. All ten positives remain open.
+The [evidence record](../../models/attached-datagram/README.md#current-evidence) keeps the exact
+inputs, CPU sample, attempts, and completed host cleanup. Dependent implementation must wait
+for the complete-search gate.
 
-The shared guards are next to their actions. An edit to assignments, post-state bounds, choice
-domains, or non-stuttering variables requires a new enabledness equivalence argument and all
-profile checks. Do not infer that a cheaper predicate preserves fairness.
+An edit that lets an omitted payload affect a guard, receive result, checked observation, or
+fair action requires a new view correspondence argument and all profile checks. The original
+invariants still run; an assumed safety result cannot justify a smaller view.
 
 Each profile must finish within one hour on a 16-vCPU host, so that a run of every profile after a
 change stays short. Use the first 10 minutes of a capped run to estimate its full size from the
