@@ -87,21 +87,20 @@ check. Init and Safety stay unfiltered; the matrix rejects narrower filters and 
 
 ## Large profiles
 
-The 2026-11-09 model took about 25 minutes on its 16-vCPU evidence host. Those timings do not
-size the revised model. Its README records the current results and any unfinished boundary.
+The 2026-11-12 matrix completed all 43 declared profiles on one 16-vCPU host. All 33 known-bad
+and reachability profiles gave their required violations. Each of the ten positive profiles
+completed safety and final liveness within its original one-hour cap; native times ranged from
+208.432595 to 3195.420733 seconds. These results cover the exact source, bounds, and assumptions
+in the [evidence record](../../models/attached-datagram/README.md#current-evidence).
 
-The gate has resumed with an exact
+The model uses an exact
 [retired payload view](../../models/attached-datagram/README.md#retired-payloads). It keeps sent
 offsets where old payload distinctions cannot affect a later step, and retains full payload
 evidence in the forgery variants. The [retired ACK view](../../models/attached-datagram/README.md#retired-ack-history)
 also omits obsolete acceptance identities while it keeps live loss/ACK membership and the
 passed-window observation. Four identity-sensitive variants keep full ACK sets. Ordinary
-actions, fairness, properties, and bounds stay unchanged. This revision awaits qualification. Both preceding revisions passed all 33
-known-bad and reachability profiles, but their positive searches stopped when progress did not
-support the one-hour cap including final temporal checking. All ten positives remain open.
-The [evidence record](../../models/attached-datagram/README.md#current-evidence) keeps the exact
-inputs, CPU sample, attempts, and completed host cleanup. Dependent implementation must wait
-for the complete-search gate.
+actions, fairness, properties, and bounds stay unchanged. The evidence retains the exact inputs,
+commands, verdicts, traces, earlier incomplete attempts, and completed host cleanup.
 
 An edit that lets omitted payload or ACK history affect a guard, receive result, checked
 observation, or fair action requires a new view correspondence argument and all profile checks. The original

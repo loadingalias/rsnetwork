@@ -4,14 +4,13 @@ This is the design model of task N000. It checks the rules of attached datagram 
 `docs/specs/networking.md`, through the decisions of 2026-11-11, before N603 fixes the wire
 format. The [statechart](statechart.md) shows its control states.
 
-**Status (2026-11-12 UTC): N000 has resumed; retired history views await qualification.**
-The [state view](#state-view) merges retired sender-ledger histories and now omits
+**Status (2026-11-12 UTC): all 43 declared profiles passed.**
+All 33 known-bad and reachability profiles gave their required violations. All ten positive
+profiles completed the state search and final temporal check within their original one-hour
+caps. The [state view](#state-view) merges retired sender-ledger histories and omits
 [payload distinctions](#retired-payloads) and [ACK identities](#retired-ack-history) that cannot
-affect a later step. The ordinary actions,
-weak fairness, properties, and bounds stay unchanged. Both preceding revisions completed all
-33 known-bad and reachability profiles, but their positive searches stopped when progress did
-not support completion within the one-hour cap. All ten positive obligations remain open.
-The [evidence record](#current-evidence) retains those results; they do not qualify this source.
+affect a later step. Ordinary actions, weak fairness, properties, and bounds stay unchanged.
+The [evidence record](#current-evidence) keeps the complete results and earlier incomplete attempts.
 
 ## Promise
 
@@ -588,17 +587,61 @@ leaves the earlier eventuality and response forms for tableau construction. From
 the recurrence forms should use its direct classification without a tableau. This is
 an inference, not a measured improvement. The ordinary
 [graph index](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/NodePtrTable.java)
-still grows on the Java heap. The current positive searches remain incomplete; no speedup or
-completed positive result is claimed.
+still grows on the Java heap. The complete positive results below qualify the current recurrence
+form and state view together. They do not measure the effect of the recurrence change alone.
 
 ## Current evidence
 
-The retired payload and ACK views have no model-checker result yet. Both modules passed
-SANY in 1.602129 seconds on the exact source and pinned tools. The source still needs independent
-review, all 33 known-bad and reachability profiles, and all ten complete positive searches. Every
-positive keeps its 3,600-second cap on a 16-vCPU host. Bounds and properties are unchanged.
-The retained runs below do not qualify the new module closure. This is the third and last
-cause-based implementation attempt in this continuation.
+The checked source is signed-off commit `e8a44d6cca08edf84f436416178e3fa6276b4e82`, with
+model digest `sha256:c2f66810c5ab151205b2027bf795c0c4f267e4f324a24ab8ca9b54f16fbc14e2`
+(45 files). Both modules passed SANY in 1.602129 seconds on that exact source and the pinned
+tools. Independent source review cleared the transition, property, and fairness correspondence.
+The ordinary actions and `WF_vars` clauses match the sender-ledger revision; only the exact
+history views change its state representation.
+
+Native run `20261112T053138Z-90307` kept the source fixed. It used one 16-vCPU, 32-GiB host
+with an 80-GB disk, a 20-GiB Java heap, and 4-GiB fingerprint storage. The tools were JRE
+`21.0.13+9`, TLC `1.8.0+d8fb231de4e4`, and Apalache `0.62.4`; TLC ran each profile.
+All 33 known-bad and reachability profiles gave their required named violations once, in
+29.061521 seconds of native checker time and 45.224359 seconds for the batch. The independent
+review retained their traces, including both reused-number cycles and the `NoAckLoss` constraint.
+
+All ten positives completed safety and final liveness, with no violation, an empty queue, and
+native and supervisor exit 0. Each kept its original 3,600-second cap. The table includes final
+temporal checking in the native time; the last column also shows that phase separately.
+
+| Profile | Native seconds | Distinct states | Final temporal check |
+| --- | ---: | ---: | ---: |
+| `AttachedDatagram.cfg` | 285.241546 | 2,479,329 | 38 s |
+| `NoOnPath` | 208.432595 | 1,859,449 | 28 s |
+| `FaultySender` | 1568.354800 | 13,254,513 | 3 min 21 s |
+| `MaxPN7` | 2153.364882 | 15,527,777 | 4 min 16 s |
+| `Cap3Range3Window3` | 3195.420733 | 25,026,209 | 7 min 13 s |
+| `Bytes5` | 485.218687 | 3,818,177 | 1 min 00 s |
+| `Paths3` | 767.515523 | 6,508,309 | 1 min 38 s |
+| `Excess2` | 1671.413264 | 13,873,369 | 3 min 30 s |
+| `Cap3` | 871.090663 | 7,597,569 | 1 min 51 s |
+| `Range3` | 580.792171 | 4,867,377 | 1 min 15 s |
+
+The 43 native checks took 11,815.906385 seconds in total. This is a complete bounded model
+result, with the assumptions and reductions above; it proves no Rust implementation.
+The positive searches ran once, sequentially. No source or bound changed during the matrix.
+The same-run sizing records keep the initial estimates and the decisions to continue. In the
+combined raised profile, the estimates exceeded the actual search time; its original cap stayed
+in force through the complete temporal verdict.
+
+`target/model/attached-datagram-evidence-index.json` records all 43 profile identities,
+configurations, source closures, tool hashes, native verdicts and times, and required trace hashes.
+The adjacent `attached-datagram-evidence-status.tsv` is its compact table. Exact commands, source
+copies, checker output, GC logs, and lifecycle records are in
+`target/model/remote-n000-20261112T053138Z-90307/`. Its native archive has SHA-256
+`75fc67a09cee2d44c1773a82ff49eac5bba89e3e19f50bbf4b71baed4de781b3`.
+Collection and teardown returned 0. No checker was left running at completion, and the native
+status command confirmed no AWS instance or EBS volume. The final index links that cleanup record.
+
+This was the third and last cause-based implementation attempt in this continuation.
+The earlier two attempts below remain incomplete at their own source closures. Their records,
+source, CPU sample, reviews, and cleanup evidence remain retained with the completed matrix.
 
 ### Retained enabledness result
 
