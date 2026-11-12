@@ -765,4 +765,37 @@ NotLastAckLost == [][~(LoseAck /\ ack \cap Flight # {})]_vars
 NotFinalBelowRead == ~(rFinal /\ rRead > Bytes /\ rEnd = "integrity")
 NotJunkDiscarded == [][~(DeliverFinalSize /\ Held(Bytes) /\ ~Held(Bytes)')]_vars
 
+-----------------------------------------------------------------------------
+(* Exact state view. The actions and properties above keep their original *)
+(* state. README, "State view", gives the transition and fairness argument. *)
+
+\* Outside Flight, an accepted or below-floor entry cannot be accepted or
+\* become live again. Variants that can revive old entries keep the full log.
+LogPNs == 1 .. Len(sLog)
+LiveLogPNs ==
+    IF Bug \in {"ReusePN", "NoWindowBound"} THEN LogPNs
+    ELSE {p \in LogPNs : p \in Flight \/ (p \notin rAck /\ p + Range > rHigh)}
+
+\* Historical uses of the log need these sets, not the old packet mapping.
+SentEntries == {sLog[p] : p \in LogPNs}
+OffsetsOf(packets) == {sLog[p].off : p \in packets \cap LogPNs} \cap Offsets
+
+OpenView ==
+    <<ends, controlVars, pathVars, {d.pn : d \in net}, Len(sLog),
+      [p \in LiveLogPNs |-> sLog[p]], SentEntries,
+      AckedOffsets, OffsetsOf(ack), OffsetsOf(rAck), JunkPNs,
+      sAcked, sLost, sCredit, receiverVars, faults>>
+
+\* Both terminal endpoints stay terminal. Only validation, parent failure,
+\* optional ACK loss, and LateReset can still change state. Keep their
+\* observations and the fixed data predicates. Keep ACK-loss enabledness:
+\* loss then leads to FALSE and cannot create an artificial repeatable edge.
+ClosedView ==
+    <<ends, path, mig, tried, rFinal, rRead,
+      TypeOK, HeldAreSenderBytes, CreditBound, PNStateBound, AckMeansHeld,
+      FinalSizeBound, NotWindowPassed,
+      ENABLED LoseAck, ack \cap Flight # {}>>
+
+StateView == IF BothDone THEN <<"closed", ClosedView>> ELSE <<"open", OpenView>>
+
 =============================================================================

@@ -4,11 +4,13 @@ This is the design model of task N000. It checks the rules of attached datagram 
 `docs/specs/networking.md`, through the decisions of 2026-11-11, before N603 fixes the wire
 format. The [statechart](statechart.md) shows its control states.
 
-**Status (2026-11-11): N000 is blocked; 33 of 43 profiles are complete.** All known-bad and
-reachability profiles pass on the current source. `FaultySender` did not finish within its
-one-hour cap; the other nine positive profiles did not start. No positive profile is qualified
-on this revision. The [current evidence](#current-evidence) records the exact boundary. Earlier
-results remain retained and are not counted as current passes.
+**Status (2026-11-12 UTC): N000 remains blocked.** The current [state view](#state-view)
+completed all 33 known-bad and reachability profiles. `FaultySender` did not finish within its
+one-hour cap: 3,260,892 states remained queued. The other nine positive profiles did not start.
+All ten positive obligations remain open. The view removes unused packet mappings and terminal
+data histories without changing the declared actions, properties, or bounds. The
+[evidence record](#current-evidence) retains all three attempts; an incomplete search is not a
+pass.
 
 ## Promise
 
@@ -226,6 +228,130 @@ protected parent frames. It does not prove cryptographic computation, nonce safe
 parent packet scheduling, recovery periods, or arbitrary-size buffers. N603 and N604 own the
 wire and implementation evidence. It proves no Rust code.
 
+## State view
+
+Every configuration selects `VIEW StateView`. The view changes the state identity that TLC
+stores; it changes no action, guard, fairness condition, property, or bound. It uses no
+`SYMMETRY`, state constraint, or action constraint. The
+[pinned state implementation](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/TLCStateMut.java)
+computes fingerprints from the view. The
+[pinned liveness implementation](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/LiveCheck.java)
+evaluates state and action conditions on the actual states and stores their results with the
+fingerprints. Therefore, equal views must have the same observed conditions and the same
+successor views with the same action observations. A smaller fingerprint alone is not evidence.
+
+The previous search retained the full offset and payload of every sent packet at every later
+state. Old packet permutations remained distinct even when no future action could use the
+mapping. Fully terminal states also retained each data history. `StateView` has two cases.
+
+### An endpoint is open
+
+`OpenView` retains all endpoint, control, path, receive, loss, and acknowledgement state.
+It retains the log length and these data summaries:
+
+| Value | Use |
+| --- | --- |
+| Log entries in `LiveLogPNs` | Every packet in `Flight`, and each unaccepted packet at or above the replay floor |
+| `SentEntries` | `Sent`, `SeenGood`, and the independent sender-byte witness in `HeldAreSenderBytes` |
+| `AckedOffsets` | Send admission, `AllAcked`, `ParentEnd`, and `AckMeansHeld` |
+| `OffsetsOf(ack)` and `OffsetsOf(rAck)` | The offsets that a pending or replacement ACK will add |
+| `JunkPNs` | The exact excess-packet contribution to `Spent` |
+| Every packet number in `net` | The enabled delivery and loss steps, including stale copies |
+
+A network entry is always the sole copy for its packet number, has connection ID 1, and has
+the offset and payload in `sLog`. `Init`, `SendData`, and `ResendSamePN` establish this fact;
+other actions only remove network entries. Thus its remaining fields add no independent state.
+
+An omitted log entry is outside `Flight` and is either accepted or below the replay floor.
+An accepted number stays in `rWin` while it is inside the floor. Once outside, it cannot become
+fresh because the floor cannot move down. A normal packet number never returns to `Flight`
+after acknowledgement or loss. The `ReusePN` and `NoWindowBound` variants keep every log entry
+because they can revive old entries. This exception keeps the information their faulty
+transitions need; it changes no variant.
+
+This also holds in `NoTag` and `SlideBeforeTag`. Every accepted number is at most `rHigh`, so
+a failed tag at an omitted number cannot slide the window. Packet-number squatting can accept
+a number before the sender uses it. When the sender later appends that number, the retained
+packet-number sets and offset summaries determine its effect on ACK processing. An entry still
+in `Flight` is never omitted: send admission and loss accounting still need its offset.
+
+For two reachable states with equal open views, the following correspondence holds:
+
+- `SendData` uses the retained flight entries, credit, window, acknowledged offsets, and sent
+  entries. It appends the same choice at the same new number. All summaries then have the same
+  updates. `ResendSamePN` has the complete log.
+- `Deliver` and `Replay` use a retained entry when a packet can pass the window. A removed
+  entry always fails the window; its arrival only removes that network number, or stutters for
+  replay. `Forge` at such a number cannot slide the window either. A tag comparison can differ
+  there, but both branches leave receive state unchanged. Current log entries and `SentEntries`
+  determine every other tag and forgery result.
+- `Lose` has the same receive effect, packet removal, and fault charge. `Doomed`, `DeclareLost`,
+  and `Spent` use retained packet-number sets, network numbers, and `JunkPNs`. Their guards and
+  results are the same. Packet numbers remain visible even after their mapping is omitted.
+- `DeliverAck` adds `OffsetsOf(ack)` to the acknowledged offsets. A new receive replaces the
+  ACK with `rAck` plus its newly accepted number; `OffsetsOf(rAck)` determines that update.
+  The packet-number sets stay unchanged by the view, including unsent numbers in `NoTag`.
+- Reads, credit, final size, completion, notification, reset, parent failure, and migration
+  use retained values. `HeldAreSenderBytes` uses `SentEntries`; the other safety and state
+  targets use retained values or summaries. The retained values also determine `TypeOK`, as
+  shown below.
+
+`OpenView` does not compute `TypeOK` again for fingerprinting. Equal open views already agree
+on it. The endpoint, control, path, sender-set, sender-credit, receiver, and fault values keep
+their type inputs directly. `Len(sLog)` and `SentEntries` determine the log's length and entry
+types. By the network/log fact above, every network entry has connection ID 1 and the log's
+offset and payload at its packet number. Thus valid log entries and the retained network
+numbers determine network typing. If an entry in the log has a wrong type, log typing already
+makes `TypeOK` false. Finally, `BothOpen` and `Spent` use only retained endpoint values, log
+length, loss and ACK sets, network numbers, and `JunkPNs`. This determines the budget clause.
+
+The omission therefore leaves the open-state equivalence classes unchanged. Every positive
+profile still checks the original `TypeOK` invariant, and `ClosedView` still stores its type
+observation. The previous view evaluated the full type and budget predicate for each generated
+successor, then checked it again when the checker found a new state. The 35-minute sample had
+about seven generated successors for each new state. Removing this repeated computation changes
+no bound, transition, property, or observed result.
+
+Each transition therefore has a matching transition with the same next view. This applies in
+both directions. No fair action that changes the state becomes a view self-loop: a send changes
+the length; a delivery removes a number or changes receive state; a loss declaration changes
+`sLost`; ACK arrival clears `ack`; credit, read, completion, notification, final size, and
+validation each change a retained value. A stale replay is a true stuttering step in both
+states, not a repeatable substitute for a fair delivery. Keeping every network number is
+necessary here: removing a finite set of stale deliveries could otherwise create such a loop.
+
+### Both endpoints have ended
+
+An endpoint never reopens, including in `LateReset`. Only `Validated`, `Abandon`, `ParentEnd`,
+`LoseAck`, and the `LateReset` action can still change state; `Done` can stutter. `ClosedView`
+retains the endpoints, parent lifetime, path and candidate, validation kind, final-size flag,
+and read point. It keeps each fixed data-safety predicate and the passed-window target.
+Completion, integrity, and endpoint targets can then be computed from the retained values.
+
+The only fair action still enabled is `Validated \/ Abandon`. Its enabledness, occurrence,
+and destination view are unchanged. Its success and abandon still differ in `path` and
+`tried`, so the abandonment observations remain. Parent failure retains its lifetime change.
+`LateReset` retains its endpoint change and still violates `OutcomeStable`. `Progress` is
+already true throughout this suffix. `ValidationEnds` still sees the full pending attempt.
+
+`ClosedView` also keeps `ENABLED LoseAck` and whether `ack` intersects `Flight`. A permitted
+loss clears `ack`, so the next view has both observations false. Other remaining steps can
+only disable that loss by ending the parent; none can enable it. Thus the optional loss and
+the `NotLastAckLost` action target keep their exact edge, without a spurious repeatable loss.
+The fixed data predicates do not change on these steps; `TypeOK` remains unchanged because a
+loss still applies `CountFault` and its original budget guard. Every other action target is
+disabled after both endpoints end. The same successor-view and action-observation argument
+therefore holds in the terminal phase and at the transition into it.
+
+The correspondence preserves every declared safety and temporal property and every witness.
+It preserves both enabledness and occurrence for all specification fairness and for the
+consumer fairness in `Progress`. Consequently a fair cycle in either state representation
+has a matching fair behavior in the other. All 33 known-bad and reachability profiles use the
+view; they must still give their named results before the ten positive profiles qualify it.
+In particular, `NoAckRecovery`, `NoFinalNotice`, `NoAbandon`, `LateReset`, and the final-size
+variants retain their failures in the reduced phases. The declared and raised bounds are
+unchanged.
+
 ## Recurrence form
 
 The resumed source replaces `<>BothDone` and the pending-validation response formula with
@@ -265,7 +391,87 @@ completed positive result is claimed.
 
 ## Current evidence
 
-Native run `20261111T175227Z-47948` used the final model and checker command. SANY parsed both
+Native run `20261112T012118Z-28397` checked the final state view at model digest
+`sha256:d4103a23e1a548792ac2d74c34353257614a5ef3dbbb60327c50a772c6584b82` (45 files).
+`AttachedDatagram.tla` has SHA-256
+`2516e452767add30b7d10dbe744af3c5579d17c24662526b1784cdcbc004d654`. Source files stayed fixed
+throughout the checks. All times in this record are UTC.
+
+| Check | Result | Exit and duration |
+| --- | --- | --- |
+| SANY: both modules | Pass | 0; 0.264140 seconds |
+| All 33 `_bad` and `_reach` profiles | Required named violation or target reached | Each 12 or 13; 30.012546 seconds total |
+| `FaultySender` | Incomplete; no native final verdict | Supervisor 137 after the 3,600-second cap and 30-second kill grace |
+| Other nine positive profiles | Not started | No result |
+
+The open profiles are the base, `NoOnPath`, `FaultySender`, `MaxPN7`, `Cap3Range3Window3`,
+`Bytes5`, `Paths3`, `Excess2`, `Cap3`, and `Range3`. The 33 small checks ran once in one
+selection and completed in 45.507219 seconds including command setup. Independent review
+confirmed that the four progress counterexamples are literal source behaviors and satisfy
+their fairness conditions. In the `OldPacketReuse` cycle, the ACK is empty, so `NoAckLoss`
+excludes no step. The retained notes and exact traces are in
+`target/model/reviewer-network-traces-d4103a23/`.
+
+The positive command began at 01:27:20 with the original 3,600-second cap. Its ten-minute
+sample had 10,656,126 distinct states and 2,931,696 queued states. Queue estimates still
+permitted completion near the cap, so the same run continued. They were estimates, not
+acceptance. The last checkpoint, during the kill grace at 02:27:37, had 316,477,807 generated
+states, 44,063,457 distinct states, 3,260,892 queued states, and depth 28. Its manifest remains
+`state=started`, without a native final exit or verdict. Supervisor exit 137 is not a checker
+verdict. The time cap ended this third and last implementation attempt; no further tuning or
+checker run followed.
+
+The dedicated c8g.4xlarge host had 16 vCPUs and 32 GiB, Linux 7.0.0-1016-aws arm64. The command
+used `--tlc-heap-mib=20480 --tlc-fp-mib=4096`, 16 TLC workers, `OffHeapDiskFPSet`, and
+`DiskStateQueue`. It kept Temurin 21.0.13+9, TLC 1.8.0+d8fb231de4e4, and the runner executable
+SHA-256 `db6b85d5c3fd036a6e8707fd34d9f506946580b8046068068981a0dd4eb35913`. Apalache 0.62.4
+was present but not used. The GC log has no OOM diagnostic; its one full collection had cause
+`Ergonomics`, lasted 815.549 ms, and reduced the used heap from 15899M to 1041M. Memory
+exhaustion did not end this run.
+
+All 34 native run records and their frozen source remain in
+`target/model/remote-n000-20261112T012118Z-28397/`. Its native archive has SHA-256
+`750b46fad87d092771a1b4fb092d60959a0bdd61449010c63ba3c66bd670b6ff`. Collection and teardown
+both returned 0; fresh native status confirmed no instance or EBS volume. The combined archive
+at `~/.local/state/model-evidence/rsnetwork/N000/20261112-state-view-network-model-evidence.tar.gz`
+retains all three attempts, their recipes and sizing records, all three independent
+review directories, final source, and the preceding durable archive. Its adjacent `.sha256`
+receipt identifies the archive. Only TLC state caches are omitted.
+
+### Earlier state-view attempts
+
+The first view, which still kept accepted non-flight entries inside the replay floor, passed
+all 33 small profiles at digest `sha256:798b64d7e22b4969f73803b335c45024663c1fe45ccd8775330b76f925c5a1b4`.
+Native run `20261112T001204Z-37209` sampled `FaultySender` with unchanged bounds and resources.
+At 00:28:32 UTC, after ten minutes, it had 8,854,385 distinct states, 2,692,942 queued states,
+and depth 19. The queue still grew; there was no complete-size or positive verdict. The lead
+selected the additional exact omission above before the full matrix. The owned supervisor
+received SIGINT at 00:29:04 UTC and exited 137 after its 30-second grace. Its native manifest
+has no final checker verdict. Collection and teardown both returned 0; no instance or EBS
+volume remains. The 34 run records, source, and logs remain in
+`target/model/remote-n000-20261112T001204Z-37209/`; its native archive has SHA-256
+`6d95eba95b106821ed5465c2baed892fb0f0f01bfa75108c2854f362d15b5014`. These results do not qualify
+the final view. Independent notes retain the four progress counterexamples and their fairness
+interpretation in `target/model/reviewer-network-traces-798b64d7/`.
+
+The accepted-packet refinement passed all 33 small profiles at digest
+`sha256:7de1eab46265965d55836672342db32fbf8161500a4a0358b123f8e53a0d6923` in native run
+`20261112T003311Z-8667`. At its 35-minute checkpoint (01:14:22 UTC), `FaultySender` had
+25,026,075 distinct states and 4,952,428 queued states, at depth 24. Its last progress before
+the stop had 25,603,384 distinct states and 4,989,293 queued states. The lead selected removal
+of the repeated open-view type calculation as the third and last implementation attempt in
+this continuation. The owned supervisor received SIGINT at 01:16:19 UTC and exited 137 after
+its 30-second grace; the native manifest has no final checker verdict. The 3,600-second cap
+was unchanged and was not exhausted. This is an incomplete search, not a positive pass.
+Collection and teardown both returned 0; no instance or EBS volume remains. Its 34 records
+and exact source remain in `target/model/remote-n000-20261112T003311Z-8667/`, whose native
+archive has SHA-256 `fb67210a584fd3e7b29cda2f44bb6c01720d8c89134b5d18c58b00fb611411f0`.
+Independent notes are in `target/model/reviewer-network-traces-7de1eab4/`. These results do
+not qualify the revision that omits `TypeOK` from `OpenView`.
+
+### Retained result before the state view
+
+Native run `20261111T175227Z-47948` used the source before the state view. SANY parsed both
 modules. All 33 small profiles reported their required named violations; their checker times
 sum to 25.418382 seconds. The first positive profile, `FaultySender`, reached the command cap.
 No further experiment is part of this attempt.
@@ -309,13 +515,13 @@ selected JDK exits with status 3 before that Java handler can recover. Such an e
 - The runner passed scoped fix/check and all 13 tests, with 0 skipped, before the native run.
   Nextest run: `c6981ba7-6d75-43dc-9a94-c8df65211f06`.
 
-All 34 retained native profile closures match the current inputs. The exact per-profile
+All 34 retained native profile closures match that revision's inputs. The exact per-profile
 closure, named property, original exit, duration, and result are in
 `target/model/attached-datagram-evidence-index.json` and `attached-datagram-evidence-status.tsv`.
 SANY is in `target/model/attached-datagram/sany/1794419733-15824/`; the incomplete profile is in
 `target/model/attached-datagram/AttachedDatagram.FaultySender.cfg/1794420213041422967-21107/`.
 
-The current `OldPacketReuse.Spread_bad` run is `1794420198936226333-20932`. Its cycle resends
+Its `OldPacketReuse.Spread_bad` run is `1794420198936226333-20932`. Its cycle resends
 PN 1, discards it because `1 + Range = rHigh = 3`, and declares it lost. `ack = {}` throughout,
 so `NoAckLoss` excludes no cycle step. The original fair actions recur or are disabled; `Read`
 is disabled at the missing byte. The path stays stable and both endpoints stay open. Thus the

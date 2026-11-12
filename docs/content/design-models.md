@@ -90,13 +90,15 @@ check. Init and Safety stay unfiltered; the matrix rejects narrower filters and 
 The 2026-11-09 model took about 25 minutes on its 16-vCPU evidence host. Those timings do not
 size the revised model. Its README records the current results and any unfinished boundary.
 
-The 2026-11-11 gate is blocked with 33 current profiles complete and all ten positive profiles
-open. The small profiles pass. `FaultySender` reached the one-hour command cap on the 16-vCPU,
-32 GiB host with a 20 GiB heap and 4 GiB fingerprint storage; its queue remained nonempty.
-The other nine positives did not start. Its native manifest has no final checker exit or verdict;
-the supervising command exited 137. The [current evidence record](../../models/attached-datagram/README.md#current-evidence)
-retains the exact inputs, results, cap, cleanup, and prior attempts. No further check is part of
-this attempt.
+The current gate remains blocked after an exact
+[state view](../../models/attached-datagram/README.md#state-view) removed unused packet mappings
+and terminal data histories. The declared actions, properties, and bounds stay unchanged.
+All 33 known-bad and reachability profiles passed on the final source. `FaultySender` reached
+the one-hour cap on the 16-vCPU, 32 GiB host with a 20 GiB heap and 4 GiB fingerprint storage;
+3,260,892 states remained queued. The other nine positives did not start, so all ten positive
+obligations remain open. The [evidence record](../../models/attached-datagram/README.md#current-evidence)
+keeps the exact inputs, failed attempts, cap, and completed host cleanup. Dependent implementation
+must wait for the complete-search gate.
 
 Each profile must finish within one hour on a 16-vCPU host, so that a run of every profile after a
 change stays short. Use the first 10 minutes of a capped run to estimate its full size from the
