@@ -90,16 +90,20 @@ check. Init and Safety stay unfiltered; the matrix rejects narrower filters and 
 The 2026-11-09 model took about 25 minutes on its 16-vCPU evidence host. Those timings do not
 size the revised model. Its README records the current results and any unfinished boundary.
 
-The gate has resumed with a further
-[sender-ledger reduction](../../models/attached-datagram/README.md#sender-ledger). The state view
-keeps live packet identities and the exact loss/excess charge, while merging retired sender
-histories with the same future effects. The declared actions, fairness, properties, and bounds
-stay unchanged. This revision awaits qualification. The preceding revision passed all 33
-known-bad and reachability profiles, but `FaultySender` reached the one-hour cap with 3,260,892
-states queued; the other nine positives did not start. Those results do not qualify the new
-source. The [evidence record](../../models/attached-datagram/README.md#current-evidence) keeps the
-exact inputs, attempts, cap, and completed host cleanup. Dependent implementation must wait for
-the complete-search gate.
+The gate has resumed with an exact
+[fair-enabledness calculation](../../models/attached-datagram/README.md#fair-enabledness).
+Shared action guards and proved post-budget expressions replace successor construction inside
+the same weak-fairness formula. Action relations, fair occurrences, properties, and bounds keep
+their meaning. This revision awaits qualification. The preceding sender-ledger revision passed
+all 33 known-bad and reachability profiles, but its `FaultySender` search was stopped when
+progress did not support the one-hour cap including final temporal checking. All ten positives
+remain open. The [evidence record](../../models/attached-datagram/README.md#current-evidence) keeps
+the exact inputs, CPU sample, attempts, and completed host cleanup. Dependent implementation
+must wait for the complete-search gate.
+
+The shared guards are next to their actions. An edit to assignments, post-state bounds, choice
+domains, or non-stuttering variables requires a new enabledness equivalence argument and all
+profile checks. Do not infer that a cheaper predicate preserves fairness.
 
 Each profile must finish within one hour on a 16-vCPU host, so that a run of every profile after a
 change stays short. Use the first 10 minutes of a capped run to estimate its full size from the

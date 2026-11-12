@@ -4,12 +4,13 @@ This is the design model of task N000. It checks the rules of attached datagram 
 `docs/specs/networking.md`, through the decisions of 2026-11-11, before N603 fixes the wire
 format. The [statechart](statechart.md) shows its control states.
 
-**Status (2026-11-12 UTC): N000 has resumed; the sender-ledger view awaits qualification.**
-The [state view](#state-view) now also merges retired sender-ledger histories. It changes no
-action, fairness condition, property, or bound. The preceding revision completed all 33 known-bad
-and reachability profiles, but `FaultySender` reached its one-hour cap with 3,260,892 states
-queued. The other nine positives did not start. Those results do not qualify this revision.
-The [evidence record](#current-evidence) keeps the exact preceding source and results.
+**Status (2026-11-12 UTC): N000 has resumed; fair enabledness awaits qualification.**
+The [state view](#state-view) merges retired sender-ledger histories. The source now also uses
+[derived enabled-state predicates](#fair-enabledness) in the same weak-fairness formula.
+Action relations, fairness meaning, properties, and bounds stay unchanged. The ledger revision
+completed all 33 known-bad and reachability profiles, but its positive search was stopped when
+progress did not support completion within the one-hour cap. All ten positive obligations remain
+open. The [evidence record](#current-evidence) retains those results; they do not qualify this source.
 
 ## Promise
 
@@ -152,6 +153,82 @@ The consumer's read is a condition of `Progress`, not specification fairness. Re
 failure, parent loss, early loss declarations, network loss, attackers, and migration starts have
 no fairness. Success alone has no fairness. `ValidationEnds` does not assume eventual path
 stability; it applies also when attempts repeat without end.
+
+## Fair enabledness
+
+`Fair(E, A)` uses the weak-fairness formula with a derived state predicate:
+
+```tla
+Fair(E, A) == ([]<>~E) \/ []<><<A>>_vars
+```
+
+For each call, `E` equals `ENABLED <<A>>_vars` on reachable states. This is equivalent to
+the [pinned checker's expansion](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/Liveness.java)
+of `WF_vars(A)`. SANY requires the action to be inside its own `<>` term. The pinned
+[disjunction normalizer](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/LNDisj.java)
+joins the two recurrence terms into one `[]<>(~E \/ <<A>>_vars)` before the conjunction's
+branch expansion. The original action and its non-stuttering occurrence remain in the formula.
+The replacement avoids the checker's
+[successor construction for enabledness](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/LNStateEnabled.java).
+It changes no transition or fairness requirement. Each existential and `Validated \/ Abandon`
+keeps its original collective fairness; no member receives separate fairness.
+
+Each shared guard is next to its owning action and is used by that action. The following guards
+already suffice for a successor; the assignments are total under the model's inductive typing
+facts. These facts hold in the known-bad variants too and do not assume their safety properties.
+
+| Action or group | State predicate | Why every enabled step is non-stuttering |
+| --- | --- | --- |
+| `DeliverAck` | `DeliverAckGuard` | Clears a nonempty ACK. An unsent PN still enables the integrity outcome. |
+| `\E d \in net : Deliver(d)` | The same existential over `DeliverGuard(d)` | Removes `d`, including a discarded datagram. |
+| `\E c \in 1..(Bytes+Excess) : DeliverCredit(c)` | The same existential over `DeliverCreditGuard(c)` | Strictly increases sender credit. |
+| `Read` | `ReadGuard` | Increases `rRead` for a good byte or changes the open receiver to integrity. |
+| `Complete` | `CompleteGuard` | Changes the open receiver to completed. |
+| `DeliverFinalSize` | `DeliverFinalSizeGuard` | Sets `rFinal`, including in `FinalKeepsJunk` and `NoFinalIntegrity`. |
+| `DeliverReceiverEnd` | `DeliverReceiverEndGuard` | Changes the open sender to a terminal value; keeps the `NoFinalNotice` exception. |
+| `DeliverSenderEnd` | `DeliverSenderEndGuard` | Changes the open receiver to a terminal value. |
+| `Validated \/ Abandon` | `ValidatedGuard \/ AbandonGuard` | Changes `mig` to none. `NoAbandon` still permits genuine success but cannot end spurious validation. |
+| `\E p \in PNs : ResendSamePN(p)` | The same existential over `ResendSamePNGuard(p)` | Removes `p` from `sLost`, even if its network copy already exists. |
+
+`ResendSamePN` has no post-`Spent`, range, or fault-counter bound. Its guard adds none. This
+preserves the faulty reused-number cycles and the full-ledger exception in the state view.
+`Read` remains a premise of `Progress`, not an added assumption in `Spec`.
+
+`SendData` needs a separate post-budget derivation. Set `p = Len(sLog)+1`. The shared
+`SendDataGuard(o)` keeps every original admission condition. While the sender is open, `p` is
+outside both sender sets; an unsent ACK ends the sender and no action reopens it. The network
+contains only sent PNs. Appending `p` therefore changes the state, and its payload choice set
+is nonempty. Every old PN keeps its contribution to `Spent`. The new PN costs one exactly when
+it is excess or when the receiver accepted it and its ACK is absent:
+
+```tla
+SpentAfterSend = Spent + (IF o >= Bytes \/ p \in rAck \ ack THEN 1 ELSE 0)
+```
+
+The second term is necessary in `NoTag`: a forged PN can be accepted and its ACK lost before
+the real send. A new network copy does not clear that accepted-but-unacknowledged condition in
+`Doomed`. Excess plus missing ACK is one union member, not two charges. Each payload has the
+same charge. Thus `SendDataEnabled(o)` is exactly the shared guard and
+`SpentAfterSend <= Budget`. `Spec` keeps its existential over offsets. `ReuseSpec` adds the
+original `~Sent(o)` inside that existential for first sends.
+
+For the collective fair loss, `Doomed(p)` entails `p \in Flight`. Declaring it lost moves an
+already charged PN into `sLost`, so `Spent' = Spent`; `CountFault(FALSE)` also keeps `faults`.
+`DoomedLossEnabled` retains the original existential, the `NoAckRecovery` exclusion, and
+`DeclareLostGuard(p)`, then checks both `faults <= Budget` and `Spent <= Budget`. These bounds
+remain explicit when the receiver has ended. Adding `p` to `sLost` proves non-stuttering.
+Early loss declarations retain their original relation and receive no fairness.
+
+Every fair action changes an observation kept by `StateView`, so these equal state predicates
+also keep its reviewed fairness correspondence. `OldPacketReuse`'s `NoAckLoss` action constraint
+still filters the same edges. Original enabledness ignores that constraint; the derived
+predicates do too. Actions can overlap, so this argument does not rely on their names.
+`ClosedView` keeps its separate `ENABLED LoseAck` observation unchanged.
+
+A guard edit changes both the action and its enabledness input. An edit to assignments,
+post-state bounds, choice domains, or the variables that define non-stuttering reopens the
+adjacent equivalence proof. Review the constructive successor and variant exceptions again,
+then run all profiles. A smaller evaluation cost is not evidence of equivalent fairness.
 
 ## Reductions and limits
 
@@ -421,8 +498,9 @@ unchanged.
 
 ## Recurrence form
 
-The resumed source replaces `<>BothDone` and the pending-validation response formula with
-these equivalent forms. This changes no behavior or property meaning:
+The source replaces `<>BothDone` and the pending-validation response formula with these
+equivalent recurrence semantics. `Fair(ReadGuard, Read)` equals the weak fairness below by
+the [enabledness argument](#fair-enabledness):
 
 ```tla
 Progress == (WF_vars(Read) /\ <>[](mig = "none")) => []<>BothDone
@@ -458,10 +536,50 @@ completed positive result is claimed.
 
 ## Current evidence
 
-The sender-ledger reduction has no checker result yet. It needs SANY, independent source
-review, all 33 known-bad and reachability profiles, and all ten complete positive searches.
-Every existing positive keeps its 3,600-second cap on a 16-vCPU host. Bounds and properties
-are unchanged. The retained runs below do not qualify the new module closure.
+The fair-enabledness representation has no checker result yet. It needs SANY, independent
+source review, all 33 known-bad and reachability profiles, and all ten complete positive
+searches. Every positive keeps its 3,600-second cap on a 16-vCPU host. Bounds and property
+meanings are unchanged. The retained runs below do not qualify the new module closure.
+
+### Retained sender-ledger result
+
+The first attempt in this continuation is commit `61ed5c0372aaaf90c74de0b81e40d9b11fc9367c`,
+model digest `sha256:2d3ce4efd05a946b964df0b287822de0c8c516d23b34abdc9ae0f6a416ba702a`
+(45 files). Native run `20261112T040532Z-98087` kept those inputs fixed. Local SANY passed for
+both modules in 0.502338 seconds. The independent reviewer ran all 33 bad/reach profiles once:
+each gave its required violation, with 27.355 seconds of native checker time and 43.570 seconds
+for the batch. The reviewer checked the four progress cycles and the `NoTagSquat` fault.
+
+A separate 150-second diagnostic ran the same `FaultySender` obligations with coverage counters
+and a 120-second CPU recording. It stopped with native status 130 after 150.264 seconds, with
+no final verdict. Coverage counts evaluations, not CPU time. Of 55,158 Java samples, 13,779
+(24.98%) have a visible `LNStateEnabled` caller; 522 of those overlap coverage bookkeeping.
+The samples show successor construction, unchanged-variable checks, and context lookup under
+that caller. They do not identify an individual fair action. Some stacks are truncated, the
+instrumentation adds cost, and no final temporal-cycle check occurred. This supports the
+enabledness correction above; it does not establish its speedup or a positive result.
+
+The ordinary command began at 04:19:22 UTC, without diagnostic flags. At ten minutes it had
+9,473,224 distinct states and 2,257,864 queued states. At the next sizing decision, the
+13-minute record had 11,740,706 distinct states and 2,567,135 queued states; recent processing
+was 653,781 states per minute. Queue fits estimated 62.6–70.9 minutes for graph search alone.
+These estimates were unstable but did not support the one-hour cap including final temporal
+checking. The owned supervisor received SIGINT at 04:34:11 and exited 137 after its existing
+30-second grace. This was an early stop, not a completed search or a native verdict.
+
+The last TLC record, during that grace at 04:34:39, has 85,203,034 generated states,
+13,137,938 distinct states, 2,635,208 queued states, and depth 22. The native manifest remains
+`state=started`. No full GC, OOM, violation, or final temporal verdict appears. The other nine
+positives did not start. All ten positive obligations remain open.
+
+The host, memory sizes, worker count, runner, and pinned tools are the same as the retained
+state-view run below. Collection and teardown both returned 0; native status confirmed no
+instance or EBS volume. The archive
+`~/.local/state/model-evidence/rsnetwork/N000/20261112-ledger-attempt1-evidence.tar.gz`
+has SHA-256 `f330cd7bba069e0a7bcfff35bb04aaee25bbec36cc84cb02e9ad9712ce85db8e`.
+It retains the native archive, source commit, SANY, independent review, CPU recording and
+attribution, recipes, sizing, and the proposed correction. Its 68 payloads and the copy under
+`target/model/` were hash-checked. The preceding durable archives remain unchanged.
 
 ### Retained state-view result
 

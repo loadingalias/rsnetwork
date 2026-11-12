@@ -275,7 +275,7 @@ Init ==
 \* flight span fewer than Range packet numbers, so the window never
 \* discards a datagram that the sender still waits for; that discard changes
 \* no state and removes the datagram from the network, as Lose does.
-SendData(o) ==
+SendDataGuard(o) ==
     LET p == Len(sLog) + 1 IN
     /\ sEnd = "open" /\ parentLive
     /\ mig = "none"
@@ -285,6 +285,10 @@ SendData(o) ==
     /\ p <= MaxPN
     /\ Cardinality(Flight) < cwnd
     /\ \A q \in Flight : q + Range > p
+
+SendData(o) ==
+    LET p == Len(sLog) + 1 IN
+    /\ SendDataGuard(o)
     \* A terminal receiver cannot reopen or inspect a new payload. Keep all
     \* earlier payloads; choose one value only for this new send (README).
     /\ \E x \in (IF FaultySender /\ rEnd = "open" THEN Payloads ELSE {"good"}) :
@@ -294,11 +298,23 @@ SendData(o) ==
     /\ UNCHANGED controlVars
     /\ Spent' <= Budget
 
+\* A new PN costs one fault if it is excess or if NoTag accepted it and
+\* its ACK is absent. These are one union member, not two charges. The
+\* append changes the state for each payload choice. README proves this
+\* post-Spent calculation; an action edit must retain that equivalence.
+SendDataEnabled(o) ==
+    LET p == Len(sLog) + 1 IN
+    /\ SendDataGuard(o)
+    /\ Spent + (IF o >= Bytes \/ p \in rAck \ ack THEN 1 ELSE 0) <= Budget
+
 \* The network delivers datagram d once. A later copy is a duplicate, which
 \* changes no state.
-Deliver(d) ==
+DeliverGuard(d) ==
     /\ rEnd = "open" /\ parentLive
     /\ d \in net
+
+Deliver(d) ==
+    /\ DeliverGuard(d)
     /\ net' = net \ {d}
     /\ Receive(d)
     /\ UNCHANGED <<ends, pathVars, senderVars, rRead, rCredit, faults>>
@@ -349,9 +365,12 @@ Forge(d) ==
 \* packet or time threshold. The model has no clock, so a declaration can
 \* come at any time, also too early. A loss is a congestion event for the
 \* shared controller. The model does not keep recovery periods.
-DeclareLost(p) ==
+DeclareLostGuard(p) ==
     /\ sEnd = "open" /\ parentLive
     /\ p \in Flight
+
+DeclareLost(p) ==
+    /\ DeclareLostGuard(p)
     /\ sLost' = sLost \cup {p}
     /\ cwnd' = Max(1, cwnd \div 2)
     /\ UNCHANGED <<ends, path, mig, tried, net, sLog, sAcked, sCredit, receiverVars>>
@@ -359,14 +378,27 @@ DeclareLost(p) ==
     /\ UNCHANGED controlVars
     /\ Spent' <= Budget
 
+\* A doomed PN is already charged. The fair loss moves that charge into
+\* sLost, changes the state, and leaves faults unchanged in every variant.
+\* Keep the post-state bounds even when the receiver has ended.
+DoomedLossEnabled ==
+    /\ \E p \in PNs : Doomed(p)
+                       /\ (Bug # "NoAckRecovery" \/ p \notin rAck)
+                       /\ DeclareLostGuard(p)
+    /\ faults <= Budget
+    /\ Spent <= Budget
+
 \* [Control] [Packet numbers and replay] The sender processes the
 \* packet-number set in one parent frame and maps each number to the
 \* offset that it sent. An acknowledgement of a packet number that the
 \* sender never sent shows a faulty peer and ends the channel with
 \* integrity; with the tag, no datagram from the network causes one.
-DeliverAck ==
+DeliverAckGuard ==
     /\ sEnd = "open" /\ parentLive
     /\ ack # {}
+
+DeliverAck ==
+    /\ DeliverAckGuard
     /\ ack' = {}
     /\ sAcked' = sAcked \cup ack
     /\ sEnd' = IF ack \subseteq 1 .. Len(sLog) THEN "open" ELSE "integrity"
@@ -374,9 +406,12 @@ DeliverAck ==
     /\ UNCHANGED rFinal
 
 \* [Receive credit] A credit frame arrives at the sender.
-DeliverCredit(c) ==
+DeliverCreditGuard(c) ==
     /\ sEnd = "open" /\ parentLive
     /\ c \in sCredit + 1 .. rCredit
+
+DeliverCredit(c) ==
+    /\ DeliverCreditGuard(c)
     /\ sCredit' = c
     /\ UNCHANGED <<ends, pathVars, net, sLog, sAcked, sLost, receiverVars, faults>>
     /\ UNCHANGED controlVars
@@ -396,10 +431,13 @@ GrantBeyond ==
 \* that offset; a tag failure ends the channel with integrity. Each read
 \* admits capacity, and the receiver grants credit only for admitted
 \* capacity.
-Read ==
+ReadGuard ==
     /\ rEnd = "open" /\ parentLive
     /\ rRead < (IF rFinal THEN Bytes ELSE Bytes + Excess)
     /\ Held(rRead)
+
+Read ==
+    /\ ReadGuard
     /\ IF rBuf[rRead] = "good"
        THEN /\ rRead' = rRead + 1
             /\ rBuf' = [rBuf EXCEPT ![rRead] = "none"]
@@ -415,9 +453,12 @@ Read ==
 \* gives that outcome to an open sender. The
 \* CompleteAtAck variant also completes when each byte is acknowledged,
 \* without the read.
-Complete ==
+CompleteGuard ==
     /\ rEnd = "open" /\ parentLive /\ rFinal
     /\ rRead = Bytes
+
+Complete ==
+    /\ CompleteGuard
     /\ rEnd' = "completed"
     /\ UNCHANGED <<sEnd, parentLive, pathVars, net, senderVars, receiverVars, faults>>
     /\ UNCHANGED controlVars
@@ -430,15 +471,21 @@ CompleteAtAck ==
 
 \* A terminal frame changes only an open endpoint. The parent's reliable
 \* delivery is conditional on its lifetime, including the final read point.
-DeliverReceiverEnd ==
+DeliverReceiverEndGuard ==
     /\ Bug # "NoFinalNotice" \/ rEnd # "completed"
     /\ parentLive /\ rEnd \in Terminal /\ sEnd = "open"
+
+DeliverReceiverEnd ==
+    /\ DeliverReceiverEndGuard
     /\ sEnd' = rEnd
     /\ UNCHANGED <<rEnd, parentLive, pathVars, net, senderVars, receiverVars, faults>>
     /\ UNCHANGED controlVars
 
-DeliverSenderEnd ==
+DeliverSenderEndGuard ==
     /\ parentLive /\ sEnd \in Terminal /\ rEnd = "open"
+
+DeliverSenderEnd ==
+    /\ DeliverSenderEndGuard
     /\ rEnd' = sEnd
     /\ UNCHANGED <<sEnd, parentLive, pathVars, net, senderVars, receiverVars, faults>>
     /\ UNCHANGED controlVars
@@ -512,9 +559,12 @@ Spoof ==
 \* section 8.2). The side flow follows the parent to the new path and its
 \* connection ID, and the new path's congestion state starts at its
 \* initial values (section 9.4).
-Validated ==
+ValidatedGuard ==
     /\ parentLive
     /\ mig = "genuine"
+
+Validated ==
+    /\ ValidatedGuard
     /\ path' = tried
     /\ mig' = "none"
     /\ cwnd' = Window
@@ -528,10 +578,13 @@ Validated ==
 \* side flow returns with it. That path's congestion state is restored
 \* (section 9.3): cwnd kept its value during the validation. The NoAbandon
 \* variant, the design as written before 2026-11-07, has no such step.
-Abandon ==
+AbandonGuard ==
     /\ Bug # "NoAbandon"
     /\ parentLive
     /\ mig # "none"
+
+Abandon ==
+    /\ AbandonGuard
     /\ mig' = "none"
     /\ UNCHANGED <<ends, path, tried, cwnd, net, senderVars, receiverVars, faults>>
     /\ UNCHANGED controlVars
@@ -547,7 +600,7 @@ Done ==
 (* receiver discards each copy as old, and the sender sends it again       *)
 (* forever. With the tag, a reused packet number is also a reused nonce.   *)
 
-ResendSamePN(p) ==
+ResendSamePNGuard(p) ==
     /\ Bug = "ReusePN"
     /\ sEnd = "open" /\ parentLive
     /\ mig = "none"
@@ -555,6 +608,11 @@ ResendSamePN(p) ==
     /\ Needs(sLog[p].off)
     /\ sLog[p].off < sCredit
     /\ Cardinality(Flight) < cwnd
+
+\* This guard is sufficient: the bad retransmission has no post-Spent or
+\* range bound. Removing p from sLost makes it a non-stuttering action.
+ResendSamePN(p) ==
+    /\ ResendSamePNGuard(p)
     /\ sLost' = sLost \ {p}
     /\ net' = net \cup {[cid |-> 1, pn |-> p, off |-> sLog[p].off, pay |-> sLog[p].pay]}
     /\ UNCHANGED <<ends, pathVars, sLog, sAcked, sCredit, receiverVars, faults>>
@@ -573,8 +631,11 @@ LoseAck ==
     /\ Spent' <= Budget
 
 \* Final-size arrival is separate from data. Unread excess is discarded.
-DeliverFinalSize ==
+DeliverFinalSizeGuard ==
     /\ parentLive /\ rEnd = "open" /\ ~rFinal
+
+DeliverFinalSize ==
+    /\ DeliverFinalSizeGuard
     /\ rFinal' = TRUE
     /\ rEnd' = IF rRead > Bytes /\ Bug # "NoFinalIntegrity" THEN "integrity" ELSE rEnd
     /\ rBuf' = IF Bug = "FinalKeepsJunk" THEN rBuf
@@ -618,25 +679,34 @@ Next ==
 (* answer. Loss, early loss declarations, the attacker, the consumer's     *)
 (* read, reset, the parent's end, parent losses, and migration starts have *)
 (* no fairness. Progress states the consumer's read as its condition.      *)
+\* The supplied state predicate equals ENABLED <<action>>_vars. This is
+\* the weak-fairness formula with that calculation done in the source.
+\* Keep the original action occurrence and existential grouping. README,
+\* "Fair enabledness", proves each case and defines the edit obligation.
+Fair(enabled, action) == ([]<>~enabled) \/ []<><<action>>_vars
+
 OtherFairness ==
-    /\ WF_vars(DeliverAck)
-    /\ WF_vars(\E d \in net : Deliver(d))
+    /\ Fair(DeliverAckGuard, DeliverAck)
+    /\ Fair(\E d \in net : DeliverGuard(d), \E d \in net : Deliver(d))
     \* The bad timer omits accepted packets whose last ACK was lost. The
     \* fault budget still charges those losses, as it does in the design.
-    /\ WF_vars(\E p \in PNs : Doomed(p)
-                              /\ (Bug # "NoAckRecovery" \/ p \notin rAck)
-                              /\ DeclareLost(p))
-    /\ WF_vars(\E c \in 1 .. (Bytes + Excess) : DeliverCredit(c))
-    /\ WF_vars(Complete)
-    /\ WF_vars(DeliverFinalSize)
-    /\ WF_vars(DeliverReceiverEnd)
-    /\ WF_vars(DeliverSenderEnd)
-    /\ WF_vars(Validated \/ Abandon)
+    /\ Fair(DoomedLossEnabled,
+            \E p \in PNs : Doomed(p)
+                          /\ (Bug # "NoAckRecovery" \/ p \notin rAck)
+                          /\ DeclareLost(p))
+    /\ Fair(\E c \in 1 .. (Bytes + Excess) : DeliverCreditGuard(c),
+            \E c \in 1 .. (Bytes + Excess) : DeliverCredit(c))
+    /\ Fair(CompleteGuard, Complete)
+    /\ Fair(DeliverFinalSizeGuard, DeliverFinalSize)
+    /\ Fair(DeliverReceiverEndGuard, DeliverReceiverEnd)
+    /\ Fair(DeliverSenderEndGuard, DeliverSenderEnd)
+    /\ Fair(ValidatedGuard \/ AbandonGuard, Validated \/ Abandon)
 
 Spec ==
     /\ Init
     /\ [][Next]_vars
-    /\ WF_vars(\E o \in WireOffsets : SendData(o))
+    /\ Fair(\E o \in WireOffsets : SendDataEnabled(o),
+            \E o \in WireOffsets : SendData(o))
     /\ OtherFairness
 
 \* The ReusePN variant: the sender's fairness covers the first
@@ -644,8 +714,10 @@ Spec ==
 ReuseSpec ==
     /\ Init
     /\ [][Next]_vars
-    /\ WF_vars(\E o \in WireOffsets : SendData(o) /\ ~Sent(o))
-    /\ WF_vars(\E p \in PNs : ResendSamePN(p))
+    /\ Fair(\E o \in WireOffsets : SendDataEnabled(o) /\ ~Sent(o),
+            \E o \in WireOffsets : SendData(o) /\ ~Sent(o))
+    /\ Fair(\E p \in PNs : ResendSamePNGuard(p),
+            \E p \in PNs : ResendSamePN(p))
     /\ OtherFairness
 
 -----------------------------------------------------------------------------
@@ -721,7 +793,7 @@ OutcomeStable ==
 \* Thus <>BothDone equals []<>BothDone. If validation is not pending, its
 \* target already holds, so the response property also equals recurrence.
 \* These forms avoid tableaux without changing fairness (README).
-Progress == (WF_vars(Read) /\ <>[](mig = "none")) => []<>BothDone
+Progress == (Fair(ReadGuard, Read) /\ <>[](mig = "none")) => []<>BothDone
 ValidationEnds == []<>(mig = "none" \/ ~parentLive)
 
 -----------------------------------------------------------------------------
