@@ -639,6 +639,13 @@ copies, checker output, GC logs, and lifecycle records are in
 Collection and teardown returned 0. No checker was left running at completion, and the native
 status command confirmed no AWS instance or EBS volume. The final index links that cleanup record.
 
+The durable final archive is
+`/Users/mr.wolf/.local/state/model-evidence/rsnetwork/N000/20261112-retired-history-network-model-evidence.tar.gz`.
+Its adjacent `.sha256`, `.inventory.json`, and `.receipt.json` files record the archive checksum,
+payload hashes, final source commit, and verified copies. The worktree-relative evidence paths
+above survive under `worktree-target-model/` in that archive. Its `source/` directory contains
+all 66 files of the reviewed final source.
+
 This was the third and last cause-based implementation attempt in this continuation.
 The earlier two attempts below remain incomplete at their own source closures. Their records,
 source, CPU sample, reviews, and cleanup evidence remain retained with the completed matrix.
