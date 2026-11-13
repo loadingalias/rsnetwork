@@ -12,6 +12,16 @@ publish.workspace = true
 # only `core`, so it does not select the `std` feature.
 rstypes = { version = "=0.1.0-alpha.2", default-features = false }
 
+# The cross-boundary proof (tests/cross_boundary.rs) runs the parser on Tokio:
+# a current-thread runtime and TCP, with no other feature.
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["rt", "net"] }
+
+# The proof runs the parser on the io_uring driver of rsasync, at the alpha of
+# its P0.3 path. The driver needs Linux on x86_64 or aarch64.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dev-dependencies]
+rsasync = "=0.1.0-alpha.2"
+
 [lints]
 workspace = true
 
