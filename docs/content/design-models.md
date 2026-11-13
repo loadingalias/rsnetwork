@@ -80,11 +80,6 @@ The command exits 0 when every selected profile passes. The output of each profi
 `run.txt` with commands and identities, `checker.log`, `stderr.log`, and `trace.json` for a violation.
 Runs have separate directories; a later run does not replace an earlier result.
 
-In an Apalache induction matrix, a Step profile can use
-`--tuning-options=search.invariantFilter=1->.*` when its initializer already includes `IndInv`.
-This checks every invariant clause at the successor state and omits the redundant initial-state
-check. Init and Safety stay unfiltered; the matrix rejects narrower filters and transition filters.
-
 ## Large profiles
 
 The 2026-11-12 matrix completed all 43 declared profiles on one 16-vCPU host. All 33 known-bad

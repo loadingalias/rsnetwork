@@ -394,7 +394,6 @@ fn profiles(models: &Path, selection: Option<&str>) -> Result<Vec<Profile>, Fail
         if !dir.is_dir() || model.is_some_and(|model| model != model_name) {
             continue;
         }
-        evidence::matrix(&dir)?;
         for path in sorted_entries(&dir)? {
             let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
                 continue;
@@ -626,7 +625,7 @@ fn digest(dir: &Path) -> Result<String, Failure> {
     let mut names = std::collections::BTreeSet::new();
     for path in sorted_entries(dir)? {
         let extension = path.extension().and_then(OsStr::to_str);
-        if extension.is_some_and(|extension| matches!(extension, "tla" | "cfg" | "apalache" | "matrix"))
+        if extension.is_some_and(|extension| matches!(extension, "tla" | "cfg" | "apalache"))
             && let Some(name) = path.file_name().and_then(OsStr::to_str)
         {
             names.insert(name.to_owned());

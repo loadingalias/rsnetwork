@@ -25,7 +25,7 @@ pub(crate) fn directory(parent: &Path) -> Result<PathBuf, Failure> {
     Ok(out)
 }
 
-/// Retain one model before profile selection and matrix validation.
+/// Retain one model before profile selection.
 pub(crate) fn freeze(from: &Path, to: &Path) -> Result<(), Failure> {
     fs::create_dir(to).map_err(failure)?;
     for path in crate::sorted_entries(from)? {
@@ -86,9 +86,6 @@ pub(crate) fn snapshot(out: &Path, profile: &Profile) -> Result<String, Failure>
     if profile.apalache {
         let text = fs::read_to_string(&profile.file).map_err(failure)?;
         names.extend(auxiliaries(&text)?);
-    }
-    if profile.dir.join("induction.matrix").is_file() {
-        names.insert("induction.matrix".to_owned());
     }
     let source = out.join("source");
     fs::create_dir(&source).map_err(failure)?;
@@ -197,75 +194,6 @@ pub(crate) fn start(
 
 fn failure(error: std::io::Error) -> Failure {
     Failure::new(error.to_string())
-}
-
-/// Require the whole initialization, step, and safety obligations for each domain.
-/// The checker expands Next and IndInv; this gate does not parse TLA+ definitions.
-pub(crate) fn matrix(dir: &Path) -> Result<(), Failure> {
-    let path = dir.join("induction.matrix");
-    if !path.exists() {
-        return Ok(());
-    }
-    let text = fs::read_to_string(&path).map_err(failure)?;
-    for row in text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-    {
-        let fields: Vec<_> = row.split_whitespace().collect();
-        let [module, cinit, ind_init] = fields.as_slice() else {
-            return Err(Failure::new(format!(
-                "{}: a row needs module, constant initializer, and invariant initializer",
-                path.display()
-            )));
-        };
-        for (role, init, invariant, length) in [
-            ("Init", "Init", "IndInv", "0"),
-            ("Step", *ind_init, "IndInv", "1"),
-            ("Safety", *ind_init, "Safety", "0"),
-        ] {
-            let name = format!("{module}.{role}.apalache");
-            let profile =
-                fs::read_to_string(dir.join(&name)).map_err(|error| Failure::new(format!("{name}: {error}")))?;
-            let mut lines = profile.lines().map(str::trim).filter(|line| !line.is_empty());
-            if lines.next() != Some("check") {
-                return Err(Failure::new(format!("{name}: an induction obligation must use check")));
-            }
-            let mut options = std::collections::BTreeMap::new();
-            for line in lines {
-                let Some((key, value)) = line.split_once('=') else {
-                    return Err(Failure::new(format!("{name}: unsupported induction argument {line}")));
-                };
-                if options.insert(key, value).is_some() {
-                    return Err(Failure::new(format!("{name}: duplicate induction argument {key}")));
-                }
-            }
-            let expected = std::collections::BTreeMap::from([
-                ("--cinit", *cinit),
-                ("--init", init),
-                ("--next", "Next"),
-                ("--inv", invariant),
-                ("--length", length),
-            ]);
-            match (options.remove("--discard-disabled"), options.remove("--no-deadlock")) {
-                (None, None) | (Some("false"), Some("true")) => {}
-                _ => {
-                    return Err(Failure::new(format!(
-                        "{name}: use --discard-disabled=false and --no-deadlock=true together"
-                    )));
-                }
-            }
-            if role == "Step" && options.get("--tuning-options") == Some(&"search.invariantFilter=1->.*") {
-                options.remove("--tuning-options");
-            }
-            if options != expected {
-                return Err(Failure::new(format!(
-                    "{name}: must check the complete {role} obligation"
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Exclude comments and strings while keeping token and line boundaries.
@@ -402,75 +330,5 @@ mod tests {
         super::auxiliaries("check\n--config=/tmp/external.cfg\n").unwrap_err();
         super::auxiliaries("check\n--config-file=ambient.json\n").unwrap_err();
         std::fs::remove_dir_all(dir).expect("remove owned inputs");
-    }
-    /// Missing or partial proofs cannot replace a whole induction obligation.
-    #[test]
-    fn induction_matrix_requires_whole_obligations() {
-        let dir = super::directory(&std::env::temp_dir().join("xtask-matrix-test"))
-            .map_err(|error| error.message)
-            .expect("scratch directory");
-        let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).expect("write matrix input");
-        write("induction.matrix", "Proof CInit IndInit\n");
-        for (role, init, inv, length) in [
-            ("Init", "Init", "IndInv", 0),
-            ("Step", "IndInit", "IndInv", 1),
-            ("Safety", "IndInit", "Safety", 0),
-        ] {
-            write(
-                &format!("Proof.{role}.apalache"),
-                &format!("check\n--cinit=CInit\n--init={init}\n--next=Next\n--inv={inv}\n--length={length}\n"),
-            );
-        }
-        assert!(super::matrix(&dir).is_ok());
-        let step = "check\n--cinit=CInit\n--init=IndInit\n--next=Next\n--inv=IndInv\n--length=1\n";
-        write(
-            "Proof.Step.apalache",
-            &format!("{step}--discard-disabled=false\n--no-deadlock=true\n"),
-        );
-        assert!(super::matrix(&dir).is_ok());
-        write(
-            "Proof.Step.apalache",
-            &format!("{step}--tuning-options=search.invariantFilter=1->.*\n"),
-        );
-        assert!(super::matrix(&dir).is_ok());
-        for options in [
-            "--discard-disabled=false\n",
-            "--no-deadlock=true\n",
-            "--discard-disabled=true\n--no-deadlock=true\n",
-            "--discard-disabled=false\n--no-deadlock=false\n",
-            "--tuning-options=search.invariantFilter=0->.*\n",
-            "--tuning-options=search.invariantFilter=1->0\n",
-            "--tuning-options=search.invariantFilter=1->.*:search.transitionFilter=0->0\n",
-        ] {
-            write("Proof.Step.apalache", &format!("{step}{options}"));
-            assert!(super::matrix(&dir).is_err());
-        }
-        write("Proof.Step.apalache", step);
-        for role in ["Init", "Safety"] {
-            let name = format!("Proof.{role}.apalache");
-            let text = std::fs::read_to_string(dir.join(&name)).expect("read complete obligation");
-            write(&name, &format!("{text}--tuning-options=search.invariantFilter=1->.*\n"));
-            assert!(super::matrix(&dir).is_err());
-            write(&name, &text);
-        }
-        let original = dir.join("Proof.Step.apalache");
-        for suffix in ["bad", "reach"] {
-            let must_fail = dir.join(format!("Proof.Step_{suffix}.apalache"));
-            std::fs::rename(&original, &must_fail).expect("select a must-fail profile");
-            assert!(super::matrix(&dir).is_err());
-            std::fs::rename(&must_fail, &original).expect("restore the proof profile");
-        }
-        for args in [
-            "--next=Take\n--inv=IndInv\n",
-            "--next=Next\n--inv=OnePart\n",
-            "--next=Next\n--inv=IndInv\n--inv=OnePart\n",
-        ] {
-            write(
-                "Proof.Step.apalache",
-                &format!("check\n--cinit=CInit\n--init=IndInit\n--length=1\n{args}"),
-            );
-            assert!(super::matrix(&dir).is_err());
-        }
-        std::fs::remove_dir_all(dir).expect("remove owned matrix input");
     }
 }
