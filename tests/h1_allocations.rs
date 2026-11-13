@@ -39,7 +39,13 @@ unsafe impl GlobalAlloc for Counting {
 static COUNTING: Counting = Counting;
 
 /// Runs `work` and gives its result with the number of allocations that it made on this thread.
+///
+/// It first counts one known allocation. Thus a count of zero cannot come from a counter that
+/// does not count.
 fn allocations<T>(work: impl FnOnce() -> T) -> (T, u64) {
+    let control = ALLOCATIONS.get();
+    drop(core::hint::black_box(Vec::<u8>::with_capacity(1)));
+    assert!(ALLOCATIONS.get() > control, "the counter sees no allocation");
     let before = ALLOCATIONS.get();
     let result = work();
     (result, ALLOCATIONS.get() - before)
