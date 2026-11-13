@@ -1,11 +1,14 @@
-# The CI gate: `cargo xtask check` on each push to main.
+# The CI gate on each push to main: `cargo xtask check`, then the tests on
+# glibc and on x86_64 musl.
 #
 # Each version comes from a file that `machine update all` writes:
 # rust-toolchain.toml, .config/nextest.toml, and Cargo.lock. A pin change
 # reaches CI with the next commit, and it changes the cache keys.
 #
-# `cargo xtask test` joins this job with the first test: Nextest fails a run
-# that has no tests.
+# The tests use the `ci` profile of .config/nextest.toml through
+# NEXTEST_PROFILE, not a `--profile` argument: `cargo xtask test` runs the
+# doctests only when it has no arguments. Thus the musl step, which has an
+# argument, runs no doctests.
 name: CI
 
 on:
@@ -22,6 +25,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  NEXTEST_PROFILE: ci
   RUSTUP_AUTO_INSTALL: "0"
 
 jobs:
@@ -109,3 +113,11 @@ jobs:
       - name: cargo xtask check
         shell: bash
         run: cargo xtask check
+
+      - name: cargo xtask test
+        shell: bash
+        run: cargo xtask test
+
+      - name: cargo xtask test on x86_64 musl
+        shell: bash
+        run: cargo xtask test --target x86_64-unknown-linux-musl

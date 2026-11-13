@@ -2,3 +2,6 @@
 channel = "nightly-2026-11-02"
 profile = "minimal"
 components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"]
+# The two musl targets run the tests on musl, the second Linux C library: CI
+# on x86_64, and the E1 hosts on both architectures.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

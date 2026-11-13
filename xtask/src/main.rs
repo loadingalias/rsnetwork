@@ -36,7 +36,8 @@ Commands
   model [--tlc-heap-mib=N --tlc-fp-mib=N] [model[/file]]...
                        Check the TLA+ models in models/; with no argument, every profile
 
-With no Cargo arguments, fix and check select the whole workspace.
+fix, check, and test select the whole workspace unless their arguments select
+packages with -p or --package.
 
 A model is a directory in models/. The first part of a profile's file name
 names its module: <M>.cfg and <M>.<name>.cfg are TLC profiles of <M>.tla, and
@@ -207,16 +208,14 @@ impl Repo {
         )
     }
 
-    /// Runs the tests with Nextest. With no arguments, it runs every test in
-    /// the workspace, then the doctests, which Nextest does not run.
+    /// Runs the tests with Nextest, in the whole workspace unless the
+    /// arguments select packages. With no arguments, it then runs the
+    /// doctests, which Nextest does not run.
     fn test(&self, args: &[String]) -> Result<(), Failure> {
+        step("nextest", self.cargo(&["nextest", "run", "--locked"]).args(scope(args)))?;
         if !args.is_empty() {
-            return step("nextest", self.cargo(&["nextest", "run", "--locked"]).args(args));
+            return Ok(());
         }
-        step(
-            "nextest",
-            &mut self.cargo(&["nextest", "run", "--locked", "--workspace"]),
-        )?;
         step(
             "doctest",
             &mut self.cargo(&["test", "--locked", "--doc", "--workspace", "--quiet"]),
@@ -907,13 +906,19 @@ fn scrubbed(name: &OsStr) -> bool {
             .any(|prefix| name.starts_with(prefix))
 }
 
-/// The Cargo arguments of the caller, or the whole workspace when there are none.
+/// The Cargo or Nextest arguments of the caller, after `--workspace` unless
+/// they select packages. With no selection, Cargo takes only the root package.
+/// With `--workspace`, Cargo ignores `-p`, and a second `--workspace` is an
+/// error.
 fn scope(args: &[String]) -> Vec<&str> {
-    if args.is_empty() {
-        vec!["--workspace"]
-    } else {
-        args.iter().map(String::as_str).collect()
-    }
+    let selects = args
+        .iter()
+        .any(|arg| arg == "--workspace" || arg.starts_with("--package") || arg.starts_with("-p"));
+    (!selects)
+        .then_some("--workspace")
+        .into_iter()
+        .chain(args.iter().map(String::as_str))
+        .collect()
 }
 
 /// Runs `command` as the step `name`. A failure keeps the exit code of the command.
@@ -955,14 +960,14 @@ impl Failure {
 
 #[cfg(test)]
 mod tests {
-    //! The verdicts from checker output, and profile discovery. Each checker
-    //! input is lines that the pinned checkers printed (TLC 1.8.0 rev 3ec1cc4,
-    //! Apalache 0.62.4).
+    //! The verdicts from checker output, profile discovery, and the package
+    //! selection of the Cargo commands. Each checker input is lines that the
+    //! pinned checkers printed (TLC 1.8.0 rev 3ec1cc4, Apalache 0.62.4).
 
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{Checkers, Report, model_args, profiles};
+    use super::{Checkers, Report, model_args, profiles, scope};
 
     /// A partial, malformed, or repeated memory option must not silently use
     /// the small-profile defaults or admit arbitrary JVM arguments.
@@ -1153,5 +1158,32 @@ mod tests {
         let result = profiles(&models, None);
         fs::remove_dir_all(&models).expect("remove the scratch model");
         assert!(matches!(result, Err(failure) if failure.message.contains("m/Missing.cfg")));
+    }
+
+    /// A feature, target, or filter argument keeps the whole workspace:
+    /// without `--workspace`, `cargo xtask check --all-features`, the musl
+    /// step of CI, and a named test cover only the root package. Each package
+    /// flag keeps its own selection.
+    #[test]
+    fn only_package_flags_narrow_the_scope() {
+        let joined = |args: &[&str]| scope(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()).join(" ");
+        for args in [
+            &[][..],
+            &["--all-features"],
+            &["--target", "x86_64-unknown-linux-musl"],
+            &["-E", "test(tlc_complete_search_holds)"],
+            &["--exclude", "xtask"],
+        ] {
+            assert_eq!(joined(args), [&["--workspace"][..], args].concat().join(" "));
+        }
+        for args in [
+            &["-p", "rsnetwork"][..],
+            &["-prsnetwork"],
+            &["--package", "rsnetwork"],
+            &["--package=rsnetwork"],
+            &["--workspace"],
+        ] {
+            assert_eq!(joined(args), args.join(" "));
+        }
     }
 }
