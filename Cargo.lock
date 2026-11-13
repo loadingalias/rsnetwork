@@ -11,6 +11,15 @@ checksum = "e708a799aaf045099fc91c80bb60a63e8e3da710a6a17953d97afc5ecb192861"
 [[package]]
 name = "rsnetwork"
 version = "0.1.0-alpha.1"
+dependencies = [
+ "rstypes",
+]
+
+[[package]]
+name = "rstypes"
+version = "0.1.0-alpha.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84124ec6ddf6cab39532f2780de6af83d9136aa2f183cc5295b4364e61842cd8"
 
 [[package]]
 name = "xtask"
