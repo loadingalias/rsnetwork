@@ -60,6 +60,7 @@
 
 mod body;
 mod chunked;
+mod client;
 mod head;
 mod request;
 mod response;
@@ -68,6 +69,7 @@ mod write;
 
 pub use body::Trailers;
 pub use chunked::{ChunkDecoder, ChunkStep};
+pub use client::{Client, ClientEvent};
 pub use head::{BodyLimits, Fields, Limits, ParseError, Version};
 pub use request::{RequestHead, RequestParser, RetainedRequest};
 pub use response::{ResponseHead, ResponseParser, RetainedResponse};
