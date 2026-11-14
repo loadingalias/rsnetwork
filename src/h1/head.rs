@@ -6,7 +6,7 @@ use core::fmt;
 use rstypes::buffer::{Buffer as _, Lease};
 
 use crate::drive::{Error, Kind};
-use crate::value::{Field, decimal};
+use crate::value::{Field, Status, decimal};
 
 /// The limits of one head, which the caller sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +20,23 @@ pub struct Limits {
     pub name_bytes: usize,
     /// The longest field value, in bytes, with no whitespace at its start or end.
     pub value_bytes: usize,
+}
+
+/// The limits of the body of one message and of a connection's drain, which the caller sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyLimits {
+    /// The largest body, in bytes: its Content-Length, or the sum of its chunk sizes.
+    pub body_bytes: u64,
+    /// The most unread body bytes that an engine reads and discards to reuse the connection.
+    /// Above it, the engine closes the connection.
+    pub drain_bytes: u64,
+    /// The longest chunk extensions of one chunk line, in bytes.
+    pub extension_bytes: usize,
+    /// The largest trailer section, in bytes, from its first field line to the end of its empty
+    /// line.
+    pub trailer_bytes: usize,
+    /// The largest number of trailer field lines.
+    pub trailer_fields: usize,
 }
 
 /// The version of a message.
@@ -271,9 +288,11 @@ impl fmt::Debug for Fields<'_> {
 /// closes the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
-    /// The head is longer than [`Limits::head_bytes`]. Respond with 431.
+    /// The head is longer than [`Limits::head_bytes`], or the trailer section is longer than
+    /// [`BodyLimits::trailer_bytes`]. Respond with 431.
     HeadTooLarge,
-    /// The head has more field lines than [`Limits::fields`]. Respond with 431.
+    /// The head has more field lines than [`Limits::fields`], or the trailer section has more
+    /// than [`BodyLimits::trailer_fields`]. Respond with 431.
     TooManyFields,
     /// A field name is longer than [`Limits::name_bytes`], or a field value is longer than
     /// [`Limits::value_bytes`]. Respond with 431.
@@ -291,9 +310,26 @@ pub enum ParseError {
     /// The message has a transfer coding other than `chunked`, which this parser does not decode.
     /// Respond with 501.
     TransferCoding,
+    /// The body is longer than [`BodyLimits::body_bytes`]. Respond with 413.
+    BodyTooLarge,
+    /// The chunk extensions of a chunk line are longer than [`BodyLimits::extension_bytes`].
+    /// Respond with 400.
+    ExtensionTooLarge,
 }
 
 impl ParseError {
+    /// The status of the response that a server sends for the refusal, before it closes the
+    /// connection.
+    pub const fn status(self) -> Status {
+        Status(match self {
+            Self::HeadTooLarge | Self::TooManyFields | Self::FieldTooLarge => 431,
+            Self::Malformed | Self::Framing | Self::ExtensionTooLarge => 400,
+            Self::Version => 505,
+            Self::TransferCoding => 501,
+            Self::BodyTooLarge => 413,
+        })
+    }
+
     /// The fixed text of the refusal.
     pub(super) const fn reason(self) -> &'static str {
         match self {
@@ -304,6 +340,8 @@ impl ParseError {
             Self::Version => "the version is not HTTP/1.0 or HTTP/1.1",
             Self::Framing => "the body framing is not clear",
             Self::TransferCoding => "the message uses a transfer coding other than chunked",
+            Self::BodyTooLarge => "the body is longer than its limit",
+            Self::ExtensionTooLarge => "the chunk extensions are longer than their limit",
         }
     }
 }
@@ -319,7 +357,11 @@ impl fmt::Display for ParseError {
 impl From<ParseError> for Error {
     fn from(error: ParseError) -> Self {
         let kind = match error {
-            ParseError::HeadTooLarge | ParseError::TooManyFields | ParseError::FieldTooLarge => Kind::Overload,
+            ParseError::HeadTooLarge
+            | ParseError::TooManyFields
+            | ParseError::FieldTooLarge
+            | ParseError::BodyTooLarge
+            | ParseError::ExtensionTooLarge => Kind::Overload,
             ParseError::Version | ParseError::TransferCoding => Kind::Unsupported,
             ParseError::Malformed | ParseError::Framing => Kind::Malformed,
         };

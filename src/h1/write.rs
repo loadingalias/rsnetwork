@@ -131,10 +131,13 @@ pub fn end_chunk<B: BufferMut>(out: &mut WriteLoan<B>) -> Result<(), WriteError>
     write(out, |put| put(b"\r\n"))
 }
 
-/// Writes the last chunk, which ends a chunked body with no trailer, into `out`. Refuses, and
-/// writes nothing, if `out` has too little free capacity.
-pub fn last_chunk<B: BufferMut>(out: &mut WriteLoan<B>) -> Result<(), WriteError> {
-    write(out, |put| put(b"0\r\n\r\n"))
+/// Writes the last chunk and the trailer section of `trailers` into `out`: `0`, CR LF, the
+/// trailer field lines in their order, and the empty line. With no trailer, it is `0\r\n\r\n`.
+///
+/// Refuses, and writes nothing, if a trailer is a framing field, or if `out` has too little free
+/// capacity.
+pub fn last_chunk<B: BufferMut>(out: &mut WriteLoan<B>, trailers: &[Field<'_>]) -> Result<(), WriteError> {
+    write_message(out, [b"0\r\n"], trailers, None)
 }
 
 /// Writes the pieces that `pieces` gives into `out`, or refuses and writes nothing if they do not

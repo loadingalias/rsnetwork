@@ -368,11 +368,20 @@ fn heads_and_chunks_have_the_exact_framing() {
     begin_chunk(&mut out, NonZeroUsize::new(26).unwrap()).unwrap();
     assert_eq!(out.fill_from(b"abcdefghijklmnopqrstuvwxyz"), 26);
     end_chunk(&mut out).unwrap();
-    last_chunk(&mut out).unwrap();
+    last_chunk(&mut out, &[]).unwrap();
     assert_eq!(
         out.into_inner(),
         b"HTTP/1.1 200 \r\ntransfer-encoding: chunked\r\n\r\n1a\r\nabcdefghijklmnopqrstuvwxyz\r\n0\r\n\r\n"
     );
+
+    // The trailer section follows the last chunk, and a framing field cannot be a trailer.
+    let mut out = WriteLoan::new(Vec::with_capacity(256));
+    last_chunk(&mut out, &[Field::new(b"X-Sum", b"31").unwrap()]).unwrap();
+    assert_eq!(out.into_inner(), b"0\r\nX-Sum: 31\r\n\r\n");
+    let mut out = WriteLoan::new(Vec::with_capacity(256));
+    let length = [Field::new(b"Content-Length", b"5").unwrap()];
+    assert_eq!(last_chunk(&mut out, &length), Err(WriteError::FramingField));
+    assert!(out.filled().is_empty());
 }
 
 /// A refused write writes nothing. The caller can then write into a larger region, or write an

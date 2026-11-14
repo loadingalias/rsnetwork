@@ -227,7 +227,7 @@ fn is_uri_part(bytes: &[u8], extra: &[u8]) -> bool {
 
 /// A status code: a number from 100 to 599 (RFC 9110, section 15).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Status(u16);
+pub struct Status(pub(crate) u16);
 
 impl Status {
     /// Checks a status code, or refuses it.
@@ -465,10 +465,12 @@ fn is_scheme(bytes: &[u8]) -> bool {
 
 /// Whether `bytes` is a token: one or more of the characters of RFC 9110, section 5.6.2.
 fn is_token(bytes: &[u8]) -> bool {
-    !bytes.is_empty()
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(byte))
+    !bytes.is_empty() && bytes.iter().all(|&byte| is_tchar(byte))
+}
+
+/// Whether `byte` is a character of a token (RFC 9110, section 5.6.2).
+pub(crate) fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 /// The value of one or more decimal digits, if it fits in a `u64`.

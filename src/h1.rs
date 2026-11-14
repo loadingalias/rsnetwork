@@ -58,12 +58,14 @@
 //!
 //! [`WriteLoan`]: crate::buffer::WriteLoan
 
+mod chunked;
 mod head;
 mod request;
 mod response;
 mod write;
 
-pub use head::{Fields, Limits, ParseError, Version};
+pub use chunked::{ChunkDecoder, ChunkStep};
+pub use head::{BodyLimits, Fields, Limits, ParseError, Version};
 pub use request::{RequestHead, RequestParser, RetainedRequest};
 pub use response::{ResponseHead, ResponseParser, RetainedResponse};
 pub use write::{WriteError, begin_chunk, end_chunk, last_chunk, write_head, write_request};
