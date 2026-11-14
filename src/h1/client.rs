@@ -35,6 +35,8 @@ pub struct Client {
     method: Method<'static>,
     /// The connection closes after the current exchange.
     close: bool,
+    /// The request in flight asks to change the protocol.
+    upgrade: bool,
     /// The end of the connection.
     end: Option<Result<(), Error>>,
 }
@@ -50,6 +52,11 @@ pub enum ClientEvent {
     Data(Lease),
     /// The end of the response body, with its trailer section if it has trailers.
     End(Option<Trailers>),
+    /// The connection changed its protocol after a 101 or a 2xx response to CONNECT, and the
+    /// request ended. The front of the `Inbound` queue is exactly the bytes after the response
+    /// head, and they belong to the new protocol, as each later byte does. The engine reads no
+    /// more, and the next turn is terminal.
+    Handoff,
 }
 
 impl fmt::Debug for ClientEvent {
@@ -59,6 +66,7 @@ impl fmt::Debug for ClientEvent {
             Self::Response(head) => f.debug_tuple("Response").field(head).finish(),
             Self::Data(data) => f.debug_struct("Data").field("len", &data.initialized()).finish(),
             Self::End(trailers) => f.debug_tuple("End").field(trailers).finish(),
+            Self::Handoff => f.write_str("Handoff"),
         }
     }
 }
@@ -85,6 +93,8 @@ enum ReadState {
     Head,
     /// In the response body.
     Body(BodyReader),
+    /// After a response that changed the protocol, until the end of the request.
+    Switch,
     /// After the response.
     Done,
 }
@@ -105,6 +115,7 @@ impl Client {
             read: ReadState::Idle,
             method: Method::GET,
             close: false,
+            upgrade: false,
             end: None,
         })
     }
@@ -153,13 +164,17 @@ impl Client {
         } else {
             Method::GET
         };
-        self.close = fields.iter().any(|field| {
-            field.name.eq_ignore_ascii_case(b"connection")
-                && field
-                    .value
-                    .split(|&byte| byte == b',')
-                    .any(|option| option.trim_ascii().eq_ignore_ascii_case(b"close"))
-        });
+        let option = |known: &[u8]| {
+            fields.iter().any(|field| {
+                field.name.eq_ignore_ascii_case(b"connection")
+                    && field
+                        .value
+                        .split(|&byte| byte == b',')
+                        .any(|option| option.trim_ascii().eq_ignore_ascii_case(known))
+            })
+        };
+        self.close = option(b"close");
+        self.upgrade = option(b"upgrade") && fields.iter().any(|field| field.name.eq_ignore_ascii_case(b"upgrade"));
         self.writer.open(framing);
         self.write = Write::Body;
         self.read = ReadState::Head;
@@ -214,7 +229,7 @@ impl Client {
             }
             ReadState::Body(reader) => reader.drain(self.body.drain_bytes),
             ReadState::Head => self.end = Some(Err(Error::new(Kind::Cancelled, "the response was cancelled"))),
-            ReadState::Idle | ReadState::Done => {}
+            ReadState::Idle | ReadState::Switch | ReadState::Done => {}
         }
     }
 
@@ -281,6 +296,12 @@ impl Client {
                     }
                     continue;
                 }
+                // The new protocol starts after the end of the request.
+                ReadState::Switch if self.write == Write::Done => {
+                    self.end = Some(Ok(()));
+                    return Ok(Some(ClientEvent::Handoff));
+                }
+                ReadState::Switch => return Ok(None),
                 ReadState::Body(reader) => reader,
             };
             let draining = reader.draining();
@@ -326,6 +347,15 @@ impl Client {
         let framing = head.framing();
         let persistent = head.persistent();
         inbound.consume(head.consumed()).map_err(|_| ParseError::Malformed)?;
+        // A server switches only to a protocol that the request asked for (RFC 9110, section
+        // 7.8). A 2xx response to CONNECT starts a tunnel (section 9.3.6).
+        if (code == 101 && self.upgrade) || (self.method == Method::CONNECT && (200..300).contains(&code)) {
+            self.read = ReadState::Switch;
+            return Ok(Some(ClientEvent::Response(retained)));
+        }
+        if code == 101 {
+            return Err(ParseError::Malformed);
+        }
         if code < 200 {
             return Ok(Some(ClientEvent::Informational(retained)));
         }

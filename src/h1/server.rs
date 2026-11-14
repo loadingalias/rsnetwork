@@ -48,6 +48,10 @@ pub enum ServerEvent {
     Data(Lease),
     /// The end of the request body, with its trailer section if it has trailers.
     End(Option<Trailers>),
+    /// The connection changed its protocol after a 101 or a 2xx response to CONNECT. The front of
+    /// the `Inbound` queue is exactly the bytes after the request, and they belong to the new
+    /// protocol, as each later byte does. The engine reads no more, and the next turn is terminal.
+    Handoff,
 }
 
 impl fmt::Debug for ServerEvent {
@@ -56,6 +60,7 @@ impl fmt::Debug for ServerEvent {
             Self::Request(head) => f.debug_tuple("Request").field(head).finish(),
             Self::Data(data) => f.debug_struct("Data").field("len", &data.initialized()).finish(),
             Self::End(trailers) => f.debug_tuple("End").field(trailers).finish(),
+            Self::Handoff => f.write_str("Handoff"),
         }
     }
 }
@@ -89,8 +94,14 @@ enum Write {
 struct Request {
     version: Option<Version>,
     head: bool,
+    connect: bool,
     /// The request waits for `100 Continue` before it sends its body.
     expect: bool,
+    /// The request asks to change the protocol.
+    upgrade: bool,
+    /// The response changes the protocol: a 101, or a 2xx to CONNECT. After the request, the
+    /// bytes belong to the new protocol.
+    switch: bool,
 }
 
 impl Server {
@@ -147,6 +158,10 @@ impl Server {
                     return Ok(None);
                 }
                 ReadState::Head => return self.head(inbound),
+                ReadState::Done if self.write == Write::Done && self.request.switch => {
+                    self.end = Some(Ok(()));
+                    return Ok(Some(ServerEvent::Handoff));
+                }
                 ReadState::Done if self.write == Write::Done => {
                     self.next();
                     continue;
@@ -196,8 +211,11 @@ impl Server {
         self.request = Request {
             version: Some(version),
             head: head.method() == Method::HEAD,
+            connect: head.method() == Method::CONNECT,
             // An HTTP/1.0 client does not wait for 100 (RFC 9110, section 10.1.1).
             expect: head.expects_continue() && version == Version::Http11 && framing != Framing::Length(0),
+            upgrade: head.upgrade() && version == Version::Http11,
+            switch: false,
         };
         self.close = !head.persistent();
         // A request has no close framing.
@@ -300,10 +318,30 @@ impl Server {
         framing: Framing,
         head: Backing,
     ) -> Result<(), Error> {
-        if self.write != Write::Waiting || status.code() < 200 {
+        let code = status.code();
+        // A 101 needs a request that asked to change the protocol, and a body that does not wait
+        // for 100 (RFC 9110, section 7.8).
+        let upgrade = code == 101 && self.request.upgrade && !self.request.expect;
+        if self.write != Write::Waiting || (code < 200 && !upgrade) {
             return Err(misuse(
-                "a final response needs a waiting request and a status of 200 to 599",
+                "a final response needs a waiting request and a status of 200 to 599, or 101 to an upgrade",
             ));
+        }
+        if upgrade || (self.request.connect && (200..300).contains(&code)) {
+            // The head has no framing field (RFC 9110, section 9.3.6), as close framing writes
+            // it, and no body. The new protocol starts after the request.
+            push_head(
+                outbound,
+                head,
+                status,
+                fields,
+                if upgrade { Framing::Length(0) } else { Framing::Close },
+                None,
+            )?;
+            self.request.switch = true;
+            self.writer.open(Framing::Length(0));
+            self.write = Write::Body;
+            return Ok(());
         }
         let http10 = self.request.version == Some(Version::Http10);
         let framing = match framing {
@@ -329,7 +367,6 @@ impl Server {
             (false, true) => Some(&b"keep-alive"[..]),
             _ => None,
         };
-        let code = status.code();
         let no_body = self.request.head || code == 204 || code == 304;
         let written = match framing {
             _ if code == 204 || code == 304 => Framing::Length(0),
@@ -390,6 +427,8 @@ impl Server {
     fn after_write(&mut self) {
         self.write = Write::Done;
         match &mut self.read {
+            // The next drive gives the handoff, after the rest of the request.
+            _ if self.request.switch => {}
             ReadState::Done => self.next(),
             ReadState::Body(reader) if self.close => {
                 reader.drain(0);

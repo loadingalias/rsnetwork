@@ -41,6 +41,7 @@ enum Seen {
     Response(u16),
     Data(Vec<u8>),
     End(Vec<u8>),
+    Handoff,
 }
 
 const WAIT: Progress = Progress::Blocked(Blocked::Input);
@@ -114,6 +115,7 @@ impl Host {
                         })
                         .unwrap_or_default(),
                 ),
+                Some(ClientEvent::Handoff) => Seen::Handoff,
                 None => return (seen, turn.progress),
             });
         }
@@ -324,5 +326,69 @@ fn unclear_responses_end_the_connection() {
     host.receive(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n");
     let (seen, progress) = host.drive();
     assert_eq!(seen, Vec::new());
+    assert!(terminal(&progress, Kind::Malformed), "{progress:?}");
+}
+
+/// A 2xx response to CONNECT, and a 101 response to a request that asked to upgrade, change the
+/// protocol. After the request ends, the engine gives the handoff, and the front of the queue is
+/// exactly the bytes after the response head, at their address. A 101 to a request that did not
+/// ask for it ends the connection.
+#[test]
+fn a_tunnel_or_an_upgrade_hands_off_exactly_the_bytes_after_the_response_head() {
+    let upgrade = [
+        rsnetwork::value::Field::new(b"Connection", b"Upgrade").unwrap(),
+        rsnetwork::value::Field::new(b"Upgrade", b"websocket").unwrap(),
+    ];
+    for (method, target, fields, head) in [
+        (
+            Method::CONNECT,
+            &b"b.example:443"[..],
+            &[][..],
+            &b"HTTP/1.1 200 Connection Established\r\n\r\n"[..],
+        ),
+        (
+            Method::GET,
+            b"/chat",
+            &upgrade[..],
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        ),
+    ] {
+        let mut host = Host::new();
+        let region = Backing::from(Vec::with_capacity(256));
+        host.client
+            .request(
+                &mut host.outbound,
+                method,
+                Target::new(target).unwrap(),
+                Authority::new(b"b.example:443").unwrap(),
+                fields,
+                Framing::Length(0),
+                region,
+            )
+            .unwrap();
+        host.client.finish(&mut host.outbound).unwrap();
+        let received = Lease::from([head, b"\x16\x03\x01new protocol"].concat());
+        let after = received.as_ptr().wrapping_add(head.len());
+        host.inbound
+            .push(Received {
+                region: received,
+                endpoint: ENDPOINT,
+                capacity: 1 << 16,
+            })
+            .unwrap();
+        let (seen, progress) = host.drive();
+        assert_eq!(seen[1..], [Seen::Handoff]);
+        assert_eq!(progress, Progress::Terminal(Ok(())));
+        let front = &host.inbound.front().unwrap().region;
+        assert_eq!(
+            (front.as_ptr(), front.bytes()),
+            (after, &b"\x16\x03\x01new protocol"[..])
+        );
+    }
+
+    let mut host = Host::new();
+    host.request(b"GET", b"/a", Framing::Length(0), b"");
+    host.receive(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n");
+    let (_, progress) = host.drive();
     assert!(terminal(&progress, Kind::Malformed), "{progress:?}");
 }

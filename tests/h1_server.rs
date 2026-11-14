@@ -44,6 +44,7 @@ enum Seen {
     Request(Vec<u8>, Vec<u8>),
     Data(Vec<u8>),
     End(Vec<u8>),
+    Handoff,
 }
 
 /// The host of one connection: the queues, and the engine.
@@ -97,6 +98,7 @@ impl Host {
                     });
                     seen.push(Seen::End(lines.unwrap_or_default()));
                 }
+                Some(ServerEvent::Handoff) => seen.push(Seen::Handoff),
                 None => return (seen, turn.progress),
             }
         }
@@ -411,4 +413,62 @@ fn the_close_of_the_client_ends_the_connection() {
     let (seen, progress) = host.drive();
     assert_eq!(seen, vec![request(b"PUT", b"/"), Seen::Data(b"ab".to_vec())]);
     assert!(matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Partial));
+}
+
+/// A 101 response to a request that asks to upgrade, and a 2xx response to CONNECT, change the
+/// protocol after the request. The engine gives the handoff, and the front of the queue is then
+/// exactly the bytes after the request, at their address. The CONNECT response has no framing
+/// field (RFC 9110, section 9.3.6). A 101 to a request that did not ask for it refuses.
+#[test]
+fn an_upgrade_or_a_tunnel_hands_off_exactly_the_bytes_after_the_request() {
+    let upgrade: &[u8] = b"GET /chat HTTP/1.1\r\nHost: a\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    let connect: &[u8] = b"CONNECT b.example:443 HTTP/1.1\r\nHost: b.example:443\r\n\r\n";
+    let switch = [
+        Field::new(b"Upgrade", b"websocket").unwrap(),
+        Field::new(b"Connection", b"Upgrade").unwrap(),
+    ];
+    for (head, status, fields, framing, response) in [
+        (
+            upgrade,
+            101,
+            &switch[..],
+            Framing::Length(0),
+            &b"HTTP/1.1 101 \r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"[..],
+        ),
+        (connect, 200, &[], Framing::Length(0), b"HTTP/1.1 200 \r\n\r\n"),
+    ] {
+        let mut host = Host::new(BODY);
+        let region = Lease::from([head, b"\x16\x03\x01new protocol"].concat());
+        let after = region.as_ptr().wrapping_add(head.len());
+        host.inbound
+            .push(Received {
+                region,
+                endpoint: ENDPOINT,
+                capacity: 1 << 16,
+            })
+            .unwrap();
+        let (seen, _) = host.drive();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        host.respond(status, fields, framing, b"");
+        assert_eq!(host.drive(), (vec![Seen::Handoff], Progress::Terminal(Ok(()))));
+        let front = &host.inbound.front().unwrap().region;
+        assert_eq!(
+            (front.as_ptr(), front.bytes()),
+            (after, &b"\x16\x03\x01new protocol"[..])
+        );
+        assert_eq!(host.sent(), response);
+    }
+
+    let mut host = Host::new(BODY);
+    host.receive(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    host.drive();
+    let head = Backing::from(Vec::with_capacity(256));
+    let refused = host.server.respond(
+        &mut host.outbound,
+        Status::new(101).unwrap(),
+        &switch,
+        Framing::Length(0),
+        head,
+    );
+    assert_eq!(refused.map_err(|error| error.kind()), Err(Kind::Misuse));
 }
