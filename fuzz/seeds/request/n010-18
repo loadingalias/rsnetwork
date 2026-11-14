@@ -1,0 +1,9 @@
+POST / HTTP/1.1
+Host: a
+Content-Length: 5
+X: a
+Transfer-Encoding: chunked
+
+helloGET /smuggled HTTP/1.1
+Host: a
+

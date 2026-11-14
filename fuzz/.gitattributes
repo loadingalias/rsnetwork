@@ -1,0 +1,2 @@
+# The seeds are raw peer bytes with CR LF line ends, not text.
+seeds/** binary

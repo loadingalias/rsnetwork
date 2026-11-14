@@ -1,0 +1,6 @@
+GET / HTTP/1.1
+Host: a
+
+GET /smuggled HTTP/1.1
+Host: a
+

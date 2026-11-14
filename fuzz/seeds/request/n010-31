@@ -1,0 +1,7 @@
+POST / HTTP/1.0
+Connection: keep-alive
+Transfer-Encoding: chunked
+Content-Length: 5
+
+helloGET /smuggled HTTP/1.0
+

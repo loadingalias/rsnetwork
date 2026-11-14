@@ -1,0 +1,18 @@
+GET /1 HTTP/1.1
+Host: a
+
+POST /2 HTTP/1.1
+Host: a
+Content-Length: 5
+
+helloPOST /3 HTTP/1.1
+Host: a
+Transfer-Encoding: chunked
+
+5
+hello
+0
+
+HEAD /4 HTTP/1.1
+Host: a
+

@@ -1,0 +1,5 @@
+# The working corpus, the crash artifacts, and the coverage of a run stay local.
+# The committed seeds are in seeds/.
+corpus/
+artifacts/
+coverage/

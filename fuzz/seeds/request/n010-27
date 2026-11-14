@@ -1,0 +1,13 @@
+POST / HTTP/1.1
+Host: a
+Transfer-Encoding: chunked
+
+000A
+0123456789
+a
+0123456789
+000
+
+GET /smuggled HTTP/1.1
+Host: a
+

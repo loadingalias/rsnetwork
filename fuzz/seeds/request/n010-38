@@ -1,0 +1,16 @@
+GET /1 HTTP/1.1
+Host: a
+
+GET /2 HTTP/1.1
+Host: a
+
+POST / HTTP/1.1
+Host: a
+Content-Length: 40
+Transfer-Encoding: chunked
+
+0
+
+GET /smuggled HTTP/1.1
+Host: a
+

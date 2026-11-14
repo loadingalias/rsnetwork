@@ -1,0 +1,10 @@
+GET /1 HTTP/1.1
+Host: a
+
+GET /2 HTTP/1.1
+Host: a
+Connection: close
+
+GET /3 HTTP/1.1
+Host: a
+

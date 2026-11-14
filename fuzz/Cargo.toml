@@ -1,0 +1,53 @@
+[package]
+name = "rsnetwork-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# A workspace of its own: libFuzzer and its build closure never enter the
+# lock file of rsnetwork, and no library depends on this package.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+rsnetwork = { path = ".." }
+
+[lints.rust]
+warnings = "deny"
+# The counting allocator is the one unsafe item, with a reasoned `expect`.
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[[bin]]
+name = "request"
+path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "response"
+path = "fuzz_targets/response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunked"
+path = "fuzz_targets/chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "values"
+path = "fuzz_targets/values.rs"
+test = false
+doc = false
+bench = false

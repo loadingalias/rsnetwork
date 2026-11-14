@@ -17,6 +17,9 @@ The suite runs the server and client engines on the caller-driven host, in memor
 socket and no runtime. A failure names the vector, its RFC sections, and the schedule or the seed.
 It shows the result of the run, and for a schedule also the result of the whole input.
 
+The [fuzz targets](../../fuzz/README.md) drive the same engines with coverage-guided input, and
+they check the same rule: each cut of the input gives the result of the whole input.
+
 ## What a vector is
 
 A vector is the bytes of a peer and the outcomes that the RFC permits for them. An outcome has
