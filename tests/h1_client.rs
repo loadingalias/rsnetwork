@@ -272,8 +272,8 @@ fn the_close_ends_a_close_delimited_body_and_cuts_any_other() {
 
 /// A cancelled response body ends `Cancelled` once, and the engine gives no more of it. It reads
 /// and discards the rest of the body, up to the drain limit, and the connection then carries the
-/// next request. A body longer than the limit closes the connection at once. A connection that reuses the connection inside an unread body reads the body as a
-/// response.
+/// next request. A body longer than the limit closes the connection at once. A client that reused
+/// the connection inside an unread body would read the rest of that body as the next response.
 #[test]
 fn reuse_after_a_cancelled_response_drains_it_or_closes() {
     let mut host = Host::new();
