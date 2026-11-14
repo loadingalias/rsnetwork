@@ -26,7 +26,7 @@
 //! use rsnetwork::body::Outcome;
 //! use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 //! use rsnetwork::capacity::Budget;
-//! use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received};
+//! use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received, TurnLimits};
 //! use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
 //! use rsnetwork::value::{Field, Status};
 //!
@@ -40,8 +40,9 @@
 //! };
 //! let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
 //! let queue = NonZeroUsize::new(16).expect("not zero");
-//! let (mut inbound, mut outbound) = (Inbound::new(queue)?, Outbound::new(queue)?);
-//! let mut server = Server::new(limits, body, &outbound, &budget)?;
+//! let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
+//! let (mut inbound, mut outbound) = (Inbound::new(queue, &budget)?, Outbound::new(queue, &budget)?);
+//! let mut server = Server::new(limits, body, turn, &outbound, &budget)?;
 //!
 //! // The transport received a request, and the host queues it.
 //! let endpoint = Endpoint {

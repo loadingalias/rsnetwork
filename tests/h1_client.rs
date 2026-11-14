@@ -7,7 +7,7 @@ use core::num::{NonZeroU64, NonZeroUsize};
 
 use rsnetwork::body::Outcome;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
-use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Progress, Received};
+use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Progress, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Client, ClientEvent, Framing, Limits};
 use rsnetwork::value::{Authority, Method, Target};
 use rstypes::capacity::Budget;
@@ -25,6 +25,11 @@ const BODY: BodyLimits = BodyLimits {
     extension_bytes: 64,
     trailer_bytes: 256,
     trailer_fields: 4,
+};
+
+const TURN: TurnLimits = TurnLimits {
+    bytes: 1 << 20,
+    frames: 1 << 10,
 };
 
 const ENDPOINT: Endpoint = Endpoint {
@@ -78,11 +83,12 @@ struct Host {
 
 impl Host {
     fn new() -> Self {
-        let outbound = Outbound::new(NonZeroUsize::new(8).unwrap()).unwrap();
         let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+        let limit = NonZeroUsize::new(8).unwrap();
+        let outbound = Outbound::new(limit, &budget).unwrap();
         Self {
-            inbound: Inbound::new(NonZeroUsize::new(8).unwrap()).unwrap(),
-            client: Client::new(LIMITS, BODY, &outbound, &budget).unwrap(),
+            inbound: Inbound::new(limit, &budget).unwrap(),
+            client: Client::new(LIMITS, BODY, TURN, &outbound, &budget).unwrap(),
             outbound,
         }
     }

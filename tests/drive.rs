@@ -3,13 +3,19 @@
 //! the test gives, not from the code under test.
 
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
-use core::num::NonZeroUsize;
+use core::num::{NonZeroU64, NonZeroUsize};
 
 use rsnetwork::buffer::{Buffer as _, Lease};
+use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{AckError, Ecn, Endpoint, Error, Inbound, Kind, Outbound, Received};
 use rsnetwork::h1::{Framing, Limits, RequestParser};
 
 const LIMIT: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
+/// A budget that pays for each queue of a test.
+fn budget() -> Budget {
+    Budget::new(NonZeroU64::new(1 << 20).unwrap())
+}
 
 const LIMITS: Limits = Limits {
     head_bytes: 1024,
@@ -46,7 +52,7 @@ fn front(inbound: &Inbound, base: *const u8) -> Option<(usize, &[u8])> {
 #[test]
 fn an_acknowledgement_that_names_no_outstanding_bytes_refuses_and_changes_nothing() {
     // The id of the third output of another queue, which this queue did not give.
-    let mut other = Outbound::new(LIMIT).unwrap();
+    let mut other = Outbound::new(LIMIT, &budget()).unwrap();
     other.push(Lease::from(b"abc".to_vec())).unwrap();
     let mut foreign = None;
     for _ in 0..3 {
@@ -56,7 +62,7 @@ fn an_acknowledgement_that_names_no_outstanding_bytes_refuses_and_changes_nothin
     }
     let foreign = foreign.unwrap();
 
-    let mut outbound = Outbound::new(LIMIT).unwrap();
+    let mut outbound = Outbound::new(LIMIT, &budget()).unwrap();
     outbound.push(Lease::from(b"0123456789".to_vec())).unwrap();
     let first = outbound.submit().unwrap();
     assert_eq!(outbound.ack(first.id, 11), Err(AckError::TooLarge));
@@ -78,7 +84,7 @@ fn an_acknowledgement_that_names_no_outstanding_bytes_refuses_and_changes_nothin
 /// When a region has no byte left, the next output is the next region.
 #[test]
 fn a_partial_acceptance_gives_the_rest_of_the_region_at_its_address() {
-    let mut outbound = Outbound::new(LIMIT).unwrap();
+    let mut outbound = Outbound::new(LIMIT, &budget()).unwrap();
     let head = Lease::from(b"HTTP/1.1 200 \r\ncontent-length: 5\r\n\r\n".to_vec());
     let base = head.as_ptr();
     outbound.push(head).unwrap();
@@ -107,7 +113,7 @@ fn consumption_keeps_each_byte_after_the_prefix_with_its_owner() {
     const REQUESTS: &[u8] = b"GET /a HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello\
         GET /b HTTP/1.1\r\nHost: b\r\n\r\n\
         CONNECT b.example:443 HTTP/1.1\r\nHost: b.example\r\n\r\n\x16\x03\x01tunnel";
-    let mut inbound = Inbound::new(LIMIT).unwrap();
+    let mut inbound = Inbound::new(LIMIT, &budget()).unwrap();
     let first = received(REQUESTS);
     let base = first.region.as_ptr();
     inbound.push(first).unwrap();
@@ -157,7 +163,7 @@ fn consumption_keeps_each_byte_after_the_prefix_with_its_owner() {
 fn an_informational_response_leaves_the_final_response_with_its_owner() {
     const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
     const RESPONSES: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 \r\ncontent-length: 2\r\n\r\nok";
-    let mut inbound = Inbound::new(LIMIT).unwrap();
+    let mut inbound = Inbound::new(LIMIT, &budget()).unwrap();
     let first = received(RESPONSES);
     let base = first.region.as_ptr();
     inbound.push(first).unwrap();
@@ -178,7 +184,7 @@ fn an_informational_response_leaves_the_final_response_with_its_owner() {
 fn no_error_or_debug_output_shows_a_credential_or_a_body() {
     const REQUEST: &[u8] = b"POST /upload HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer s3cr3t\r\n\
         Content-Length: 6\r\nContent-Length: 6\r\n\r\nsecret";
-    let mut inbound = Inbound::new(LIMIT).unwrap();
+    let mut inbound = Inbound::new(LIMIT, &budget()).unwrap();
     inbound.push(received(REQUEST)).unwrap();
     let refusal = RequestParser::new(LIMITS)
         .parse(inbound.front().unwrap().region.bytes())
@@ -186,7 +192,7 @@ fn no_error_or_debug_output_shows_a_credential_or_a_body() {
     let error = Error::from(refusal);
     assert_eq!(error.kind(), Kind::Malformed);
 
-    let mut outbound = Outbound::new(LIMIT).unwrap();
+    let mut outbound = Outbound::new(LIMIT, &budget()).unwrap();
     outbound.push(Lease::from(&b"secret body"[..])).unwrap();
     let output = outbound.submit().unwrap();
     for text in [

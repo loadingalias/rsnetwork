@@ -37,15 +37,18 @@ documentation of `rsnetwork::drive` runs the same example as a test.
 
 ```rust
 use core::net::{Ipv4Addr, SocketAddr};
-use core::num::NonZeroUsize;
+use core::num::{NonZeroU64, NonZeroUsize};
 
 use rsnetwork::buffer::{Buffer as _, Lease};
+use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received};
 
+// One budget pays for each queue of the connection.
+let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
 let limit = NonZeroUsize::new(8).expect("not zero");
 
 // The host receives a region and queues it for the engine.
-let mut inbound = Inbound::new(limit)?;
+let mut inbound = Inbound::new(limit, &budget)?;
 let endpoint = Endpoint {
     peer: SocketAddr::from((Ipv4Addr::new(192, 0, 2, 7), 50_000)),
     local: SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 8080)),
@@ -61,7 +64,7 @@ inbound.consume(6)?;
 assert_eq!(inbound.front().map(|received| received.region.bytes()), Some(&b"PI"[..]));
 
 // The engine queues its output. The host sends it, and the transport accepts 3 bytes.
-let mut outbound = Outbound::new(limit)?;
+let mut outbound = Outbound::new(limit, &budget)?;
 outbound.push(Lease::from(b"PONG\r\n".to_vec())).expect("the queue has space");
 let output = outbound.submit().expect("an output is ready");
 outbound.ack(output.id, 3)?;
@@ -85,7 +88,7 @@ A `Received` is one received region with its facts:
 
 | Operation | Result |
 | --- | --- |
-| `Inbound::new(limit)` | A queue for at most `limit` regions. It reserves their space now, so a push never allocates. `Err` with `Kind::Overload` if the memory is not available |
+| `Inbound::new(limit, &budget)` | A queue for at most `limit` regions. It charges their memory to `budget` and reserves it now, so a push never allocates. `Err` with `Kind::Overload`, and no allocation, if the budget or the memory refuses |
 | `push(received)` | Adds the region after the others. `Err(received)` gives it back when the queue is full. The queue drops an empty region |
 | `front()` | The front region, with the bytes that no drive consumed |
 | `consume(len)` | Acknowledges that the engine consumed the first `len` bytes of the front region. The queue keeps a view of the bytes after them and drops a region with no byte left. `Err(AckError::TooLarge)` if `len` is more than the front region has. The queue does not change |
@@ -98,7 +101,7 @@ A `Received` is one received region with its facts:
 
 | Operation | Result |
 | --- | --- |
-| `Outbound::new(limit)` | A queue for at most `limit` regions, with their space reserved. `Err` with `Kind::Overload` if the memory is not available |
+| `Outbound::new(limit, &budget)` | A queue for at most `limit` regions, with their memory charged to `budget` and reserved. `Err` with `Kind::Overload`, and no allocation, if the budget or the memory refuses |
 | `push(region)` | Adds the region after the others. `Err(region)` gives it back when the queue is full. The queue drops an empty region |
 | `limit()`, `free()` | The most regions that the queue holds, and the number that it can take now |
 | `submit()` | The next `Output`: an `ActionId` and a view of the bytes of the front region that the transport has not accepted. `None` while an output has no acknowledgement, or when the queue is empty |
@@ -130,7 +133,7 @@ Each drive gives a `Turn`:
 | `Blocked(Blocked::Input)` | Receive more bytes, then drive again |
 | `Blocked(Blocked::Output)` | Acknowledge the outstanding output, then drive again |
 | `Blocked(Blocked::Capacity(n))` | Admit `n` more bytes of capacity, then drive again |
-| `Pending` | The engine stopped at a limit of the drive and has more work. Drive it again with no wait |
+| `Pending` | The engine gave an event, or it stopped at a [turn limit](limits.md) with more work. Drive it again with no wait |
 | `Terminal(Ok(()))` | The engine completed |
 | `Terminal(Err(error))` | The engine failed. See [errors](errors.md) |
 

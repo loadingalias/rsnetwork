@@ -8,7 +8,7 @@ use core::num::{NonZeroU64, NonZeroUsize};
 use rsnetwork::body::{Collect, Consumer, Outcome, Read};
 use rsnetwork::buffer::{Backing, Lease, WriteLoan};
 use rsnetwork::capacity::Budget;
-use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received};
+use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Client, ClientEvent, Framing, Limits, Server, ServerEvent};
 use rsnetwork::value::{Authority, Method, Target};
 
@@ -31,6 +31,11 @@ const BODY: BodyLimits = BodyLimits {
     trailer_fields: 4,
 };
 
+const TURN: TurnLimits = TurnLimits {
+    bytes: 1 << 20,
+    frames: 1 << 10,
+};
+
 const ENDPOINT: Endpoint = Endpoint {
     peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 50_000),
     local: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 80),
@@ -48,10 +53,11 @@ fn received(bytes: &[u8]) -> Received {
 
 fn queues() -> (Inbound, Outbound, Budget) {
     let limit = NonZeroUsize::new(8).unwrap();
+    let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
     (
-        Inbound::new(limit).unwrap(),
-        Outbound::new(limit).unwrap(),
-        Budget::new(NonZeroU64::new(1 << 20).unwrap()),
+        Inbound::new(limit, &budget).unwrap(),
+        Outbound::new(limit, &budget).unwrap(),
+        budget,
     )
 }
 
@@ -61,7 +67,7 @@ fn queues() -> (Inbound, Outbound, Budget) {
 #[test]
 fn a_chunked_body_reads_into_an_admitted_region_with_no_allocation() {
     let (mut inbound, mut outbound, budget) = queues();
-    let mut server = Server::new(LIMITS, BODY, &outbound, &budget).unwrap();
+    let mut server = Server::new(LIMITS, BODY, TURN, &outbound, &budget).unwrap();
     inbound
         .push(received(
             b"POST /up HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n",
@@ -137,7 +143,7 @@ fn a_body_is_complete_only_when_its_framing_says_so() {
         ),
     ] {
         let (mut inbound, mut outbound, budget) = queues();
-        let mut client = Client::new(LIMITS, BODY, &outbound, &budget).unwrap();
+        let mut client = Client::new(LIMITS, BODY, TURN, &outbound, &budget).unwrap();
         let head = Backing::from(Vec::with_capacity(256));
         let target = Target::new(b"/").unwrap();
         let authority = Authority::new(b"a.example").unwrap();

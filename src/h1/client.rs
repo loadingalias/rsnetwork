@@ -11,7 +11,7 @@ use super::join::{Join, Step, join};
 use super::write::write_request_head;
 use super::{Framing, ResponseHead, ResponseParser, RetainedResponse};
 use crate::body::Outcome;
-use crate::drive::{Blocked, Error, Inbound, Kind, Outbound, Progress, Turn};
+use crate::drive::{Blocked, Error, Inbound, Kind, Outbound, Progress, Turn, TurnLimits, Work};
 use crate::value::{Authority, Field, Method, Target};
 
 /// The client side of one HTTP/1.1 connection, with no I/O.
@@ -37,6 +37,10 @@ pub struct Client {
     join: Option<Join>,
     /// The capacity that a join waits for.
     capacity: Option<u64>,
+    /// The limits of each turn.
+    turn: TurnLimits,
+    /// The last turn stopped at a limit, and work remains.
+    more: bool,
     write: Write,
     read: ReadState,
     /// The method of the request in flight, as the framing of its response needs it: HEAD,
@@ -112,12 +116,19 @@ enum ReadState {
 }
 
 impl Client {
-    /// Makes the engine of one connection, for response heads within `limits` and bodies within
-    /// `body`.
+    /// Makes the engine of one connection, for response heads within `limits`, bodies within
+    /// `body`, and drives within `turn`.
     ///
     /// It makes its pool of chunk-size lines here: one slot for each entry of `outbound`, charged
-    /// to `budget`. Refuses with [`Kind::Overload`] when the budget or the memory refuses.
-    pub fn new(limits: Limits, body: BodyLimits, outbound: &Outbound, budget: &Budget) -> Result<Self, Error> {
+    /// to `budget`, which also pays for each join later. Refuses with [`Kind::Overload`], and
+    /// allocates nothing, when the budget or the memory refuses.
+    pub fn new(
+        limits: Limits,
+        body: BodyLimits,
+        turn: TurnLimits,
+        outbound: &Outbound,
+        budget: &Budget,
+    ) -> Result<Self, Error> {
         Ok(Self {
             limits,
             body,
@@ -126,6 +137,8 @@ impl Client {
             budget: budget.clone(),
             join: None,
             capacity: None,
+            turn,
+            more: false,
             write: Write::Idle,
             read: ReadState::Idle,
             method: Method::GET,
@@ -258,10 +271,11 @@ impl Client {
             Ok(Some(event)) => (Some(event), Progress::Pending),
             Ok(None) => (
                 None,
-                match (self.end, self.capacity.take()) {
-                    (Some(end), _) => Progress::Terminal(end),
-                    (None, Some(units)) => Progress::Blocked(Blocked::Capacity(units)),
-                    (None, None) => Progress::Blocked(Blocked::Input),
+                match (self.end, self.capacity.take(), core::mem::take(&mut self.more)) {
+                    (Some(end), _, _) => Progress::Terminal(end),
+                    (None, Some(units), _) => Progress::Blocked(Blocked::Capacity(units)),
+                    (None, None, true) => Progress::Pending,
+                    (None, None, false) => Progress::Blocked(Blocked::Input),
                 },
             ),
             Err(refusal) => {
@@ -281,6 +295,7 @@ impl Client {
 
     /// Reads the next event from `inbound`, or gives `None` when the engine waits.
     fn step(&mut self, inbound: &mut Inbound) -> Result<Option<ClientEvent>, ParseError> {
+        let mut work = Work::default();
         loop {
             if self.end.is_some() {
                 return Ok(None);
@@ -321,7 +336,7 @@ impl Client {
                 ReadState::Body(reader) => reader,
             };
             let draining = reader.draining();
-            let read = match reader.read(inbound, &self.budget) {
+            let read = match reader.read(inbound, &self.budget, &mut work) {
                 Ok(read) => read,
                 // A body that breaks its framing ends as malformed, and then the connection ends.
                 Err(refusal) => {
@@ -332,6 +347,11 @@ impl Client {
             };
             match read {
                 Read::Data(data) if !draining => return Ok(Some(ClientEvent::Data(data))),
+                // A turn stops at its limits between two steps, and the next turn goes on.
+                Read::Data(_) | Read::Again if work.reached(&self.turn) => {
+                    self.more = true;
+                    return Ok(None);
+                }
                 Read::Data(_) | Read::Again => {}
                 // A body that the close delimits is complete at the end of input.
                 Read::End(trailers) => {

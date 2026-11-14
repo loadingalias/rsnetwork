@@ -7,7 +7,7 @@ use core::num::{NonZeroU64, NonZeroUsize};
 
 use rsnetwork::body::Outcome;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
-use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Progress, Received};
+use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Progress, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
 use rsnetwork::value::{Field, Status};
 use rstypes::capacity::Budget;
@@ -29,6 +29,11 @@ const BODY: BodyLimits = BodyLimits {
     extension_bytes: 64,
     trailer_bytes: 256,
     trailer_fields: 4,
+};
+
+const TURN: TurnLimits = TurnLimits {
+    bytes: 1 << 20,
+    frames: 1 << 10,
 };
 
 const ENDPOINT: Endpoint = Endpoint {
@@ -82,11 +87,19 @@ impl Host {
         Self::with(body, &Budget::new(NonZeroU64::new(1 << 20).unwrap()))
     }
 
+    /// A host whose engine charges `budget`. The queues have a budget of their own, so a test of
+    /// `budget` sees only the charges of the engine.
     fn with(body: BodyLimits, budget: &Budget) -> Self {
-        let outbound = Outbound::new(NonZeroUsize::new(8).unwrap()).unwrap();
+        Self::turns(body, TURN, budget)
+    }
+
+    fn turns(body: BodyLimits, turn: TurnLimits, budget: &Budget) -> Self {
+        let queues = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+        let limit = NonZeroUsize::new(8).unwrap();
+        let outbound = Outbound::new(limit, &queues).unwrap();
         Self {
-            inbound: Inbound::new(NonZeroUsize::new(8).unwrap()).unwrap(),
-            server: Server::new(LIMITS, body, &outbound, budget).unwrap(),
+            inbound: Inbound::new(limit, &queues).unwrap(),
+            server: Server::new(LIMITS, body, turn, &outbound, budget).unwrap(),
             outbound,
         }
     }

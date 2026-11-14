@@ -23,15 +23,18 @@
 //!
 //! ```
 //! use core::net::{Ipv4Addr, SocketAddr};
-//! use core::num::NonZeroUsize;
+//! use core::num::{NonZeroU64, NonZeroUsize};
 //!
 //! use rsnetwork::buffer::{Buffer as _, Lease};
+//! use rsnetwork::capacity::Budget;
 //! use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received};
 //!
+//! // One budget pays for each queue of the connection.
+//! let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
 //! let limit = NonZeroUsize::new(8).expect("not zero");
 //!
 //! // The host receives a region and queues it for the engine.
-//! let mut inbound = Inbound::new(limit)?;
+//! let mut inbound = Inbound::new(limit, &budget)?;
 //! let endpoint = Endpoint {
 //!     peer: SocketAddr::from((Ipv4Addr::new(192, 0, 2, 7), 50_000)),
 //!     local: SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 8080)),
@@ -47,7 +50,7 @@
 //! assert_eq!(inbound.front().map(|received| received.region.bytes()), Some(&b"PI"[..]));
 //!
 //! // The engine queues its output. The host sends it, and the transport accepts 3 bytes.
-//! let mut outbound = Outbound::new(limit)?;
+//! let mut outbound = Outbound::new(limit, &budget)?;
 //! outbound.push(Lease::from(b"PONG\r\n".to_vec())).expect("the queue has space");
 //! let output = outbound.submit().expect("an output is ready");
 //! outbound.ack(output.id, 3)?;
@@ -64,6 +67,7 @@ use core::num::NonZeroUsize;
 use std::collections::VecDeque;
 
 use rstypes::buffer::{Buffer as _, Lease};
+use rstypes::capacity::{Budget, Permit};
 use rstypes::time::Deadline;
 
 /// The ECN codepoint of a received datagram (RFC 3168, section 5).
@@ -125,21 +129,27 @@ impl fmt::Debug for Received {
 /// new owner.
 ///
 /// The queue holds at most the number of regions that [`new`](Self::new) sets, and it reserves
-/// their space there. Thus a push never allocates.
+/// their space there, charged to the caller's budget. Thus a push never allocates.
 pub struct Inbound {
     regions: VecDeque<Received>,
     limit: usize,
     /// The transport gives no more bytes.
     ended: bool,
+    /// The charge of the queue memory.
+    _charge: Permit,
 }
 
 impl Inbound {
-    /// Makes a queue for at most `limit` regions, and reserves their space.
-    pub fn new(limit: NonZeroUsize) -> Result<Self, Error> {
+    /// Makes a queue for at most `limit` regions. It charges their memory to `budget` before it
+    /// allocates it, and refuses with [`Kind::Overload`], with no allocation, when the budget
+    /// cannot pay.
+    pub fn new(limit: NonZeroUsize, budget: &Budget) -> Result<Self, Error> {
+        let (regions, charge) = reserve(limit, budget)?;
         Ok(Self {
-            regions: reserve(limit)?,
+            regions,
             limit: limit.get(),
             ended: false,
+            _charge: charge,
         })
     }
 
@@ -243,10 +253,12 @@ impl fmt::Debug for Output {
 /// did not accept, at the same address, and the next output gives them with no copy.
 ///
 /// The queue holds at most the number of regions that [`new`](Self::new) sets, and it reserves
-/// their space there. Thus a push never allocates.
+/// their space there, charged to the caller's budget. Thus a push never allocates.
 pub struct Outbound {
     regions: VecDeque<Lease>,
     limit: usize,
+    /// The charge of the queue memory.
+    _charge: Permit,
     /// The identifier of the next output.
     next: u64,
     /// The output that has no acknowledgement yet, and the length of its region.
@@ -254,11 +266,15 @@ pub struct Outbound {
 }
 
 impl Outbound {
-    /// Makes a queue for at most `limit` regions, and reserves their space.
-    pub fn new(limit: NonZeroUsize) -> Result<Self, Error> {
+    /// Makes a queue for at most `limit` regions. It charges their memory to `budget` before it
+    /// allocates it, and refuses with [`Kind::Overload`], with no allocation, when the budget
+    /// cannot pay.
+    pub fn new(limit: NonZeroUsize, budget: &Budget) -> Result<Self, Error> {
+        let (regions, charge) = reserve(limit, budget)?;
         Ok(Self {
-            regions: reserve(limit)?,
+            regions,
             limit: limit.get(),
+            _charge: charge,
             next: 0,
             outstanding: None,
         })
@@ -340,12 +356,22 @@ impl fmt::Debug for Outbound {
 }
 
 /// Makes an empty queue with space reserved for `limit` items.
-fn reserve<T>(limit: NonZeroUsize) -> Result<VecDeque<T>, Error> {
+/// Makes an empty queue with space for `limit` items. It charges that memory to `budget` before
+/// it allocates, and the permit pays for the queue until it drops.
+fn reserve<T>(limit: NonZeroUsize, budget: &Budget) -> Result<(VecDeque<T>, Permit), Error> {
+    let bytes = limit
+        .get()
+        .checked_mul(size_of::<T>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| Error::new(Kind::Overload, "the queue is too large"))?;
+    let charge = budget
+        .reserve(bytes)
+        .map_err(|_| Error::new(Kind::Overload, "the budget refused the queue"))?;
     let mut queue = VecDeque::new();
     queue
         .try_reserve_exact(limit.get())
         .map_err(|_| Error::new(Kind::Overload, "the memory for the queue is not available"))?;
-    Ok(queue)
+    Ok((queue, charge))
 }
 
 /// A refused acknowledgement. It changed nothing.
@@ -393,6 +419,40 @@ pub struct Turn {
     /// also if nothing else arrives. A new or earlier deadline replaces the host's wait on the
     /// same turn.
     pub deadline: Option<Deadline>,
+}
+
+/// The limits of the work of one drive, which the caller sets. One drive call is one turn.
+///
+/// An engine counts its work in each turn. At a limit, it stops between two steps and gives
+/// [`Progress::Pending`]: work remains, so drive again with no wait for input. An event ends the
+/// turn at once. A head or a trailer section that the engine starts to read in a turn ends in that
+/// turn, because its own limit bounds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TurnLimits {
+    /// The most received bytes that one turn reads: framing, discarded bytes, and body bytes.
+    pub bytes: u64,
+    /// The most frames that one turn decodes, for example the chunks of an HTTP/1.1 body.
+    pub frames: usize,
+}
+
+/// The work of an engine in one turn.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Work {
+    bytes: u64,
+    frames: usize,
+}
+
+impl Work {
+    /// Counts `bytes` received bytes and `frames` frames.
+    pub(crate) fn add(&mut self, bytes: usize, frames: usize) {
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        self.frames = self.frames.saturating_add(frames);
+    }
+
+    /// Whether the work reached a limit of `limits`.
+    pub(crate) fn reached(&self, limits: &TurnLimits) -> bool {
+        self.bytes >= limits.bytes || self.frames >= limits.frames
+    }
 }
 
 /// What an engine needs after a drive.

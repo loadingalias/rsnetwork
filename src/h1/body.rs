@@ -12,7 +12,7 @@ use super::join::{Join, Step, join};
 use super::write::{begin_chunk, last_chunk};
 use super::{ChunkDecoder, ChunkStep, Framing, WriteError};
 use crate::body::Trailers;
-use crate::drive::{Error, Inbound, Kind, Outbound};
+use crate::drive::{Error, Inbound, Kind, Outbound, Work};
 use crate::value::Field;
 
 /// The size of a slot of the chunk-size line pool: 14 hexadecimal digits and CR LF.
@@ -108,7 +108,9 @@ impl BodyReader {
 
     /// Reads the next part of the body at the front of `inbound`. A trailer section that
     /// continues in the next region joins into one region, charged to `budget`.
-    pub(super) fn read(&mut self, inbound: &mut Inbound, budget: &Budget) -> Result<Read, ParseError> {
+    ///
+    /// It counts the bytes that it reads and the chunks that it decodes in `work`.
+    pub(super) fn read(&mut self, inbound: &mut Inbound, budget: &Budget, work: &mut Work) -> Result<Read, ParseError> {
         if matches!(self.state, State::Done) {
             return Ok(Read::Wait);
         }
@@ -142,18 +144,26 @@ impl BodyReader {
             State::Length(left) => {
                 let len = usize::try_from(*left).map_or(available, |left| left.min(available));
                 *left -= len as u64;
+                work.add(len, 0);
                 self.take(inbound, &region, 0, len)
             }
-            State::Close => self.take(inbound, &region, 0, available),
+            State::Close => {
+                work.add(available, 0);
+                self.take(inbound, &region, 0, available)
+            }
             State::Chunked(decoder) => match decoder.decode(region.bytes())? {
                 // The trailer section continues in the next region.
                 ChunkStep::More => self.trailers(inbound, budget),
-                ChunkStep::Data { framing, data } => self.take(inbound, &region, framing, data),
+                ChunkStep::Data { framing, data } => {
+                    work.add(framing + data, usize::from(data > 0));
+                    self.take(inbound, &region, framing, data)
+                }
                 ChunkStep::End { len, trailers } => {
                     let lines = (!trailers.is_empty())
                         .then(|| region.view(trailers))
                         .flatten()
                         .map(|lines| Trailers { lines });
+                    work.add(len, 0);
                     inbound.consume(len).map_err(|_| ParseError::Framing)?;
                     self.state = State::Done;
                     Ok(Read::End(lines))

@@ -37,7 +37,7 @@ use core::num::{NonZeroU64, NonZeroUsize};
 use rsnetwork::body::Outcome;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
-use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received};
+use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
 use rsnetwork::value::{Field, Status};
 
@@ -51,8 +51,9 @@ let body = BodyLimits {
 };
 let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
 let queue = NonZeroUsize::new(16).expect("not zero");
-let (mut inbound, mut outbound) = (Inbound::new(queue)?, Outbound::new(queue)?);
-let mut server = Server::new(limits, body, &outbound, &budget)?;
+let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
+let (mut inbound, mut outbound) = (Inbound::new(queue, &budget)?, Outbound::new(queue, &budget)?);
+let mut server = Server::new(limits, body, turn, &outbound, &budget)?;
 
 // The transport received a request, and the host queues it.
 let endpoint = Endpoint {
@@ -95,7 +96,7 @@ assert_eq!(sent, b"HTTP/1.1 201 \r\nContent-Type: text/plain\r\ncontent-length: 
 
 ## Serve requests
 
-1. Make one `Server` for each connection with `Server::new(limits, body, &outbound, &budget)`.
+1. Make one `Server` for each connection with `Server::new(limits, body, turn, &outbound, &budget)`.
    It makes its pool of chunk-size lines there: one 16-byte slot for each `Outbound` entry,
    charged to the budget.
 2. Call `server.drive(&mut inbound, &mut outbound)` until it gives no event. Drive again when more
@@ -122,7 +123,7 @@ and change nothing. Acknowledge output, then call again. A call in the wrong sta
 
 ## Send requests
 
-1. Make one `Client` for each connection with `Client::new(limits, body, &outbound, &budget)`.
+1. Make one `Client` for each connection with `Client::new(limits, body, turn, &outbound, &budget)`.
 2. Call `client.request(outbound, method, target, authority, fields, framing, region)`. The engine
    writes `authority` as the Host field, the first field line. Do not give a Host field yourself.
 3. Send the body with `send`, and end it with `finish` or `finish_with_trailers`. Call `finish`
@@ -158,6 +159,8 @@ and change nothing. Acknowledge output, then call again. A call in the wrong sta
 | `extension_bytes` | The chunk extensions of one chunk line |
 | `trailer_bytes` | The bytes of a trailer section |
 | `trailer_fields` | The number of trailer field lines |
+
+`TurnLimits` bounds the work of each drive call: see [limits](limits.md).
 
 ## Framing and connection rules
 
