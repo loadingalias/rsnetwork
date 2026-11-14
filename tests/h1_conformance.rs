@@ -257,7 +257,6 @@ fn fetch(fetch: &Fetch, schedule: Schedule) -> Run {
     let (mut seen, mut owed) = (Seen::default(), false);
     let input = &fetch.vector.input;
     let (sent, steps, end) = run(connection, input, &available, schedule, |connection, event| {
-        let gave = event.is_some();
         match event {
             Some(ClientEvent::Response(response)) => {
                 let head = response.head();
@@ -272,11 +271,7 @@ fn fetch(fetch: &Fetch, schedule: Schedule) -> Run {
             Some(ClientEvent::Informational(_) | ClientEvent::Handoff) => {
                 panic!("no vector has an informational response or a protocol change")
             }
-            // The connection carries the next request after the drive that ends the exchange.
             None => {}
-        }
-        if gave {
-            return false;
         }
         let (client, outbound) = connection.parts();
         let Some(&(method, length)) = requests.as_slice().first() else {

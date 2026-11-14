@@ -154,7 +154,9 @@ impl Client {
     /// The engine writes `authority` as the Host field, the first field line (RFC 9112, section
     /// 3.2): give the authority of the target URI. `framing` gives the body: `Length(n)` or
     /// `Chunked`. A request has no close framing. Refuses with [`Kind::Misuse`] while an exchange
-    /// is in flight, after the connection ended, and when `fields` has a Host field.
+    /// is in flight, after the connection ended, and when `fields` has a Host field. When the
+    /// connection persists, the next request can follow at once, in answer to the end of the
+    /// response.
     #[expect(
         clippy::too_many_arguments,
         reason = "each argument is one independent fact of the request, and a struct of them would only repeat these parameters"
@@ -219,6 +221,7 @@ impl Client {
     pub fn finish(&mut self, outbound: &mut Outbound) -> Result<(), Error> {
         self.writer.finish(outbound)?;
         self.write = Write::Done;
+        self.settle();
         Ok(())
     }
 
@@ -231,6 +234,7 @@ impl Client {
     ) -> Result<(), Error> {
         self.writer.finish_with_trailers(outbound, trailers, region)?;
         self.write = Write::Done;
+        self.settle();
         Ok(())
     }
 
@@ -243,6 +247,25 @@ impl Client {
             self.writer.cancel();
             self.write = Write::Cancelled;
             self.close = true;
+            self.settle();
+        }
+    }
+
+    /// Ends the exchange when its request and its response are both complete: the connection
+    /// carries the next request, or it closes (RFC 9112, section 9.3). Thus the application can
+    /// send the next request in answer to the end of the response.
+    fn settle(&mut self) {
+        if !matches!(self.read, ReadState::Done) {
+            return;
+        }
+        match self.write {
+            Write::Done if !self.close => {
+                self.write = Write::Idle;
+                self.read = ReadState::Idle;
+            }
+            Write::Done | Write::Cancelled => self.end = Some(Ok(())),
+            // The response came before the end of the request body.
+            Write::Body | Write::Idle => {}
         }
     }
 
@@ -315,18 +338,8 @@ impl Client {
                     return Ok(None);
                 }
                 ReadState::Head => return self.head(inbound),
-                ReadState::Done => {
-                    match self.write {
-                        Write::Done if !self.close => {
-                            self.write = Write::Idle;
-                            self.read = ReadState::Idle;
-                        }
-                        Write::Done | Write::Cancelled => self.end = Some(Ok(())),
-                        // The response came before the end of the request body.
-                        Write::Body | Write::Idle => return Ok(None),
-                    }
-                    continue;
-                }
+                // The response came before the end of the request body, which ends the exchange.
+                ReadState::Done => return Ok(None),
                 // The new protocol starts after the end of the request.
                 ReadState::Switch if self.write == Write::Done => {
                     self.end = Some(Ok(()));
@@ -356,6 +369,7 @@ impl Client {
                 // A body that the close delimits is complete at the end of input.
                 Read::End(trailers) => {
                     self.read = ReadState::Done;
+                    self.settle();
                     if !draining {
                         return Ok(Some(ClientEvent::End(Outcome::Complete(trailers))));
                     }

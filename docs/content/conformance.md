@@ -60,7 +60,7 @@ wrong shows it as a request that the application must not see.
 ## How each vector runs
 
 The test application answers each complete request with `200` and no body. A client sends its
-next request after the drive that ends the exchange, and the bytes of each response arrive only
+next request in answer to the end of the response, and the bytes of each response arrive only
 after its request, as from a server. The output queue has two entries, so pipelined requests meet
 output backpressure.
 

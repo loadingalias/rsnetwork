@@ -135,7 +135,8 @@ and change nothing. Acknowledge output, then call again. A call in the wrong sta
    `ClientEvent::Informational(head)` for each 1xx response, then `ClientEvent::Response(head)`,
    `ClientEvent::Data(data)`, and `ClientEvent::End(outcome)`. The [body page](body.md) explains
    the outcomes.
-5. Send the next request after the end of the response. The client sends one request at a time.
+5. Send the next request after the end of the response, also in direct answer to the `End` event.
+   The client sends one request at a time.
 
 | Client call | Result |
 | --- | --- |
