@@ -30,7 +30,7 @@ CONSTANTS
     Bug      \* "none", or the known-bad variant.
 
 Bugs == {"none", "ReleaseAtAck", "WholeRelease", "DeadlineRelease",
-         "ChargePerCopy", "RefusalLeak", "UnknownAck"}
+         "ChargePerCopy", "RefusalLeak", "UnknownAck", "DoubleRelease"}
 
 ASSUME
     /\ Slices \in Nat \ {0}
@@ -77,11 +77,11 @@ Held ==
     \/ \E s \in S : st[s] = "store"
     \/ \E s \in S, c \in C : InKernel(s, c)
 
-\* The release hook runs in the step that drops the last view. A bug charges
-\* the backing again with `charged`. Each action ends with it, after every
-\* other update.
-Settle(charged) ==
-    LET hook == IF Views > 0 /\ Views' = 0 THEN 1 ELSE 0
+\* The release hook runs in the step that drops the last view. A bug runs it
+\* `extra` more times, or charges the backing again with `charged`. Each
+\* action ends with it, after every other update.
+Settle(extra, charged) ==
+    LET hook == (IF Views > 0 /\ Views' = 0 THEN 1 ELSE 0) + extra
     IN /\ rel' = rel + hook
        /\ charge' = charge + charged - hook
 
@@ -114,7 +114,7 @@ Accept(j) ==
     /\ sv' = sv \cup (wr .. j)
     /\ wv' = (j < Slices /\ Bug # "WholeRelease")
     /\ ev' = "accept"
-    /\ Settle(0)
+    /\ Settle(0, 0)
 
 \* The writer drops its unaccepted suffix: a cancelled write, or a caller
 \* that keeps no use for it after the stream ended.
@@ -125,7 +125,7 @@ WriterDrop ==
     /\ wgone' = TRUE
     /\ wv' = FALSE
     /\ ev' = "drop"
-    /\ Settle(0)
+    /\ Settle(0, 0)
 
 \* The protocol sends copy c of slice s with a new packet number: the first
 \* copy, or a retransmission after it declared copy c - 1 lost, which can be
@@ -142,13 +142,13 @@ Send(s, c) ==
           /\ dv' = dv \cup {<<s, c>>}
           /\ xv' = xv
           /\ ev' = IF k[s][c] = "ref" THEN "retry" ELSE "send"
-          /\ Settle(IF Bug = "ChargePerCopy" THEN 1 ELSE 0)
+          /\ Settle(0, IF Bug = "ChargePerCopy" THEN 1 ELSE 0)
        \/ /\ k[s][c] = "none"
           /\ k' = [k EXCEPT ![s][c] = "ref"]
           /\ dv' = dv
           /\ xv' = IF Bug = "RefusalLeak" THEN xv + 1 ELSE xv
           /\ ev' = "refuse"
-          /\ Settle(0)
+          /\ Settle(0, 0)
 
 \* The send result of copy c. With a notice armed, the driver keeps its view
 \* for the notice. Without one, the result is terminal and the view drops.
@@ -158,11 +158,11 @@ Result(s, c) ==
     /\ \/ /\ k' = [k EXCEPT ![s][c] = "zc"]
           /\ dv' = dv
           /\ ev' = "result"
-          /\ Settle(0)
+          /\ Settle(0, 0)
        \/ /\ k' = [k EXCEPT ![s][c] = "res"]
           /\ dv' = dv \ {<<s, c>>}
           /\ ev' = "result"
-          /\ Settle(IF Bug = "ChargePerCopy" THEN -1 ELSE 0)
+          /\ Settle(0, IF Bug = "ChargePerCopy" THEN -1 ELSE 0)
 
 \* The zero-copy notice of copy c: the kernel no longer reads the pages, and
 \* the driver drops its view.
@@ -172,7 +172,7 @@ Notice(s, c) ==
     /\ k' = [k EXCEPT ![s][c] = "ntc"]
     /\ dv' = dv \ {<<s, c>>}
     /\ ev' = "notice"
-    /\ Settle(IF Bug = "ChargePerCopy" THEN -1 ELSE 0)
+    /\ Settle(0, IF Bug = "ChargePerCopy" THEN -1 ELSE 0)
 
 \* An acknowledgement frame names the packet number of copy c of slice s.
 \* The peer can repeat it, acknowledge another copy of a slice that it
@@ -190,11 +190,12 @@ PeerAck(s, c) ==
        /\ ev' = CASE ~known -> "unknown"
                   [] st[s] = "store" -> "ack"
                   [] OTHER -> "repeat"
-       /\ Settle(0)
+       /\ Settle(0, 0)
 
 \* The stream ends: a cancellation, a request deadline, or a close. It stops
 \* new acceptance and new sends, and the store drops each slice that it kept.
 \* Each kernel use keeps its view until its own terminal event.
+\* DoubleRelease: the close runs the hook for a backing that no view holds.
 End(why) ==
     /\ end = "none"
     /\ UNCHANGED <<wr, wgone, k, wv, xv>>
@@ -203,7 +204,7 @@ End(why) ==
     /\ sv' = {}
     /\ dv' = IF why = "deadline" /\ Bug = "DeadlineRelease" THEN {} ELSE dv
     /\ ev' = "end"
-    /\ Settle(0)
+    /\ Settle(IF why = "close" /\ Bug = "DoubleRelease" /\ Views = 0 THEN 1 ELSE 0, 0)
 
 Next ==
     \/ \E j \in S : Accept(j)
@@ -238,8 +239,12 @@ AliveWhileHeld == Held => rel = 0
 \* release.
 ChargedOnce == charge = IF rel = 0 THEN 1 ELSE 0
 
-\* The release runs once, in the step that ends the last obligation.
-ReleaseOnce == rel <= 1 /\ (~Held => rel = 1)
+\* The release runs at most once.
+ReleaseAtMostOnce == rel <= 1
+
+\* The release has run when no obligation remains, so it runs in the step that
+\* ends the last obligation.
+ReleasedAfterLast == ~Held => rel = 1
 
 \* After a partial acceptance, the writer keeps a view of the suffix that the
 \* protocol has not accepted, until the writer drops it.

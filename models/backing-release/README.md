@@ -86,8 +86,12 @@ Each known-bad variant still fails its own property under all of them (see the e
 
 1. One backing. This bound is proved, not argued. Each step changes the state of one backing.
    `End` changes each backing of the stream, and the one-backing model allows `End` in each
-   state. No property reads two backings. So each behavior with more backings projects to a
-   behavior of this model for each backing, and each property holds for each projection. A
+   state. Backings can share one budget, so the charge of one backing can make the driver
+   refuse a submission of another. The model makes each refusal a free choice of the
+   environment: `Send` can refuse each first submission of a copy in each state, with no
+   budget guard. So a refusal that another backing's charge causes adds no behavior to the
+   projection. No property reads two backings. So each behavior with more backings projects to
+   a behavior of this model for each backing, and each property holds for each projection. A
    datagram that gathers views of two backings is a limit (below).
 2. One datagram carries one slice. A datagram that carries several slices of the backing maps to
    one copy of each slice, whose events come in consecutive steps. Its one driver view exists
@@ -127,7 +131,8 @@ builds, and a change to either side reopens this check.
 | --- | --- | --- |
 | `AliveWhileHeld` | Each retained reference and kernel obligation keeps the backing alive | Invariant |
 | `ChargedOnce` | The budget charges the backing once while it is alive, and not after its release | Invariant |
-| `ReleaseOnce` | Release occurs once after the last obligation ends | Invariant |
+| `ReleaseAtMostOnce` | Release occurs once: the hook never runs a second time | Invariant |
+| `ReleasedAfterLast` | Release occurs after the last obligation ends: when no obligation remains, the hook has run. It runs in the step that drops the last view, so a leak shows as a violation | Invariant |
 | `SuffixKept` | Partial acceptance preserves the suffix: the writer keeps a view of each slice that the protocol has not accepted, until the writer drops it | Invariant |
 | `AckKeepsOwnership` | Repeated or unknown acknowledgements change no ownership: such a step changes no variable except `ev` | Action property |
 
@@ -163,7 +168,8 @@ property, at the declared bounds.
 | `WholeRelease_bad` | A partial acceptance releases the whole region, also the writer's suffix | `SuffixKept` |
 | `DeadlineRelease_bad` | A request deadline drops the driver's views as if the kernel had released them | `AliveWhileHeld` |
 | `ChargePerCopy_bad` | The driver charges the backing again for each accepted copy, until its terminal event | `ChargedOnce` |
-| `RefusalLeak_bad` | The binding keeps the view of a refused submission, so no release follows the last obligation | `ReleaseOnce` |
+| `RefusalLeak_bad` | The binding keeps the view of a refused submission, so no release follows the last obligation | `ReleasedAfterLast` |
+| `DoubleRelease_bad` | A close runs the release hook again for a backing that no view holds | `ReleaseAtMostOnce` |
 | `UnknownAck_bad` | An acknowledgement of a number that the sender never sent ends the store's retention of its slice | `AckKeepsOwnership` |
 
 ## Reachability
@@ -216,6 +222,8 @@ The shortest counterexamples, as actions and observations:
 - `ChargePerCopy_bad`: `Accept(2)`; `Send(1,1)`. The budget holds two charges of one backing.
 - `RefusalLeak_bad`: `Accept(2)`; `Send(1,1)` (refused); `End("cancel")`. No obligation
   remains, and the release did not run.
+- `DoubleRelease_bad`: `WriterDrop` (the release runs); `End("close")`. The hook runs a
+  second time.
 - `UnknownAck_bad`: `Accept(1)`; `Accept(2)`; `PeerAck(1,1)` for a number that was never sent.
   Slice 1 leaves the store, so the store never sends it.
 
@@ -224,22 +232,19 @@ The shortest counterexamples, as actions and observations:
 Run on 2026-11-13 on this Mac: macOS 27.2.1 (26B131), Darwin 27.2.0 arm64, MacBookPro18,3, 10
 CPUs. The tools were temurin-jre `21.0.13+9`, tla2tools `1.8.0+d8fb231de4e4`, and Apalache
 `0.62.4`. TLC ran each profile with the default memory settings. The command printed the model
-digest `sha256:6608ad2cacf61c9c6dca1cefc74adbe30bc5f4e055575c939f71e79915ac08ba` (20 files).
+digest `sha256:5f1d0c7861012a685f7d7f833990080261e20bb6bed400924524bd700b5613ed` (21 files).
 
 ```sh
-cargo xtask model backing-release/BackingRelease.cfg
-cargo xtask model backing-release/BackingRelease.Copies3.cfg
-cargo xtask model backing-release/BackingRelease.Slices3.cfg
-cargo xtask model <each _bad and _reach profile>
+cargo xtask model backing-release
 ```
 
 | Profile | Verdict | Distinct states | Depth | Time |
 | --- | --- | ---: | ---: | ---: |
-| `BackingRelease.cfg` | ok: complete, 0 states left on the queue | 42,357 | 18 | 1.34 s |
-| `BackingRelease.Copies3.cfg` | ok: complete, 0 states left on the queue | 776,789 | 24 | 11.34 s |
-| `BackingRelease.Slices3.cfg` | ok: complete, 0 states left on the queue | 2,384,599 | 25 | 46.10 s |
+| `BackingRelease.cfg` | ok: complete, 0 states left on the queue | 42,357 | 18 | 0.99 s |
+| `BackingRelease.Copies3.cfg` | ok: complete, 0 states left on the queue | 776,789 | 24 | 16.96 s |
+| `BackingRelease.Slices3.cfg` | ok: complete, 0 states left on the queue | 2,384,599 | 26 | 18.00 s |
 
-Each of the six known-bad profiles violated only its own property, in 0.50 to 0.93 seconds. Each
-of the ten witnesses reached its target, in 0.44 to 0.72 seconds. Each profile fits the one-hour
+Each of the seven known-bad profiles violated only its own property, in 0.41 to 1.04 seconds.
+Each of the ten witnesses reached its target, in 0.39 to 1.32 seconds. Each profile fits the one-hour
 budget on this host, so no evidence host was used. This is a complete bounded model result under
 the assumptions and reductions above. It proves no Rust code.
