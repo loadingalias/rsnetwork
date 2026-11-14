@@ -392,3 +392,24 @@ fn a_tunnel_or_an_upgrade_hands_off_exactly_the_bytes_after_the_response_head() 
     let (_, progress) = host.drive();
     assert!(terminal(&progress, Kind::Malformed), "{progress:?}");
 }
+
+/// A response head that continues across received regions, cut at each position, gives the same
+/// response and body.
+#[test]
+fn a_response_head_across_regions_gives_the_same_response() {
+    const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    for cut in 1..RESPONSE.len() - 2 {
+        let mut host = Host::new();
+        host.request(b"GET", b"/a", Framing::Length(0), b"");
+        host.receive(&RESPONSE[..cut]);
+        host.receive(&RESPONSE[cut..]);
+        assert_eq!(
+            host.drive(),
+            (
+                vec![Seen::Response(200), Seen::Data(b"ok".to_vec()), Seen::End(Vec::new())],
+                WAIT
+            ),
+            "cut at {cut}"
+        );
+    }
+}

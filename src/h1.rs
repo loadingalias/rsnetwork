@@ -62,6 +62,7 @@ mod body;
 mod chunked;
 mod client;
 mod head;
+mod join;
 mod request;
 mod response;
 mod server;

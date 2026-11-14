@@ -8,6 +8,7 @@ use rstypes::buffer::{Backing, Buffer as _, Lease, Pool, WriteLoan};
 use rstypes::capacity::Budget;
 
 use super::head::{BodyLimits, Fields, Limits, ParseError};
+use super::join::{Join, Step, join};
 use super::write::{begin_chunk, last_chunk};
 use super::{ChunkDecoder, ChunkStep, Framing, WriteError};
 use crate::drive::{Error, Inbound, Kind, Outbound};
@@ -52,15 +53,30 @@ pub(super) enum Read {
     Overdrawn,
     /// The input ended before the end of the body.
     Truncated,
+    /// A trailer section continues in the next region, and the budget cannot pay for its join of
+    /// this many bytes now.
+    Capacity(u64),
 }
 
 /// Reads one body from the received regions, with no copy.
-#[derive(Debug)]
 pub(super) struct BodyReader {
     state: State,
     /// The body bytes that the engine can still read and discard. `None` while the application
     /// reads the body.
     drain: Option<u64>,
+    /// The largest trailer section, which is the limit of its join.
+    trailer_bytes: usize,
+    /// The join of a trailer section that continues in the next region.
+    join: Option<Join>,
+}
+
+impl fmt::Debug for BodyReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BodyReader")
+            .field("state", &self.state)
+            .field("drain", &self.drain)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The place of the reader in the body.
@@ -87,6 +103,8 @@ impl BodyReader {
                 Framing::Close => State::Close,
             },
             drain: None,
+            trailer_bytes: body.trailer_bytes,
+            join: None,
         }
     }
 
@@ -109,10 +127,14 @@ impl BodyReader {
         self.drain.is_some()
     }
 
-    /// Reads the next part of the body at the front of `inbound`.
-    pub(super) fn read(&mut self, inbound: &mut Inbound) -> Result<Read, ParseError> {
+    /// Reads the next part of the body at the front of `inbound`. A trailer section that
+    /// continues in the next region joins into one region, charged to `budget`.
+    pub(super) fn read(&mut self, inbound: &mut Inbound, budget: &Budget) -> Result<Read, ParseError> {
         if matches!(self.state, State::Done) {
             return Ok(Read::Wait);
+        }
+        if self.join.is_some() {
+            return self.trailers(inbound, budget);
         }
         if matches!(self.state, State::Close) && self.draining() {
             return Ok(Read::Overdrawn);
@@ -146,8 +168,7 @@ impl BodyReader {
             State::Close => self.take(inbound, &region, 0, available),
             State::Chunked(decoder) => match decoder.decode(region.bytes())? {
                 // The trailer section continues in the next region.
-                ChunkStep::More if inbound.ended() => Ok(Read::Truncated),
-                ChunkStep::More => Ok(Read::Wait),
+                ChunkStep::More => self.trailers(inbound, budget),
                 ChunkStep::Data { framing, data } => self.take(inbound, &region, framing, data),
                 ChunkStep::End { len, trailers } => {
                     let lines = (!trailers.is_empty())
@@ -161,6 +182,35 @@ impl BodyReader {
             },
             State::Done => Ok(Read::Wait),
         }
+    }
+
+    /// Joins the trailer section at the front of `inbound`, which continues in the next region.
+    fn trailers(&mut self, inbound: &mut Inbound, budget: &Budget) -> Result<Read, ParseError> {
+        let State::Chunked(decoder) = &mut self.state else {
+            return Ok(Read::Wait);
+        };
+        let mut lines = 0..0;
+        let step = join(&mut self.join, budget, self.trailer_bytes, inbound, |bytes| {
+            match decoder.decode(bytes)? {
+                ChunkStep::End { len, trailers } => {
+                    lines = trailers;
+                    Ok(Some(len))
+                }
+                ChunkStep::More => Ok(None),
+                // The decoder is in the trailer section, which has no data.
+                ChunkStep::Data { .. } => Err(ParseError::Framing),
+            }
+        })?;
+        Ok(match step {
+            Step::Complete(region) => {
+                self.state = State::Done;
+                let trailers = (!lines.is_empty()).then(|| region.view(lines)).flatten();
+                Read::End(trailers.map(|lines| Trailers { lines }))
+            }
+            Step::Wait if inbound.ended() => Read::Truncated,
+            Step::Wait => Read::Wait,
+            Step::Capacity(units) => Read::Capacity(units),
+        })
     }
 
     /// Consumes `framing` bytes and then `len` body bytes of `region`, the front region of

@@ -7,8 +7,9 @@ use rstypes::capacity::Budget;
 
 use super::body::{BodyReader, BodyWriter, Read, Trailers, full, misuse, write_error};
 use super::head::{BodyLimits, Limits, ParseError};
+use super::join::{Join, Step, join};
 use super::write::write_request_head;
-use super::{Framing, ResponseParser, RetainedResponse};
+use super::{Framing, ResponseHead, ResponseParser, RetainedResponse};
 use crate::drive::{Blocked, Error, Inbound, Kind, Outbound, Progress, Turn};
 use crate::value::{Authority, Field, Method, Target};
 
@@ -20,14 +21,21 @@ use crate::value::{Authority, Field, Method, Target};
 /// queue and gives one [`ClientEvent`]. After the response, the connection carries the next
 /// request when the request and the response let it persist (RFC 9112, section 9.3).
 ///
-/// As the [`Server`](super::Server) does, the engine allocates nothing after
-/// [`new`](Self::new): the caller gives the region of each request head, and the size lines of
-/// chunks come from a pool of the engine.
+/// As for the [`Server`](super::Server), the caller gives the region of each request head, and
+/// the size lines of chunks come from a pool of the engine. The engine allocates after
+/// [`new`](Self::new) only to join a response head or trailer section that continues in the next
+/// region, and the budget pays for the join.
 pub struct Client {
     limits: Limits,
     body: BodyLimits,
     parser: ResponseParser,
     writer: BodyWriter,
+    /// The budget that pays for the pool and for each join.
+    budget: Budget,
+    /// The join of a response head that continues in the next region.
+    join: Option<Join>,
+    /// The capacity that a join waits for.
+    capacity: Option<u64>,
     write: Write,
     read: ReadState,
     /// The method of the request in flight, as the framing of its response needs it: HEAD,
@@ -111,6 +119,9 @@ impl Client {
             body,
             parser: ResponseParser::new(limits),
             writer: BodyWriter::new(outbound, budget)?,
+            budget: budget.clone(),
+            join: None,
+            capacity: None,
             write: Write::Idle,
             read: ReadState::Idle,
             method: Method::GET,
@@ -243,9 +254,10 @@ impl Client {
             Ok(Some(event)) => (Some(event), Progress::Pending),
             Ok(None) => (
                 None,
-                match self.end {
-                    Some(end) => Progress::Terminal(end),
-                    None => Progress::Blocked(Blocked::Input),
+                match (self.end, self.capacity.take()) {
+                    (Some(end), _) => Progress::Terminal(end),
+                    (None, Some(units)) => Progress::Blocked(Blocked::Capacity(units)),
+                    (None, None) => Progress::Blocked(Blocked::Input),
                 },
             ),
             Err(refusal) => {
@@ -305,7 +317,7 @@ impl Client {
                 ReadState::Body(reader) => reader,
             };
             let draining = reader.draining();
-            match reader.read(inbound)? {
+            match reader.read(inbound, &self.budget)? {
                 Read::Data(data) if !draining => return Ok(Some(ClientEvent::Data(data))),
                 Read::Data(_) | Read::Again => {}
                 Read::End(trailers) => {
@@ -319,54 +331,86 @@ impl Client {
                 Read::Truncated => {
                     self.end = Some(Err(Error::new(Kind::Partial, "the response body ended before its end")));
                 }
+                Read::Capacity(units) => {
+                    self.capacity = Some(units);
+                    return Ok(None);
+                }
             }
         }
     }
 
     /// Reads a response head from `inbound`.
     fn head(&mut self, inbound: &mut Inbound) -> Result<Option<ClientEvent>, ParseError> {
-        let Some(front) = inbound.front() else {
-            if inbound.ended() {
-                // The server may have processed the request before it closed.
+        if inbound.front().is_none() && self.join.is_none() && inbound.ended() {
+            // The server may have processed the request before it closed.
+            self.end = Some(Err(Error::new(
+                Kind::Uncertain,
+                "the connection closed before the response",
+            )));
+            return Ok(None);
+        }
+        if self.join.is_none() {
+            let Some(front) = inbound.front() else { return Ok(None) };
+            let region = front.region.clone();
+            if let Some(head) = self.parser.parse(region.bytes(), self.method)? {
+                let consumed = head.consumed();
+                let event = self.accept(head, &region)?;
+                inbound.consume(consumed).map_err(|_| ParseError::Malformed)?;
+                return Ok(Some(event));
+            }
+        }
+        let (parser, method) = (&mut self.parser, self.method);
+        let step = join(&mut self.join, &self.budget, self.limits.head_bytes, inbound, |bytes| {
+            Ok(parser.parse(bytes, method)?.map(|head| head.consumed()))
+        })?;
+        let region = match step {
+            Step::Complete(region) => region,
+            Step::Wait if inbound.ended() => {
                 self.end = Some(Err(Error::new(
                     Kind::Uncertain,
-                    "the connection closed before the response",
+                    "the connection closed in the response head",
                 )));
+                return Ok(None);
             }
-            return Ok(None);
+            Step::Wait => return Ok(None),
+            Step::Capacity(units) => {
+                self.capacity = Some(units);
+                return Ok(None);
+            }
         };
-        let region = front.region.clone();
-        // A head that continues in the next region waits for more bytes.
         let Some(head) = self.parser.parse(region.bytes(), self.method)? else {
-            return Ok(None);
+            return Err(ParseError::Malformed);
         };
-        let Some(retained) = head.retain(&region) else {
+        self.accept(head, &region).map(Some)
+    }
+
+    /// Takes the response of a complete `head` in `region`.
+    fn accept(&mut self, head: ResponseHead<'_>, region: &Lease) -> Result<ClientEvent, ParseError> {
+        let Some(retained) = head.retain(region) else {
             return Err(ParseError::Malformed);
         };
         let code = head.status().code();
         let framing = head.framing();
-        let persistent = head.persistent();
-        inbound.consume(head.consumed()).map_err(|_| ParseError::Malformed)?;
         // A server switches only to a protocol that the request asked for (RFC 9110, section
         // 7.8). A 2xx response to CONNECT starts a tunnel (section 9.3.6).
         if (code == 101 && self.upgrade) || (self.method == Method::CONNECT && (200..300).contains(&code)) {
             self.read = ReadState::Switch;
-            return Ok(Some(ClientEvent::Response(retained)));
+            return Ok(ClientEvent::Response(retained));
         }
         if code == 101 {
             return Err(ParseError::Malformed);
         }
         if code < 200 {
-            return Ok(Some(ClientEvent::Informational(retained)));
+            return Ok(ClientEvent::Informational(retained));
         }
         if let Framing::Length(length) = framing
             && length > self.body.body_bytes
         {
             return Err(ParseError::BodyTooLarge);
         }
-        self.close |= !persistent;
+        self.close |= !head.persistent();
         self.read = ReadState::Body(BodyReader::new(framing, self.body, self.limits));
-        Ok(Some(ClientEvent::Response(retained)))
+        Ok(ClientEvent::Response(retained))
     }
 }
 

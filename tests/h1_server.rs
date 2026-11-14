@@ -56,11 +56,14 @@ struct Host {
 
 impl Host {
     fn new(body: BodyLimits) -> Self {
+        Self::with(body, &Budget::new(NonZeroU64::new(1 << 20).unwrap()))
+    }
+
+    fn with(body: BodyLimits, budget: &Budget) -> Self {
         let outbound = Outbound::new(NonZeroUsize::new(8).unwrap()).unwrap();
-        let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
         Self {
             inbound: Inbound::new(NonZeroUsize::new(8).unwrap()).unwrap(),
-            server: Server::new(LIMITS, body, &outbound, &budget).unwrap(),
+            server: Server::new(LIMITS, body, &outbound, budget).unwrap(),
             outbound,
         }
     }
@@ -471,4 +474,111 @@ fn an_upgrade_or_a_tunnel_hands_off_exactly_the_bytes_after_the_request() {
         head,
     );
     assert_eq!(refused.map_err(|error| error.kind()), Err(Kind::Misuse));
+}
+
+/// A request head that continues across received regions, cut at each position, gives the same
+/// request. Its body keeps its address in the last region, because the join copies only the bytes
+/// of the head. The join is charged to the budget while a view of the head lives, and the charge
+/// returns after the last view. A head of one byte in each region costs one join buffer, which a
+/// copy for each region or a buffer that grows would pass, and one charge. A budget that cannot
+/// pay for a join blocks on capacity.
+#[test]
+fn a_head_across_regions_joins_with_a_charge_and_no_copy_of_its_body() {
+    const REQUEST: &[u8] = b"POST /notes HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello";
+    let head = REQUEST.len() - 5;
+    for cut in 1..head {
+        let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+        let mut host = Host::with(BODY, &budget);
+        let idle = budget.available();
+        host.receive(&REQUEST[..cut]);
+        let last = Lease::from(REQUEST[cut..].to_vec());
+        let body = last.as_ptr().wrapping_add(head - cut);
+        host.inbound
+            .push(Received {
+                region: last,
+                endpoint: ENDPOINT,
+                capacity: 1 << 16,
+            })
+            .unwrap();
+        let mut events = Vec::new();
+        while let (Some(event), _) = host.server.drive(&mut host.inbound, &mut host.outbound) {
+            events.push(event);
+        }
+        let [
+            ServerEvent::Request(request),
+            ServerEvent::Data(data),
+            ServerEvent::End(None),
+        ] = &events[..]
+        else {
+            panic!("cut at {cut}: {events:?}");
+        };
+        assert_eq!(request.head().target().as_bytes(), b"/notes", "cut at {cut}");
+        assert_eq!((data.as_ptr(), data.bytes()), (body, &b"hello"[..]), "cut at {cut}");
+        assert_eq!(budget.available(), idle - LIMITS.head_bytes as u64, "cut at {cut}");
+        drop(events);
+        assert_eq!(budget.available(), idle, "cut at {cut}");
+    }
+
+    // One byte in each region: one join buffer that never grows again, with the lease that owns
+    // it, and one charge of the head limit, which returns when the last view of the head drops.
+    let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+    let mut host = Host::with(BODY, &budget);
+    let idle = budget.available();
+    let regions: Vec<Received> = REQUEST[..head]
+        .iter()
+        .map(|&byte| Received {
+            region: Lease::from(vec![byte]),
+            endpoint: ENDPOINT,
+            capacity: 1 << 16,
+        })
+        .collect();
+    let mut events = Vec::with_capacity(4);
+    let ((), count) = allocations(|| {
+        for received in regions {
+            host.inbound.push(received).unwrap();
+            while let (Some(event), _) = host.server.drive(&mut host.inbound, &mut host.outbound) {
+                events.push(event);
+            }
+        }
+    });
+    assert_eq!(count, 2);
+    let [ServerEvent::Request(request)] = &events[..] else {
+        panic!("{events:?}");
+    };
+    assert_eq!(request.head().target().as_bytes(), b"/notes");
+    assert_eq!(budget.available(), idle - LIMITS.head_bytes as u64);
+    drop(events);
+    assert_eq!(budget.available(), idle);
+
+    // The pool takes 8 slots of 16 bytes, and the join of a 1024-byte head does not fit after it.
+    let budget = Budget::new(NonZeroU64::new(8 * 16 + 512).unwrap());
+    let mut host = Host::with(BODY, &budget);
+    host.receive(&REQUEST[..10]);
+    assert_eq!(host.drive(), (Vec::new(), Progress::Blocked(Blocked::Capacity(1024))));
+}
+
+/// A trailer section that continues across received regions, cut at each position, gives the
+/// same trailers.
+#[test]
+fn a_trailer_section_across_regions_gives_the_same_trailers() {
+    const REQUEST: &[u8] =
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\nX-Sum: 1\r\n\r\n";
+    let trailers = REQUEST.len() - b"X-Sum: 1\r\n\r\n".len();
+    for cut in trailers..REQUEST.len() {
+        let mut host = Host::new(BODY);
+        host.receive(&REQUEST[..cut]);
+        host.receive(&REQUEST[cut..]);
+        assert_eq!(
+            host.drive(),
+            (
+                vec![
+                    request(b"POST", b"/"),
+                    Seen::Data(b"a".to_vec()),
+                    Seen::End(b"X-Sum: 1\r\n".to_vec())
+                ],
+                WAIT
+            ),
+            "cut at {cut}"
+        );
+    }
 }

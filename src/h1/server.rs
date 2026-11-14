@@ -7,8 +7,9 @@ use rstypes::capacity::Budget;
 
 use super::body::{BodyReader, BodyWriter, Read, Trailers, full, misuse, write_error};
 use super::head::{BodyLimits, Limits, ParseError, Version};
+use super::join::{Join, Step, join};
 use super::write::write_response;
-use super::{Framing, RequestParser, RetainedRequest};
+use super::{Framing, RequestHead, RequestParser, RetainedRequest};
 use crate::drive::{Blocked, Error, Inbound, Kind, Outbound, Progress, Turn};
 use crate::value::{Field, Method, Status};
 
@@ -20,15 +21,23 @@ use crate::value::{Field, Method, Status};
 /// [`Outbound`] queue. Responses go in the order of the requests: the engine reads a pipelined
 /// request only after the response before it is complete.
 ///
-/// The engine allocates nothing after [`new`](Self::new). The caller gives the region of each
-/// response head. The size line of each chunk comes from a pool that the engine makes at
-/// construction, with one slot of 16 bytes for each entry of the output queue, charged to the
-/// caller's budget. A slot returns to the pool when the last view of its line drops.
+/// The caller gives the region of each response head. The size line of each chunk comes from a
+/// pool that the engine makes at construction, with one slot of 16 bytes for each entry of the
+/// output queue, charged to the caller's budget. A slot returns to the pool when the last view of
+/// its line drops. Thus the engine allocates after [`new`](Self::new) only for a request head or
+/// trailer section that continues in the next region: it joins their bytes into one region of at
+/// most the limit of the section, which the budget pays for until the last view of it drops.
 pub struct Server {
     limits: Limits,
     body: BodyLimits,
     parser: RequestParser,
     writer: BodyWriter,
+    /// The budget that pays for the pool and for each join.
+    budget: Budget,
+    /// The join of a request head that continues in the next region.
+    join: Option<Join>,
+    /// The capacity that a join waits for.
+    capacity: Option<u64>,
     read: ReadState,
     write: Write,
     /// The facts of the current request.
@@ -115,6 +124,9 @@ impl Server {
             body,
             parser: RequestParser::new(limits),
             writer: BodyWriter::new(outbound, budget)?,
+            budget: budget.clone(),
+            join: None,
+            capacity: None,
             read: ReadState::Head,
             write: Write::Idle,
             request: Request::default(),
@@ -154,7 +166,10 @@ impl Server {
                 // A pipelined request waits for the response before it.
                 ReadState::Head if self.write != Write::Idle => return Ok(None),
                 ReadState::Head if inbound.front().is_none() && inbound.ended() => {
-                    self.end = Some(Ok(()));
+                    self.end = Some(match self.join {
+                        Some(_) => Err(Error::new(Kind::Partial, "the request head ended before its end")),
+                        None => Ok(()),
+                    });
                     return Ok(None);
                 }
                 ReadState::Head => return self.head(inbound),
@@ -172,7 +187,7 @@ impl Server {
                 ReadState::Body(reader) => reader,
             };
             let draining = reader.draining();
-            match reader.read(inbound)? {
+            match reader.read(inbound, &self.budget)? {
                 Read::Data(data) if !draining => return Ok(Some(ServerEvent::Data(data))),
                 Read::Data(_) | Read::Again => {}
                 Read::End(trailers) => {
@@ -186,25 +201,58 @@ impl Server {
                 Read::Truncated => {
                     self.end = Some(Err(Error::new(Kind::Partial, "the request body ended before its end")));
                 }
+                Read::Capacity(units) => {
+                    self.capacity = Some(units);
+                    return Ok(None);
+                }
             }
         }
     }
 
-    /// Reads a request head from `inbound`.
+    /// Reads a request head from `inbound`. A head that continues in the next region joins into
+    /// one region, charged to the budget.
     fn head(&mut self, inbound: &mut Inbound) -> Result<Option<ServerEvent>, ParseError> {
-        let Some(front) = inbound.front() else { return Ok(None) };
-        let region = front.region.clone();
-        // A head that continues in the next region waits for more bytes.
-        let Some(head) = self.parser.parse(region.bytes())? else {
-            return Ok(None);
+        if self.join.is_none() {
+            let Some(front) = inbound.front() else { return Ok(None) };
+            let region = front.region.clone();
+            if let Some(head) = self.parser.parse(region.bytes())? {
+                let consumed = head.consumed();
+                let event = self.accept(head, &region)?;
+                inbound.consume(consumed).map_err(|_| ParseError::Malformed)?;
+                return Ok(Some(event));
+            }
+        }
+        let parser = &mut self.parser;
+        let step = join(&mut self.join, &self.budget, self.limits.head_bytes, inbound, |bytes| {
+            Ok(parser.parse(bytes)?.map(|head| head.consumed()))
+        })?;
+        let region = match step {
+            Step::Complete(region) => region,
+            Step::Wait => return Ok(None),
+            Step::Capacity(units) => {
+                self.capacity = Some(units);
+                return Ok(None);
+            }
         };
+        let Some(head) = self.parser.parse(region.bytes())? else {
+            return Err(ParseError::Malformed);
+        };
+        self.accept(head, &region).map(Some)
+    }
+
+    /// Takes the request of a complete `head` in `region`: its facts, and the reader of its body.
+    fn accept(&mut self, head: RequestHead<'_>, region: &Lease) -> Result<ServerEvent, ParseError> {
         let framing = head.framing();
         if let Framing::Length(length) = framing
             && length > self.body.body_bytes
         {
             return Err(ParseError::BodyTooLarge);
         }
-        let Some(retained) = head.retain(&region) else {
+        // A request has no close framing.
+        if framing == Framing::Close {
+            return Err(ParseError::Framing);
+        }
+        let Some(retained) = head.retain(region) else {
             return Err(ParseError::Malformed);
         };
         let version = head.version();
@@ -218,14 +266,9 @@ impl Server {
             switch: false,
         };
         self.close = !head.persistent();
-        // A request has no close framing.
-        if framing == Framing::Close {
-            return Err(ParseError::Framing);
-        }
         self.read = ReadState::Body(BodyReader::new(framing, self.body, self.limits));
         self.write = Write::Waiting;
-        inbound.consume(head.consumed()).map_err(|_| ParseError::Malformed)?;
-        Ok(Some(ServerEvent::Request(retained)))
+        Ok(ServerEvent::Request(retained))
     }
 
     /// Ends the exchange of a request and its response: the connection closes, or the next request
@@ -241,10 +284,11 @@ impl Server {
     }
 
     /// The progress of the engine when it gives no event.
-    fn progress(&self) -> Progress {
-        match self.end {
-            Some(end) => Progress::Terminal(end),
-            None => Progress::Blocked(Blocked::Input),
+    fn progress(&mut self) -> Progress {
+        match (self.end, self.capacity.take()) {
+            (Some(end), _) => Progress::Terminal(end),
+            (None, Some(units)) => Progress::Blocked(Blocked::Capacity(units)),
+            (None, None) => Progress::Blocked(Blocked::Input),
         }
     }
 
