@@ -1,14 +1,23 @@
 # Check the design models
 
-rsnetwork has a TLA+ model of the datagram form of attached channels:
-[`models/attached-datagram/`](../../models/attached-datagram/README.md). It checks that the
-consumer reads only the bytes that the sender sent, that an acknowledgement means that the
-receiver holds the bytes, that the receiver's replay state stays bounded, and that the channel
-ends under the declared loss budget when the consumer reads and the path eventually stays
-stable. It checks lossy ordinary ACKs, delayed final-size arrival, independent endpoint outcomes,
-and repeated migration attempts. Each validation must end even if attempts continue. The model
-checks the design, not the Rust code. Change the model when you change one of these rules or the
-wire format that they constrain.
+rsnetwork has two TLA+ design models. They check the design, not the Rust code. Change a model
+when you change one of its rules or the wire format that the rules constrain.
+
+- [`models/attached-datagram/`](../../models/attached-datagram/README.md) checks the datagram
+  form of attached channels. It checks that the consumer reads only the bytes that the sender
+  sent, that an acknowledgement means that the receiver holds the bytes, that the receiver's
+  replay state stays bounded, and that the channel ends under the declared loss budget when the
+  consumer reads and the path eventually stays stable. It checks lossy ordinary ACKs, delayed
+  final-size arrival, independent endpoint outcomes, and repeated migration attempts. Each
+  validation must end even if attempts continue.
+- [`models/backing-release/`](../../models/backing-release/README.md) checks one charged
+  backing across protocol acceptance, retransmission, peer acknowledgement, and kernel release.
+  It checks that each retained view and each kernel use keeps the backing alive and charged
+  once, and that the release runs once, when the last obligation ends. It also checks that a
+  partial acceptance keeps the suffix with its writer, and that a repeated or unknown
+  acknowledgement changes no ownership. The
+  [boundary assumptions](#backing-release-boundary-assumptions) below state what it takes from
+  the runtime.
 
 ## Checker requirements
 
@@ -25,6 +34,7 @@ From the repository root:
 ```sh
 cargo xtask model attached-datagram                                  # every profile
 cargo xtask model attached-datagram/AttachedDatagram.NoTagSquat_bad.cfg # one profile
+cargo xtask model backing-release                                    # every profile
 ```
 
 You can give several selections to one command. The command freezes the selected model files
@@ -76,13 +86,13 @@ files of .../target/model/inputs/<run>/attached-datagram: sha256:<digest> (<coun
   target.
 
 The command exits 0 when every selected profile passes. The output of each profile goes to
-`target/model/attached-datagram/<profile>/<run>/`: the input closure in `source/`,
+`target/model/<model>/<profile>/<run>/`: the input closure in `source/`,
 `run.txt` with commands and identities, `checker.log`, `stderr.log`, and `trace.json` for a violation.
 Runs have separate directories; a later run does not replace an earlier result.
 
 ## Large profiles
 
-The 2026-11-12 matrix completed all 43 declared profiles on one 16-vCPU host. All 33 known-bad
+The 2026-11-12 matrix of the attached-datagram model completed all 43 declared profiles on one 16-vCPU host. All 33 known-bad
 and reachability profiles gave their required violations. Each of the ten positive profiles
 completed safety and final liveness within its original one-hour cap; native times ranged from
 208.432595 to 3195.420733 seconds. These results cover the exact source, bounds, and assumptions
@@ -113,6 +123,27 @@ profile with that bound raised by one.
 
 On a smaller host, select the profiles that your change touches, and run the whole model before
 you record evidence.
+
+## Backing-release boundary assumptions
+
+The backing-release model composes two ownership contracts. The protocol keeps output until
+exact acceptance and peer acknowledgement. The rsasync driver keeps each accepted submission
+until its terminal event. The model takes the driver side from rsasync's terminal-release
+contract, which the rsasync model `models/operation-ownership/` checks. It owns no driver. These
+facts are its boundary:
+
+- An accepted submission gives the driver a view of the backing until its terminal event. A
+  refused submission returns the view to the caller.
+- A zero-copy send has a send result and, when the kernel armed one, a later notice. Without a
+  notice, the result is terminal. A copying send is that second case.
+- Notices, send results, and the peer's acknowledgements come in any order.
+- Cancellation, a request deadline, and close prove no kernel release. Each kernel use keeps its
+  view until its own terminal event.
+- The model checks safety only. The rsasync model checks that each terminal event comes.
+
+The model checks one backing, two slices, and two datagram copies of each slice. The
+`Slices3` and `Copies3` profiles raise each of the two argued bounds by one. If a protocol or
+runtime change breaks one of these facts, change the model first, and run all of its profiles.
 
 ## When a profile fails
 
