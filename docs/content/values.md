@@ -55,7 +55,7 @@ assert!(Status::new(600).is_err());
 
 Each value is a view of the bytes that you give, with the same lifetime. To keep a value after its
 bytes, keep the bytes. A parsed request head can keep its received region with no copy: see
-[keep a head after the call](http1.md#keep-a-head-after-the-call).
+`retain` in [parsers and writers](http1.md#parsers-and-writers).
 
 ## Methods
 

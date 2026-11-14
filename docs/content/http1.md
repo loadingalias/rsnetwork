@@ -1,186 +1,233 @@
-# Parse HTTP/1.1 requests and write responses with no I/O
+# Run HTTP/1.1 connections with no I/O
 
-The `rsnetwork::h1` module parses the head of an HTTP/1.1 request and writes the head of a
-response. It reads the bytes that you received and writes into a region that you own. It does no
-I/O and starts nothing, so any runtime, or your own event loop, can drive it. It is for servers.
+The `rsnetwork::h1` module runs HTTP/1.1 connections for servers and clients, also with HTTP/1.0
+peers. It does no I/O and starts nothing, so any runtime, or your own event loop, can drive it.
 
-rsnetwork is in development and has no release. The buffer types come from the runtime family:
-`rsnetwork::buffer` is the same module as `rsasync::buffer`. The method, target, authority,
-field, and status types are the [checked values](values.md) of `rsnetwork::value`.
+rsnetwork is in development and has no release. The buffer, capacity, and time types come from
+the runtime family: `rsnetwork::buffer` is the same module as `rsasync::buffer`. The method,
+target, authority, field, and status types are the [checked values](values.md).
 
-## Inputs and outputs
+## The model
 
-| Operation | Input | Output |
-| --- | --- | --- |
-| `RequestParser::parse` | All of the received bytes of one head, from its first byte | `Ok(Some(RequestHead))` for a complete head, `Ok(None)` for a partial head, or `Err(ParseError)` |
-| `RequestHead::retain` | The frozen `Lease` whose bytes the parser read | `Some(RetainedHead)`, a head that keeps the backing, or `None` if the head is not in the lease |
-| `write_head` | A `WriteLoan` over a region that you own, a `Status`, fields, and a `Framing` | The head bytes after the bytes that the region holds, or `Err(WriteError)` with nothing written |
-| `begin_chunk`, `end_chunk`, `last_chunk` | A `WriteLoan` and, for `begin_chunk`, the size of the chunk | The framing of a chunked body, or `Err(WriteError::Full)` with nothing written |
+`h1::Server` and `h1::Client` are the engines of one connection. They run on the queues of
+[the drive interface](drive.md):
 
-A `RequestHead` holds views of the received bytes, and the parser allocates nothing:
+1. Your host receives bytes from the transport and pushes each region into an `Inbound` queue.
+2. Each `drive` call reads the queued bytes in place and gives one event, or none.
+3. The application answers each event with calls that push output into an `Outbound` queue.
+4. The host sends each `Output` and acknowledges the bytes that the transport accepted.
+5. When the drive gives a terminal turn, the host sends the rest of the `Outbound` queue and
+   closes the connection.
 
-- `method()` gives the `Method`. An unknown method stays as it is.
-- `target()` gives the `Target`, with its exact bytes and its form.
-- `authority()` gives the `Authority` of the request: that of an absolute-form or authority-form
-  target, or else the value of the Host field (RFC 9112, section 3.3).
-- `fields()` gives each field line in its received order, as a `Field` with a name and a value.
-  Repeated names stay as separate fields. Names keep their received case.
-- `consumed()` gives the number of bytes of the head. The body starts there.
-- `framing()` gives the end of the body: `Framing::Length(n)` or `Framing::Chunked`. A request
-  with no framing field has `Length(0)`.
+Body bytes are views of the received regions, with no copy. The engines allocate nothing after
+construction, except for a head or a trailer section that continues in the next received region:
+you give the region of each head that you send, and the size line of each chunk comes from a pool
+of the engine. When the transport reports that the peer closed its side, call `Inbound::end`.
 
-## Parse a request head
+## Example
 
-1. Make one `RequestParser` with your `Limits` for each connection.
-2. Receive bytes into a region. Give all of the received bytes of the head to `parse`.
-3. If `parse` gives `Ok(None)`, receive more bytes after the others. Then call `parse` again with
-   all of them.
-4. If `parse` gives a head, read the body from `consumed()`, as `framing()` tells.
-5. If `parse` gives an error, send the response that the error names. Then close the connection.
+A server reads one request and answers it. The code runs in a function that returns
+`Result<(), Box<dyn std::error::Error>>`. The module documentation of `rsnetwork::h1` runs the
+same example as a test.
 
-The parser records how far it searched. Thus it searches each byte one time, also when the bytes
-arrive one at a time. After a complete head, the parser starts again. Give it the bytes of the
-next request from their first byte.
+```rust
+use core::net::{Ipv4Addr, SocketAddr};
+use core::num::{NonZeroU64, NonZeroUsize};
 
-`Limits` has four limits, which you set:
+use rsnetwork::buffer::{Backing, Buffer as _, Lease};
+use rsnetwork::capacity::Budget;
+use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received};
+use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
+use rsnetwork::value::{Field, Status};
+
+let limits = Limits { head_bytes: 8 * 1024, fields: 64, name_bytes: 64, value_bytes: 4 * 1024 };
+let body = BodyLimits {
+    body_bytes: 1 << 20,
+    drain_bytes: 64 * 1024,
+    extension_bytes: 256,
+    trailer_bytes: 4 * 1024,
+    trailer_fields: 16,
+};
+let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
+let queue = NonZeroUsize::new(16).expect("not zero");
+let (mut inbound, mut outbound) = (Inbound::new(queue)?, Outbound::new(queue)?);
+let mut server = Server::new(limits, body, &outbound, &budget)?;
+
+// The transport received a request, and the host queues it.
+let endpoint = Endpoint {
+    peer: SocketAddr::from((Ipv4Addr::new(192, 0, 2, 7), 50_000)),
+    local: SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 8080)),
+    ecn: Ecn::NotEct,
+    segment: None,
+};
+let region = Lease::from(b"POST /notes HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello".to_vec());
+inbound.push(Received { region, endpoint, capacity: 64 * 1024 }).expect("the queue has space");
+
+// Each drive gives one event: the head, the body bytes, and the end of the body.
+let (Some(ServerEvent::Request(request)), _) = server.drive(&mut inbound, &mut outbound) else {
+    panic!("a request head")
+};
+assert_eq!(request.head().target().as_bytes(), b"/notes");
+let (Some(ServerEvent::Data(data)), _) = server.drive(&mut inbound, &mut outbound) else {
+    panic!("body bytes")
+};
+assert_eq!(data.bytes(), b"hello");
+let (Some(ServerEvent::End(None)), _) = server.drive(&mut inbound, &mut outbound) else {
+    panic!("the end of the body")
+};
+
+// The answer: its head in a region of the caller, then the body with no copy.
+let fields = [Field::new(b"Content-Type", b"text/plain")?];
+let head = Backing::from(Vec::with_capacity(256));
+server.respond(&mut outbound, Status::new(201)?, &fields, Framing::Length(2), head)?;
+server.send(&mut outbound, &Lease::from(b"ok".to_vec()))?;
+server.finish(&mut outbound)?;
+
+// The host sends each output and acknowledges the bytes that the transport accepted.
+let mut sent = Vec::new();
+while let Some(output) = outbound.submit() {
+    sent.extend_from_slice(output.region.bytes());
+    outbound.ack(output.id, output.region.initialized())?;
+}
+assert_eq!(sent, b"HTTP/1.1 201 \r\nContent-Type: text/plain\r\ncontent-length: 2\r\n\r\nok");
+```
+
+## Serve requests
+
+1. Make one `Server` for each connection with `Server::new(limits, body, &outbound, &budget)`.
+   It makes its pool of chunk-size lines there: one 16-byte slot for each `Outbound` entry,
+   charged to the budget.
+2. Call `server.drive(&mut inbound, &mut outbound)` until it gives no event. Drive again when more
+   bytes arrive or after the application answers.
+3. For `ServerEvent::Request(head)`, answer with `respond(outbound, status, fields, framing,
+   region)`. Then send the body with `send(outbound, &data)`, and end it with `finish(outbound)`
+   or `finish_with_trailers(outbound, trailers, region)`. Call `finish` also when the response has
+   no body.
+4. Read the request body from `ServerEvent::Data(data)` and `ServerEvent::End(trailers)`.
+
+| Server call | Result |
+| --- | --- |
+| `respond` | Writes the final response head into your region and queues it. The engine adds the `connection` field that the connection needs |
+| `send` | Queues a view of `data` as the next body bytes. A chunked body sends each call as one chunk |
+| `finish`, `finish_with_trailers` | Ends the body. A chunked body gets its last chunk, with trailers or with none |
+| `accept_body` | Sends `100 Continue` to a request that waits for it, and starts the read of its body |
+| `inform` | Sends an informational response with a status from 102 to 199, for example 103 |
+| `cancel` | Stops the response with no end of its body. The connection then ends |
+
+`send` and `finish` refuse with `Kind::Overload` when the `Outbound` queue or the pool is full,
+and change nothing. Acknowledge output, then call again. A call in the wrong state, for example
+`send` before `respond`, refuses with `Kind::Misuse`.
+
+## Send requests
+
+1. Make one `Client` for each connection with `Client::new(limits, body, &outbound, &budget)`.
+2. Call `client.request(outbound, method, target, authority, fields, framing, region)`. The engine
+   writes `authority` as the Host field, the first field line. Do not give a Host field yourself.
+3. Send the body with `send`, and end it with `finish` or `finish_with_trailers`. Call `finish`
+   also when the request has no body.
+4. Call `client.drive(&mut inbound)` until it gives no event. It gives
+   `ClientEvent::Informational(head)` for each 1xx response, then `ClientEvent::Response(head)`,
+   `ClientEvent::Data(data)`, and `ClientEvent::End(trailers)`.
+5. Send the next request after the end of the response. The client sends one request at a time.
+
+| Client call | Result |
+| --- | --- |
+| `cancel_upload` | Sends no more request body bytes and no end of the body. The response can still arrive, and then the connection closes |
+| `cancel_response` | Reads and discards the rest of the response body, up to `drain_bytes`, to reuse the connection. Above it, the connection closes at once |
+
+## Limits
+
+`Limits` bounds each head, also a response head:
 
 | Limit | Bounds |
 | --- | --- |
-| `head_bytes` | The bytes of the head, from the first byte of the request line to the end of the empty line |
+| `head_bytes` | The bytes of the head, from the first byte of the start line to the end of the empty line |
 | `fields` | The number of field lines |
 | `name_bytes` | The bytes of each field name |
 | `value_bytes` | The bytes of each field value, with no whitespace at its start or end |
 
-## Keep a head after the call
+`BodyLimits` bounds each body and the drain:
 
-A `RequestHead` borrows the received bytes, so it lives only while you hold them. To keep the head
-longer, for example to give it to another task:
+| Limit | Bounds |
+| --- | --- |
+| `body_bytes` | The bytes of a body: its Content-Length, or the sum of its chunk sizes. A body over it refuses before its data |
+| `drain_bytes` | The unread body bytes that an engine reads and discards to reuse the connection |
+| `extension_bytes` | The chunk extensions of one chunk line |
+| `trailer_bytes` | The bytes of a trailer section |
+| `trailer_fields` | The number of trailer field lines |
 
-1. Freeze the received region into a `Lease`. Parse the bytes of the lease.
-2. Call `head.retain(&lease)`. It gives a `RetainedHead`, which holds a view of the backing of
-   the lease, with no copy.
-3. Read the head with `retained.head()`, which gives a `RequestHead` of the retained bytes.
+## Framing and connection rules
 
-The retained head keeps the whole backing alive, also after the lease drops. Each view of one
-backing shares its one charge: two retained heads of pipelined requests in one pool slot hold one
-slot. The slot returns to its pool when the last view drops. A pool slot needs no allocation for
-the retained head. To keep a small part of a large backing without the backing, copy that part
-into a new buffer.
+The body length follows RFC 9112, section 6.3:
 
-To keep a part of the region, such as the body, take a `view` of the lease. A view keeps the
-region alive with no copy.
+| Message | Body |
+| --- | --- |
+| A request with `Content-Length: n`, or a response with it | `n` bytes |
+| A message with `Transfer-Encoding: chunked`, one coding in one field line | Chunks, then trailers |
+| A request with no framing field | No body |
+| A response to HEAD, a 1xx, 204, or 304 response, or a 2xx response to CONNECT | No body, whatever the framing fields say |
+| A response with no framing field | Each byte until the close |
 
-## Write a response head
+These messages refuse, because two readers could read two different bodies:
 
-1. Make a `WriteLoan` over a region with enough free capacity for the head.
-2. Make each field with `Field::new`, which refuses a name or a value that can split the line.
-3. Make the status with `Status::new`. Call `write_head` with the status, the fields, and the
-   framing.
-4. Write the body after the head, or send it from a region of its own.
+- `Content-Length` and `Transfer-Encoding` together.
+- More than one `Content-Length`, or a length that is not a decimal `u64`.
+- A transfer coding other than one `chunked` (501).
+- A `Transfer-Encoding` field in an HTTP/1.0 message (RFC 9112, section 6.1).
+- A chunk size that is not 1 to 16 hexadecimal digits, a chunk extension outside the grammar of
+  RFC 9112, section 7.1.1, a line end that is not CR LF, or chunk data that CR LF does not end.
 
-`write_head` writes the status line `HTTP/1.1 <status> ` with no reason phrase, which RFC 9112
-permits. Then it writes the fields in their order, the framing field, and the empty line.
-`Length(n)` writes `content-length: n`. `Chunked` writes `transfer-encoding: chunked`. For a 204
-or a 304 response, give `Length(0)`: the head then has no framing field, as RFC 9110 requires.
-Do not give `Content-Length` or `Transfer-Encoding` as a field, because `framing` writes it.
-`write_head` does not write informational (1xx) responses.
+A connection persists after each exchange when the request and the response permit it (RFC 9112,
+section 9.3): an HTTP/1.1 message with no `close` connection option, or an HTTP/1.0 message with
+the `keep-alive` option. A response that the close ends does not persist.
 
-For a chunked body, call `begin_chunk` with the chunk size, write or send the chunk bytes, and call
-`end_chunk`. Do this for each chunk. Then call `last_chunk`.
-
-## Example
-
-The bytes of a request arrive in two receives. The first parse gives `None`, and the second gives
-the head. The body stays in the received region, and the head stays after the region drops. The
-code runs in a function that returns `Result<(), Box<dyn std::error::Error>>`. The module
-documentation of `rsnetwork::h1` runs the same example as a test.
-
-```rust
-use rsnetwork::buffer::{Buffer as _, Lease, WriteLoan};
-use rsnetwork::h1::{Framing, Limits, RequestParser, write_head};
-use rsnetwork::value::{Field, Host, Method, Status, TargetForm};
-
-let limits = Limits { head_bytes: 8 * 1024, fields: 64, name_bytes: 64, value_bytes: 4 * 1024 };
-let mut parser = RequestParser::new(limits);
-
-// The bytes of a request arrive in two receives into one region.
-let mut received = WriteLoan::new(Vec::with_capacity(8 * 1024));
-received.fill_from(b"PUT /notes/7 HTTP/1.1\r\nHost: exa");
-assert!(parser.parse(received.filled())?.is_none()); // not complete: receive more
-received.fill_from(b"mple.com\r\nContent-Length: 5\r\n\r\nhello");
-
-// Freeze the region. Views of a `Lease` can go to other owners with no copy.
-let received = Lease::from(received.into_inner());
-let head = parser.parse(received.bytes())?.expect("the head is complete");
-assert_eq!(head.method(), Method::PUT);
-assert!(matches!(head.target().form(), TargetForm::Origin { path: b"/notes/7", query: None }));
-assert_eq!(head.authority().host(), Host::Name(b"example.com"));
-
-// The body follows the head in the same region.
-assert_eq!(head.framing(), Framing::Length(5));
-let body = received.view(head.consumed()..head.consumed() + 5).expect("the body is in the region");
-assert_eq!(body.bytes(), b"hello");
-
-// Keep the head after the region drops. It holds a view of the same backing, with no copy.
-let kept = head.retain(&received).expect("the head is in the region");
-drop(received);
-assert_eq!(kept.head().method(), Method::PUT);
-
-// Write the response head into the free capacity of an owned region, then the body after it.
-let mut out = WriteLoan::new(Vec::with_capacity(256));
-let fields = [Field::new(b"Content-Type", b"text/plain")?];
-write_head(&mut out, Status::new(200)?, &fields, Framing::Length(2))?;
-out.fill_from(b"ok");
-assert_eq!(out.into_inner(), b"HTTP/1.1 200 \r\nContent-Type: text/plain\r\ncontent-length: 2\r\n\r\nok");
-```
-
-## What the parser checks
-
-- Each line ends with CR LF. A CR that is not before an LF, or an LF that is not after a CR,
-  refuses as soon as it arrives.
-- The request line has three parts with one space between them. The method is a `Method`. The
-  target is a `Target` in one of the four forms. The version is `HTTP/1.1`.
-- The method permits the form of the target. Only CONNECT has the authority form, and a CONNECT
-  has no other form. Only OPTIONS has the asterisk form.
-- The request has exactly one Host field, and its value is an `Authority` (RFC 9112, section 3.2).
-  This is the HTTP/1.1 rule. When the target has an authority, the Host field must still be valid,
-  but the authority of the request comes from the target.
-- Each field name is a token, with no whitespace before the colon. A line that starts with
-  whitespace refuses, also a folded line.
-- A field value has no control byte except HTAB. The parser removes the spaces and HTABs at its
-  start and end. Bytes above 0x7F stay as they are.
-- The framing is clear. Both `Content-Length` and `Transfer-Encoding` refuse. More than one
-  `Content-Length`, or a length that is not a `u64`, refuses. The only transfer coding is one
-  `chunked`.
-- The head is within each of the `Limits`. A head refuses as soon as `head_bytes` bytes have no
-  end of the head in them.
-
-The parser does not decode chunks or read trailers, and it refuses HTTP/1.0 requests. It does not
-ignore an empty line before the request line.
+| Case | Behavior |
+| --- | --- |
+| A head or a trailer section that continues in the next received region | The engine copies its bytes into one region of at most `head_bytes` or `trailer_bytes`. This is one counted copy, which the budget pays for until the last view of the head drops. Each new region adds only its new bytes, and the bytes after the section keep their region. When the budget cannot pay, the turn is `Blocked(Blocked::Capacity(n))`. Thus the budget bounds the memory of many slow partial heads. The engine has no timer, so bound their time with a deadline for each head in your host |
+| Pipelined requests | The server reads the next request only after the response before it is complete, so the responses go in the order of the requests |
+| A response before the end of the request body | The server reads and discards the rest, up to `drain_bytes`, then reads the next request. A Content-Length body that is longer gets `connection: close`, and a chunked body that passes the limit closes the connection |
+| An HTTP/1.0 request | Its response has an HTTP/1.1 status line, and never chunks: a chunked response becomes one that the close ends. It has `connection: keep-alive` when the connection persists, and `connection: close` when it does not. A request with no Host field is served |
+| `Expect: 100-continue` | The server reads no body byte until `accept_body`. A final response before it closes the connection, because the client can send its body or not (RFC 9110, section 10.1.1) |
+| A 101 response to an upgrade request, or a 2xx response to CONNECT | After the request, the engine gives `Handoff`. The front of the `Inbound` queue is then exactly the bytes after the message, for the new protocol |
+| A cancelled response | No last chunk and no remaining Content-Length bytes: the peer sees an incomplete message, never a complete one |
+| The end of input between exchanges | The connection ends with no error |
+| The end of input inside a body | `Kind::Partial` |
+| The end of input before a response | `Kind::Uncertain`: the server can have processed the request |
+| Response bytes with no request in flight | `Kind::Malformed`: each later response would be unclear |
 
 ## Errors
 
-The connection cannot continue after a `ParseError`, because the end of the request is not
-known. Send the response, then close the connection. `From` converts a `ParseError` into the
-[error](errors.md) of an engine, with its kind.
+A refused head or body is a `ParseError`. The server sends the response that it names, with
+`connection: close`, when no response head was out. Then the connection ends. `From` converts a
+`ParseError` into the [error](errors.md) of the engine, with its kind.
 
-| `ParseError` | Cause | Response |
-| --- | --- | --- |
-| `HeadTooLarge` | The head is longer than `Limits::head_bytes` | 431 |
-| `TooManyFields` | The head has more field lines than `Limits::fields` | 431 |
-| `FieldTooLarge` | A field name is longer than `Limits::name_bytes`, or a field value is longer than `Limits::value_bytes` | 431 |
-| `Malformed` | The request line, a field line, or a line end does not obey RFC 9112. Or the method does not permit the form of the target, or the request does not have exactly one Host field with a valid authority | 400 |
-| `Version` | The version is not HTTP/1.1 | 505 |
-| `Framing` | The body framing is not clear | 400 |
-| `TransferCoding` | The codings end with `chunked` but have one more coding | 501 |
+| `ParseError` | Cause | Response | Kind |
+| --- | --- | --- | --- |
+| `HeadTooLarge` | The head or the trailer section is longer than its limit | 431 | `Overload` |
+| `TooManyFields` | The head or the trailer section has more field lines than its limit | 431 | `Overload` |
+| `FieldTooLarge` | A field name or a field value is longer than its limit | 431 | `Overload` |
+| `Malformed` | The start line, a field line, or a line end does not obey RFC 9112. Or the method does not permit the form of the target, or the Host fields are not valid for the version | 400 | `Malformed` |
+| `Version` | The version is not HTTP/1.0 or HTTP/1.1 | 505 | `Unsupported` |
+| `Framing` | The body framing is not clear | 400 | `Malformed` |
+| `TransferCoding` | The message has a transfer coding other than `chunked` | 501 | `Unsupported` |
+| `BodyTooLarge` | The body is longer than `body_bytes` | 413 | `Overload` |
+| `ExtensionTooLarge` | The chunk extensions are longer than `extension_bytes` | 400 | `Overload` |
 
-A `WriteError` writes nothing, so the region holds no partial head.
+`ParseError::status` gives the response status of a refusal.
 
-| `WriteError` | Cause | Correction |
-| --- | --- | --- |
-| `Full { needed, available }` | The region has fewer free bytes than the write needs | Write into a region with at least `needed` free bytes |
-| `Status` | The status is informational (100 to 199), or a 204 or 304 has framing other than `Length(0)` | Give a final status, and `Length(0)` for 204 and 304 |
-| `FramingField` | A field is `Content-Length` or `Transfer-Encoding` | Remove the field, and give the framing as `framing` |
+## Parsers and writers
 
-The `Debug` output of a head, a retained head, a field, a value, and an error contains no peer
-text, so a log line does not show a credential.
+The engines use these parts, which are public for a host that needs only a part:
+
+| Item | Use |
+| --- | --- |
+| `RequestParser`, `ResponseParser` | Parse a head in the received bytes, with no copy. Give all of the bytes of the head each time that more arrive. `ResponseParser::parse` takes the method of the request |
+| `RequestHead`, `ResponseHead` | The checked head: its values, `version`, `framing`, `persistent`, and `consumed`. `retain(&lease)` keeps it after the call as a view of its backing |
+| `ChunkDecoder` | Decodes a chunked body in any pieces and gives the position of each run of data |
+| `write_head`, `write_request` | Write a response or a request head into the free capacity of a `WriteLoan`. A refusal writes nothing |
+| `begin_chunk`, `end_chunk`, `last_chunk` | Write the framing of a chunked body. `last_chunk` writes the trailers |
+
+## Debug output
+
+The `Debug` output of a head, an event, an engine, a field, and an error contains no peer text,
+so a log line does not show a credential.

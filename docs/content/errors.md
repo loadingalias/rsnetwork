@@ -33,7 +33,7 @@ Each module keeps its own error type, with the detail that its caller needs. Eac
 
 | Error | Kind |
 | --- | --- |
-| `h1::ParseError::HeadTooLarge`, `TooManyFields`, `FieldTooLarge` | `Overload` |
+| `h1::ParseError::HeadTooLarge`, `TooManyFields`, `FieldTooLarge`, `BodyTooLarge`, `ExtensionTooLarge` | `Overload` |
 | `h1::ParseError::Version`, `TransferCoding` | `Unsupported` |
 | `h1::ParseError::Malformed`, `Framing` | `Malformed` |
 | `drive::AckError` | `Misuse` |

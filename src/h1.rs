@@ -1,62 +1,86 @@
-//! HTTP/1.1 for servers, with no I/O: a request head parser and a response head writer.
+//! HTTP/1.1, with HTTP/1.0 peers, for servers and clients, with no I/O.
 //!
-//! The caller receives bytes into its own region and gives them to a [`RequestParser`]. The
-//! parser reads them in place and allocates nothing. A complete head gives the checked
-//! [values](crate::value) of the request as views of the received bytes, the exact number of
-//! bytes that the head consumed, and the [`Framing`] of the body that follows it. The body and
-//! any next request stay in the received region, at their offsets after the head. A
-//! [`RetainedRequest`] keeps a head after the call, with no copy, as a view of the backing of the
-//! region.
+//! [`Server`] and [`Client`] are the engines of one connection. They run in drives on the queues
+//! of [`drive`](crate::drive): the host puts the received regions into an `Inbound` queue, and
+//! each drive reads them in place and gives one event. The application answers with calls that
+//! push the output into an `Outbound` queue, and the host sends it. Body bytes are views of the
+//! received regions, with no copy. A drive also gives the turn: what the engine needs next, or
+//! the end of the connection.
 //!
-//! [`write_head`] writes a response head and its framing field into the free capacity of an owned
-//! output region, through a [`WriteLoan`]. [`begin_chunk`], [`end_chunk`], and [`last_chunk`]
-//! write the framing of a chunked body. The chunk bytes can follow in the same region or stay in
-//! a region of their own.
+//! The engines apply the framing and the connection rules of RFC 9112: Content-Length and the
+//! chunked coding, informational responses, persistence and reuse, pipelined requests, the drain
+//! of an unread body, cancellation, and the handoff after an upgrade or a CONNECT tunnel. The
+//! caller gives the region of each head that the engine writes, and the size line of each chunk
+//! comes from a small pool of the engine. Thus an engine allocates only for a received head or
+//! trailer section that continues in the next region, which it joins into one region that the
+//! caller's budget pays for.
+//!
+//! The parsers and writers that the engines use are public too: [`RequestParser`],
+//! [`ResponseParser`], [`ChunkDecoder`], [`write_head`], [`write_request`], and the chunk
+//! functions.
 //!
 //! ```
-//! use rsnetwork::buffer::{Buffer as _, Lease, WriteLoan};
-//! use rsnetwork::h1::{Framing, Limits, RequestParser, write_head};
-//! use rsnetwork::value::{Field, Host, Method, Status, TargetForm};
+//! use core::net::{Ipv4Addr, SocketAddr};
+//! use core::num::{NonZeroU64, NonZeroUsize};
+//!
+//! use rsnetwork::buffer::{Backing, Buffer as _, Lease};
+//! use rsnetwork::capacity::Budget;
+//! use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received};
+//! use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
+//! use rsnetwork::value::{Field, Status};
 //!
 //! let limits = Limits { head_bytes: 8 * 1024, fields: 64, name_bytes: 64, value_bytes: 4 * 1024 };
-//! let mut parser = RequestParser::new(limits);
+//! let body = BodyLimits {
+//!     body_bytes: 1 << 20,
+//!     drain_bytes: 64 * 1024,
+//!     extension_bytes: 256,
+//!     trailer_bytes: 4 * 1024,
+//!     trailer_fields: 16,
+//! };
+//! let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
+//! let queue = NonZeroUsize::new(16).expect("not zero");
+//! let (mut inbound, mut outbound) = (Inbound::new(queue)?, Outbound::new(queue)?);
+//! let mut server = Server::new(limits, body, &outbound, &budget)?;
 //!
-//! // The bytes of a request arrive in two receives into one region.
-//! let mut received = WriteLoan::new(Vec::with_capacity(8 * 1024));
-//! received.fill_from(b"PUT /notes/7 HTTP/1.1\r\nHost: exa");
-//! assert!(parser.parse(received.filled())?.is_none()); // not complete: receive more
-//! received.fill_from(b"mple.com\r\nContent-Length: 5\r\n\r\nhello");
+//! // The transport received a request, and the host queues it.
+//! let endpoint = Endpoint {
+//!     peer: SocketAddr::from((Ipv4Addr::new(192, 0, 2, 7), 50_000)),
+//!     local: SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 8080)),
+//!     ecn: Ecn::NotEct,
+//!     segment: None,
+//! };
+//! let region = Lease::from(b"POST /notes HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello".to_vec());
+//! inbound.push(Received { region, endpoint, capacity: 64 * 1024 }).expect("the queue has space");
 //!
-//! // Freeze the region. Views of a `Lease` can go to other owners with no copy.
-//! let received = Lease::from(received.into_inner());
-//! let head = parser.parse(received.bytes())?.expect("the head is complete");
-//! assert_eq!(head.method(), Method::PUT);
-//! assert!(matches!(head.target().form(), TargetForm::Origin { path: b"/notes/7", query: None }));
-//! assert_eq!(head.authority().map(|authority| authority.host()), Some(Host::Name(b"example.com")));
+//! // Each drive gives one event: the head, the body bytes, and the end of the body.
+//! let (Some(ServerEvent::Request(request)), _) = server.drive(&mut inbound, &mut outbound) else {
+//!     panic!("a request head")
+//! };
+//! assert_eq!(request.head().target().as_bytes(), b"/notes");
+//! let (Some(ServerEvent::Data(data)), _) = server.drive(&mut inbound, &mut outbound) else {
+//!     panic!("body bytes")
+//! };
+//! assert_eq!(data.bytes(), b"hello");
+//! let (Some(ServerEvent::End(None)), _) = server.drive(&mut inbound, &mut outbound) else {
+//!     panic!("the end of the body")
+//! };
 //!
-//! // The body follows the head in the same region.
-//! assert_eq!(head.framing(), Framing::Length(5));
-//! let body = received.view(head.consumed()..head.consumed() + 5).expect("the body is in the region");
-//! assert_eq!(body.bytes(), b"hello");
-//!
-//! // Keep the head after the region drops. It holds a view of the same backing, with no copy.
-//! let kept = head.retain(&received).expect("the head is in the region");
-//! drop(received);
-//! assert_eq!(kept.head().method(), Method::PUT);
-//!
-//! // Write the response head into the free capacity of an owned region, then the body after it.
-//! let mut out = WriteLoan::new(Vec::with_capacity(256));
+//! // The answer: its head in a region of the caller, then the body with no copy.
 //! let fields = [Field::new(b"Content-Type", b"text/plain")?];
-//! write_head(&mut out, Status::new(200)?, &fields, Framing::Length(2))?;
-//! out.fill_from(b"ok");
-//! assert_eq!(out.into_inner(), b"HTTP/1.1 200 \r\nContent-Type: text/plain\r\ncontent-length: 2\r\n\r\nok");
+//! let head = Backing::from(Vec::with_capacity(256));
+//! server.respond(&mut outbound, Status::new(201)?, &fields, Framing::Length(2), head)?;
+//! server.send(&mut outbound, &Lease::from(b"ok".to_vec()))?;
+//! server.finish(&mut outbound)?;
+//!
+//! // The host sends each output and acknowledges the bytes that the transport accepted.
+//! let mut sent = Vec::new();
+//! while let Some(output) = outbound.submit() {
+//!     sent.extend_from_slice(output.region.bytes());
+//!     outbound.ack(output.id, output.region.initialized())?;
+//! }
+//! assert_eq!(sent, b"HTTP/1.1 201 \r\nContent-Type: text/plain\r\ncontent-length: 2\r\n\r\nok");
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
-//!
-//! This part of the core is for servers. It accepts HTTP/1.1 requests only. It does not decode
-//! chunks, read trailers, or apply a keepalive policy.
-//!
-//! [`WriteLoan`]: crate::buffer::WriteLoan
 
 mod body;
 mod chunked;

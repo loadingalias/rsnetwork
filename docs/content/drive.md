@@ -86,10 +86,11 @@ A `Received` is one received region with its facts:
 | Operation | Result |
 | --- | --- |
 | `Inbound::new(limit)` | A queue for at most `limit` regions. It reserves their space now, so a push never allocates. `Err` with `Kind::Overload` if the memory is not available |
-| `push(received)` | Adds the region after the others. `Err(received)` gives it back when the queue is full |
+| `push(received)` | Adds the region after the others. `Err(received)` gives it back when the queue is full. The queue drops an empty region |
 | `front()` | The front region, with the bytes that no drive consumed |
 | `consume(len)` | Acknowledges that the engine consumed the first `len` bytes of the front region. The queue keeps a view of the bytes after them and drops a region with no byte left. `Err(AckError::TooLarge)` if `len` is more than the front region has. The queue does not change |
 | `take_front()` | Removes the front region and gives exactly its unconsumed bytes, for example the bytes after an upgrade or a CONNECT head, to their new owner |
+| `end()`, `ended()` | Records, or tells, that the transport gives no more bytes after the queued regions: the peer closed its side. An engine reads the queued regions first, and then sees the end |
 
 ## Output regions
 
@@ -99,6 +100,7 @@ A `Received` is one received region with its facts:
 | --- | --- |
 | `Outbound::new(limit)` | A queue for at most `limit` regions, with their space reserved. `Err` with `Kind::Overload` if the memory is not available |
 | `push(region)` | Adds the region after the others. `Err(region)` gives it back when the queue is full. The queue drops an empty region |
+| `limit()`, `free()` | The most regions that the queue holds, and the number that it can take now |
 | `submit()` | The next `Output`: an `ActionId` and a view of the bytes of the front region that the transport has not accepted. `None` while an output has no acknowledgement, or when the queue is empty |
 | `ack(id, accepted)` | Acknowledges that the transport accepted the first `accepted` bytes of output `id`. The next output gives the bytes after them, at the same address, with no copy |
 
