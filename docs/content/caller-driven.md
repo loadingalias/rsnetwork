@@ -4,7 +4,8 @@ The `rsnetwork::host` module is the caller-driven host: one connection that your
 drives from its own event loop, with no runtime. Your loop owns the socket, or any other byte
 source, and the clock. The connection spawns no task, starts no thread, and does not need `Send`.
 
-rsnetwork is in development and has no release.
+rsnetwork is in development and has no release. To connect the engines to a runtime instead, see
+[Write a binding](adapters.md).
 
 ## The loop
 
@@ -24,8 +25,19 @@ your loop:
 | `Wait` | Next action |
 | --- | --- |
 | `Now` | Drive again now: the engine has an event or more work |
-| `Until(deadline)` | Drive when bytes arrive, when the socket can take more output, or at `deadline`, whichever comes first. `None` has no deadline |
+| `Until { blocked, deadline }` | Drive when your host gives what `blocked` names, or at `deadline`, whichever comes first. `None` has no deadline |
 | `Ended(result)` | Do not drive again. Send the rest of the output, then release the connection |
+
+| `blocked` | The engine waits for |
+| --- | --- |
+| `Blocked::Input` | Received bytes, or the end of the input |
+| `Blocked::Output` | The socket to accept output: the engine has output that must go first |
+| `Blocked::Capacity(n)` | `n` more bytes of capacity, for example after your code consumes a body |
+
+Wait only for the cause that `blocked` names. A socket can almost always take output, so a loop
+that also waits for that while the engine waits for input wakes at once, again and again. Write
+each output that `connection.output()` gives in any wait. Wait for the socket to take more output
+only when it accepted part of an output.
 
 The wait comes from the last turn. A deadline that the engine starts on a turn, also with no new
 input, is in the wait of that turn, so set your timer after each drive, not only after a receive.

@@ -12,7 +12,7 @@ use std::net::{TcpListener, TcpStream};
 use rsnetwork::body::Outcome;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
-use rsnetwork::drive::{Ecn, Endpoint, Inbound, Kind, Outbound, Received, TurnLimits};
+use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Client, ClientEvent, Framing, Limits, Server, ServerEvent};
 use rsnetwork::host::{Connection, Engine, Wait};
 use rsnetwork::time::{ClockDomain, Deadline, Instant, Suspend};
@@ -84,6 +84,14 @@ fn open_client() -> Connection<Client> {
     Connection::new(client, inbound, outbound, Some(CLOCK)).unwrap()
 }
 
+/// The wait of a connection whose engine waits for input, with the deadline at `deadline`.
+fn input(deadline: Option<Instant>) -> Wait {
+    Wait::Until {
+        blocked: Blocked::Input,
+        deadline: deadline.map(Deadline::at),
+    }
+}
+
 /// Sends each output of `from` into `to`, as a transport that accepts all of it does.
 fn wire<A: Engine, B: Engine>(from: &mut Connection<A>, to: &mut Connection<B>) {
     while let Some(output) = from.output() {
@@ -131,7 +139,7 @@ fn a_client_and_a_server_exchange_through_memory_with_injected_time() {
     engine.finish(outbound).unwrap();
     wire(&mut server, &mut client);
     drive(&mut server, at(2));
-    assert_eq!(server.wait(), Wait::Until(Some(Deadline::at(at(7)))));
+    assert_eq!(server.wait(), input(Some(at(7))));
 
     let events = drive(&mut client, at(2));
     let [
@@ -143,7 +151,7 @@ fn a_client_and_a_server_exchange_through_memory_with_injected_time() {
         panic!("{events:?}");
     };
     assert_eq!((response.head().status().code(), data.bytes()), (200, &b"ok"[..]));
-    assert_eq!(client.wait(), Wait::Until(None));
+    assert_eq!(client.wait(), input(None));
 }
 
 /// A deadline that the engine starts on a turn reaches the host on that turn, also with no new
@@ -153,11 +161,11 @@ fn a_client_and_a_server_exchange_through_memory_with_injected_time() {
 fn a_new_deadline_reaches_the_host_on_its_turn() {
     let mut server = open_server(Some(Duration::from_secs(5)));
     assert!(drive(&mut server, at(0)).is_empty());
-    assert_eq!(server.wait(), Wait::Until(Some(Deadline::at(at(5)))));
+    assert_eq!(server.wait(), input(Some(at(5))));
 
     server.receive(received(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")).unwrap();
     assert_eq!(drive(&mut server, at(1)).len(), 2);
-    assert_eq!(server.wait(), Wait::Until(None));
+    assert_eq!(server.wait(), input(None));
     let (engine, outbound) = server.parts();
     let head = Backing::from(Vec::with_capacity(256));
     engine
@@ -165,7 +173,7 @@ fn a_new_deadline_reaches_the_host_on_its_turn() {
         .unwrap();
     engine.finish(outbound).unwrap();
     assert!(drive(&mut server, at(3)).is_empty());
-    assert_eq!(server.wait(), Wait::Until(Some(Deadline::at(at(8)))));
+    assert_eq!(server.wait(), input(Some(at(8))));
 }
 
 /// At its head deadline, a server connection with no byte of a head closes with no error and no
@@ -177,7 +185,7 @@ fn the_head_timeout_closes_an_idle_connection_and_answers_a_slow_head_with_408()
     let mut server = open_server(Some(Duration::from_secs(5)));
     drive(&mut server, at(0));
     drive(&mut server, at(4));
-    assert!(matches!(server.wait(), Wait::Until(Some(_))));
+    assert_eq!(server.wait(), input(Some(at(5))));
     drive(&mut server, at(5));
     assert_eq!(server.wait(), Wait::Ended(Ok(())));
     assert_eq!(server.release(), Some(Ok(())));
@@ -216,7 +224,13 @@ fn the_head_timeout_closes_an_idle_connection_and_answers_a_slow_head_with_408()
     engine.finish(outbound).unwrap();
     drive(&mut server, at(1));
     drive(&mut server, at(6));
-    assert_eq!(server.wait(), Wait::Until(None));
+    assert_eq!(
+        server.wait(),
+        Wait::Until {
+            blocked: Blocked::Output,
+            deadline: None
+        }
+    );
     let response = server.output().unwrap();
     assert_eq!(response.region.bytes(), b"HTTP/1.1 200 \r\ncontent-length: 0\r\n\r\n");
     server.ack(response.id, response.region.initialized()).unwrap();

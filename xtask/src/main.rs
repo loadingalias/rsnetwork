@@ -31,7 +31,8 @@ Usage: cargo xtask <command> [arguments]
 
 Commands
   fix [Cargo args]     Apply Clippy fixes, format, then fail on the lints that remain (local only)
-  check [Cargo args]   Check formatting, lints, and rustdoc, and change no file (the CI gate)
+  check [Cargo args]   Check formatting, lints, rustdoc, and the protocol-only closure, and
+                       change no file (the CI gate)
   test [Nextest args]  Run the tests; with no arguments, also run the doctests
   model [--tlc-heap-mib=N --tlc-fp-mib=N] [model[/file]]...
                        Check the TLA+ models in models/; with no argument, every profile
@@ -80,6 +81,11 @@ const TLC_KEYWORDS: &[&str] = &[
 /// The name that a deadlock report gets. It is not a TLA+ identifier, so no
 /// property can have it.
 const DEADLOCK: &str = "(deadlock)";
+
+/// The crates that a protocol-only build of `rsnetwork` can hold: the core, and the shared types
+/// of the runtime family, which have no scheduler and no driver. A binding adds its runtime in its
+/// own package (`rsnetwork-tokio`, `rsnetwork-rsasync`), never in this closure.
+const PROTOCOL_CLOSURE: &[&str] = &["rsnetwork", "rstypes"];
 
 /// Environment variables that change compilation without notice. Each command
 /// removes them, so only the checked-in configuration applies. Each variable
@@ -205,7 +211,57 @@ impl Repo {
         step(
             "rustdoc",
             self.cargo(&["doc", "--locked", "--no-deps", "--quiet"]).args(&scope),
-        )
+        )?;
+        self.closure()
+    }
+
+    /// Fails when the dependencies of a protocol-only build hold a crate outside
+    /// [`PROTOCOL_CLOSURE`], for example an executor, a socket driver, or Tokio.
+    /// It reads the normal and build dependencies of `rsnetwork` on every target.
+    fn closure(&self) -> Result<(), Failure> {
+        eprintln!("── closure");
+        let started = Instant::now();
+        let output = self
+            .cargo(&[
+                "tree",
+                "--locked",
+                "--quiet",
+                "-p",
+                "rsnetwork",
+                "-e",
+                "normal,build",
+                "--target",
+                "all",
+                "--prefix",
+                "none",
+                "--format",
+                "{p}",
+            ])
+            .output()
+            .map_err(|error| Failure::new(format!("closure: cannot start cargo tree: {error}")))?;
+        if !output.status.success() {
+            return Err(Failure::new(format!(
+                "closure: cargo tree failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let tree = String::from_utf8_lossy(&output.stdout);
+        let mut outside: Vec<&str> = tree
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|name| !PROTOCOL_CLOSURE.contains(name))
+            .collect();
+        outside.sort_unstable();
+        outside.dedup();
+        if !outside.is_empty() {
+            return Err(Failure::new(format!(
+                "closure: a protocol-only build of rsnetwork holds {}; a binding takes its runtime in its own package",
+                outside.join(", ")
+            )));
+        }
+        eprintln!("   ok in {:.2}s", started.elapsed().as_secs_f64());
+        Ok(())
     }
 
     /// Runs the tests with Nextest, in the whole workspace unless the

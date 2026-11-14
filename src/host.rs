@@ -4,8 +4,8 @@
 //! [`Connection`] owns one engine and its two queues. The application gives it the received bytes
 //! and the time, drives it, writes its output to the transport, and acknowledges the bytes that
 //! the transport accepted. After each drive, [`Connection::wait`] tells when to drive again: now,
-//! or at the next deadline unless bytes arrive first. The connection spawns no task and needs no
-//! runtime, and it does not need `Send`.
+//! when the host gives what the engine waits for, or at the next deadline. The connection spawns no
+//! task and needs no runtime, and it does not need `Send`.
 //!
 //! The application keeps driving the connection until its terminal release: the engine ended,
 //! and the transport accepted each output. [`Connection::release`] tells when that is. A
@@ -76,7 +76,9 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::drive::{AckError, ActionId, Error, Inbound, Kind, Outbound, Output, Outstanding, Progress, Received, Turn};
+use crate::drive::{
+    AckError, ActionId, Blocked, Error, Inbound, Kind, Outbound, Output, Outstanding, Progress, Received, Turn,
+};
 use crate::h1::{Client, ClientEvent, Server, ServerEvent};
 use crate::time::{ClockDomain, Deadline, Instant};
 
@@ -141,9 +143,21 @@ impl Engine for Client {
 pub enum Wait {
     /// Now: the engine gave an event, or it has more work.
     Now,
-    /// When bytes arrive, when the transport accepts output, or at the deadline, whichever comes
-    /// first. `None` has no deadline.
-    Until(Option<Deadline>),
+    /// When the host gives what `blocked` names, or at `deadline`, whichever comes first:
+    ///
+    /// - [`Blocked::Input`]: when bytes arrive, or the peer closes its side.
+    /// - [`Blocked::Output`]: when the transport accepts output.
+    /// - [`Blocked::Capacity`]: when that much capacity is free again.
+    ///
+    /// A host that waits only for this cause does not wake for an event that cannot help, for
+    /// example a socket that can take output while the engine waits for input. Send each
+    /// outstanding output in any wait.
+    Until {
+        /// What the engine waits for.
+        blocked: Blocked,
+        /// The next deadline of the engine, or `None` when it has none.
+        deadline: Option<Deadline>,
+    },
     /// Never: the engine ended with this result. Send the rest of the output, and then release
     /// the connection.
     Ended(Result<(), Error>),
@@ -216,7 +230,10 @@ impl<E: Engine> Connection<E> {
         let (event, turn) = self.engine.drive(&mut self.inbound, &mut self.outbound, now);
         self.wait = match turn.progress {
             Progress::Pending => Wait::Now,
-            Progress::Blocked(_) => Wait::Until(turn.deadline),
+            Progress::Blocked(blocked) => Wait::Until {
+                blocked,
+                deadline: turn.deadline,
+            },
             Progress::Terminal(end) => Wait::Ended(end),
         };
         Ok(event)
