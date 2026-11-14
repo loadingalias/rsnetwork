@@ -5,7 +5,8 @@ use core::num::NonZeroUsize;
 
 use rstypes::buffer::{BufferMut, WriteLoan};
 
-use super::{Field, Framing};
+use super::Framing;
+use crate::value::{Field, Status};
 
 /// Writes a response head into the free capacity of `out`, after the bytes that it holds.
 ///
@@ -15,16 +16,17 @@ use super::{Field, Framing};
 /// `transfer-encoding: chunked`. A 204 or 304 response has no body: give `Length(0)`, and the
 /// head then has no framing field, as RFC 9110, section 8.6, requires.
 ///
-/// Refuses, and writes nothing, if the status is not in 200 to 599, if a 204 or 304 has other
-/// framing, if a field is a framing field, or if `out` has too little free capacity.
+/// Refuses, and writes nothing, if the status is informational (100 to 199), if a 204 or 304 has
+/// other framing, if a field is a framing field, or if `out` has too little free capacity.
 pub fn write_head<B: BufferMut>(
     out: &mut WriteLoan<B>,
-    status: u16,
+    status: Status,
     fields: &[Field<'_>],
     framing: Framing,
 ) -> Result<(), WriteError> {
-    let no_body = matches!(status, 204 | 304);
-    if !(200..=599).contains(&status) || (no_body && framing != Framing::Length(0)) {
+    let code = status.code();
+    let no_body = matches!(code, 204 | 304);
+    if code < 200 || (no_body && framing != Framing::Length(0)) {
         return Err(WriteError::Status);
     }
     let framing_field = |field: &Field<'_>| {
@@ -34,7 +36,7 @@ pub fn write_head<B: BufferMut>(
         return Err(WriteError::FramingField);
     }
     let mut status_digits = [0; 20];
-    let status = digits(u64::from(status), 10, &mut status_digits);
+    let status = digits(u64::from(code), 10, &mut status_digits);
     let mut length_digits = [0; 20];
     let framing: [&[u8]; 3] = match framing {
         _ if no_body => [b"", b"", b""],
@@ -126,8 +128,8 @@ pub enum WriteError {
         /// The free bytes of the output region.
         available: usize,
     },
-    /// The status is not in 200 to 599, or a 204 or 304 response has framing other than
-    /// `Length(0)`.
+    /// The status is informational (100 to 199), or a 204 or 304 response has framing other
+    /// than `Length(0)`.
     Status,
     /// A field is `Content-Length` or `Transfer-Encoding`. The framing argument writes the
     /// framing field.
@@ -141,7 +143,7 @@ impl fmt::Display for WriteError {
                 f,
                 "the write needs {needed} bytes, but the output region has only {available} free bytes"
             ),
-            Self::Status => f.write_str("the status is not in 200 to 599, or it does not permit the framing"),
+            Self::Status => f.write_str("the status is informational, or it does not permit the framing"),
             Self::FramingField => f.write_str("a field is a framing field, which the framing argument writes"),
         }
     }

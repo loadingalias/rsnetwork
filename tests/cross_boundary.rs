@@ -19,7 +19,8 @@ use std::process::Command;
 use std::thread;
 
 use rsnetwork::buffer::{BufferMut, WriteLoan};
-use rsnetwork::h1::{Field, Framing, Limits, ParseError, RequestParser, write_head};
+use rsnetwork::h1::{Framing, Limits, ParseError, RequestParser, write_head};
+use rsnetwork::value::{Field, Status};
 
 mod counting;
 
@@ -29,6 +30,8 @@ use counting::allocations;
 const LIMITS: Limits = Limits {
     head_bytes: 4096,
     fields: 32,
+    name_bytes: 4096,
+    value_bytes: 4096,
 };
 
 /// The target that `curl` requests, and the response that it must print with `--include`.
@@ -90,7 +93,7 @@ fn respond<B: BufferMut>(parser: &mut RequestParser, received: &[u8], out: &mut 
         let (status, body) = match parser.parse(received) {
             Ok(None) => return None,
             Ok(Some(head)) => {
-                let target = head.target();
+                let target = head.target().as_bytes();
                 let start = target
                     .as_ptr()
                     .addr()
@@ -106,7 +109,13 @@ fn respond<B: BufferMut>(parser: &mut RequestParser, received: &[u8], out: &mut 
             Err(error) => (status(error), 0..0),
         };
         let fields = [Field::new(b"connection", b"close").unwrap()];
-        write_head(out, status, &fields, Framing::Length(body.len() as u64)).unwrap();
+        write_head(
+            out,
+            Status::new(status).unwrap(),
+            &fields,
+            Framing::Length(body.len() as u64),
+        )
+        .unwrap();
         Some(body)
     });
     assert_eq!(count, 0, "the parser and the serializer allocated");
@@ -116,7 +125,7 @@ fn respond<B: BufferMut>(parser: &mut RequestParser, received: &[u8], out: &mut 
 /// The response status for a refused head, as the documentation of `ParseError` names it.
 fn status(error: ParseError) -> u16 {
     match error {
-        ParseError::HeadTooLarge | ParseError::TooManyFields => 431,
+        ParseError::HeadTooLarge | ParseError::TooManyFields | ParseError::FieldTooLarge => 431,
         ParseError::Malformed | ParseError::Framing => 400,
         ParseError::Version => 505,
         ParseError::TransferCoding => 501,

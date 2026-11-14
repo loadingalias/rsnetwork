@@ -6,28 +6,32 @@ use core::num::NonZeroUsize;
 use rstypes::buffer::WriteLoan;
 
 use super::{
-    Field, Framing, InvalidField, Limits, ParseError, RequestHead, RequestParser, WriteError, begin_chunk, end_chunk,
-    last_chunk, write_head,
+    Framing, Limits, ParseError, RequestHead, RequestParser, WriteError, begin_chunk, end_chunk, last_chunk, write_head,
 };
+use crate::value::{Field, Status};
 
 /// The method, target, fields, consumed count, and framing of a head.
 type Summary<'a> = (&'a [u8], &'a [u8], Vec<(&'a [u8], &'a [u8])>, usize, Framing);
 
 fn summary(head: RequestHead<'_>) -> Summary<'_> {
     (
-        head.method(),
-        head.target(),
+        head.method().as_bytes(),
+        head.target().as_bytes(),
         head.fields().map(|field| (field.name(), field.value())).collect(),
         head.consumed(),
         head.framing(),
     )
 }
 
+const LIMITS: Limits = Limits {
+    head_bytes: 1024,
+    fields: 16,
+    name_bytes: 64,
+    value_bytes: 256,
+};
+
 fn parser() -> RequestParser {
-    RequestParser::new(Limits {
-        head_bytes: 1024,
-        fields: 16,
-    })
+    RequestParser::new(LIMITS)
 }
 
 fn parse<'a>(parser: &mut RequestParser, input: &'a [u8]) -> Option<Summary<'a>> {
@@ -102,7 +106,13 @@ fn split_and_byte_at_a_time_input_give_the_same_head() {
 /// arrive one at a time. A head of exactly the limit passes. The field limit works the same way.
 #[test]
 fn a_head_over_its_limit_refuses_before_it_ends() {
-    let limits = |head_bytes, fields| RequestParser::new(Limits { head_bytes, fields });
+    let limits = |head_bytes, fields| {
+        RequestParser::new(Limits {
+            head_bytes,
+            fields,
+            ..LIMITS
+        })
+    };
     let len = LENGTH_HEAD.len();
     assert!(limits(len, 5).parse(LENGTH_HEAD).unwrap().is_some());
 
@@ -192,20 +202,127 @@ fn each_syntax_defect_refuses() {
     }
 }
 
-/// The `Debug` output of a head, its fields, and a field shows no peer text, so a log line of a
+/// The `Debug` output of a head, its fields, and its values shows no peer text, so a log line of a
 /// request does not show a credential.
 #[test]
 fn debug_output_shows_no_peer_text() {
-    let input = b"GET /?token=secret HTTP/1.1\r\nAuthorization: Bearer secret\r\n\r\n";
+    let input = b"SECRET /?token=secret HTTP/1.1\r\nAuthorization: Bearer secret\r\nHost: secret.example\r\n\r\n";
     let head = parser().parse(input).unwrap().unwrap();
     let field = head.fields().next().unwrap();
     for text in [
         format!("{head:?}"),
         format!("{:?}", head.fields()),
         format!("{field:?}"),
+        format!("{:?}", head.method()),
+        format!("{:?}", head.target()),
+        format!("{:?}", head.target().form()),
+        format!("{:?}", head.authority()),
+        format!("{:?}", head.authority().host()),
     ] {
-        assert!(!text.contains("secret") && !text.contains("Authorization"), "{text}");
+        assert!(
+            !text.to_ascii_lowercase().contains("secret") && !text.contains("Authorization"),
+            "{text}"
+        );
     }
+}
+
+/// An HTTP/1.1 request has exactly one Host field with a valid authority, or it refuses (RFC 9112,
+/// section 3.2). A target in the absolute or the authority form gives the authority, and the Host
+/// value then has no effect (RFC 9112, sections 3.2.2 and 3.3). With two Host values, two readers
+/// can send the request to two different virtual hosts.
+#[test]
+fn the_authority_comes_from_the_target_or_from_one_valid_host_field() {
+    for (input, expected) in [
+        (
+            &b"GET /where?q=now HTTP/1.1\r\nHost: www.example.org\r\n\r\n"[..],
+            Ok(&b"www.example.org"[..]),
+        ),
+        (
+            b"GET http://www.example.org/pub/WWW/TheProject.html HTTP/1.1\r\nHost: other.example\r\n\r\n",
+            Ok(b"www.example.org"),
+        ),
+        (
+            b"CONNECT server.example.com:80 HTTP/1.1\r\nHost: server.example.com\r\n\r\n",
+            Ok(b"server.example.com:80"),
+        ),
+        (
+            b"OPTIONS * HTTP/1.1\r\nHost: www.example.org:8001\r\n\r\n",
+            Ok(b"www.example.org:8001"),
+        ),
+        (b"GET /a HTTP/1.1\r\nX-Host: a\r\n\r\n", Err(ParseError::Malformed)),
+        (
+            b"GET /a HTTP/1.1\r\nHost: a\r\nhost: a\r\n\r\n",
+            Err(ParseError::Malformed),
+        ),
+        (b"GET /a HTTP/1.1\r\nHost:\r\n\r\n", Err(ParseError::Malformed)),
+        (b"GET /a HTTP/1.1\r\nHost: user@a\r\n\r\n", Err(ParseError::Malformed)),
+        (b"GET /a HTTP/1.1\r\nHost: a, b\r\n\r\n", Err(ParseError::Malformed)),
+        (b"GET http://a.example/ HTTP/1.1\r\n\r\n", Err(ParseError::Malformed)),
+        (
+            b"GET http://a.example/ HTTP/1.1\r\nHost: a.example:99999\r\n\r\n",
+            Err(ParseError::Malformed),
+        ),
+    ] {
+        let authority = parser().parse(input).map(|head| head.unwrap().authority().as_bytes());
+        assert_eq!(authority, expected, "{:?}", input.escape_ascii().to_string());
+    }
+}
+
+/// Only CONNECT has the authority form, and a CONNECT has no other form. Only OPTIONS has the
+/// asterisk form (RFC 9112, section 3.2, and RFC 9110, section 9.3.6). Each other pair refuses.
+/// The case of a method has a meaning, so `connect` is an extension method.
+#[test]
+fn a_method_refuses_a_target_form_that_it_does_not_permit() {
+    for (request_line, permitted) in [
+        ("CONNECT a.example:443", true),
+        ("OPTIONS *", true),
+        ("OPTIONS /a", true),
+        ("GET a.example:443", false),
+        ("connect a.example:443", false),
+        ("CONNECT /a", false),
+        ("CONNECT http://a.example/", false),
+        ("GET *", false),
+    ] {
+        let input = format!("{request_line} HTTP/1.1\r\nHost: a.example\r\n\r\n");
+        let result = parser().parse(input.as_bytes()).map(|head| head.is_some());
+        let expected = if permitted {
+            Ok(true)
+        } else {
+            Err(ParseError::Malformed)
+        };
+        assert_eq!(result, expected, "{request_line}");
+    }
+}
+
+/// A field name or value longer than its limit refuses, and one of exactly its limit passes. The
+/// length of a value does not include the whitespace at its start and end.
+#[test]
+fn a_field_over_its_name_or_value_limit_refuses() {
+    let name = "N".repeat(LIMITS.name_bytes);
+    let value = "v".repeat(LIMITS.value_bytes);
+    let parse = |name: &str, value: &str| {
+        let input = format!("GET / HTTP/1.1\r\nHost: a\r\n{name}: {value}\r\n\r\n");
+        parser().parse(input.as_bytes()).map(|head| head.is_some())
+    };
+    assert_eq!(parse(&name, &format!(" \t{value}\t ")), Ok(true));
+    assert_eq!(parse(&format!("{name}N"), "v"), Err(ParseError::FieldTooLarge));
+    assert_eq!(parse("N", &format!("{value}v")), Err(ParseError::FieldTooLarge));
+}
+
+/// The fields of a request keep their order and the case of their names when a server writes them
+/// again, also for a repeated name. A map of fields would merge them, change their order, or change
+/// their case.
+#[test]
+fn fields_keep_their_order_and_name_case_from_parse_to_write() {
+    let input = b"GET / HTTP/1.1\r\nHost: a\r\nX-Tag: a\r\nx-tag: b\r\nX-TAG: c\r\n\r\n";
+    let head = parser().parse(input).unwrap().unwrap();
+    let fields: Vec<Field<'_>> = head.fields().collect();
+    let mut out = WriteLoan::new(Vec::with_capacity(256));
+    write_head(&mut out, Status::new(200).unwrap(), &fields, Framing::Length(0)).unwrap();
+    assert_eq!(
+        out.into_inner(),
+        b"HTTP/1.1 200 \r\nHost: a\r\nX-Tag: a\r\nx-tag: b\r\nX-TAG: c\r\ncontent-length: 0\r\n\r\n"
+    );
 }
 
 /// A region with exactly `capacity` free bytes.
@@ -226,7 +343,7 @@ fn heads_and_chunks_have_the_exact_framing() {
     ];
     let head = |status, fields: &[Field<'_>], framing| {
         let mut out = WriteLoan::new(Vec::with_capacity(256));
-        write_head(&mut out, status, fields, framing).unwrap();
+        write_head(&mut out, Status::new(status).unwrap(), fields, framing).unwrap();
         out.into_inner()
     };
     assert_eq!(
@@ -244,7 +361,7 @@ fn heads_and_chunks_have_the_exact_framing() {
     assert_eq!(head(304, &[], Framing::Length(0)), b"HTTP/1.1 304 \r\n\r\n");
 
     let mut out = WriteLoan::new(Vec::with_capacity(256));
-    write_head(&mut out, 200, &[], Framing::Chunked).unwrap();
+    write_head(&mut out, Status::new(200).unwrap(), &[], Framing::Chunked).unwrap();
     begin_chunk(&mut out, NonZeroUsize::new(26).unwrap()).unwrap();
     assert_eq!(out.fill_from(b"abcdefghijklmnopqrstuvwxyz"), 26);
     end_chunk(&mut out).unwrap();
@@ -261,11 +378,11 @@ fn heads_and_chunks_have_the_exact_framing() {
 fn a_refused_write_writes_nothing() {
     let expected = b"HTTP/1.1 200 \r\ncontent-length: 0\r\n\r\n";
     let mut out = WriteLoan::new(region(expected.len()));
-    write_head(&mut out, 200, &[], Framing::Length(0)).unwrap();
+    write_head(&mut out, Status::new(200).unwrap(), &[], Framing::Length(0)).unwrap();
     assert_eq!(out.filled(), expected);
     let mut out = WriteLoan::new(region(expected.len() - 1));
     assert_eq!(
-        write_head(&mut out, 200, &[], Framing::Length(0)),
+        write_head(&mut out, Status::new(200).unwrap(), &[], Framing::Length(0)),
         Err(WriteError::Full {
             needed: expected.len(),
             available: expected.len() - 1
@@ -276,42 +393,19 @@ fn a_refused_write_writes_nothing() {
     let length = [Field::new(b"Content-Length", b"5").unwrap()];
     let coding = [Field::new(b"TRANSFER-ENCODING", b"chunked").unwrap()];
     for (status, fields, framing, expected) in [
-        (199, &[][..], Framing::Length(0), WriteError::Status),
-        (600, &[], Framing::Length(0), WriteError::Status),
+        (100, &[][..], Framing::Length(0), WriteError::Status),
+        (199, &[], Framing::Length(0), WriteError::Status),
         (204, &[], Framing::Length(1), WriteError::Status),
         (304, &[], Framing::Chunked, WriteError::Status),
         (200, &length, Framing::Length(5), WriteError::FramingField),
         (200, &coding, Framing::Chunked, WriteError::FramingField),
     ] {
         let mut out = WriteLoan::new(Vec::with_capacity(256));
-        assert_eq!(write_head(&mut out, status, fields, framing), Err(expected), "{status}");
-        assert!(out.filled().is_empty());
-    }
-}
-
-/// A CR or an LF in a field value ends the field line early, so the rest of the value becomes a
-/// field or a second response (response splitting). Edge whitespace changes the value that the
-/// peer reads. Each of these refuses. Other bytes stay as they are.
-#[test]
-fn a_field_refuses_bytes_that_change_its_line() {
-    for (name, value) in [
-        (&b"X-A"[..], &b"a\r\nX-B: b"[..]),
-        (b"X-A", b"a\nb"),
-        (b"X-A", b"a\rb"),
-        (b"X-A", b" a"),
-        (b"X-A", b"a\t"),
-        (b"X A", b"a"),
-        (b"X-A:", b"a"),
-        (b"", b"a"),
-    ] {
         assert_eq!(
-            Field::new(name, value),
-            Err(InvalidField),
-            "{:?}",
-            value.escape_ascii().to_string()
+            write_head(&mut out, Status::new(status).unwrap(), fields, framing),
+            Err(expected),
+            "{status}"
         );
-    }
-    for value in [&b""[..], b"a \tb", b"caf\xc3\xa9"] {
-        assert_eq!(Field::new(b"X-A", value).map(|field| field.value()), Ok(value));
+        assert!(out.filled().is_empty());
     }
 }

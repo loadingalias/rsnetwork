@@ -2,7 +2,10 @@
 
 use core::fmt;
 
-use super::{Field, Framing, is_token};
+use rstypes::buffer::{Buffer as _, Lease};
+
+use super::Framing;
+use crate::value::{Authority, Field, Method, Target, TargetForm, decimal};
 
 /// The limits of one request head, which the caller sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,6 +15,10 @@ pub struct Limits {
     pub head_bytes: usize,
     /// The largest number of field lines in the head.
     pub fields: usize,
+    /// The longest field name, in bytes.
+    pub name_bytes: usize,
+    /// The longest field value, in bytes, with no whitespace at its start or end.
+    pub value_bytes: usize,
 }
 
 /// Parses HTTP/1.1 request heads in received bytes, with no copy and no allocation.
@@ -50,7 +57,7 @@ impl RequestParser {
             return Ok(None);
         };
         self.searched = 0;
-        check(&window[..end], self.limits.fields).map(Some)
+        check(&window[..end], &self.limits).map(Some)
     }
 
     /// Finds the end of the head in `window`: the position after its empty line. Refuses a CR
@@ -77,16 +84,16 @@ impl RequestParser {
 }
 
 /// Checks a complete head. `head` ends with its empty line, and each of its CRs is before an LF.
-fn check(head: &[u8], max_fields: usize) -> Result<RequestHead<'_>, ParseError> {
+fn check<'a>(head: &'a [u8], limits: &Limits) -> Result<RequestHead<'a>, ParseError> {
     let lines = head.strip_suffix(b"\r\n").unwrap_or(head);
     let (request_line, block) = split_line(lines).ok_or(ParseError::Malformed)?;
     let mut parts = request_line.splitn(3, |&byte| byte == b' ');
     let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next()) else {
         return Err(ParseError::Malformed);
     };
-    if !is_token(method) || target.is_empty() || !target.iter().all(u8::is_ascii_graphic) {
+    let (Ok(method), Ok(target)) = (Method::new(method), Target::new(target)) else {
         return Err(ParseError::Malformed);
-    }
+    };
     if version != b"HTTP/1.1" {
         return Err(match version {
             [b'H', b'T', b'T', b'P', b'/', major, b'.', minor] if major.is_ascii_digit() && minor.is_ascii_digit() => {
@@ -95,19 +102,34 @@ fn check(head: &[u8], max_fields: usize) -> Result<RequestHead<'_>, ParseError> 
             _ => ParseError::Malformed,
         });
     }
+    // Only CONNECT has the authority form, and only OPTIONS has the asterisk form (RFC 9112,
+    // section 3.2). A CONNECT request has the authority form (RFC 9110, section 9.3.6).
+    let form = target.form();
+    let form_ok = match form {
+        TargetForm::Authority(_) => method == Method::CONNECT,
+        TargetForm::Asterisk => method == Method::OPTIONS,
+        TargetForm::Origin { .. } | TargetForm::Absolute { .. } => method != Method::CONNECT,
+    };
+    if !form_ok {
+        return Err(ParseError::Malformed);
+    }
 
     let mut count = 0;
     let mut length = None;
     let mut coding = None;
     let mut coding_lines = 0_usize;
+    let mut host = None;
     let mut rest = block;
     while let Some((line, next)) = split_line(rest) {
         rest = next;
         count += 1;
-        if count > max_fields {
+        if count > limits.fields {
             return Err(ParseError::TooManyFields);
         }
         let (name, value) = field_parts(line).ok_or(ParseError::Malformed)?;
+        if name.len() > limits.name_bytes || value.len() > limits.value_bytes {
+            return Err(ParseError::FieldTooLarge);
+        }
         let field = Field::new(name, value).map_err(|_| ParseError::Malformed)?;
         if field.name.eq_ignore_ascii_case(b"content-length") {
             if length.is_some() {
@@ -117,6 +139,8 @@ fn check(head: &[u8], max_fields: usize) -> Result<RequestHead<'_>, ParseError> 
         } else if field.name.eq_ignore_ascii_case(b"transfer-encoding") {
             coding = Some(field.value);
             coding_lines += 1;
+        } else if field.name.eq_ignore_ascii_case(b"host") && host.replace(field.value).is_some() {
+            return Err(ParseError::Malformed);
         }
     }
 
@@ -133,12 +157,27 @@ fn check(head: &[u8], max_fields: usize) -> Result<RequestHead<'_>, ParseError> 
             });
         }
     };
+    // An HTTP/1.1 request has one Host field, and its value is an authority (RFC 9112, section
+    // 3.2). A target with an authority gives the authority of the request, and the Host value
+    // then has no effect (RFC 9112, sections 3.2.2 and 3.3).
+    let host = host
+        .and_then(|value| Authority::new(value).ok())
+        .ok_or(ParseError::Malformed)?;
+    let authority = match form {
+        TargetForm::Absolute { authority, .. } | TargetForm::Authority(authority) => authority,
+        TargetForm::Origin { .. } | TargetForm::Asterisk => host,
+    };
+    let offset = |part: &[u8]| part.as_ptr().addr() - head.as_ptr().addr();
+    let span = |part: &[u8]| (offset(part), offset(part) + part.len());
     Ok(RequestHead {
-        method,
-        target,
-        fields: block,
-        consumed: head.len(),
-        framing,
+        bytes: head,
+        layout: Layout {
+            method: method.as_bytes().len(),
+            target: span(target.as_bytes()),
+            fields: offset(block),
+            authority: span(authority.as_bytes()),
+            framing,
+        },
     })
 }
 
@@ -166,68 +205,121 @@ fn trim_whitespace(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-/// The value of one or more decimal digits, if it fits in a `u64`.
-fn decimal(digits: &[u8]) -> Option<u64> {
-    if digits.is_empty() {
-        return None;
-    }
-    digits.iter().try_fold(0_u64, |value, &digit| {
-        if !digit.is_ascii_digit() {
-            return None;
-        }
-        value.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
-    })
-}
-
 /// A checked HTTP/1.1 request head: views of the received bytes.
 ///
 /// Its `Debug` output shows only the consumed length and the framing, because the method, the
 /// target, and the fields are peer text.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RequestHead<'a> {
-    method: &'a [u8],
-    target: &'a [u8],
-    /// The field lines, each with its CR LF.
-    fields: &'a [u8],
-    consumed: usize,
+    /// The head, from the first byte of the request line to the end of the empty line.
+    bytes: &'a [u8],
+    layout: Layout,
+}
+
+/// The positions of the checked parts of a head, from its first byte.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Layout {
+    /// The end of the method, which starts at the first byte.
+    method: usize,
+    /// The start and the end of the target.
+    target: (usize, usize),
+    /// The start of the field lines.
+    fields: usize,
+    /// The start and the end of the authority: in the target, or in the Host field.
+    authority: (usize, usize),
     framing: Framing,
 }
 
 impl<'a> RequestHead<'a> {
-    /// The method, a token. Its case is significant, and an unknown method stays as it is.
-    pub fn method(&self) -> &'a [u8] {
-        self.method
+    /// The method. An unknown method stays as it is.
+    pub fn method(&self) -> Method<'a> {
+        Method(&self.bytes[..self.layout.method])
     }
 
-    /// The request target: one or more visible ASCII bytes.
-    pub fn target(&self) -> &'a [u8] {
-        self.target
+    /// The request target, in its exact bytes.
+    pub fn target(&self) -> Target<'a> {
+        let (start, end) = self.layout.target;
+        Target(&self.bytes[start..end])
+    }
+
+    /// The authority of the request: that of an absolute-form or authority-form target, or else
+    /// the value of the Host field (RFC 9112, section 3.3).
+    ///
+    /// The parser refuses an HTTP/1.1 request that does not have exactly one Host field with a
+    /// valid authority (RFC 9112, section 3.2), also when the target gives the authority.
+    pub fn authority(&self) -> Authority<'a> {
+        let (start, end) = self.layout.authority;
+        Authority(&self.bytes[start..end])
     }
 
     /// The field lines, in their received order. Repeated names stay as separate fields.
     ///
     /// Each call reads the checked field lines again. It allocates nothing.
     pub fn fields(&self) -> Fields<'a> {
-        Fields { block: self.fields }
+        Fields {
+            block: &self.bytes[self.layout.fields..self.bytes.len() - 2],
+        }
     }
 
     /// The number of bytes of the head, from the first byte of the input. The body starts there.
     pub fn consumed(&self) -> usize {
-        self.consumed
+        self.bytes.len()
     }
 
     /// The framing of the body after the head.
     pub fn framing(&self) -> Framing {
-        self.framing
+        self.layout.framing
+    }
+
+    /// Keeps this head after the call, as a view of the backing of `region`, with no copy.
+    ///
+    /// Give the frozen region whose bytes the parser read. The retained head keeps the backing
+    /// alive, and it shares the one charge of the backing with each other view of it. A pool slot
+    /// needs no allocation for it. Gives `None` if this head is not in the bytes of `region`.
+    pub fn retain(&self, region: &Lease) -> Option<RetainedHead> {
+        let start = self.bytes.as_ptr().addr().checked_sub(region.as_ptr().addr())?;
+        let region = region.view(start..start.checked_add(self.bytes.len())?)?;
+        Some(RetainedHead {
+            region,
+            layout: self.layout,
+        })
     }
 }
 
 impl fmt::Debug for RequestHead<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RequestHead")
-            .field("consumed", &self.consumed)
-            .field("framing", &self.framing)
+            .field("consumed", &self.consumed())
+            .field("framing", &self.layout.framing)
             .finish_non_exhaustive()
+    }
+}
+
+/// A request head that keeps the backing of its received region alive, from
+/// [`RequestHead::retain`].
+///
+/// It holds one view of the backing. Thus it keeps no copy, and its values count the backing one
+/// time. The backing returns or frees its region when its last view drops.
+#[derive(Clone)]
+pub struct RetainedHead {
+    /// A view of exactly the bytes of the head.
+    region: Lease,
+    layout: Layout,
+}
+
+impl RetainedHead {
+    /// The head, with its values as views of the retained bytes.
+    pub fn head(&self) -> RequestHead<'_> {
+        RequestHead {
+            bytes: self.region.bytes(),
+            layout: self.layout,
+        }
+    }
+}
+
+impl fmt::Debug for RetainedHead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("RetainedHead").field(&self.head()).finish()
     }
 }
 
@@ -265,7 +357,12 @@ pub enum ParseError {
     HeadTooLarge,
     /// The head has more field lines than [`Limits::fields`]. Respond with 431.
     TooManyFields,
-    /// The request line, a field line, or a line end does not obey RFC 9112. Respond with 400.
+    /// A field name is longer than [`Limits::name_bytes`], or a field value is longer than
+    /// [`Limits::value_bytes`]. Respond with 431.
+    FieldTooLarge,
+    /// The request line, a field line, or a line end does not obey RFC 9112. Or the method does
+    /// not permit the form of the target, or the request does not have exactly one Host field
+    /// with a valid authority. Respond with 400.
     Malformed,
     /// The version is not HTTP/1.1. Respond with 505.
     Version,
@@ -283,6 +380,7 @@ impl fmt::Display for ParseError {
         f.write_str(match self {
             Self::HeadTooLarge => "the request head is longer than its limit",
             Self::TooManyFields => "the request head has more field lines than its limit",
+            Self::FieldTooLarge => "a field name or a field value is longer than its limit",
             Self::Malformed => "the request head does not obey the HTTP/1.1 syntax",
             Self::Version => "the request version is not HTTP/1.1",
             Self::Framing => "the request body framing is not clear",
