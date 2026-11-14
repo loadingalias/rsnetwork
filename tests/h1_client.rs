@@ -5,6 +5,7 @@
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 
+use rsnetwork::body::Outcome;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Progress, Received};
 use rsnetwork::h1::{BodyLimits, Client, ClientEvent, Framing, Limits};
@@ -41,7 +42,29 @@ enum Seen {
     Response(u16),
     Data(Vec<u8>),
     End(Vec<u8>),
+    Truncated,
+    Malformed,
     Handoff,
+}
+
+/// What the application saw of the outcome of a body: a complete body with its trailer lines, or
+/// the outcome that is not complete.
+fn outcome(outcome: Outcome) -> Seen {
+    match outcome {
+        Outcome::Complete(trailers) => Seen::End(
+            trailers
+                .map(|trailers| {
+                    trailers
+                        .fields()
+                        .flat_map(|field| [field.name(), b": ", field.value(), b"\r\n"].concat())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        Outcome::Truncated => Seen::Truncated,
+        Outcome::Malformed => Seen::Malformed,
+        other => panic!("{other:?}"),
+    }
 }
 
 const WAIT: Progress = Progress::Blocked(Blocked::Input);
@@ -105,16 +128,7 @@ impl Host {
                 Some(ClientEvent::Informational(head)) => Seen::Informational(head.head().status().code()),
                 Some(ClientEvent::Response(head)) => Seen::Response(head.head().status().code()),
                 Some(ClientEvent::Data(data)) => Seen::Data(data.bytes().to_vec()),
-                Some(ClientEvent::End(trailers)) => Seen::End(
-                    trailers
-                        .map(|trailers| {
-                            trailers
-                                .fields()
-                                .flat_map(|field| [field.name(), b": ", field.value(), b"\r\n"].concat())
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                ),
+                Some(ClientEvent::End(end)) => outcome(end),
                 Some(ClientEvent::Handoff) => Seen::Handoff,
                 None => return (seen, turn.progress),
             });
@@ -234,7 +248,10 @@ fn the_close_ends_a_close_delimited_body_and_cuts_any_other() {
     host.receive(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello");
     host.inbound.end();
     let (seen, progress) = host.drive();
-    assert_eq!(seen, vec![Seen::Response(200), Seen::Data(b"hello".to_vec())]);
+    assert_eq!(
+        seen,
+        vec![Seen::Response(200), Seen::Data(b"hello".to_vec()), Seen::Truncated]
+    );
     assert!(terminal(&progress, Kind::Partial), "{progress:?}");
 
     let mut host = Host::new();

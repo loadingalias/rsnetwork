@@ -261,7 +261,7 @@ pub(super) fn view_of(region: &Lease, head: &[u8]) -> Option<Lease> {
 #[derive(Clone)]
 pub struct Fields<'a> {
     /// The field lines that remain, each with its CR LF. The parser checked each of them.
-    pub(super) block: &'a [u8],
+    pub(crate) block: &'a [u8],
 }
 
 impl<'a> Iterator for Fields<'a> {

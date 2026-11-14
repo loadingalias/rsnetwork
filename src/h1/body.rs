@@ -1,4 +1,4 @@
-//! The body reader and the body writer that the server and the client engines share.
+//! The H1 body reader and body writer that the server and the client engines share.
 
 use core::alloc::Layout;
 use core::fmt;
@@ -7,37 +7,16 @@ use core::num::{NonZeroU32, NonZeroUsize};
 use rstypes::buffer::{Backing, Buffer as _, Lease, Pool, WriteLoan};
 use rstypes::capacity::Budget;
 
-use super::head::{BodyLimits, Fields, Limits, ParseError};
+use super::head::{BodyLimits, Limits, ParseError};
 use super::join::{Join, Step, join};
 use super::write::{begin_chunk, last_chunk};
 use super::{ChunkDecoder, ChunkStep, Framing, WriteError};
+use crate::body::Trailers;
 use crate::drive::{Error, Inbound, Kind, Outbound};
 use crate::value::Field;
 
 /// The size of a slot of the chunk-size line pool: 14 hexadecimal digits and CR LF.
 const LINE: usize = 16;
-
-/// The trailer section of a body: a view of its field lines in the received region.
-#[derive(Clone)]
-pub struct Trailers {
-    /// The field lines, each with its CR LF. The decoder checked each of them.
-    lines: Lease,
-}
-
-impl Trailers {
-    /// The trailer fields, in their received order.
-    pub fn fields(&self) -> Fields<'_> {
-        Fields {
-            block: self.lines.bytes(),
-        }
-    }
-}
-
-impl fmt::Debug for Trailers {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Trailers").finish_non_exhaustive()
-    }
-}
 
 /// What a read of a body found.
 pub(super) enum Read {

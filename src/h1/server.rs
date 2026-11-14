@@ -5,11 +5,12 @@ use core::fmt;
 use rstypes::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use rstypes::capacity::Budget;
 
-use super::body::{BodyReader, BodyWriter, Read, Trailers, full, misuse, write_error};
+use super::body::{BodyReader, BodyWriter, Read, full, misuse, write_error};
 use super::head::{BodyLimits, Limits, ParseError, Version};
 use super::join::{Join, Step, join};
 use super::write::write_response;
 use super::{Framing, RequestHead, RequestParser, RetainedRequest};
+use crate::body::Outcome;
 use crate::drive::{Blocked, Error, Inbound, Kind, Outbound, Progress, Turn};
 use crate::value::{Field, Method, Status};
 
@@ -38,6 +39,8 @@ pub struct Server {
     join: Option<Join>,
     /// The capacity that a join waits for.
     capacity: Option<u64>,
+    /// The refusal of a request body, which the drive applies after the body's outcome.
+    failure: Option<ParseError>,
     read: ReadState,
     write: Write,
     /// The facts of the current request.
@@ -55,8 +58,10 @@ pub enum ServerEvent {
     Request(RetainedRequest),
     /// Bytes of the request body: a view of a received region, with no copy.
     Data(Lease),
-    /// The end of the request body, with its trailer section if it has trailers.
-    End(Option<Trailers>),
+    /// The end of the request body, with its outcome: complete with its trailers, truncated by
+    /// the end of input, or malformed. After a truncated or malformed body, the next turn is
+    /// terminal.
+    End(Outcome),
     /// The connection changed its protocol after a 101 or a 2xx response to CONNECT. The front of
     /// the `Inbound` queue is exactly the bytes after the request, and they belong to the new
     /// protocol, as each later byte does. The engine reads no more, and the next turn is terminal.
@@ -68,7 +73,7 @@ impl fmt::Debug for ServerEvent {
         match self {
             Self::Request(head) => f.debug_tuple("Request").field(head).finish(),
             Self::Data(data) => f.debug_struct("Data").field("len", &data.initialized()).finish(),
-            Self::End(trailers) => f.debug_tuple("End").field(trailers).finish(),
+            Self::End(outcome) => f.debug_tuple("End").field(outcome).finish(),
             Self::Handoff => f.write_str("Handoff"),
         }
     }
@@ -127,6 +132,7 @@ impl Server {
             budget: budget.clone(),
             join: None,
             capacity: None,
+            failure: None,
             read: ReadState::Head,
             write: Write::Idle,
             request: Request::default(),
@@ -143,8 +149,14 @@ impl Server {
     /// head was out.
     pub fn drive(&mut self, inbound: &mut Inbound, outbound: &mut Outbound) -> (Option<ServerEvent>, Turn) {
         let (event, progress) = match self.step(inbound) {
-            Ok(Some(event)) => (Some(event), Progress::Pending),
-            Ok(None) => (None, self.progress()),
+            Ok(event) => {
+                let progress = match self.failure.take() {
+                    Some(refusal) => self.refuse(refusal, outbound),
+                    None if event.is_some() => Progress::Pending,
+                    None => self.progress(),
+                };
+                (event, progress)
+            }
             Err(refusal) => (None, self.refuse(refusal, outbound)),
         };
         (
@@ -187,19 +199,32 @@ impl Server {
                 ReadState::Body(reader) => reader,
             };
             let draining = reader.draining();
-            match reader.read(inbound, &self.budget)? {
+            let read = match reader.read(inbound, &self.budget) {
+                Ok(read) => read,
+                // A body that breaks its framing ends as malformed. Then the drive refuses the
+                // request.
+                Err(refusal) => {
+                    self.read = ReadState::Done;
+                    self.failure = Some(refusal);
+                    return Ok((!draining).then_some(ServerEvent::End(Outcome::Malformed)));
+                }
+            };
+            match read {
                 Read::Data(data) if !draining => return Ok(Some(ServerEvent::Data(data))),
                 Read::Data(_) | Read::Again => {}
                 Read::End(trailers) => {
                     self.read = ReadState::Done;
                     if !draining {
-                        return Ok(Some(ServerEvent::End(trailers)));
+                        return Ok(Some(ServerEvent::End(Outcome::Complete(trailers))));
                     }
                 }
                 Read::Wait => return Ok(None),
                 Read::Overdrawn => self.end = Some(Ok(())),
                 Read::Truncated => {
                     self.end = Some(Err(Error::new(Kind::Partial, "the request body ended before its end")));
+                    if !draining {
+                        return Ok(Some(ServerEvent::End(Outcome::Truncated)));
+                    }
                 }
                 Read::Capacity(units) => {
                     self.capacity = Some(units);

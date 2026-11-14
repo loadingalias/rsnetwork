@@ -5,6 +5,7 @@
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 
+use rsnetwork::body::Outcome;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Progress, Received};
 use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
@@ -44,7 +45,29 @@ enum Seen {
     Request(Vec<u8>, Vec<u8>),
     Data(Vec<u8>),
     End(Vec<u8>),
+    Truncated,
+    Malformed,
     Handoff,
+}
+
+/// What the application saw of the outcome of a body: a complete body with its trailer lines, or
+/// the outcome that is not complete.
+fn outcome(outcome: Outcome) -> Seen {
+    match outcome {
+        Outcome::Complete(trailers) => Seen::End(
+            trailers
+                .map(|trailers| {
+                    trailers
+                        .fields()
+                        .flat_map(|field| [field.name(), b": ", field.value(), b"\r\n"].concat())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        Outcome::Truncated => Seen::Truncated,
+        Outcome::Malformed => Seen::Malformed,
+        other => panic!("{other:?}"),
+    }
 }
 
 /// The host of one connection: the queues, and the engine.
@@ -92,15 +115,7 @@ impl Host {
                     ));
                 }
                 Some(ServerEvent::Data(data)) => seen.push(Seen::Data(data.bytes().to_vec())),
-                Some(ServerEvent::End(trailers)) => {
-                    let lines = trailers.map(|trailers| {
-                        trailers
-                            .fields()
-                            .flat_map(|field| [field.name(), b": ", field.value(), b"\r\n"].concat())
-                            .collect()
-                    });
-                    seen.push(Seen::End(lines.unwrap_or_default()));
-                }
+                Some(ServerEvent::End(end)) => seen.push(outcome(end)),
                 Some(ServerEvent::Handoff) => seen.push(Seen::Handoff),
                 None => return (seen, turn.progress),
             }
@@ -414,7 +429,10 @@ fn the_close_of_the_client_ends_the_connection() {
     host.receive(b"PUT / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nab");
     host.inbound.end();
     let (seen, progress) = host.drive();
-    assert_eq!(seen, vec![request(b"PUT", b"/"), Seen::Data(b"ab".to_vec())]);
+    assert_eq!(
+        seen,
+        vec![request(b"PUT", b"/"), Seen::Data(b"ab".to_vec()), Seen::Truncated]
+    );
     assert!(matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Partial));
 }
 
@@ -507,7 +525,7 @@ fn a_head_across_regions_joins_with_a_charge_and_no_copy_of_its_body() {
         let [
             ServerEvent::Request(request),
             ServerEvent::Data(data),
-            ServerEvent::End(None),
+            ServerEvent::End(Outcome::Complete(None)),
         ] = &events[..]
         else {
             panic!("cut at {cut}: {events:?}");

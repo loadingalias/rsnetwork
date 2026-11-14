@@ -23,6 +23,7 @@
 //! use core::net::{Ipv4Addr, SocketAddr};
 //! use core::num::{NonZeroU64, NonZeroUsize};
 //!
+//! use rsnetwork::body::Outcome;
 //! use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 //! use rsnetwork::capacity::Budget;
 //! use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received};
@@ -61,7 +62,7 @@
 //!     panic!("body bytes")
 //! };
 //! assert_eq!(data.bytes(), b"hello");
-//! let (Some(ServerEvent::End(None)), _) = server.drive(&mut inbound, &mut outbound) else {
+//! let (Some(ServerEvent::End(Outcome::Complete(None))), _) = server.drive(&mut inbound, &mut outbound) else {
 //!     panic!("the end of the body")
 //! };
 //!
@@ -92,7 +93,8 @@ mod response;
 mod server;
 mod write;
 
-pub use body::Trailers;
+use crate::body::Body;
+
 pub use chunked::{ChunkDecoder, ChunkStep};
 pub use client::{Client, ClientEvent};
 pub use head::{BodyLimits, Fields, Limits, ParseError, Version};
@@ -110,6 +112,13 @@ pub enum Framing {
     Chunked,
     /// The close of the connection ends the body. Only a response has this framing.
     Close,
+}
+
+/// The framing of a body to send: its length when it is known, and chunks when it is not.
+impl From<&Body> for Framing {
+    fn from(body: &Body) -> Self {
+        body.length().map_or(Self::Chunked, Self::Length)
+    }
 }
 
 #[cfg(test)]

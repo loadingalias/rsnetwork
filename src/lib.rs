@@ -8,7 +8,9 @@
 //! loop can drive it.
 //!
 //! [`drive`] is the interface that each protocol engine shares: received and output regions,
-//! their exact acknowledgements, the result of each drive, and the errors.
+//! their exact acknowledgements, the result of each drive, and the errors. [`body`] is the body
+//! model that each protocol shares: terminal outcomes, trailers, a consumer that reads a body
+//! into regions of the caller, bounded collection, and the bodies that a sender gives.
 //!
 //! [`buffer`], [`capacity`], and [`time`] are the buffer, capacity, and time modules of the
 //! runtime family, which the public API uses. They are the same modules that `rsasync` gives, so
@@ -16,6 +18,7 @@
 
 pub use rstypes::{buffer, capacity, time};
 
+pub mod body;
 pub mod drive;
 pub mod h1;
 pub mod value;

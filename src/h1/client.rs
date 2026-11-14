@@ -5,11 +5,12 @@ use core::fmt;
 use rstypes::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use rstypes::capacity::Budget;
 
-use super::body::{BodyReader, BodyWriter, Read, Trailers, full, misuse, write_error};
+use super::body::{BodyReader, BodyWriter, Read, full, misuse, write_error};
 use super::head::{BodyLimits, Limits, ParseError};
 use super::join::{Join, Step, join};
 use super::write::write_request_head;
 use super::{Framing, ResponseHead, ResponseParser, RetainedResponse};
+use crate::body::Outcome;
 use crate::drive::{Blocked, Error, Inbound, Kind, Outbound, Progress, Turn};
 use crate::value::{Authority, Field, Method, Target};
 
@@ -58,8 +59,11 @@ pub enum ClientEvent {
     Response(RetainedResponse),
     /// Bytes of the response body: a view of a received region, with no copy.
     Data(Lease),
-    /// The end of the response body, with its trailer section if it has trailers.
-    End(Option<Trailers>),
+    /// The end of the response body, with its outcome: complete with its trailers, truncated by
+    /// the end of input inside a body with a length or chunks, or malformed. A body that the
+    /// close delimits is complete at the end of input. After a truncated or malformed body, the
+    /// next turn is terminal.
+    End(Outcome),
     /// The connection changed its protocol after a 101 or a 2xx response to CONNECT, and the
     /// request ended. The front of the `Inbound` queue is exactly the bytes after the response
     /// head, and they belong to the new protocol, as each later byte does. The engine reads no
@@ -73,7 +77,7 @@ impl fmt::Debug for ClientEvent {
             Self::Informational(head) => f.debug_tuple("Informational").field(head).finish(),
             Self::Response(head) => f.debug_tuple("Response").field(head).finish(),
             Self::Data(data) => f.debug_struct("Data").field("len", &data.initialized()).finish(),
-            Self::End(trailers) => f.debug_tuple("End").field(trailers).finish(),
+            Self::End(outcome) => f.debug_tuple("End").field(outcome).finish(),
             Self::Handoff => f.write_str("Handoff"),
         }
     }
@@ -317,19 +321,32 @@ impl Client {
                 ReadState::Body(reader) => reader,
             };
             let draining = reader.draining();
-            match reader.read(inbound, &self.budget)? {
+            let read = match reader.read(inbound, &self.budget) {
+                Ok(read) => read,
+                // A body that breaks its framing ends as malformed, and then the connection ends.
+                Err(refusal) => {
+                    self.read = ReadState::Done;
+                    self.end = Some(Err(Error::from(refusal)));
+                    return Ok((!draining).then_some(ClientEvent::End(Outcome::Malformed)));
+                }
+            };
+            match read {
                 Read::Data(data) if !draining => return Ok(Some(ClientEvent::Data(data))),
                 Read::Data(_) | Read::Again => {}
+                // A body that the close delimits is complete at the end of input.
                 Read::End(trailers) => {
                     self.read = ReadState::Done;
                     if !draining {
-                        return Ok(Some(ClientEvent::End(trailers)));
+                        return Ok(Some(ClientEvent::End(Outcome::Complete(trailers))));
                     }
                 }
                 Read::Wait => return Ok(None),
                 Read::Overdrawn => self.end = Some(Ok(())),
                 Read::Truncated => {
                     self.end = Some(Err(Error::new(Kind::Partial, "the response body ended before its end")));
+                    if !draining {
+                        return Ok(Some(ClientEvent::End(Outcome::Truncated)));
+                    }
                 }
                 Read::Capacity(units) => {
                     self.capacity = Some(units);

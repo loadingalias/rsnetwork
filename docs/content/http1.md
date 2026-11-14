@@ -34,6 +34,7 @@ same example as a test.
 use core::net::{Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 
+use rsnetwork::body::Outcome;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received};
@@ -72,7 +73,7 @@ let (Some(ServerEvent::Data(data)), _) = server.drive(&mut inbound, &mut outboun
     panic!("body bytes")
 };
 assert_eq!(data.bytes(), b"hello");
-let (Some(ServerEvent::End(None)), _) = server.drive(&mut inbound, &mut outbound) else {
+let (Some(ServerEvent::End(Outcome::Complete(None))), _) = server.drive(&mut inbound, &mut outbound) else {
     panic!("the end of the body")
 };
 
@@ -103,7 +104,8 @@ assert_eq!(sent, b"HTTP/1.1 201 \r\nContent-Type: text/plain\r\ncontent-length: 
    region)`. Then send the body with `send(outbound, &data)`, and end it with `finish(outbound)`
    or `finish_with_trailers(outbound, trailers, region)`. Call `finish` also when the response has
    no body.
-4. Read the request body from `ServerEvent::Data(data)` and `ServerEvent::End(trailers)`.
+4. Read the request body from `ServerEvent::Data(data)` and `ServerEvent::End(outcome)`. Keep the
+   views, or copy them into your own regions with a [consumer](body.md).
 
 | Server call | Result |
 | --- | --- |
@@ -127,7 +129,8 @@ and change nothing. Acknowledge output, then call again. A call in the wrong sta
    also when the request has no body.
 4. Call `client.drive(&mut inbound)` until it gives no event. It gives
    `ClientEvent::Informational(head)` for each 1xx response, then `ClientEvent::Response(head)`,
-   `ClientEvent::Data(data)`, and `ClientEvent::End(trailers)`.
+   `ClientEvent::Data(data)`, and `ClientEvent::End(outcome)`. The [body page](body.md) explains
+   the outcomes.
 5. Send the next request after the end of the response. The client sends one request at a time.
 
 | Client call | Result |
@@ -191,7 +194,9 @@ the `keep-alive` option. A response that the close ends does not persist.
 | A 101 response to an upgrade request, or a 2xx response to CONNECT | After the request, the engine gives `Handoff`. The front of the `Inbound` queue is then exactly the bytes after the message, for the new protocol |
 | A cancelled response | No last chunk and no remaining Content-Length bytes: the peer sees an incomplete message, never a complete one |
 | The end of input between exchanges | The connection ends with no error |
-| The end of input inside a body | `Kind::Partial` |
+| The end of input inside a body with a length or chunks | `End(Outcome::Truncated)`, and then `Kind::Partial` |
+| The end of input in a body that the close delimits | `End(Outcome::Complete(None))`: the body is complete |
+| A chunk framing error inside a body | `End(Outcome::Malformed)`, and then the refusal |
 | The end of input before a response | `Kind::Uncertain`: the server can have processed the request |
 | Response bytes with no request in flight | `Kind::Malformed`: each later response would be unclear |
 
