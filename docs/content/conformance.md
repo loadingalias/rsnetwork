@@ -56,14 +56,17 @@ wrong shows it as a request that the application must not see.
 | Empty lines before a request line and before the end of input | RFC 9112, section 2.2 | The server ignores them |
 | Client: two `Content-Length` values, both framing fields, a chunk size past `u64`, and a bare LF in a chunk line | RFC 9112, sections 6.3 and 7.1 | The client discards the response or ends its body as malformed, and closes. It never reads the `Content-Length` body when `Transfer-Encoding` is present |
 | Client: a response to HEAD with a `Content-Length`, then the next response | RFC 9112, section 6.3 | No body for HEAD, and the next response whole |
+| Client: a response to HEAD with a forged response after it, in its region | RFC 9112, sections 6.3 and 9.3 | The end of the HEAD response, then `Kind::Malformed`. The next request never gets the forged response |
 | Client: obsolete line folding in a response | RFC 9112, section 5.2 | The fold becomes a space |
 
 ## How each vector runs
 
 The test application answers each complete request with `200` and no body. A client sends its
-next request in answer to the end of the response, and the bytes of each response arrive only
-after its request, as from a server. The output queue has two entries, so pipelined requests meet
-output backpressure.
+next request in answer to the end of the response, or later: only after the transport received
+each byte that the server sent before the request. The bytes of each response arrive only after
+its request, as from a server. Thus no cut moves bytes of the server after a later request. A
+client whose engine ended the connection sends no more requests. The output queue has two
+entries, so pipelined requests meet output backpressure.
 
 1. The whole input arrives in one region, and the transport accepts each output in one write. The
    outcome must be one that the vector permits.
@@ -92,7 +95,8 @@ A binding adds a runner of its own, as a test file of this package that includes
 on the module. The runner must keep the rules that the permitted outcomes assume:
 
 1. Give the input in the regions of the schedule, and give the bytes of each response only after
-   its request.
+   its request. Send the next request of a client only after the transport received each byte
+   that the server sent before it, and send no more requests after the engine refuses one.
 2. Accept each write in the sizes of the schedule, and drive between two writes.
 3. Answer as the test application does.
 4. Record the outcome, each accepted byte, and each step in a `Run`.

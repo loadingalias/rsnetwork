@@ -209,6 +209,7 @@ the `keep-alive` option. A response that the close ends does not persist.
 | A chunk framing error inside a body | `End(Outcome::Malformed)`, and then the refusal |
 | The end of input before a response | `Kind::Uncertain`: the server can have processed the request |
 | Response bytes with no request in flight | `Kind::Malformed`: each later response would be unclear |
+| Bytes in the queue after the end of a response, on a connection that persists | The client gives the `End` of the body, and then the connection ends with `Kind::Malformed`, "bytes after the response". A request in answer to the `End` refuses with `Kind::Misuse`. The bytes arrived before the next request existed, so they cannot be its response: a server that sends a body after its response to HEAD would otherwise give a forged response to the next request |
 
 ## Errors
 

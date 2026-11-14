@@ -120,22 +120,23 @@ impl Seen {
 /// accepted, each step, and the end of the connection.
 ///
 /// Each round, the transport receives one region of the first `available` bytes of `input`, or
-/// the end of input after the last byte. Then the host drives until the connection waits, with
-/// the time of the round, and `answer` sees each drive: it gives whether the application acted.
-/// Then the transport makes one write. A host reads its socket and writes to it in the same way.
+/// the end of input after the last byte, and `read` counts the bytes that it received. Then the
+/// host drives until the connection waits, with the time of the round, and `answer` sees each
+/// drive: it gives whether the application acted. Then the transport makes one write. A host reads
+/// its socket and writes to it in the same way.
 fn run<E: Engine>(
     mut connection: Connection<E>,
     input: &[u8],
-    available: &Cell<usize>,
+    (available, read): (&Cell<usize>, &Cell<usize>),
     mut schedule: Schedule,
     mut answer: impl FnMut(&mut Connection<E>, Option<E::Event>) -> bool,
 ) -> (Vec<u8>, Vec<Step>, Result<(), Kind>) {
-    let (mut read, mut ended, mut now) = (0, false, 0);
+    let (mut ended, mut now) = (false, 0);
     let (mut sent, mut steps) = (Vec::new(), Vec::new());
     for _ in 0..ROUNDS {
-        if read < available.get() {
-            let size = schedule.region(read).min(available.get() - read);
-            let region = &input[read..read + size];
+        if read.get() < available.get() {
+            let size = schedule.region(read.get()).min(available.get() - read.get());
+            let region = &input[read.get()..read.get() + size];
             let received = Received {
                 region: Lease::from(region.to_vec()),
                 endpoint: ENDPOINT,
@@ -143,10 +144,10 @@ fn run<E: Engine>(
             };
             // A full queue gives the region back, and the transport gives it again later.
             if connection.receive(received).is_ok() {
-                read += size;
+                read.set(read.get() + size);
                 steps.push(Step::Region(region.to_vec()));
             }
-        } else if read == input.len() && !ended {
+        } else if read.get() == input.len() && !ended {
             connection.end_input();
             ended = true;
             steps.push(Step::End);
@@ -204,7 +205,7 @@ fn serve(input: &[u8], schedule: Schedule) -> Run {
     let (sent, steps, end) = run(
         connection,
         input,
-        &Cell::new(input.len()),
+        (&Cell::new(input.len()), &Cell::new(0)),
         schedule,
         |connection, event| {
             match event {
@@ -245,18 +246,21 @@ fn request(client: &mut Client, outbound: &mut Outbound, method: Method<'_>) -> 
 }
 
 /// Sends the requests of `fetch` and reads their responses. The bytes of each response become
-/// available after its request.
+/// available after its request. The client sends its next request in answer to the end of a
+/// response, or later: only after it received each byte that the server sent before the request.
+/// A cut thus never moves bytes of the server after a later request. An engine that ended the
+/// connection refuses the next request, and the client then sends no more.
 fn fetch(fetch: &Fetch, schedule: Schedule) -> Run {
     let (inbound, mut outbound, budget) = queues();
     let mut client = Client::new(LIMITS, BODY, TURN, &outbound, &budget).unwrap();
     let mut requests = fetch.requests.iter();
     let (method, length) = requests.next().expect("a client vector has a request");
     request(&mut client, &mut outbound, *method).unwrap();
-    let available = Cell::new(*length);
+    let (available, read) = (Cell::new(*length), Cell::new(0));
     let connection = Connection::new(client, inbound, outbound, Some(CLOCK)).unwrap();
     let (mut seen, mut owed) = (Seen::default(), false);
     let input = &fetch.vector.input;
-    let (sent, steps, end) = run(connection, input, &available, schedule, |connection, event| {
+    let (sent, steps, end) = run(connection, input, (&available, &read), schedule, |connection, event| {
         match event {
             Some(ClientEvent::Response(response)) => {
                 let head = response.head();
@@ -277,12 +281,23 @@ fn fetch(fetch: &Fetch, schedule: Schedule) -> Run {
         let Some(&(method, length)) = requests.as_slice().first() else {
             return false;
         };
-        let sent = send(&mut owed, || request(client, outbound, method));
-        if sent {
-            requests.next();
-            available.set(available.get() + length);
+        if !owed || read.get() < available.get() {
+            return false;
         }
-        sent
+        match request(client, outbound, method) {
+            Ok(()) => {
+                owed = false;
+                requests.next();
+                available.set(available.get() + length);
+                true
+            }
+            Err(error) if error.kind() == Kind::Overload => false,
+            Err(error) if error.kind() == Kind::Misuse => {
+                owed = false;
+                false
+            }
+            Err(error) => panic!("{error}"),
+        }
     });
     Run {
         outcome: Outcome {

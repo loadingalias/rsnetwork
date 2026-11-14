@@ -359,7 +359,10 @@ impl Client {
                 }
                 ReadState::Head => return self.head(inbound),
                 // The response came before the end of the request body, which ends the exchange.
-                ReadState::Done => return Ok(None),
+                ReadState::Done => {
+                    self.refuse_bytes_after(inbound);
+                    return Ok(None);
+                }
                 // The new protocol starts after the end of the request.
                 ReadState::Switch if self.write == Write::Done => {
                     self.end = Some(Ok(()));
@@ -389,7 +392,9 @@ impl Client {
                 // A body that the close delimits is complete at the end of input.
                 Read::End(trailers) => {
                     self.read = ReadState::Done;
-                    self.settle();
+                    if !self.refuse_bytes_after(inbound) {
+                        self.settle();
+                    }
                     if !draining {
                         return Ok(Some(ClientEvent::End(Outcome::Complete(trailers))));
                     }
@@ -408,6 +413,19 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Ends the connection with [`Kind::Malformed`] when `inbound` holds bytes after a complete
+    /// response of a connection that persists, and gives whether it did. The bytes arrived before
+    /// the next request existed, so they cannot be its response. For example, a body that a server
+    /// sent after a response to HEAD would otherwise become the response to the next request. A
+    /// connection that closes after the response reads no more bytes, so they change nothing.
+    fn refuse_bytes_after(&mut self, inbound: &Inbound) -> bool {
+        let after = !self.close && inbound.front().is_some();
+        if after {
+            self.end = Some(Err(Error::new(Kind::Malformed, "bytes after the response")));
+        }
+        after
     }
 
     /// Reads a response head from `inbound`.

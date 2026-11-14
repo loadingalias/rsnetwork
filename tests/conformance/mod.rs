@@ -762,6 +762,20 @@ pub(crate) fn client() -> Vec<Fetch> {
             ])],
         ),
         Fetch::new(
+            "bytes after a response to HEAD, in its region, in the form of a response",
+            // A response comes after its request, so bytes that arrive with an earlier response
+            // are not the response to a later request.
+            "RFC 9112, sections 6.3 item 1 and 9.3",
+            &[
+                (
+                    Method::HEAD,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 44\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nforged",
+                ),
+                (Method::GET, b""),
+            ],
+            vec![bad(vec![complete("200\r\nContent-Length: 44", b"")])],
+        ),
+        Fetch::new(
             "obsolete line folding in a response",
             // A user agent replaces each obs-fold with one or more SP before it reads the value.
             "RFC 9112, section 5.2",

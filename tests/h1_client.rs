@@ -355,6 +355,40 @@ fn unclear_responses_end_the_connection() {
     assert!(terminal(&progress, Kind::Malformed), "{progress:?}");
 }
 
+/// Bytes after a complete response arrived before the next request existed, so they are never its
+/// response. Here a server sends a body after its response to HEAD, in the form of a complete
+/// response, in the same region. The client gives the end of the HEAD response, and a request in
+/// answer to it refuses. The connection then ends as malformed. A client that reuses the
+/// connection gives the forged 200 to the next GET.
+#[test]
+fn bytes_after_a_response_never_become_the_next_response() {
+    let mut host = Host::new();
+    host.request(b"HEAD", b"/a", Framing::Length(0), b"");
+    let forged = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nforged";
+    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", forged.len());
+    host.receive(&[head.as_bytes(), forged].concat());
+    let (response, _) = host.client.drive(&mut host.inbound);
+    assert!(matches!(response, Some(ClientEvent::Response(_))), "{response:?}");
+    let (end, _) = host.client.drive(&mut host.inbound);
+    assert!(
+        matches!(end, Some(ClientEvent::End(Outcome::Complete(None)))),
+        "{end:?}"
+    );
+    let next = host.client.request(
+        &mut host.outbound,
+        Method::GET,
+        Target::new(b"/b").unwrap(),
+        Authority::new(b"a.example").unwrap(),
+        &[],
+        Framing::Length(0),
+        Backing::from(Vec::with_capacity(256)),
+    );
+    assert_eq!(next.map_err(|error| error.kind()), Err(Kind::Misuse));
+    let (seen, progress) = host.drive();
+    assert_eq!(seen, Vec::new());
+    assert!(terminal(&progress, Kind::Malformed), "{progress:?}");
+}
+
 /// A 2xx response to CONNECT, and a 101 response to a request that asked to upgrade, change the
 /// protocol. After the request ends, the engine gives the handoff, and the front of the queue is
 /// exactly the bytes after the response head, at their address. A 101 to a request that did not
