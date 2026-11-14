@@ -68,7 +68,9 @@ event.
 
 A server connection answers one request. The code runs in a function that returns
 `Result<(), Box<dyn std::error::Error>>`. The module documentation of `rsnetwork::host` runs the
-same example as a test.
+same example as a test. [The caller-driven protocol loop](caller-driven-example.md) is a complete
+program over loopback sockets, with partial I/O, backpressure, a timeout, cancellation, and
+shutdown.
 
 ```rust
 use core::net::{Ipv4Addr, SocketAddr};
