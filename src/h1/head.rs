@@ -12,7 +12,7 @@ use crate::value::{Field, Status, decimal};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// The largest head, in bytes, from the first byte of the start line to the end of the empty
-    /// line that ends the head.
+    /// line that ends the head. For the server, the empty lines before a request line count too.
     pub head_bytes: usize,
     /// The largest number of field lines in the head.
     pub fields: usize,

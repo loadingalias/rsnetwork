@@ -646,6 +646,22 @@ pub(crate) fn server() -> Vec<Vector> {
             ],
         },
         Vector {
+            name: "an empty line before a pipelined request line",
+            rfc: "RFC 9112, section 2.2",
+            input: [
+                &b"POST /1 HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello\r\n"[..],
+                b"GET /2 HTTP/1.1\r\nHost: a\r\n\r\n",
+            ]
+            .concat(),
+            permitted: vec![served(vec![complete("POST /1", b"hello"), complete("GET /2", b"")])],
+        },
+        Vector {
+            name: "an empty line after the last request, then the end of input",
+            rfc: "RFC 9112, section 2.2",
+            input: b"GET / HTTP/1.1\r\nHost: a\r\n\r\n\r\n".to_vec(),
+            permitted: vec![served(vec![complete("GET /", b"")])],
+        },
+        Vector {
             name: "a bare LF before a pipelined request line",
             // A recipient can read a bare LF as a line end, or refuse it.
             rfc: "RFC 9112, section 2.2",

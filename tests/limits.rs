@@ -204,3 +204,45 @@ fn a_refused_admission_is_an_overload_and_allocates_nothing() {
     assert_eq!(kinds, [Some(Kind::Overload); 3]);
     assert_eq!(count, 0);
 }
+
+/// The server ignores empty lines before a request line (RFC 9112, section 2.2), and their bytes
+/// count against the head limit. Thus a peer that sends only empty lines gets 431 at the limit,
+/// and an empty line and a head that pass the limit together refuse with 431 too. An engine that
+/// discards empty lines with no count reads them for as long as the peer sends them.
+#[test]
+fn empty_lines_before_a_request_line_count_against_the_head_limit() {
+    let turn = TurnLimits {
+        bytes: 1 << 20,
+        frames: 1 << 10,
+    };
+    // A request head of `bytes` bytes after one empty line.
+    let after_an_empty_line = |bytes: usize| {
+        let target = vec![b'a'; bytes - b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".len()];
+        [b"\r\nGET /", &target[..], b" HTTP/1.1\r\nHost: a\r\n\r\n"].concat()
+    };
+    for (input, accepted) in [
+        (b"\r\n".repeat(LIMITS.head_bytes / 2 + 1), false),
+        (after_an_empty_line(LIMITS.head_bytes - 2), true),
+        (after_an_empty_line(LIMITS.head_bytes - 1), false),
+    ] {
+        let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+        let (mut inbound, mut outbound) = queues();
+        let mut server = Server::new(LIMITS, BODY, turn, &outbound, &budget).unwrap();
+        inbound.push(received(&input)).unwrap();
+        let (event, turn) = server.drive(&mut inbound, &mut outbound, NOW);
+        if accepted {
+            assert!(matches!(event, Some(ServerEvent::Request(_))), "{turn:?}");
+        } else {
+            assert!(event.is_none());
+            assert!(
+                matches!(turn.progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Overload),
+                "{turn:?}"
+            );
+            let response = outbound.submit().unwrap();
+            assert_eq!(
+                response.region.bytes(),
+                b"HTTP/1.1 431 \r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+            );
+        }
+    }
+}

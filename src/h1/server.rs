@@ -59,6 +59,11 @@ pub struct Server {
     /// The error response that waits for room in the output queue. The connection ends after
     /// it.
     owed: Option<&'static [u8]>,
+    /// The bytes of the empty lines before the next request line, which count against the head
+    /// limit.
+    empty: usize,
+    /// The last empty line has its CR, and its LF did not arrive.
+    cr: bool,
     read: ReadState,
     write: Write,
     /// The facts of the current request.
@@ -164,6 +169,8 @@ impl Server {
             more: false,
             failure: None,
             owed: None,
+            empty: 0,
+            cr: false,
             read: ReadState::Head,
             write: Write::Idle,
             request: Request::default(),
@@ -350,6 +357,10 @@ impl Server {
     /// one region, charged to the budget.
     fn head(&mut self, inbound: &mut Inbound) -> Result<Option<ServerEvent>, ParseError> {
         if self.join.is_none() {
+            self.skip_empty_lines(inbound)?;
+            if self.cr {
+                return Ok(None);
+            }
             let Some(front) = inbound.front() else { return Ok(None) };
             let region = front.region.clone();
             if let Some(head) = self.parser.parse(region.bytes())? {
@@ -377,8 +388,40 @@ impl Server {
         self.accept(head, &region).map(Some)
     }
 
+    /// Discards the empty lines before a request line (RFC 9112, section 2.2). Their bytes count
+    /// against the head limit. A CR at the end of a region waits for its LF in the next region,
+    /// and a CR before another byte refuses, as in a head. A bare LF stays, and the head refuses.
+    fn skip_empty_lines(&mut self, inbound: &mut Inbound) -> Result<(), ParseError> {
+        while let Some(front) = inbound.front() {
+            let bytes = front.region.bytes();
+            let mut skip = 0;
+            for &byte in bytes {
+                match (self.cr, byte) {
+                    (false, b'\r') => self.cr = true,
+                    (true, b'\n') => self.cr = false,
+                    (true, _) => return Err(ParseError::Malformed),
+                    (false, _) => break,
+                }
+                skip += 1;
+            }
+            let rest = bytes.len() - skip;
+            self.empty = self.empty.saturating_add(skip);
+            if self.empty > self.limits.head_bytes {
+                return Err(ParseError::HeadTooLarge);
+            }
+            inbound.consume(skip).map_err(|_| ParseError::Malformed)?;
+            if rest > 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Takes the request of a complete `head` in `region`: its facts, and the reader of its body.
     fn accept(&mut self, head: RequestHead<'_>, region: &Lease) -> Result<ServerEvent, ParseError> {
+        if core::mem::take(&mut self.empty).saturating_add(head.consumed()) > self.limits.head_bytes {
+            return Err(ParseError::HeadTooLarge);
+        }
         let framing = head.framing();
         if let Framing::Length(length) = framing
             && length > self.body.body_bytes

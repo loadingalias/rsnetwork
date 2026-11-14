@@ -148,7 +148,7 @@ and change nothing. Acknowledge output, then call again. A call in the wrong sta
 
 | Limit | Bounds |
 | --- | --- |
-| `head_bytes` | The bytes of the head, from the first byte of the start line to the end of the empty line |
+| `head_bytes` | The bytes of the head, from the first byte of the start line to the end of the empty line. For the server, the empty lines before a request line count too |
 | `fields` | The number of field lines |
 | `name_bytes` | The bytes of each field name |
 | `value_bytes` | The bytes of each field value, with no whitespace at its start or end |
@@ -194,6 +194,7 @@ the `keep-alive` option. A response that the close ends does not persist.
 | --- | --- |
 | A head or a trailer section that continues in the next received region | The engine copies its bytes into one region of at most `head_bytes` or `trailer_bytes`. This is one counted copy, which the budget pays for until the last view of the head drops. Each new region adds only its new bytes, and the bytes after the section keep their region. When the budget cannot pay, the turn is `Blocked(Blocked::Capacity(n))`. Thus the budget bounds the memory of many slow partial heads, and the head timeout of the server bounds their time |
 | The head timeout of the server | From when the server waits for a request head, after the connection starts or after a response, to the end of the head. At its deadline, a connection with no byte of a head closes with no error, and one with part of a head gets `408` and ends with `Kind::Deadline`. The default is `HEAD_TIMEOUT`, 30 seconds: the default header read timeout of the hyper HTTP/1 server, and half of the 60-second `client_header_timeout` of nginx. Change it with `Server::head_timeout`, and turn it off with `None` |
+| Empty lines (CR LF) before a request line | The server ignores them (RFC 9112, section 2.2). A bare LF refuses, as in a head |
 | Pipelined requests | The server reads the next request only after the response before it is complete, so the responses go in the order of the requests |
 | A response before the end of the request body | The server reads and discards the rest, up to `drain_bytes`, then reads the next request. A Content-Length body that is longer gets `connection: close`, and a chunked body that passes the limit closes the connection |
 | An HTTP/1.0 request | Its response has an HTTP/1.1 status line, and never chunks: a chunked response becomes one that the close ends. It has `connection: keep-alive` when the connection persists, and `connection: close` when it does not. A request with no Host field is served |
