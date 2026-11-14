@@ -623,6 +623,29 @@ pub(crate) fn server() -> Vec<Vector> {
             permitted: vec![served(vec![complete("GET /1", b""), complete("GET /2", b"")])],
         },
         Vector {
+            // With an output queue of two entries, the two responses before the refusal fill it.
+            name: "CL.TE after two pipelined requests",
+            rfc: "RFC 9112, sections 6.1 and 9.3.2",
+            input: [
+                b"GET /1 HTTP/1.1\r\nHost: a\r\n\r\nGET /2 HTTP/1.1\r\nHost: a\r\n\r\n".to_vec(),
+                post(&cl_te, b"0\r\n\r\n"),
+                SMUGGLED.to_vec(),
+            ]
+            .concat(),
+            permitted: vec![
+                refused(
+                    vec![complete("GET /1", b""), complete("GET /2", b"")],
+                    400,
+                    Kind::Malformed,
+                ),
+                served(vec![
+                    complete("GET /1", b""),
+                    complete("GET /2", b""),
+                    complete("POST /", b""),
+                ]),
+            ],
+        },
+        Vector {
             name: "a bare LF before a pipelined request line",
             // A recipient can read a bare LF as a line end, or refuse it.
             rfc: "RFC 9112, section 2.2",

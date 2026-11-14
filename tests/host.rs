@@ -170,7 +170,8 @@ fn a_new_deadline_reaches_the_host_on_its_turn() {
 
 /// At its head deadline, a server connection with no byte of a head closes with no error and no
 /// output. A connection with part of a head gets a 408 and ends with a deadline error. The
-/// connection then releases after the transport accepts its output.
+/// connection then releases after the transport accepts its output. When the output queue is
+/// full, the 408 waits for room, and the connection ends after it (RFC 9110, section 15.5.9).
 #[test]
 fn the_head_timeout_closes_an_idle_connection_and_answers_a_slow_head_with_408() {
     let mut server = open_server(Some(Duration::from_secs(5)));
@@ -195,6 +196,37 @@ fn the_head_timeout_closes_an_idle_connection_and_answers_a_slow_head_with_408()
     );
     server.ack(response.id, response.region.initialized()).unwrap();
     assert!(matches!(server.release(), Some(Err(error)) if error.kind() == Kind::Deadline));
+
+    let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+    let inbound = Inbound::new(NonZeroUsize::new(16).unwrap(), &budget).unwrap();
+    let outbound = Outbound::new(NonZeroUsize::new(1).unwrap(), &budget).unwrap();
+    let engine = Server::new(LIMITS, BODY, TURN, &outbound, &budget)
+        .unwrap()
+        .head_timeout(Some(Duration::from_secs(5)));
+    let mut server = Connection::new(engine, inbound, outbound, Some(CLOCK)).unwrap();
+    server
+        .receive(received(b"GET /1 HTTP/1.1\r\nHost: a\r\n\r\nGET /2 HTTP/1.1\r\nHo"))
+        .unwrap();
+    assert_eq!(drive(&mut server, at(0)).len(), 2);
+    let (engine, outbound) = server.parts();
+    let head = Backing::from(Vec::with_capacity(256));
+    engine
+        .respond(outbound, Status::new(200).unwrap(), &[], Framing::Length(0), head)
+        .unwrap();
+    engine.finish(outbound).unwrap();
+    drive(&mut server, at(1));
+    drive(&mut server, at(6));
+    assert_eq!(server.wait(), Wait::Until(None));
+    let response = server.output().unwrap();
+    assert_eq!(response.region.bytes(), b"HTTP/1.1 200 \r\ncontent-length: 0\r\n\r\n");
+    server.ack(response.id, response.region.initialized()).unwrap();
+    drive(&mut server, at(6));
+    assert!(matches!(server.wait(), Wait::Ended(Err(error)) if error.kind() == Kind::Deadline));
+    let response = server.output().unwrap();
+    assert_eq!(
+        response.region.bytes(),
+        b"HTTP/1.1 408 \r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+    );
 }
 
 /// A host with no clock cannot run the head timeout, so its connection refuses with an

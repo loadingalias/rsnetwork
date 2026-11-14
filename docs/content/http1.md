@@ -210,7 +210,9 @@ the `keep-alive` option. A response that the close ends does not persist.
 ## Errors
 
 A refused head or body is a `ParseError`. The server sends the response that it names, with
-`connection: close`, when no response head was out. Then the connection ends. `From` converts a
+`connection: close`, when no response head was out. Then the connection ends. When the output
+queue has no room for the response, the turn is `Blocked(Blocked::Output)`, and the response waits
+until the transport accepts output. The 408 of the head timeout waits in the same way. `From` converts a
 `ParseError` into the [error](errors.md) of the engine, with its kind.
 
 | `ParseError` | Cause | Response | Kind |

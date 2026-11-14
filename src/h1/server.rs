@@ -56,6 +56,9 @@ pub struct Server {
     more: bool,
     /// The refusal of a request body, which the drive applies after the body's outcome.
     failure: Option<ParseError>,
+    /// The error response that waits for room in the output queue. The connection ends after
+    /// it.
+    owed: Option<&'static [u8]>,
     read: ReadState,
     write: Write,
     /// The facts of the current request.
@@ -160,6 +163,7 @@ impl Server {
             head_deadline: None,
             more: false,
             failure: None,
+            owed: None,
             read: ReadState::Head,
             write: Write::Idle,
             request: Request::default(),
@@ -173,14 +177,16 @@ impl Server {
     /// Drive again after each event, and after more bytes arrive or the application answers.
     /// When the turn is terminal, send the rest of `outbound`, and then close the connection. A
     /// refused request gets its error response in `outbound` before the close, when no response
-    /// head was out.
+    /// head was out. When `outbound` has no room for it, the turn is
+    /// [`Blocked::Output`](crate::drive::Blocked::Output) until the transport accepts output.
     pub fn drive(
         &mut self,
         inbound: &mut Inbound,
         outbound: &mut Outbound,
         now: Option<Instant>,
     ) -> (Option<ServerEvent>, Turn) {
-        self.expire(inbound, outbound, now);
+        self.expire(inbound, now);
+        self.flush(outbound);
         let (event, progress) = match self.step(inbound) {
             Ok(event) => {
                 let progress = match self.failure.take() {
@@ -223,7 +229,7 @@ impl Server {
     /// Ends the connection at `now` when its head deadline passed. With no byte of a head, the
     /// connection was idle, and it closes with no error. With part of a head, it gets a 408 and
     /// then the close (RFC 9110, section 15.5.9). A head timeout needs the time of the host.
-    fn expire(&mut self, inbound: &Inbound, outbound: &mut Outbound, now: Option<Instant>) {
+    fn expire(&mut self, inbound: &Inbound, now: Option<Instant>) {
         if self.head_timeout.is_none() || self.end.is_some() {
             return;
         }
@@ -241,10 +247,7 @@ impl Server {
             Ok(false) => {}
             Ok(true) if self.join.is_none() && inbound.front().is_none() => self.end = Some(Ok(())),
             Ok(true) => {
-                // A full queue drops the response: the close still ends the connection.
-                drop(outbound.push(Lease::from(
-                    &b"HTTP/1.1 408 \r\nconnection: close\r\ncontent-length: 0\r\n\r\n"[..],
-                )));
+                self.owed = Some(b"HTTP/1.1 408 \r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
                 self.end = Some(Err(Error::new(
                     Kind::Deadline,
                     "the request head did not arrive before its deadline",
@@ -420,6 +423,8 @@ impl Server {
     /// The progress of the engine when it gives no event.
     fn progress(&mut self) -> Progress {
         match (self.end, self.capacity.take(), core::mem::take(&mut self.more)) {
+            // The connection ends after its error response, which waits for room in the queue.
+            (Some(_), _, _) if self.owed.is_some() => Progress::Blocked(Blocked::Output),
             (Some(end), _, _) => Progress::Terminal(end),
             (None, Some(units), _) => Progress::Blocked(Blocked::Capacity(units)),
             (None, None, true) => Progress::Pending,
@@ -428,15 +433,23 @@ impl Server {
     }
 
     /// Ends the connection after a refusal. When no response head is out, it queues the error
-    /// response that the refusal names.
+    /// response that the refusal names, when the output queue has room, or later.
     fn refuse(&mut self, refusal: ParseError, outbound: &mut Outbound) -> Progress {
         if matches!(self.write, Write::Idle | Write::Waiting) {
-            // A full queue drops the error response: the close still ends the connection.
-            drop(outbound.push(Lease::from(error_response(refusal))));
+            self.owed = Some(error_response(refusal));
+            self.flush(outbound);
         }
-        let error = Error::from(refusal);
-        self.end = Some(Err(error));
-        Progress::Terminal(Err(error))
+        self.end = Some(Err(Error::from(refusal)));
+        self.progress()
+    }
+
+    /// Queues the error response that waits, when the output queue has room.
+    fn flush(&mut self, outbound: &mut Outbound) {
+        if let Some(response) = self.owed
+            && outbound.push(Lease::from(response)).is_ok()
+        {
+            self.owed = None;
+        }
     }
 
     /// Accepts the body of the current request: it sends `100 Continue` when the request waits

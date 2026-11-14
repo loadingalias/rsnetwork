@@ -52,6 +52,7 @@ wrong shows it as a request that the application must not see.
 | HTTP/1.1 with no `Host` or two `Host` lines | RFC 9112, section 3.2 | `400` |
 | Pipelining: four requests and a `close` option | RFC 9112, sections 9.3.2 and 9.6 | Each response in the order of the requests, and no request after the close |
 | A bare LF before a pipelined request line | RFC 9112, section 2.2 | `400`, or the LF as a line end |
+| A refusal after two pipelined requests, with a full output queue | RFC 9112, sections 6.1 and 9.3.2 | The two responses, then `400` and the close, or a third response and then the close |
 | Client: two `Content-Length` values, both framing fields, a chunk size past `u64`, and a bare LF in a chunk line | RFC 9112, sections 6.3 and 7.1 | The client discards the response or ends its body as malformed, and closes. It never reads the `Content-Length` body when `Transfer-Encoding` is present |
 | Client: a response to HEAD with a `Content-Length`, then the next response | RFC 9112, section 6.3 | No body for HEAD, and the next response whole |
 
