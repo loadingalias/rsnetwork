@@ -5,6 +5,7 @@ use core::fmt;
 use rstypes::buffer::{Buffer as _, Lease};
 
 use super::Framing;
+use crate::drive::{Error, Kind};
 use crate::value::{Authority, Field, Method, Target, TargetForm, decimal};
 
 /// The limits of one request head, which the caller sets.
@@ -375,9 +376,10 @@ pub enum ParseError {
     TransferCoding,
 }
 
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl ParseError {
+    /// The fixed text of the refusal.
+    const fn reason(self) -> &'static str {
+        match self {
             Self::HeadTooLarge => "the request head is longer than its limit",
             Self::TooManyFields => "the request head has more field lines than its limit",
             Self::FieldTooLarge => "a field name or a field value is longer than its limit",
@@ -385,7 +387,26 @@ impl fmt::Display for ParseError {
             Self::Version => "the request version is not HTTP/1.1",
             Self::Framing => "the request body framing is not clear",
             Self::TransferCoding => "the request uses a transfer coding other than chunked",
-        })
+        }
+    }
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+/// A head over a limit is an overload, a version or a coding that the parser does not have is
+/// unsupported, and each other refusal is malformed peer input.
+impl From<ParseError> for Error {
+    fn from(error: ParseError) -> Self {
+        let kind = match error {
+            ParseError::HeadTooLarge | ParseError::TooManyFields | ParseError::FieldTooLarge => Kind::Overload,
+            ParseError::Version | ParseError::TransferCoding => Kind::Unsupported,
+            ParseError::Malformed | ParseError::Framing => Kind::Malformed,
+        };
+        Self::new(kind, error.reason())
     }
 }
 

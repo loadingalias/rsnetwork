@@ -161,7 +161,8 @@ ignore an empty line before the request line.
 ## Errors
 
 The connection cannot continue after a `ParseError`, because the end of the request is not
-known. Send the response, then close the connection.
+known. Send the response, then close the connection. `From` converts a `ParseError` into the
+[error](errors.md) of an engine, with its kind.
 
 | `ParseError` | Cause | Response |
 | --- | --- | --- |

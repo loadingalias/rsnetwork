@@ -1,13 +1,13 @@
 # Backing ownership across acceptance, retransmission, and kernel release
 
-This is the design model of task N014. It checks how two ownership contracts compose before the
-action vocabulary (N004) and the datagram form (N604) exist. The protocol keeps output until exact
-acceptance and peer acknowledgement. The runtime keeps each accepted submission until its terminal
-event. The sources are in the local design `docs/specs/networking.md`: Backing and Completion
-Ownership, Resource and Progress Bounds, and Datagram Form. The driver side is the terminal-release
-contract of rsasync, which its model R000 checks (`models/operation-ownership/` in rsasync). This
-model owns no driver. The Design Models section of `family-policy.md` in rsasync sets the
-acceptance.
+This is the design model of task N014. It checks how two ownership contracts compose in the
+action vocabulary (N004, `src/drive.rs`) and the datagram form (N604). The protocol keeps output
+until exact acceptance and peer acknowledgement. The runtime keeps each accepted submission until
+its terminal event. The sources are in the local design `docs/specs/networking.md`: Backing and
+Completion Ownership, Resource and Progress Bounds, and Datagram Form. The driver side is the
+terminal-release contract of rsasync, which its model R000 checks (`models/operation-ownership/` in
+rsasync). This model owns no driver. The Design Models section of `family-policy.md` in rsasync
+sets the acceptance.
 
 ## The promise and a concrete failure
 
@@ -111,19 +111,19 @@ Each known-bad variant still fails its own property under all of them (see the e
 
 ## Correspondence
 
-Each action is one atomic step. N004 and N604 do not exist yet, so their columns name the
-transition that each task must build. Each task replaces its column with the code that it
-builds, and a change to either side reopens this check.
+Each action is one atomic step. The N004 column names the code in `src/drive.rs` (module
+`rsnetwork::drive`). N604 does not exist yet, so its column names the transition that it must
+build, and N604 replaces it with its code. A change to either side reopens this check.
 
 | Action | Design rule | N004 transition | N604 transition | R000 action |
 | --- | --- | --- | --- | --- |
-| `Accept(j)` | Backing and Completion Ownership: exact acceptance releases only the accepted prefix; partial output advances a stable offset and does not recopy the unchanged suffix | The acknowledgement that names the outstanding action and its exact accepted region | The side flow takes stream bytes within the granted receive credit (Receive credit row) | — |
-| `WriterDrop` | Retention after a call needs an owning lease; the caller drops it | The end of the caller's lease on the suffix | The end of a cancelled write | — |
-| `Send(s, c)` | Completion I/O: an accepted submission gives the driver the backing; a refused one returns it. Resource and Progress Bounds: backpressure is explicit, and submission pressure is not network loss | The output action and its capacity demand after a refusal | Retransmission with a new packet number; zero-copy UDP send that takes a payload view | `BeginTx` (`Submit`), and `Table::withdraw` for a refused push |
+| `Accept(j)` | Backing and Completion Ownership: exact acceptance releases only the accepted prefix; partial output advances a stable offset and does not recopy the unchanged suffix | `Outbound::ack(id, accepted)`: the acknowledgement of the outstanding `Output` with the exact accepted bytes. The queue keeps a view of the suffix, at its address | The side flow takes stream bytes within the granted receive credit (Receive credit row) | — |
+| `WriterDrop` | Retention after a call needs an owning lease; the caller drops it | The drop of the `Outbound` queue, or of its view of the suffix | The end of a cancelled write | — |
+| `Send(s, c)` | Completion I/O: an accepted submission gives the driver the backing; a refused one returns it. Resource and Progress Bounds: backpressure is explicit, and submission pressure is not network loss | `Outbound::submit` gives an `Output`, whose region is a view of its own. A refusal is `ack(id, 0)` and `Progress::Blocked(Blocked::Capacity(n))` | Retransmission with a new packet number; zero-copy UDP send that takes a payload view | `BeginTx` (`Submit`), and `Table::withdraw` for a refused push |
 | `Result(s, c)` | Terminal-event table: the send result, with or without `IORING_CQE_F_MORE` | — | — | `Complete("tx")` |
 | `Notice(s, c)` | Terminal-event table: the zero-copy notice releases its own backing | — | A payload region stays owned until the zero-copy notice of each datagram that carried it | `Notice(g)` |
-| `PeerAck(s, c)` | Datagram Form: acknowledgements name packet numbers; an acknowledgement of a number that the sender never sent shows a faulty peer | A duplicate or unknown acknowledgement fails with a typed error and changes no state | RFC 9002 acknowledgement processing; the end of a range's retention at its acknowledgement | — |
-| `End(why)` | Backing and Completion Ownership: cancellation, a dropped future, close, and a request deadline prove no release; final completion releases the remaining ownership | The terminal outcome, and the cancellation and deadline errors | Reset, the end of the parent, and the integrity outcome | `CloseDone`, and `EndTask` for a close at shutdown |
+| `PeerAck(s, c)` | Datagram Form: acknowledgements name packet numbers; an acknowledgement of a number that the sender never sent shows a faulty peer | `AckError::Duplicate` and `AckError::Unknown`: the acknowledgement refuses and changes no state | RFC 9002 acknowledgement processing; the end of a range's retention at its acknowledgement | — |
+| `End(why)` | Backing and Completion Ownership: cancellation, a dropped future, close, and a request deadline prove no release; final completion releases the remaining ownership | `Progress::Terminal`, and the errors of `Kind::Cancelled` and `Kind::Deadline`. The host keeps each `Output` until its terminal event | Reset, the end of the parent, and the integrity outcome | `CloseDone`, and `EndTask` for a close at shutdown |
 
 ## Properties
 
@@ -197,18 +197,18 @@ the notice was pending at the end.
 The model does not cover these items. Each one is outside the task, or a later task owns it.
 
 - The input side: consumption of a received region, which releases only the consumed prefix
-  (N004 tests it).
+  (`Inbound::consume`; `tests/drive.rs` tests it).
 - A datagram that gathers views of two backings, such as framing from one and payload from
   another. Each backing then has its own obligations, but this model checks only one backing.
-- Time and capacity. A refusal is a free choice. The budget's admission order and refusal record
-  belong to rsasync R603 and the N004 tests.
+- Time and capacity. A refusal is a free choice. The budget's admission order belongs to rsasync
+  R603 and N007. `tests/drive.rs` tests that a refused submission keeps its bytes.
 - Progress. The model checks safety only. R000 checks that each terminal event comes and that
   detached debt ends.
 - The TCP form. Its zero-copy notice waits for the peer's TCP acknowledgement, and R000 models
   that wait and the reset. The order of that notice against this protocol's acknowledgement is
   free here too, so the same composition applies.
-- The model proves no Rust code. N004 and N604 add their transitions to the correspondence table
-  when their code exists.
+- The model proves no Rust code. N004 added its code to the correspondence table, and N604 adds
+  its code when it exists.
 
 The shortest counterexamples, as actions and observations:
 

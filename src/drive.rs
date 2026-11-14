@@ -1,0 +1,475 @@
+//! The drive interface of the core: received regions, output regions, their exact
+//! acknowledgements, the result of each drive, and the errors.
+//!
+//! A protocol engine runs in drives: bounded synchronous calls. In each drive, the host lends the
+//! engine its [`Inbound`] queue of received regions and its time, and the engine reads them in
+//! place. The engine acknowledges the exact prefix that it consumed. Each byte after that prefix
+//! stays with its owner for the next drive. The engine keeps a received byte after the call only
+//! through a [`Lease`] view of its backing, never through a reference.
+//!
+//! Output goes through an [`Outbound`] queue. The host takes one [`Output`] at a time, gives its
+//! region to the transport, and acknowledges the exact number of bytes that the transport
+//! accepted. The queue keeps the bytes that the transport did not accept, at the same address,
+//! for the next output. An acknowledgement that names no outstanding bytes refuses and changes
+//! nothing.
+//!
+//! Each holder of a region keeps its own view: the queue, the transport, and the engine. The
+//! backing stays alive and charged once while any view of it lives, and the last view releases it
+//! (the design model `models/backing-release/`).
+//!
+//! Each drive ends with a [`Turn`]: the [`Progress`] of the engine and its next deadline. Stream
+//! events are the types of each protocol engine. [`Error`] is the error of each engine and
+//! binding: a [`Kind`] that names the recovery, and a fixed reason.
+//!
+//! ```
+//! use core::net::{Ipv4Addr, SocketAddr};
+//! use core::num::NonZeroUsize;
+//!
+//! use rsnetwork::buffer::{Buffer as _, Lease};
+//! use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received};
+//!
+//! let limit = NonZeroUsize::new(8).expect("not zero");
+//!
+//! // The host receives a region and queues it for the engine.
+//! let mut inbound = Inbound::new(limit)?;
+//! let endpoint = Endpoint {
+//!     peer: SocketAddr::from((Ipv4Addr::new(192, 0, 2, 7), 50_000)),
+//!     local: SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 8080)),
+//!     ecn: Ecn::NotEct,
+//!     segment: None,
+//! };
+//! let region = Lease::from(b"PING\r\nPI".to_vec());
+//! inbound.push(Received { region, endpoint, capacity: 64 * 1024 }).expect("the queue has space");
+//!
+//! // In a drive, the engine reads the bytes in place and consumes one complete line.
+//! inbound.consume(6)?;
+//! // The partial line stays, at its address in the same region, for the next drive.
+//! assert_eq!(inbound.front().map(|received| received.region.bytes()), Some(&b"PI"[..]));
+//!
+//! // The engine queues its output. The host sends it, and the transport accepts 3 bytes.
+//! let mut outbound = Outbound::new(limit)?;
+//! outbound.push(Lease::from(b"PONG\r\n".to_vec())).expect("the queue has space");
+//! let output = outbound.submit().expect("an output is ready");
+//! outbound.ack(output.id, 3)?;
+//! // The next output is the rest of the same region, with no copy.
+//! let rest = outbound.submit().expect("the rest is ready");
+//! assert_eq!(rest.region.bytes(), b"G\r\n");
+//! assert_eq!(rest.region.as_ptr(), output.region.as_ptr().wrapping_add(3));
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+
+use core::fmt;
+use core::net::SocketAddr;
+use core::num::NonZeroUsize;
+use std::collections::VecDeque;
+
+use rstypes::buffer::{Buffer as _, Lease};
+use rstypes::time::Deadline;
+
+/// The ECN codepoint of a received datagram (RFC 3168, section 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ecn {
+    /// Not ECN-capable transport. A byte stream also has this codepoint.
+    NotEct,
+    /// ECN-capable transport, ECT(0).
+    Ect0,
+    /// ECN-capable transport, ECT(1).
+    Ect1,
+    /// Congestion experienced.
+    Ce,
+}
+
+/// The endpoint facts of a received region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    /// The address of the peer that sent the bytes.
+    pub peer: SocketAddr,
+    /// The local address that the bytes came to: for a datagram, its destination address.
+    pub local: SocketAddr,
+    /// The ECN codepoint of the datagram.
+    pub ecn: Ecn,
+    /// The size of each datagram when one region holds several datagrams of one size, as a
+    /// coalesced receive gives them. The last datagram can be shorter. `None` for one datagram or
+    /// a byte stream.
+    pub segment: Option<NonZeroUsize>,
+}
+
+/// A received region with its facts.
+pub struct Received {
+    /// The exact initialized bytes, and the backing that holds them. A view of the region keeps
+    /// the backing alive.
+    pub region: Lease,
+    /// Where the bytes came from and where they went.
+    pub endpoint: Endpoint,
+    /// The bytes that the host can still admit after this region. The engine grants no more
+    /// receive credit than this.
+    pub capacity: u64,
+}
+
+impl fmt::Debug for Received {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Received")
+            .field("len", &self.region.initialized())
+            .field("endpoint", &self.endpoint)
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
+/// The received regions of one engine that it has not consumed, in their order.
+///
+/// The host owns the queue and lends it to the engine for each drive. The engine reads the front
+/// region in place and acknowledges the exact prefix that it consumed with
+/// [`consume`](Self::consume). Each byte after the prefix stays in the queue, at its address in
+/// its region, until a later drive consumes it or [`take_front`](Self::take_front) gives it to a
+/// new owner.
+///
+/// The queue holds at most the number of regions that [`new`](Self::new) sets, and it reserves
+/// their space there. Thus a push never allocates.
+pub struct Inbound {
+    regions: VecDeque<Received>,
+    limit: usize,
+}
+
+impl Inbound {
+    /// Makes a queue for at most `limit` regions, and reserves their space.
+    pub fn new(limit: NonZeroUsize) -> Result<Self, Error> {
+        Ok(Self {
+            regions: reserve(limit)?,
+            limit: limit.get(),
+        })
+    }
+
+    /// Adds a region after the others. Gives it back if the queue is full.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
+    )]
+    pub fn push(&mut self, received: Received) -> Result<(), Received> {
+        if self.regions.len() >= self.limit {
+            return Err(received);
+        }
+        self.regions.push_back(received);
+        Ok(())
+    }
+
+    /// The front region, with the bytes that no drive consumed.
+    pub fn front(&self) -> Option<&Received> {
+        self.regions.front()
+    }
+
+    /// Acknowledges that the engine consumed the first `len` bytes of the front region.
+    ///
+    /// The queue keeps a view of the bytes after them, at the same address, and drops the region
+    /// when no byte remains. Its backing stays alive while another view of it lives. Refuses, and
+    /// changes nothing, if `len` is more than the bytes of the front region.
+    pub fn consume(&mut self, len: usize) -> Result<(), AckError> {
+        let Some(front) = self.regions.front_mut() else {
+            return if len == 0 { Ok(()) } else { Err(AckError::TooLarge) };
+        };
+        let rest = front.region.view(len..).ok_or(AckError::TooLarge)?;
+        if rest.initialized() == 0 {
+            self.regions.pop_front();
+        } else {
+            front.region = rest;
+        }
+        Ok(())
+    }
+
+    /// Removes the front region and gives it, with exactly the bytes that no drive consumed. Use
+    /// it to give the bytes after an upgrade or a CONNECT head to their new owner.
+    pub fn take_front(&mut self) -> Option<Received> {
+        self.regions.pop_front()
+    }
+}
+
+impl fmt::Debug for Inbound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Inbound")
+            .field("regions", &self.regions.len())
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The identifier of one output action. Each [`Outbound`] gives each output a new identifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActionId(u64);
+
+/// One output action: a region to give to the transport.
+///
+/// The region is a view of its own, so the transport can keep it until its terminal event, also
+/// after the queue drops its view. Acknowledge the action with [`Outbound::ack`].
+pub struct Output {
+    /// The identifier that the acknowledgement names.
+    pub id: ActionId,
+    /// The bytes to send.
+    pub region: Lease,
+}
+
+impl fmt::Debug for Output {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Output")
+            .field("id", &self.id)
+            .field("len", &self.region.initialized())
+            .finish()
+    }
+}
+
+/// The output regions of one engine that the transport has not accepted, in their order.
+///
+/// The engine pushes each region. The host takes one [`Output`] at a time with
+/// [`submit`](Self::submit) and acknowledges it with [`ack`](Self::ack): the exact number of
+/// bytes that the transport accepted. The queue then keeps a view of the bytes that the transport
+/// did not accept, at the same address, and the next output gives them with no copy.
+///
+/// The queue holds at most the number of regions that [`new`](Self::new) sets, and it reserves
+/// their space there. Thus a push never allocates.
+pub struct Outbound {
+    regions: VecDeque<Lease>,
+    limit: usize,
+    /// The identifier of the next output.
+    next: u64,
+    /// The output that has no acknowledgement yet, and the length of its region.
+    outstanding: Option<(ActionId, usize)>,
+}
+
+impl Outbound {
+    /// Makes a queue for at most `limit` regions, and reserves their space.
+    pub fn new(limit: NonZeroUsize) -> Result<Self, Error> {
+        Ok(Self {
+            regions: reserve(limit)?,
+            limit: limit.get(),
+            next: 0,
+            outstanding: None,
+        })
+    }
+
+    /// Adds a region after the others. Gives it back if the queue is full. An empty region has
+    /// nothing to send, so the queue drops it.
+    pub fn push(&mut self, region: Lease) -> Result<(), Lease> {
+        if region.initialized() == 0 {
+            return Ok(());
+        }
+        if self.regions.len() >= self.limit {
+            return Err(region);
+        }
+        self.regions.push_back(region);
+        Ok(())
+    }
+
+    /// Gives the next output: the bytes of the front region that the transport has not accepted.
+    ///
+    /// Gives `None` while an output has no acknowledgement, and when the queue is empty.
+    pub fn submit(&mut self) -> Option<Output> {
+        if self.outstanding.is_some() {
+            return None;
+        }
+        let region = self.regions.front()?.clone();
+        let id = ActionId(self.next);
+        self.next = self.next.checked_add(1)?;
+        self.outstanding = Some((id, region.initialized()));
+        Some(Output { id, region })
+    }
+
+    /// Acknowledges that the transport accepted the first `accepted` bytes of output `id`.
+    ///
+    /// Give `0` when the transport accepted no byte, also when it refused the submission. The
+    /// queue keeps a view of the bytes after the accepted ones for the next output. Refuses, and
+    /// changes nothing, if `id` has no outstanding output or if `accepted` is more than its bytes.
+    pub fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
+        match self.outstanding {
+            Some((outstanding, len)) if outstanding == id => {
+                if accepted > len {
+                    return Err(AckError::TooLarge);
+                }
+                self.outstanding = None;
+                if let Some(front) = self.regions.front_mut() {
+                    match front.view(accepted..) {
+                        Some(rest) if rest.initialized() > 0 => *front = rest,
+                        _ => {
+                            self.regions.pop_front();
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ if id.0 < self.next => Err(AckError::Duplicate),
+            _ => Err(AckError::Unknown),
+        }
+    }
+}
+
+impl fmt::Debug for Outbound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Outbound")
+            .field("regions", &self.regions.len())
+            .field("limit", &self.limit)
+            .field("outstanding", &self.outstanding)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Makes an empty queue with space reserved for `limit` items.
+fn reserve<T>(limit: NonZeroUsize) -> Result<VecDeque<T>, Error> {
+    let mut queue = VecDeque::new();
+    queue
+        .try_reserve_exact(limit.get())
+        .map_err(|_| Error::new(Kind::Overload, "the memory for the queue is not available"))?;
+    Ok(queue)
+}
+
+/// A refused acknowledgement. It changed nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckError {
+    /// The action had its acknowledgement before.
+    Duplicate,
+    /// No action has this identifier: the queue did not give it.
+    Unknown,
+    /// The acknowledgement names more bytes than the region has.
+    TooLarge,
+}
+
+impl AckError {
+    /// The fixed text of the refusal.
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Duplicate => "the action had its acknowledgement before",
+            Self::Unknown => "no action has this identifier",
+            Self::TooLarge => "the acknowledgement names more bytes than the region has",
+        }
+    }
+}
+
+impl fmt::Display for AckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl core::error::Error for AckError {}
+
+impl From<AckError> for Error {
+    fn from(error: AckError) -> Self {
+        Self::new(Kind::Misuse, error.reason())
+    }
+}
+
+/// The result of one drive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Turn {
+    /// What the engine needs next.
+    pub progress: Progress,
+    /// The earliest deadline of the engine's timers. Drive the engine again when it is reached,
+    /// also if nothing else arrives. A new or earlier deadline replaces the host's wait on the
+    /// same turn.
+    pub deadline: Option<Deadline>,
+}
+
+/// What an engine needs after a drive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Progress {
+    /// The engine can do nothing more until the host gives what the variant names.
+    Blocked(Blocked),
+    /// The engine stopped at a limit of the drive, and it has more work. Drive it again, with no
+    /// wait for input.
+    Pending,
+    /// The engine ended: `Ok` when it completed, and the error when it failed.
+    Terminal(Result<(), Error>),
+}
+
+/// What blocks an engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blocked {
+    /// More received bytes.
+    Input,
+    /// The acknowledgement of its outstanding output.
+    Output,
+    /// This many more bytes of capacity.
+    Capacity(u64),
+}
+
+/// The error of an engine or a binding: a [`Kind`], which names the recovery, and a fixed reason.
+///
+/// The reason is fixed text of the code that refused. Thus no error holds peer text, a
+/// credential, or a body, and its `Display` and `Debug` output show only the kind and the reason.
+///
+/// ```
+/// use rsnetwork::drive::{Error, Kind};
+///
+/// let error = Error::new(Kind::Overload, "the connection has no free stream");
+/// assert_eq!(error.kind(), Kind::Overload);
+/// assert_eq!(error.to_string(), "overload: the connection has no free stream");
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Error {
+    kind: Kind,
+    reason: &'static str,
+}
+
+impl Error {
+    /// Makes an error of `kind`. Give a fixed text as the reason, never text from a peer.
+    pub const fn new(kind: Kind, reason: &'static str) -> Self {
+        Self { kind, reason }
+    }
+
+    /// The kind of the error.
+    pub const fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    /// The fixed reason.
+    pub const fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.kind, self.reason)
+    }
+}
+
+impl core::error::Error for Error {}
+
+/// The kind of an [`Error`]. Each kind has its own recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// The caller broke a contract of the API, or gave a configuration that cannot work. Correct
+    /// the code or the configuration. A retry gives the same error.
+    Misuse,
+    /// The peer sent bytes that the protocol forbids. Refuse the message, and close the
+    /// connection when the protocol cannot find the next message.
+    Malformed,
+    /// A trust check failed, for example a certificate chain or a name. Never downgrade.
+    Trust,
+    /// The peer or the operation needs a capability that this build or this peer does not have.
+    Unsupported,
+    /// A limit or a budget refused the work. Retry later, or with more capacity.
+    Overload,
+    /// The deadline came before the operation completed.
+    Deadline,
+    /// The caller cancelled the operation.
+    Cancelled,
+    /// Only a part of the data arrived or went before the end.
+    Partial,
+    /// The operation ended with no proof of whether the peer completed it. Retry it only if
+    /// it is safe to do two times.
+    Uncertain,
+}
+
+impl fmt::Display for Kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Misuse => "misuse or configuration",
+            Self::Malformed => "malformed peer input",
+            Self::Trust => "trust failure",
+            Self::Unsupported => "unsupported capability",
+            Self::Overload => "overload",
+            Self::Deadline => "deadline",
+            Self::Cancelled => "cancellation",
+            Self::Partial => "partial delivery",
+            Self::Uncertain => "uncertain remote completion",
+        })
+    }
+}
