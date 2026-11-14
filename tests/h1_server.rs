@@ -325,6 +325,31 @@ fn a_refused_request_gets_its_error_response_and_the_connection_ends() {
     }
 }
 
+/// After a refusal, the error response is the last output: a response of the application then
+/// refuses as misuse and queues nothing. A response head after the 400 would reach a pipelined
+/// client as the response to its next request.
+#[test]
+fn after_a_refusal_the_error_response_is_the_last_output() {
+    let mut host = Host::new(BODY);
+    host.receive(b"POST /a HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n");
+    let (seen, progress) = host.drive();
+    assert_eq!(seen, [request(b"POST", b"/a"), Seen::Malformed]);
+    assert!(matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Malformed));
+    let head = Backing::from(Vec::with_capacity(256));
+    let response = host.server.respond(
+        &mut host.outbound,
+        Status::new(200).unwrap(),
+        &[],
+        Framing::Length(0),
+        head,
+    );
+    assert_eq!(response.map_err(|error| error.kind()), Err(Kind::Misuse));
+    assert_eq!(
+        host.sent(),
+        b"HTTP/1.1 400 \r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+    );
+}
+
 /// A request with `Expect: 100-continue` waits for `100 Continue` before it sends its body. The
 /// engine reads no body byte until the application accepts the body, which sends the 100. A
 /// final response before the 100 closes the connection, because the client may send its body

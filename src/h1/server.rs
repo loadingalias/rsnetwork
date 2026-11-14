@@ -35,6 +35,9 @@ pub const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// its line drops. Thus the engine allocates after [`new`](Self::new) only for a request head or
 /// trailer section that continues in the next region: it joins their bytes into one region of at
 /// most the limit of the section, which the budget pays for until the last view of it drops.
+///
+/// After the connection ends, each call that writes refuses with [`Kind::Misuse`] and queues
+/// nothing. Thus after a refusal, its error response is the last output.
 pub struct Server {
     limits: Limits,
     body: BodyLimits,
@@ -498,6 +501,7 @@ impl Server {
     /// Accepts the body of the current request: it sends `100 Continue` when the request waits
     /// for it, and then the engine reads the body. Without an expectation, it does nothing.
     pub fn accept_body(&mut self, outbound: &mut Outbound) -> Result<(), Error> {
+        self.writable()?;
         if self.request.expect && self.write == Write::Waiting {
             outbound
                 .push(Lease::from(&b"HTTP/1.1 100 Continue\r\n\r\n"[..]))
@@ -520,6 +524,7 @@ impl Server {
         fields: &[Field<'_>],
         head: Backing,
     ) -> Result<(), Error> {
+        self.writable()?;
         if self.write != Write::Waiting || !(102..200).contains(&status.code()) {
             return Err(misuse(
                 "an informational response needs a waiting request and a status of 102 to 199",
@@ -553,6 +558,7 @@ impl Server {
         framing: Framing,
         head: Backing,
     ) -> Result<(), Error> {
+        self.writable()?;
         let code = status.code();
         // A 101 needs a request that asked to change the protocol, and a body that does not wait
         // for 100 (RFC 9110, section 7.8).
@@ -622,6 +628,7 @@ impl Server {
     /// pool is full: acknowledge output, then send again. Refuses with [`Kind::Misuse`] when the
     /// response has no open body, or when `data` passes its Content-Length.
     pub fn send(&mut self, outbound: &mut Outbound, data: &Lease) -> Result<(), Error> {
+        self.writable()?;
         self.writer.send(outbound, data)
     }
 
@@ -629,6 +636,7 @@ impl Server {
     /// [`Kind::Overload`] when the queue is full, and with [`Kind::Misuse`] when no body is open or
     /// a Content-Length body has fewer bytes than its length.
     pub fn finish(&mut self, outbound: &mut Outbound) -> Result<(), Error> {
+        self.writable()?;
         self.writer.finish(outbound)?;
         self.after_write();
         Ok(())
@@ -643,6 +651,7 @@ impl Server {
         trailers: &[Field<'_>],
         region: Backing,
     ) -> Result<(), Error> {
+        self.writable()?;
         self.writer.finish_with_trailers(outbound, trailers, region)?;
         self.after_write();
         Ok(())
@@ -655,6 +664,16 @@ impl Server {
         self.writer.cancel();
         self.close = true;
         self.end = Some(Err(Error::new(Kind::Cancelled, "the response was cancelled")));
+    }
+
+    /// Refuses a write after the end of the connection. After a refusal, a later response head
+    /// would follow the error response, and a pipelined client would read it as the response to
+    /// its next request.
+    fn writable(&self) -> Result<(), Error> {
+        match self.end {
+            Some(_) => Err(misuse("the connection ended")),
+            None => Ok(()),
+        }
     }
 
     /// Starts the drain of the unread request body after a complete response, or ends the
