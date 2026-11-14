@@ -14,30 +14,38 @@ use crate::value::{Field, Method, Status, Target};
 /// the framing field, and the empty line. The status line has no reason phrase, which RFC 9112,
 /// section 4, permits. `Length(n)` writes `content-length: n`, `Chunked` writes
 /// `transfer-encoding: chunked`, and `Close` writes no framing field: the close of the connection
-/// ends the body. A 204 or 304 response has no body: give `Length(0)`, and the head then has no
-/// framing field, as RFC 9110, section 8.6, requires.
+/// ends the body. A 1xx, 204, or 304 response has no body: give `Length(0)`, and the head then has
+/// no framing field, as RFC 9110, sections 8.6 and 15.2, require.
 ///
-/// Refuses, and writes nothing, if the status is informational (100 to 199), if a 204 or 304 has
-/// other framing, if a field is a framing field, or if `out` has too little free capacity.
+/// Refuses, and writes nothing, if a 1xx, 204, or 304 has other framing, if a field is a framing
+/// field, or if `out` has too little free capacity.
 pub fn write_head<B: BufferMut>(
     out: &mut WriteLoan<B>,
     status: Status,
     fields: &[Field<'_>],
     framing: Framing,
 ) -> Result<(), WriteError> {
+    write_response(out, status, fields, framing, None)
+}
+
+/// Writes a response head as [`write_head`] does, with the field `connection: <option>` after
+/// `fields` when `connection` is `Some`.
+pub(super) fn write_response<B: BufferMut>(
+    out: &mut WriteLoan<B>,
+    status: Status,
+    fields: &[Field<'_>],
+    framing: Framing,
+    connection: Option<&[u8]>,
+) -> Result<(), WriteError> {
     let code = status.code();
-    let no_body = matches!(code, 204 | 304);
-    if code < 200 || (no_body && framing != Framing::Length(0)) {
+    let no_body = code < 200 || matches!(code, 204 | 304);
+    if no_body && framing != Framing::Length(0) {
         return Err(WriteError::Status);
     }
     let mut status_digits = [0; 20];
     let status = digits(u64::from(code), 10, &mut status_digits);
-    write_message(
-        out,
-        [b"HTTP/1.1 ", status, b" \r\n"],
-        fields,
-        (!no_body).then_some(framing),
-    )
+    let start = [b"HTTP/1.1 ", status, b" \r\n"];
+    write_message(out, start, None, fields, connection, (!no_body).then_some(framing))
 }
 
 /// Writes a request head into the free capacity of `out`, after the bytes that it holds.
@@ -58,6 +66,19 @@ pub fn write_request<B: BufferMut>(
     fields: &[Field<'_>],
     framing: Framing,
 ) -> Result<(), WriteError> {
+    write_request_head(out, method, target, None, fields, framing)
+}
+
+/// Writes a request head as [`write_request`] does, with `host` as its first field line when it
+/// is `Some`, as RFC 9112, section 3.2, advises.
+pub(super) fn write_request_head<B: BufferMut>(
+    out: &mut WriteLoan<B>,
+    method: Method<'_>,
+    target: Target<'_>,
+    host: Option<Field<'_>>,
+    fields: &[Field<'_>],
+    framing: Framing,
+) -> Result<(), WriteError> {
     if framing == Framing::Close {
         return Err(WriteError::Framing);
     }
@@ -72,15 +93,18 @@ pub fn write_request<B: BufferMut>(
         ]
         .contains(&method);
     let start = [method.as_bytes(), b" ", target.as_bytes(), b" HTTP/1.1\r\n"];
-    write_message(out, start, fields, (!no_content).then_some(framing))
+    write_message(out, start, host, fields, None, (!no_content).then_some(framing))
 }
 
-/// Writes a head: the pieces of `start`, the field lines of `fields`, the framing field of
-/// `framing`, and the empty line. Refuses a field that is a framing field.
+/// Writes a head: the pieces of `start`, the field line of `first`, the field lines of `fields`,
+/// the `connection` field of `connection`, the framing field of `framing`, and the empty line.
+/// Refuses a field that is a framing field.
 fn write_message<B: BufferMut, const N: usize>(
     out: &mut WriteLoan<B>,
     start: [&[u8]; N],
+    first: Option<Field<'_>>,
     fields: &[Field<'_>],
+    connection: Option<&[u8]>,
     framing: Option<Framing>,
 ) -> Result<(), WriteError> {
     let framing_field = |field: &Field<'_>| {
@@ -99,10 +123,15 @@ fn write_message<B: BufferMut, const N: usize>(
         for piece in start {
             put(piece);
         }
-        for field in fields {
+        for field in first.iter().chain(fields) {
             put(field.name);
             put(b": ");
             put(field.value);
+            put(b"\r\n");
+        }
+        if let Some(option) = connection {
+            put(b"connection: ");
+            put(option);
             put(b"\r\n");
         }
         for piece in framing {
@@ -137,7 +166,7 @@ pub fn end_chunk<B: BufferMut>(out: &mut WriteLoan<B>) -> Result<(), WriteError>
 /// Refuses, and writes nothing, if a trailer is a framing field, or if `out` has too little free
 /// capacity.
 pub fn last_chunk<B: BufferMut>(out: &mut WriteLoan<B>, trailers: &[Field<'_>]) -> Result<(), WriteError> {
-    write_message(out, [b"0\r\n"], trailers, None)
+    write_message(out, [b"0\r\n"], None, trailers, None, None)
 }
 
 /// Writes the pieces that `pieces` gives into `out`, or refuses and writes nothing if they do not
@@ -183,8 +212,7 @@ pub enum WriteError {
         /// The free bytes of the output region.
         available: usize,
     },
-    /// The status is informational (100 to 199), or a 204 or 304 response has framing other
-    /// than `Length(0)`.
+    /// A 1xx, 204, or 304 response has framing other than `Length(0)`.
     Status,
     /// A field is `Content-Length` or `Transfer-Encoding`. The framing argument writes the
     /// framing field.
@@ -200,7 +228,7 @@ impl fmt::Display for WriteError {
                 f,
                 "the write needs {needed} bytes, but the output region has only {available} free bytes"
             ),
-            Self::Status => f.write_str("the status is informational, or it does not permit the framing"),
+            Self::Status => f.write_str("the status does not permit the framing"),
             Self::FramingField => f.write_str("a field is a framing field, which the framing argument writes"),
             Self::Framing => f.write_str("the framing does not fit the message"),
         }

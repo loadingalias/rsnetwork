@@ -362,6 +362,10 @@ fn heads_and_chunks_have_the_exact_framing() {
         b"HTTP/1.1 204 \r\nServer: rsnetwork\r\n\r\n"
     );
     assert_eq!(head(304, &[], Framing::Length(0)), b"HTTP/1.1 304 \r\n\r\n");
+    assert_eq!(
+        head(103, &fields[1..], Framing::Length(0)),
+        b"HTTP/1.1 103 \r\nX-Tag: a b\r\n\r\n"
+    );
 
     let mut out = WriteLoan::new(Vec::with_capacity(256));
     write_head(&mut out, Status::new(200).unwrap(), &[], Framing::Chunked).unwrap();
@@ -405,8 +409,8 @@ fn a_refused_write_writes_nothing() {
     let length = [Field::new(b"Content-Length", b"5").unwrap()];
     let coding = [Field::new(b"TRANSFER-ENCODING", b"chunked").unwrap()];
     for (status, fields, framing, expected) in [
-        (100, &[][..], Framing::Length(0), WriteError::Status),
-        (199, &[], Framing::Length(0), WriteError::Status),
+        (100, &[][..], Framing::Length(1), WriteError::Status),
+        (103, &[], Framing::Chunked, WriteError::Status),
         (204, &[], Framing::Length(1), WriteError::Status),
         (304, &[], Framing::Chunked, WriteError::Status),
         (200, &length, Framing::Length(5), WriteError::FramingField),

@@ -129,6 +129,8 @@ impl fmt::Debug for Received {
 pub struct Inbound {
     regions: VecDeque<Received>,
     limit: usize,
+    /// The transport gives no more bytes.
+    ended: bool,
 }
 
 impl Inbound {
@@ -137,15 +139,31 @@ impl Inbound {
         Ok(Self {
             regions: reserve(limit)?,
             limit: limit.get(),
+            ended: false,
         })
     }
 
-    /// Adds a region after the others. Gives it back if the queue is full.
+    /// Records that the transport gives no more bytes after the queued regions: the peer closed
+    /// its side. An engine reads the queued regions first, and then sees the end.
+    pub fn end(&mut self) {
+        self.ended = true;
+    }
+
+    /// Whether the transport gives no more bytes after the queued regions.
+    pub fn ended(&self) -> bool {
+        self.ended
+    }
+
+    /// Adds a region after the others. Gives it back if the queue is full. An empty region has
+    /// no byte to consume, so the queue drops it.
     #[expect(
         clippy::result_large_err,
         reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
     )]
     pub fn push(&mut self, received: Received) -> Result<(), Received> {
+        if received.region.initialized() == 0 {
+            return Ok(());
+        }
         if self.regions.len() >= self.limit {
             return Err(received);
         }
@@ -188,6 +206,7 @@ impl fmt::Debug for Inbound {
         f.debug_struct("Inbound")
             .field("regions", &self.regions.len())
             .field("limit", &self.limit)
+            .field("ended", &self.ended)
             .finish_non_exhaustive()
     }
 }
@@ -243,6 +262,16 @@ impl Outbound {
             next: 0,
             outstanding: None,
         })
+    }
+
+    /// The most regions that the queue holds.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// The number of regions that the queue can take now.
+    pub fn free(&self) -> usize {
+        self.limit - self.regions.len()
     }
 
     /// Adds a region after the others. Gives it back if the queue is full. An empty region has
