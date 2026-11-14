@@ -118,7 +118,7 @@ assert_eq!(sent, b"HTTP/1.1 201 \r\nContent-Type: text/plain\r\ncontent-length: 
 | `finish`, `finish_with_trailers` | Ends the body. A chunked body gets its last chunk, with trailers or with none |
 | `accept_body` | Sends `100 Continue` to a request that waits for it, and starts the read of its body |
 | `inform` | Sends an informational response with a status from 102 to 199, for example 103 |
-| `cancel` | Stops the response with no end of its body. The connection then ends |
+| `cancel` | Stops the response with no end of its body. A request body that did not end gets `End(Outcome::Cancelled)`. The connection then ends |
 
 `send` and `finish` refuse with `Kind::Overload` when the `Outbound` queue or the pool is full,
 and change nothing. Acknowledge output, then call again. A call in the wrong state, for example
@@ -141,7 +141,7 @@ and change nothing. Acknowledge output, then call again. A call in the wrong sta
 | Client call | Result |
 | --- | --- |
 | `cancel_upload` | Sends no more request body bytes and no end of the body. The response can still arrive, and then the connection closes |
-| `cancel_response` | Reads and discards the rest of the response body, up to `drain_bytes`, to reuse the connection. Above it, the connection closes at once |
+| `cancel_response` | Ends the response body with `End(Outcome::Cancelled)`, and gives no more of it. The engine reads and discards the rest, up to `drain_bytes`, to reuse the connection. Above it, the connection closes at once |
 
 ## Limits
 

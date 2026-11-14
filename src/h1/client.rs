@@ -55,6 +55,9 @@ pub struct Client {
     close: bool,
     /// The request in flight asks to change the protocol.
     upgrade: bool,
+    /// The application cancelled the response body: the next drive gives its
+    /// `End(Outcome::Cancelled)`.
+    cancelled: bool,
     /// The end of the connection.
     end: Option<Result<(), Error>>,
 }
@@ -149,6 +152,7 @@ impl Client {
             method: Method::GET,
             close: false,
             upgrade: false,
+            cancelled: false,
             end: None,
         })
     }
@@ -274,16 +278,24 @@ impl Client {
         }
     }
 
-    /// Cancels the read of the response. The engine reads and discards the rest of the body, up to
-    /// [`BodyLimits::drain_bytes`], to reuse the connection, and closes it when the body is longer
-    /// or ends only with the close. Before the response head, the connection closes at once, and
-    /// the turn becomes terminal with [`Kind::Cancelled`].
+    /// Cancels the read of the response. Inside the body, the next drive gives
+    /// [`End(Outcome::Cancelled)`](ClientEvent::End), once, and no more of the body. The engine then
+    /// reads and discards the rest of the body, up to [`BodyLimits::drain_bytes`], to reuse the
+    /// connection, and closes it when the body is longer or ends only with the close. Before the
+    /// response head, the connection closes at once, and the turn becomes terminal with
+    /// [`Kind::Cancelled`].
     pub fn cancel_response(&mut self) {
         match &mut self.read {
-            ReadState::Body(reader) if self.close || reader.left().is_some_and(|left| left > self.body.drain_bytes) => {
-                self.end = Some(Ok(()));
+            // A body that the application cancelled ends `Cancelled`, so its reader sees its end.
+            ReadState::Body(reader) if reader.draining() || self.end.is_some() => {}
+            ReadState::Body(reader) => {
+                self.cancelled = true;
+                if self.close || reader.left().is_some_and(|left| left > self.body.drain_bytes) {
+                    self.end = Some(Ok(()));
+                } else {
+                    reader.drain(self.body.drain_bytes);
+                }
             }
-            ReadState::Body(reader) => reader.drain(self.body.drain_bytes),
             ReadState::Head => self.end = Some(Err(Error::new(Kind::Cancelled, "the response was cancelled"))),
             ReadState::Idle | ReadState::Switch | ReadState::Done => {}
         }
@@ -324,6 +336,9 @@ impl Client {
     /// Reads the next event from `inbound`, or gives `None` when the engine waits.
     fn step(&mut self, inbound: &mut Inbound) -> Result<Option<ClientEvent>, ParseError> {
         let mut work = Work::default();
+        if core::mem::take(&mut self.cancelled) {
+            return Ok(Some(ClientEvent::End(Outcome::Cancelled)));
+        }
         loop {
             if self.end.is_some() {
                 return Ok(None);

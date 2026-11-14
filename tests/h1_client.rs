@@ -48,6 +48,7 @@ enum Seen {
     Data(Vec<u8>),
     End(Vec<u8>),
     Truncated,
+    Cancelled,
     Malformed,
     Handoff,
 }
@@ -67,6 +68,7 @@ fn outcome(outcome: Outcome) -> Seen {
                 .unwrap_or_default(),
         ),
         Outcome::Truncated => Seen::Truncated,
+        Outcome::Cancelled => Seen::Cancelled,
         Outcome::Malformed => Seen::Malformed,
         other => panic!("{other:?}"),
     }
@@ -268,9 +270,9 @@ fn the_close_ends_a_close_delimited_body_and_cuts_any_other() {
     assert!(terminal(&progress, Kind::Uncertain), "{progress:?}");
 }
 
-/// A cancelled response reads and discards the rest of its body, up to the drain limit, and the
-/// connection then carries the next request. A body longer than the limit closes the connection
-/// at once. A connection that reuses the connection inside an unread body reads the body as a
+/// A cancelled response body ends `Cancelled` once, and the engine gives no more of it. It reads
+/// and discards the rest of the body, up to the drain limit, and the connection then carries the
+/// next request. A body longer than the limit closes the connection at once. A connection that reuses the connection inside an unread body reads the body as a
 /// response.
 #[test]
 fn reuse_after_a_cancelled_response_drains_it_or_closes() {
@@ -282,8 +284,9 @@ fn reuse_after_a_cancelled_response_drains_it_or_closes() {
         (vec![Seen::Response(200), Seen::Data(b"abc".to_vec())], WAIT)
     );
     host.client.cancel_response();
+    host.client.cancel_response();
     host.receive(b"5\r\nhello\r\n0\r\n\r\n");
-    assert_eq!(host.drive(), (Vec::new(), WAIT));
+    assert_eq!(host.drive(), (vec![Seen::Cancelled], WAIT));
     host.request(b"GET", b"/b", Framing::Length(0), b"");
     host.receive(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb");
     assert_eq!(
@@ -299,7 +302,7 @@ fn reuse_after_a_cancelled_response_drains_it_or_closes() {
     host.receive(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nab");
     host.drive();
     host.client.cancel_response();
-    assert_eq!(host.drive(), (Vec::new(), Progress::Terminal(Ok(()))));
+    assert_eq!(host.drive(), (vec![Seen::Cancelled], Progress::Terminal(Ok(()))));
 }
 
 /// A cancelled upload sends no more body bytes and no last chunk, so the server never sees a

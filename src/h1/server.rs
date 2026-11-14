@@ -73,6 +73,9 @@ pub struct Server {
     request: Request,
     /// The connection closes after the current response.
     close: bool,
+    /// The application cancelled the response inside the request body: the next drive gives that
+    /// body its `End(Outcome::Cancelled)`.
+    cancelled: bool,
     /// The end of the connection.
     end: Option<Result<(), Error>>,
 }
@@ -178,6 +181,7 @@ impl Server {
             write: Write::Idle,
             request: Request::default(),
             close: false,
+            cancelled: false,
             end: None,
         })
     }
@@ -287,6 +291,10 @@ impl Server {
     /// Reads the next event from `inbound`, or gives `None` when the engine waits.
     fn step(&mut self, inbound: &mut Inbound) -> Result<Option<ServerEvent>, ParseError> {
         let mut work = Work::default();
+        if core::mem::take(&mut self.cancelled) {
+            self.read = ReadState::Done;
+            return Ok(Some(ServerEvent::End(Outcome::Cancelled)));
+        }
         loop {
             if self.end.is_some() {
                 return Ok(None);
@@ -660,7 +668,12 @@ impl Server {
     /// Cancels the current response. The connection closes after the bytes that `outbound`
     /// holds, with no end of the body, so the client sees an incomplete response, never a
     /// complete one (RFC 9112, section 9). The turn becomes terminal with [`Kind::Cancelled`].
+    /// Inside the request body, the next drive first gives
+    /// [`End(Outcome::Cancelled)`](ServerEvent::End) for it, once.
     pub fn cancel(&mut self) {
+        // A request body that the application did not read to its end ends `Cancelled`, so its
+        // reader sees its end.
+        self.cancelled |= self.end.is_none() && matches!(&self.read, ReadState::Body(reader) if !reader.draining());
         self.writer.cancel();
         self.close = true;
         self.end = Some(Err(Error::new(Kind::Cancelled, "the response was cancelled")));

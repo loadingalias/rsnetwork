@@ -55,6 +55,7 @@ enum Seen {
     Data(Vec<u8>),
     End(Vec<u8>),
     Truncated,
+    Cancelled,
     Malformed,
     Handoff,
 }
@@ -74,6 +75,7 @@ fn outcome(outcome: Outcome) -> Seen {
                 .unwrap_or_default(),
         ),
         Outcome::Truncated => Seen::Truncated,
+        Outcome::Cancelled => Seen::Cancelled,
         Outcome::Malformed => Seen::Malformed,
         other => panic!("{other:?}"),
     }
@@ -406,6 +408,23 @@ fn a_cancelled_response_ends_with_no_end_of_its_body() {
         assert!(matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Cancelled));
         assert_eq!(host.sent(), expected);
     }
+}
+
+/// A cancel inside the request body ends that body `Cancelled` once, before the terminal turn, so
+/// the reader of the body sees its end.
+#[test]
+fn a_cancel_inside_the_request_body_ends_it_cancelled() {
+    let mut host = Host::new(BODY);
+    host.receive(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc");
+    assert_eq!(
+        host.drive(),
+        (vec![request(b"POST", b"/"), Seen::Data(b"abc".to_vec())], WAIT)
+    );
+    host.server.cancel();
+    host.server.cancel();
+    let (seen, progress) = host.drive();
+    assert_eq!(seen, vec![Seen::Cancelled]);
+    assert!(matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Cancelled));
 }
 
 /// After construction, the engine sends a long chunked body with no allocation: each size line
