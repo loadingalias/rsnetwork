@@ -139,6 +139,13 @@ fn unclear_framing_refuses() {
             Ok(Framing::Length(u64::MAX)),
         ),
         ("transfer-encoding: Chunked\r\n", Ok(Framing::Chunked)),
+        // A recipient ignores empty list elements (RFC 9110, section 5.6.1), also across lines.
+        ("Transfer-Encoding: chunked, ,\r\n", Ok(Framing::Chunked)),
+        (
+            "Transfer-Encoding: ,\r\nTransfer-Encoding: chunked\r\n",
+            Ok(Framing::Chunked),
+        ),
+        ("Transfer-Encoding: ,\r\n", Err(ParseError::Framing)),
         ("Content-Length: 18446744073709551616\r\n", Err(ParseError::Framing)),
         ("Content-Length: 5\r\nContent-Length: 5\r\n", Err(ParseError::Framing)),
         ("Content-Length: 5, 5\r\n", Err(ParseError::Framing)),

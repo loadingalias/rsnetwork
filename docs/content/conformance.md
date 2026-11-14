@@ -42,6 +42,7 @@ wrong shows it as a request that the application must not see.
 | Two equal `Content-Length` values | RFC 9110, section 8.6 | `400`, or one length |
 | TE.TE: a coding that is not `chunked`, a quoted `chunked`, a second `Transfer-Encoding` line, and whitespace before the colon | RFC 9112, sections 5.1, 6.3, and 7 | `400` and the close |
 | TE.TE: a tab before `chunked` and capital letters | RFC 9112, sections 5.1 and 7 | The chunked body |
+| TE.TE: an empty list element before `chunked` | RFC 9110, section 5.6.1 | The chunked body |
 | Obsolete line folding in a request, and whitespace before the first field line | RFC 9112, sections 2.2 and 5.2 | `400`, or the fold as a space or the line ignored |
 | Bare LF and bare CR in a head | RFC 9112, section 2.2 | `400`, or the LF as a line end and the CR as a space |
 | Bare LF in a chunk line, chunk sizes with `0x`, a sign, no digit, or a value past `u64`, and chunk data longer than its size | RFC 9112, section 7.1 | `End(Malformed)`, `400`, and the close |

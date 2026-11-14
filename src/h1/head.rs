@@ -125,9 +125,9 @@ pub(super) fn split_head(head: &[u8]) -> Result<(&[u8], &[u8]), ParseError> {
 /// The transfer codings of a message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Coding {
-    /// Exactly one `chunked`, in one field line.
+    /// Exactly one coding, `chunked`.
     Chunked,
-    /// Codings that end with `chunked`, with one more coding before it.
+    /// Codings that end with `chunked`, with more codings before it.
     ChunkedLast,
     /// Codings that do not end with `chunked`.
     Other,
@@ -157,8 +157,8 @@ pub(super) struct Facts<'a> {
 pub(super) fn scan<'a>(block: &'a [u8], limits: &Limits) -> Result<Facts<'a>, ParseError> {
     let mut facts = Facts::default();
     let mut count = 0_usize;
-    let mut coding = None;
-    let mut coding_lines = 0_usize;
+    // The codings of each Transfer-Encoding field line, as one list (RFC 9110, section 5.3).
+    let (mut coded, mut codings, mut last) = (false, 0_usize, None);
     let (mut upgrade_option, mut upgrade_field) = (false, false);
     let mut rest = block;
     while let Some((line, next)) = split_line(rest) {
@@ -179,8 +179,11 @@ pub(super) fn scan<'a>(block: &'a [u8], limits: &Limits) -> Result<Facts<'a>, Pa
             }
             facts.length = Some(decimal(field.value).ok_or(ParseError::Framing)?);
         } else if named(b"transfer-encoding") {
-            coding = Some(field.value);
-            coding_lines += 1;
+            coded = true;
+            for coding in list(field.value) {
+                codings += 1;
+                last = Some(coding);
+            }
         } else if named(b"host") {
             if facts.host.replace(field.value).is_some() {
                 return Err(ParseError::Malformed);
@@ -198,24 +201,17 @@ pub(super) fn scan<'a>(block: &'a [u8], limits: &Limits) -> Result<Facts<'a>, Pa
         }
     }
     facts.upgrade = upgrade_option && upgrade_field;
-    facts.coding = coding.map(|value| {
-        if coding_lines == 1 && value.eq_ignore_ascii_case(b"chunked") {
-            Coding::Chunked
-        } else if list(value)
-            .next_back()
-            .is_some_and(|last| last.eq_ignore_ascii_case(b"chunked"))
-        {
-            Coding::ChunkedLast
-        } else {
-            Coding::Other
-        }
+    facts.coding = coded.then(|| match last {
+        Some(last) if last.eq_ignore_ascii_case(b"chunked") && codings == 1 => Coding::Chunked,
+        Some(last) if last.eq_ignore_ascii_case(b"chunked") => Coding::ChunkedLast,
+        _ => Coding::Other,
     });
     Ok(facts)
 }
 
 /// The elements of a comma-separated list, with no whitespace around them and no empty element
 /// (RFC 9110, section 5.6.1).
-fn list(value: &[u8]) -> impl DoubleEndedIterator<Item = &[u8]> {
+fn list(value: &[u8]) -> impl Iterator<Item = &[u8]> {
     value
         .split(|&byte| byte == b',')
         .map(trim_whitespace)

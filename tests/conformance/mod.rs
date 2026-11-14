@@ -412,6 +412,16 @@ pub(crate) fn server() -> Vec<Vector> {
             permitted: vec![both(b"hello")],
         },
         Vector {
+            name: "TE.TE: an empty list element before chunked",
+            rfc: "RFC 9110, section 5.6.1",
+            input: [
+                post("Transfer-Encoding: , chunked\r\n", b"5\r\nhello\r\n0\r\n\r\n"),
+                SMUGGLED.to_vec(),
+            ]
+            .concat(),
+            permitted: vec![both(b"hello")],
+        },
+        Vector {
             name: "obsolete line folding",
             rfc: "RFC 9112, section 5.2",
             input: [b"GET / HTTP/1.1\r\nHost: a\r\nX: a\r\n b\r\n\r\n", SMUGGLED].concat(),

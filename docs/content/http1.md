@@ -172,7 +172,7 @@ The body length follows RFC 9112, section 6.3:
 | Message | Body |
 | --- | --- |
 | A request with `Content-Length: n`, or a response with it | `n` bytes |
-| A message with `Transfer-Encoding: chunked`, one coding in one field line | Chunks, then trailers |
+| A message whose `Transfer-Encoding` field lines have one coding, `chunked`. Empty list elements do not count (RFC 9110, section 5.6.1) | Chunks, then trailers |
 | A request with no framing field | No body |
 | A response to HEAD, a 1xx, 204, or 304 response, or a 2xx response to CONNECT | No body, whatever the framing fields say |
 | A response with no framing field | Each byte until the close |
