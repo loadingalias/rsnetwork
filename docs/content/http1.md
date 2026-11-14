@@ -39,6 +39,7 @@ use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
+use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::value::{Field, Status};
 
 let limits = Limits { head_bytes: 8 * 1024, fields: 64, name_bytes: 64, value_bytes: 4 * 1024 };
@@ -54,6 +55,8 @@ let queue = NonZeroUsize::new(16).expect("not zero");
 let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
 let (mut inbound, mut outbound) = (Inbound::new(queue, &budget)?, Outbound::new(queue, &budget)?);
 let mut server = Server::new(limits, body, turn, &outbound, &budget)?;
+// The time of the host, on its monotonic clock. The engine waits 30 seconds for a head.
+let now = Some(Instant::new(ClockDomain::new(1, Suspend::Pauses), 0));
 
 // The transport received a request, and the host queues it.
 let endpoint = Endpoint {
@@ -66,15 +69,15 @@ let region = Lease::from(b"POST /notes HTTP/1.1\r\nHost: example.com\r\nContent-
 inbound.push(Received { region, endpoint, capacity: 64 * 1024 }).expect("the queue has space");
 
 // Each drive gives one event: the head, the body bytes, and the end of the body.
-let (Some(ServerEvent::Request(request)), _) = server.drive(&mut inbound, &mut outbound) else {
+let (Some(ServerEvent::Request(request)), _) = server.drive(&mut inbound, &mut outbound, now) else {
     panic!("a request head")
 };
 assert_eq!(request.head().target().as_bytes(), b"/notes");
-let (Some(ServerEvent::Data(data)), _) = server.drive(&mut inbound, &mut outbound) else {
+let (Some(ServerEvent::Data(data)), _) = server.drive(&mut inbound, &mut outbound, now) else {
     panic!("body bytes")
 };
 assert_eq!(data.bytes(), b"hello");
-let (Some(ServerEvent::End(Outcome::Complete(None))), _) = server.drive(&mut inbound, &mut outbound) else {
+let (Some(ServerEvent::End(Outcome::Complete(None))), _) = server.drive(&mut inbound, &mut outbound, now) else {
     panic!("the end of the body")
 };
 
@@ -99,7 +102,7 @@ assert_eq!(sent, b"HTTP/1.1 201 \r\nContent-Type: text/plain\r\ncontent-length: 
 1. Make one `Server` for each connection with `Server::new(limits, body, turn, &outbound, &budget)`.
    It makes its pool of chunk-size lines there: one 16-byte slot for each `Outbound` entry,
    charged to the budget.
-2. Call `server.drive(&mut inbound, &mut outbound)` until it gives no event. Drive again when more
+2. Call `server.drive(&mut inbound, &mut outbound, now)` until it gives no event. Drive again when more
    bytes arrive or after the application answers.
 3. For `ServerEvent::Request(head)`, answer with `respond(outbound, status, fields, framing,
    region)`. Then send the body with `send(outbound, &data)`, and end it with `finish(outbound)`
@@ -189,7 +192,8 @@ the `keep-alive` option. A response that the close ends does not persist.
 
 | Case | Behavior |
 | --- | --- |
-| A head or a trailer section that continues in the next received region | The engine copies its bytes into one region of at most `head_bytes` or `trailer_bytes`. This is one counted copy, which the budget pays for until the last view of the head drops. Each new region adds only its new bytes, and the bytes after the section keep their region. When the budget cannot pay, the turn is `Blocked(Blocked::Capacity(n))`. Thus the budget bounds the memory of many slow partial heads. The engine has no timer, so bound their time with a deadline for each head in your host |
+| A head or a trailer section that continues in the next received region | The engine copies its bytes into one region of at most `head_bytes` or `trailer_bytes`. This is one counted copy, which the budget pays for until the last view of the head drops. Each new region adds only its new bytes, and the bytes after the section keep their region. When the budget cannot pay, the turn is `Blocked(Blocked::Capacity(n))`. Thus the budget bounds the memory of many slow partial heads, and the head timeout of the server bounds their time |
+| The head timeout of the server | From when the server waits for a request head, after the connection starts or after a response, to the end of the head. At its deadline, a connection with no byte of a head closes with no error, and one with part of a head gets `408` and ends with `Kind::Deadline`. The default is `HEAD_TIMEOUT`, 30 seconds: the default header read timeout of the hyper HTTP/1 server, and half of the 60-second `client_header_timeout` of nginx. Change it with `Server::head_timeout`, and turn it off with `None` |
 | Pipelined requests | The server reads the next request only after the response before it is complete, so the responses go in the order of the requests |
 | A response before the end of the request body | The server reads and discards the rest, up to `drain_bytes`, then reads the next request. A Content-Length body that is longer gets `connection: close`, and a chunked body that passes the limit closes the connection |
 | An HTTP/1.0 request | Its response has an HTTP/1.1 status line, and never chunks: a chunked response becomes one that the close ends. It has `connection: keep-alive` when the connection persists, and `connection: close` when it does not. A request with no Host field is served |

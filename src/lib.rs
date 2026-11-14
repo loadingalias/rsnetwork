@@ -12,6 +12,9 @@
 //! model that each protocol shares: terminal outcomes, trailers, a consumer that reads a body
 //! into regions of the caller, bounded collection, and the bodies that a sender gives.
 //!
+//! [`host`] is the caller-driven host: one connection that the application drives from its own
+//! event loop, with no runtime.
+//!
 //! [`buffer`], [`capacity`], and [`time`] are the buffer, capacity, and time modules of the
 //! runtime family, which the public API uses. They are the same modules that `rsasync` gives, so
 //! a value from either path is the same type.
@@ -21,4 +24,5 @@ pub use rstypes::{buffer, capacity, time};
 pub mod body;
 pub mod drive;
 pub mod h1;
+pub mod host;
 pub mod value;

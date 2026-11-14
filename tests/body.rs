@@ -10,6 +10,7 @@ use rsnetwork::buffer::{Backing, Lease, WriteLoan};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Client, ClientEvent, Framing, Limits, Server, ServerEvent};
+use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::value::{Authority, Method, Target};
 
 mod counting;
@@ -35,6 +36,9 @@ const TURN: TurnLimits = TurnLimits {
     bytes: 1 << 20,
     frames: 1 << 10,
 };
+
+/// The time of the host, which the tests keep at the start of their clock.
+const NOW: Option<Instant> = Some(Instant::new(ClockDomain::new(1, Suspend::Pauses), 0));
 
 const ENDPOINT: Endpoint = Endpoint {
     peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 50_000),
@@ -73,7 +77,7 @@ fn a_chunked_body_reads_into_an_admitted_region_with_no_allocation() {
             b"POST /up HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n",
         ))
         .unwrap();
-    let (Some(ServerEvent::Request(_)), _) = server.drive(&mut inbound, &mut outbound) else {
+    let (Some(ServerEvent::Request(_)), _) = server.drive(&mut inbound, &mut outbound, NOW) else {
         panic!("a request head");
     };
     let chunks = b"5;e=1\r\nhello\r\n7\r\n, world\r\n";
@@ -86,7 +90,7 @@ fn a_chunked_body_reads_into_an_admitted_region_with_no_allocation() {
         let mut collected = Collect::More;
         for each in regions {
             inbound.push(each).unwrap();
-            while let (Some(event), _) = server.drive(&mut inbound, &mut outbound) {
+            while let (Some(event), _) = server.drive(&mut inbound, &mut outbound, NOW) {
                 match event {
                     ServerEvent::Data(data) => consumer.data(data).unwrap(),
                     ServerEvent::End(outcome) => consumer.end(outcome),

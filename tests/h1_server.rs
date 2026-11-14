@@ -9,6 +9,7 @@ use rsnetwork::body::Outcome;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Progress, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
+use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::value::{Field, Status};
 use rstypes::capacity::Budget;
 
@@ -35,6 +36,9 @@ const TURN: TurnLimits = TurnLimits {
     bytes: 1 << 20,
     frames: 1 << 10,
 };
+
+/// The time of the host, which the tests keep at the start of their clock.
+const NOW: Option<Instant> = Some(Instant::new(ClockDomain::new(1, Suspend::Pauses), 0));
 
 const ENDPOINT: Endpoint = Endpoint {
     peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 50_000),
@@ -118,7 +122,7 @@ impl Host {
     fn drive(&mut self) -> (Vec<Seen>, Progress) {
         let mut seen = Vec::new();
         loop {
-            let (event, turn) = self.server.drive(&mut self.inbound, &mut self.outbound);
+            let (event, turn) = self.server.drive(&mut self.inbound, &mut self.outbound, NOW);
             match event {
                 Some(ServerEvent::Request(head)) => {
                     let head = head.head();
@@ -532,7 +536,7 @@ fn a_head_across_regions_joins_with_a_charge_and_no_copy_of_its_body() {
             })
             .unwrap();
         let mut events = Vec::new();
-        while let (Some(event), _) = host.server.drive(&mut host.inbound, &mut host.outbound) {
+        while let (Some(event), _) = host.server.drive(&mut host.inbound, &mut host.outbound, NOW) {
             events.push(event);
         }
         let [
@@ -567,7 +571,7 @@ fn a_head_across_regions_joins_with_a_charge_and_no_copy_of_its_body() {
     let ((), count) = allocations(|| {
         for received in regions {
             host.inbound.push(received).unwrap();
-            while let (Some(event), _) = host.server.drive(&mut host.inbound, &mut host.outbound) {
+            while let (Some(event), _) = host.server.drive(&mut host.inbound, &mut host.outbound, NOW) {
                 events.push(event);
             }
         }

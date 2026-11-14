@@ -9,6 +9,7 @@ use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Progress, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
+use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::value::Status;
 
 mod counting;
@@ -29,6 +30,9 @@ const BODY: BodyLimits = BodyLimits {
     trailer_bytes: 256,
     trailer_fields: 4,
 };
+
+/// The time of the host, which the tests keep at the start of their clock.
+const NOW: Option<Instant> = Some(Instant::new(ClockDomain::new(1, Suspend::Pauses), 0));
 
 const ENDPOINT: Endpoint = Endpoint {
     peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 50_000),
@@ -74,7 +78,7 @@ fn a_slow_peer_retains_one_charged_head_and_is_refused_at_its_limit() {
     let head = [b"GET /".as_slice(), &[b'a'; 2048]].concat();
     for (at, byte) in head.iter().enumerate() {
         inbound.push(received(&[*byte])).unwrap();
-        let (event, turn) = server.drive(&mut inbound, &mut outbound);
+        let (event, turn) = server.drive(&mut inbound, &mut outbound, NOW);
         assert!(event.is_none(), "byte {at}");
         if at + 1 < LIMITS.head_bytes {
             assert_eq!(turn.progress, Progress::Blocked(Blocked::Input), "byte {at}");
@@ -113,7 +117,7 @@ fn a_turn_with_more_work_than_its_limit_stops_and_reports_the_rest() {
             b"POST /up HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n",
         ))
         .unwrap();
-    let (Some(ServerEvent::Request(_)), _) = server.drive(&mut inbound, &mut outbound) else {
+    let (Some(ServerEvent::Request(_)), _) = server.drive(&mut inbound, &mut outbound, NOW) else {
         panic!("a request head");
     };
     let head = Backing::from(Vec::with_capacity(64));
@@ -140,7 +144,7 @@ fn a_turn_with_more_work_than_its_limit_stops_and_reports_the_rest() {
     let mut pending = 0;
     let mut consumed = 0;
     loop {
-        let (event, turn) = server.drive(&mut inbound, &mut outbound);
+        let (event, turn) = server.drive(&mut inbound, &mut outbound, NOW);
         if let Some(event) = event {
             assert!(matches!(event, ServerEvent::Request(_)), "{event:?}");
             break;
@@ -161,7 +165,7 @@ fn a_turn_with_more_work_than_its_limit_stops_and_reports_the_rest() {
     inbound
         .push(received(b"PUT /up HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\n\r\n"))
         .unwrap();
-    server.drive(&mut inbound, &mut outbound);
+    server.drive(&mut inbound, &mut outbound, NOW);
     let head = Backing::from(Vec::with_capacity(64));
     server
         .respond(&mut outbound, status, &[], Framing::Length(0), head)
@@ -171,7 +175,7 @@ fn a_turn_with_more_work_than_its_limit_stops_and_reports_the_rest() {
         inbound.push(received(&[b'x'; 10])).unwrap();
     }
     let turns: Vec<Progress> = (0..3)
-        .map(|_| server.drive(&mut inbound, &mut outbound).1.progress)
+        .map(|_| server.drive(&mut inbound, &mut outbound, NOW).1.progress)
         .collect();
     assert_eq!(
         turns,

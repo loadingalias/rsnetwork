@@ -49,8 +49,9 @@ bounds it. Each turn makes at least one step, so a small limit slows an engine b
 | A slow request or response body | No state of its own: the body bytes are views of the received regions, and a consumer holds one waiting part | The `Inbound` limit: when the queue is full, `push` gives the region back, so stop receiving |
 | An unread body after a response | The drain of the rest | `drain_bytes`: above it, the connection closes |
 
-The engines have no timer. Bound the time of a slow head or body with your own deadline for it, and
-end the connection when it passes.
+The head timeout of the server bounds the time of a slow head: see
+[HTTP/1.1](http1.md#framing-and-connection-rules). Bound the time of a slow body with your own
+deadline for it, and end the connection when it passes.
 
 ## Each limit
 

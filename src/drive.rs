@@ -290,6 +290,16 @@ impl Outbound {
         self.limit - self.regions.len()
     }
 
+    /// The output that the transport has not accepted: the regions that the queue holds, their
+    /// bytes, and the output that waits for its acknowledgement.
+    pub fn outstanding(&self) -> Outstanding {
+        Outstanding {
+            regions: self.regions.len(),
+            bytes: self.regions.iter().map(|region| region.initialized() as u64).sum(),
+            submitted: self.outstanding.map(|(id, _)| id),
+        }
+    }
+
     /// Adds a region after the others. Gives it back if the queue is full. An empty region has
     /// nothing to send, so the queue drops it.
     pub fn push(&mut self, region: Lease) -> Result<(), Lease> {
@@ -355,7 +365,24 @@ impl fmt::Debug for Outbound {
     }
 }
 
-/// Makes an empty queue with space reserved for `limit` items.
+/// The output of an [`Outbound`] queue that the transport has not accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Outstanding {
+    /// The regions that the queue holds.
+    pub regions: usize,
+    /// The bytes of these regions.
+    pub bytes: u64,
+    /// The output that waits for its acknowledgement. The transport holds its own view of it.
+    pub submitted: Option<ActionId>,
+}
+
+impl Outstanding {
+    /// Whether the transport accepted each output.
+    pub fn is_empty(&self) -> bool {
+        self.regions == 0 && self.submitted.is_none()
+    }
+}
+
 /// Makes an empty queue with space for `limit` items. It charges that memory to `budget` before
 /// it allocates, and the permit pays for the queue until it drops.
 fn reserve<T>(limit: NonZeroUsize, budget: &Budget) -> Result<(VecDeque<T>, Permit), Error> {

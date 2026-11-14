@@ -28,6 +28,7 @@
 //! use rsnetwork::capacity::Budget;
 //! use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received, TurnLimits};
 //! use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
+//! use rsnetwork::time::{ClockDomain, Instant, Suspend};
 //! use rsnetwork::value::{Field, Status};
 //!
 //! let limits = Limits { head_bytes: 8 * 1024, fields: 64, name_bytes: 64, value_bytes: 4 * 1024 };
@@ -43,6 +44,8 @@
 //! let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
 //! let (mut inbound, mut outbound) = (Inbound::new(queue, &budget)?, Outbound::new(queue, &budget)?);
 //! let mut server = Server::new(limits, body, turn, &outbound, &budget)?;
+//! // The time of the host, on its monotonic clock. The engine waits 30 seconds for a head.
+//! let now = Some(Instant::new(ClockDomain::new(1, Suspend::Pauses), 0));
 //!
 //! // The transport received a request, and the host queues it.
 //! let endpoint = Endpoint {
@@ -55,15 +58,15 @@
 //! inbound.push(Received { region, endpoint, capacity: 64 * 1024 }).expect("the queue has space");
 //!
 //! // Each drive gives one event: the head, the body bytes, and the end of the body.
-//! let (Some(ServerEvent::Request(request)), _) = server.drive(&mut inbound, &mut outbound) else {
+//! let (Some(ServerEvent::Request(request)), _) = server.drive(&mut inbound, &mut outbound, now) else {
 //!     panic!("a request head")
 //! };
 //! assert_eq!(request.head().target().as_bytes(), b"/notes");
-//! let (Some(ServerEvent::Data(data)), _) = server.drive(&mut inbound, &mut outbound) else {
+//! let (Some(ServerEvent::Data(data)), _) = server.drive(&mut inbound, &mut outbound, now) else {
 //!     panic!("body bytes")
 //! };
 //! assert_eq!(data.bytes(), b"hello");
-//! let (Some(ServerEvent::End(Outcome::Complete(None))), _) = server.drive(&mut inbound, &mut outbound) else {
+//! let (Some(ServerEvent::End(Outcome::Complete(None))), _) = server.drive(&mut inbound, &mut outbound, now) else {
 //!     panic!("the end of the body")
 //! };
 //!
@@ -101,7 +104,7 @@ pub use client::{Client, ClientEvent};
 pub use head::{BodyLimits, Fields, Limits, ParseError, Version};
 pub use request::{RequestHead, RequestParser, RetainedRequest};
 pub use response::{ResponseHead, ResponseParser, RetainedResponse};
-pub use server::{Server, ServerEvent};
+pub use server::{HEAD_TIMEOUT, Server, ServerEvent};
 pub use write::{WriteError, begin_chunk, end_chunk, last_chunk, write_head, write_request};
 
 /// The framing of a message body: how its end is found.

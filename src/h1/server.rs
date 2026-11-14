@@ -1,9 +1,11 @@
 //! The server engine: one connection, for HTTP/1.1 and HTTP/1.0 clients.
 
 use core::fmt;
+use core::time::Duration;
 
 use rstypes::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use rstypes::capacity::Budget;
+use rstypes::time::{Deadline, Instant};
 
 use super::body::{BodyReader, BodyWriter, Read, full, misuse, write_error};
 use super::head::{BodyLimits, Limits, ParseError, Version};
@@ -13,6 +15,11 @@ use super::{Framing, RequestHead, RequestParser, RetainedRequest};
 use crate::body::Outcome;
 use crate::drive::{Blocked, Error, Inbound, Kind, Outbound, Progress, Turn, TurnLimits, Work};
 use crate::value::{Field, Method, Status};
+
+/// The default head timeout of a [`Server`]: 30 seconds. It is the default header read timeout of
+/// the hyper HTTP/1 server, and half of the 60-second `client_header_timeout` of nginx. A client
+/// on a slow link sends a head in far less time, and a slow peer holds its connection no longer.
+pub const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The server side of one HTTP/1.1 connection, with no I/O.
 ///
@@ -41,6 +48,10 @@ pub struct Server {
     capacity: Option<u64>,
     /// The limits of each turn.
     turn: TurnLimits,
+    /// The most time to wait for a request head.
+    head_timeout: Option<Duration>,
+    /// The deadline of the head that the engine waits for.
+    head_deadline: Option<Deadline>,
     /// The last turn stopped at a limit, and work remains.
     more: bool,
     /// The refusal of a request body, which the drive applies after the body's outcome.
@@ -145,6 +156,8 @@ impl Server {
             join: None,
             capacity: None,
             turn,
+            head_timeout: Some(HEAD_TIMEOUT),
+            head_deadline: None,
             more: false,
             failure: None,
             read: ReadState::Head,
@@ -161,7 +174,13 @@ impl Server {
     /// When the turn is terminal, send the rest of `outbound`, and then close the connection. A
     /// refused request gets its error response in `outbound` before the close, when no response
     /// head was out.
-    pub fn drive(&mut self, inbound: &mut Inbound, outbound: &mut Outbound) -> (Option<ServerEvent>, Turn) {
+    pub fn drive(
+        &mut self,
+        inbound: &mut Inbound,
+        outbound: &mut Outbound,
+        now: Option<Instant>,
+    ) -> (Option<ServerEvent>, Turn) {
+        self.expire(inbound, outbound, now);
         let (event, progress) = match self.step(inbound) {
             Ok(event) => {
                 let progress = match self.failure.take() {
@@ -173,13 +192,83 @@ impl Server {
             }
             Err(refusal) => (None, self.refuse(refusal, outbound)),
         };
+        self.arm(now);
         (
             event,
             Turn {
                 progress,
-                deadline: None,
+                deadline: self.head_deadline,
             },
         )
+    }
+
+    /// Sets the head timeout: the most time from when the engine waits for a request head, after
+    /// the connection starts or after a response, to the end of the head. `None` turns it off.
+    /// The default is [`HEAD_TIMEOUT`].
+    pub fn head_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.head_timeout = timeout;
+        self
+    }
+
+    /// Whether the engine has a timer, which needs the time of the host.
+    pub(crate) fn has_timer(&self) -> bool {
+        self.head_timeout.is_some()
+    }
+
+    /// Whether the engine waits for a request head.
+    fn waits_for_head(&self) -> bool {
+        matches!(self.read, ReadState::Head) && self.write == Write::Idle && self.end.is_none()
+    }
+
+    /// Ends the connection at `now` when its head deadline passed. With no byte of a head, the
+    /// connection was idle, and it closes with no error. With part of a head, it gets a 408 and
+    /// then the close (RFC 9110, section 15.5.9). A head timeout needs the time of the host.
+    fn expire(&mut self, inbound: &Inbound, outbound: &mut Outbound, now: Option<Instant>) {
+        if self.head_timeout.is_none() || self.end.is_some() {
+            return;
+        }
+        let Some(now) = now else {
+            self.end = Some(Err(Error::new(
+                Kind::Unsupported,
+                "the head timeout needs the time of the host",
+            )));
+            return;
+        };
+        let Some(deadline) = self.head_deadline.filter(|_| self.waits_for_head()) else {
+            return;
+        };
+        match deadline.is_reached(now) {
+            Ok(false) => {}
+            Ok(true) if self.join.is_none() && inbound.front().is_none() => self.end = Some(Ok(())),
+            Ok(true) => {
+                // A full queue drops the response: the close still ends the connection.
+                drop(outbound.push(Lease::from(
+                    &b"HTTP/1.1 408 \r\nconnection: close\r\ncontent-length: 0\r\n\r\n"[..],
+                )));
+                self.end = Some(Err(Error::new(
+                    Kind::Deadline,
+                    "the request head did not arrive before its deadline",
+                )));
+            }
+            Err(_) => {
+                self.end = Some(Err(Error::new(
+                    Kind::Misuse,
+                    "the time of the host is on another clock than the deadline",
+                )));
+            }
+        }
+    }
+
+    /// Starts the head deadline at `now` when the engine starts to wait for a head, and clears it
+    /// when the engine does not wait for one.
+    fn arm(&mut self, now: Option<Instant>) {
+        if !self.waits_for_head() {
+            self.head_deadline = None;
+        } else if self.head_deadline.is_none()
+            && let (Some(timeout), Some(now)) = (self.head_timeout, now)
+        {
+            self.head_deadline = now.checked_add(timeout).ok().map(Deadline::at);
+        }
     }
 
     /// Reads the next event from `inbound`, or gives `None` when the engine waits.
