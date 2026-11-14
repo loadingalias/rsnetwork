@@ -5,7 +5,7 @@
 //! [values](crate::value) of the request as views of the received bytes, the exact number of
 //! bytes that the head consumed, and the [`Framing`] of the body that follows it. The body and
 //! any next request stay in the received region, at their offsets after the head. A
-//! [`RetainedHead`] keeps a head after the call, with no copy, as a view of the backing of the
+//! [`RetainedRequest`] keeps a head after the call, with no copy, as a view of the backing of the
 //! region.
 //!
 //! [`write_head`] writes a response head and its framing field into the free capacity of an owned
@@ -32,7 +32,7 @@
 //! let head = parser.parse(received.bytes())?.expect("the head is complete");
 //! assert_eq!(head.method(), Method::PUT);
 //! assert!(matches!(head.target().form(), TargetForm::Origin { path: b"/notes/7", query: None }));
-//! assert_eq!(head.authority().host(), Host::Name(b"example.com"));
+//! assert_eq!(head.authority().map(|authority| authority.host()), Some(Host::Name(b"example.com")));
 //!
 //! // The body follows the head in the same region.
 //! assert_eq!(head.framing(), Framing::Length(5));
@@ -58,11 +58,15 @@
 //!
 //! [`WriteLoan`]: crate::buffer::WriteLoan
 
-mod parse;
+mod head;
+mod request;
+mod response;
 mod write;
 
-pub use parse::{Fields, Limits, ParseError, RequestHead, RequestParser, RetainedHead};
-pub use write::{WriteError, begin_chunk, end_chunk, last_chunk, write_head};
+pub use head::{Fields, Limits, ParseError, Version};
+pub use request::{RequestHead, RequestParser, RetainedRequest};
+pub use response::{ResponseHead, ResponseParser, RetainedResponse};
+pub use write::{WriteError, begin_chunk, end_chunk, last_chunk, write_head, write_request};
 
 /// The framing of a message body: how its end is found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +75,8 @@ pub enum Framing {
     Length(u64),
     /// The body is a sequence of chunks, and a chunk of size zero ends it.
     Chunked,
+    /// The close of the connection ends the body. Only a response has this framing.
+    Close,
 }
 
 #[cfg(test)]

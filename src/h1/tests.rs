@@ -1,14 +1,15 @@
-//! The contracts of the request parser and the response writer. Each expected result comes from
-//! the grammar of RFC 9112 and RFC 9110, not from the code under test.
+//! The contracts of the head parsers and writers. Each expected result comes from the grammar and
+//! the rules of RFC 9112 and RFC 9110, not from the code under test.
 
 use core::num::NonZeroUsize;
 
 use rstypes::buffer::WriteLoan;
 
 use super::{
-    Framing, Limits, ParseError, RequestHead, RequestParser, WriteError, begin_chunk, end_chunk, last_chunk, write_head,
+    Framing, Limits, ParseError, RequestHead, RequestParser, ResponseParser, Version, WriteError, begin_chunk,
+    end_chunk, last_chunk, write_head, write_request,
 };
-use crate::value::{Field, Status};
+use crate::value::{Field, Method, Status, Target};
 
 /// The method, target, fields, consumed count, and framing of a head.
 type Summary<'a> = (&'a [u8], &'a [u8], Vec<(&'a [u8], &'a [u8])>, usize, Framing);
@@ -190,7 +191,7 @@ fn each_syntax_defect_refuses() {
         (b"G(T /a HTTP/1.1\r\nHost: a\r\n\r\n", ParseError::Malformed),
         (b"GET /\x01a HTTP/1.1\r\nHost: a\r\n\r\n", ParseError::Malformed),
         (b"GET /a http/1.1\r\nHost: a\r\n\r\n", ParseError::Malformed),
-        (b"GET /a HTTP/1.0\r\nHost: a\r\n\r\n", ParseError::Version),
+        (b"GET /a HTTP/1.2\r\nHost: a\r\n\r\n", ParseError::Version),
         (b"GET /a HTTP/2.0\r\nHost: a\r\n\r\n", ParseError::Version),
     ] {
         assert_eq!(
@@ -217,7 +218,7 @@ fn debug_output_shows_no_peer_text() {
         format!("{:?}", head.target()),
         format!("{:?}", head.target().form()),
         format!("{:?}", head.authority()),
-        format!("{:?}", head.authority().host()),
+        format!("{:?}", head.authority().map(|authority| authority.host())),
     ] {
         assert!(
             !text.to_ascii_lowercase().contains("secret") && !text.contains("Authorization"),
@@ -263,7 +264,9 @@ fn the_authority_comes_from_the_target_or_from_one_valid_host_field() {
             Err(ParseError::Malformed),
         ),
     ] {
-        let authority = parser().parse(input).map(|head| head.unwrap().authority().as_bytes());
+        let authority = parser()
+            .parse(input)
+            .map(|head| head.unwrap().authority().unwrap().as_bytes());
         assert_eq!(authority, expected, "{:?}", input.escape_ascii().to_string());
     }
 }
@@ -408,4 +411,256 @@ fn a_refused_write_writes_nothing() {
         );
         assert!(out.filled().is_empty());
     }
+}
+
+/// An HTTP/1.0 request can have no Host field, and then it has no authority. A Host field that it
+/// has must be valid, and a second one refuses (RFC 9112, section 3.2, and appendix C.2). A
+/// Transfer-Encoding field in an HTTP/1.0 request makes its framing faulty, also with a
+/// Content-Length (RFC 9112, section 6.1). An HTTP/1.1 connection persists unless the request has
+/// the `close` option, and an HTTP/1.0 connection persists only with the `keep-alive` option
+/// (RFC 9112, section 9.3). The facts of `Expect` and `Upgrade` come from their fields.
+#[test]
+fn each_version_has_its_host_framing_and_persistence_rules() {
+    /// The version, authority, persistence, `100-continue`, upgrade, and framing of a head.
+    type Facts<'a> = (Version, Option<&'a [u8]>, bool, bool, bool, Framing);
+    fn facts(head: RequestHead<'_>) -> Facts<'_> {
+        (
+            head.version(),
+            head.authority().map(|authority| authority.as_bytes()),
+            head.persistent(),
+            head.expects_continue(),
+            head.upgrade(),
+            head.framing(),
+        )
+    }
+    let none = Framing::Length(0);
+    let cases: [(&[u8], Result<Facts<'_>, ParseError>); 14] = [
+        (
+            b"GET / HTTP/1.0\r\n\r\n",
+            Ok((Version::Http10, None, false, false, false, none)),
+        ),
+        (
+            b"GET / HTTP/1.0\r\nHost: a.example\r\nConnection: keep-alive\r\n\r\n",
+            Ok((Version::Http10, Some(b"a.example"), true, false, false, none)),
+        ),
+        (
+            b"GET / HTTP/1.0\r\nConnection: Keep-Alive\r\nConnection: close\r\n\r\n",
+            Ok((Version::Http10, None, false, false, false, none)),
+        ),
+        (b"GET / HTTP/1.0\r\nHost: a b\r\n\r\n", Err(ParseError::Malformed)),
+        (
+            b"GET / HTTP/1.0\r\nHost: a\r\nHost: a\r\n\r\n",
+            Err(ParseError::Malformed),
+        ),
+        (
+            b"POST / HTTP/1.0\r\nContent-Length: 5\r\n\r\n",
+            Ok((Version::Http10, None, false, false, false, Framing::Length(5))),
+        ),
+        (
+            b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",
+            Err(ParseError::Framing),
+        ),
+        (
+            b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+            Err(ParseError::Framing),
+        ),
+        (b"GET / HTTP/1.1\r\n\r\n", Err(ParseError::Malformed)),
+        (
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            Ok((Version::Http11, Some(b"a"), true, false, false, none)),
+        ),
+        (
+            b"GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, Close\r\n\r\n",
+            Ok((Version::Http11, Some(b"a"), false, false, false, none)),
+        ),
+        (
+            b"PUT / HTTP/1.1\r\nHost: a\r\nExpect: 100-Continue\r\nContent-Length: 1\r\n\r\n",
+            Ok((Version::Http11, Some(b"a"), true, true, false, Framing::Length(1))),
+        ),
+        (
+            b"GET / HTTP/1.1\r\nHost: a\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            Ok((Version::Http11, Some(b"a"), true, false, true, none)),
+        ),
+        (
+            b"GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\n\r\n",
+            Ok((Version::Http11, Some(b"a"), true, false, false, none)),
+        ),
+    ];
+    for (input, expected) in cases {
+        let result = parser().parse(input).map(|head| facts(head.unwrap()));
+        assert_eq!(result, expected, "{}", input.escape_ascii());
+    }
+}
+
+/// The length of a response body follows RFC 9112, section 6.3. A response to HEAD, a 1xx, 204,
+/// or 304 response, and a 2xx response to CONNECT have no body, whatever their framing fields
+/// say. Content-Length and Transfer-Encoding together refuse. A coding other than one `chunked`
+/// refuses, as does a Transfer-Encoding in HTTP/1.0. With no framing field, the close ends the
+/// body, and the connection then does not persist.
+#[test]
+fn a_response_body_has_the_length_of_rfc_9112_section_6_3() {
+    /// The method of the request, the response head, and its framing and persistence.
+    type Case<'a> = (Method<'a>, &'a [u8], Result<(Framing, bool), ParseError>);
+    let cases: [Case<'_>; 17] = [
+        (
+            Method::GET,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            Ok((Framing::Length(5), true)),
+        ),
+        (
+            Method::HEAD,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            Ok((Framing::Length(0), true)),
+        ),
+        (
+            Method::GET,
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n",
+            Ok((Framing::Length(0), true)),
+        ),
+        (
+            Method::GET,
+            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n",
+            Ok((Framing::Length(0), true)),
+        ),
+        (
+            Method::GET,
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            Ok((Framing::Length(0), true)),
+        ),
+        (
+            Method::CONNECT,
+            b"HTTP/1.1 200 Connection Established\r\nTransfer-Encoding: chunked\r\n\r\n",
+            Ok((Framing::Length(0), true)),
+        ),
+        (
+            Method::CONNECT,
+            b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 3\r\n\r\n",
+            Ok((Framing::Length(3), true)),
+        ),
+        (
+            Method::GET,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            Ok((Framing::Chunked, true)),
+        ),
+        (
+            Method::GET,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+            Err(ParseError::Framing),
+        ),
+        (
+            Method::GET,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+            Err(ParseError::TransferCoding),
+        ),
+        (
+            Method::GET,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+            Err(ParseError::TransferCoding),
+        ),
+        (
+            Method::GET,
+            b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            Err(ParseError::Framing),
+        ),
+        (
+            Method::GET,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5, 5\r\n\r\n",
+            Err(ParseError::Framing),
+        ),
+        (Method::GET, b"HTTP/1.1 200 OK\r\n\r\n", Ok((Framing::Close, false))),
+        (
+            Method::GET,
+            b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n",
+            Ok((Framing::Length(2), false)),
+        ),
+        (
+            Method::GET,
+            b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\n",
+            Ok((Framing::Length(2), true)),
+        ),
+        (
+            Method::GET,
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\n",
+            Ok((Framing::Length(2), false)),
+        ),
+    ];
+    for (method, input, expected) in cases {
+        let result = ResponseParser::new(LIMITS)
+            .parse(input, method)
+            .map(|head| head.map(|head| (head.framing(), head.persistent())));
+        assert_eq!(result, expected.map(Some), "{}", input.escape_ascii());
+    }
+}
+
+/// A status line is the version, a space, three digits of a status from 100 to 599, and a
+/// reason phrase after a space (RFC 9112, section 4). The reason can be empty, and its space can
+/// be absent. It has visible bytes, spaces, HTABs, and bytes above 0x7F, and no other control
+/// byte. Each other status line refuses.
+#[test]
+fn a_status_line_gives_its_status_and_reason_or_refuses() {
+    let parse = |line: &[u8]| {
+        let input = [line, b"\r\nContent-Length: 0\r\n\r\n"].concat();
+        ResponseParser::new(LIMITS)
+            .parse(&input, Method::GET)
+            .map(|head| head.map(|head| (head.version(), head.status().code(), head.reason().to_vec())))
+    };
+    for (line, expected) in [
+        (
+            &b"HTTP/1.1 200 OK"[..],
+            Ok(Some((Version::Http11, 200, b"OK".to_vec()))),
+        ),
+        (b"HTTP/1.0 404 ", Ok(Some((Version::Http10, 404, Vec::new())))),
+        (b"HTTP/1.1 599", Ok(Some((Version::Http11, 599, Vec::new())))),
+        (
+            b"HTTP/1.1 404 Not\tFound caf\xc3\xa9",
+            Ok(Some((Version::Http11, 404, b"Not\tFound caf\xc3\xa9".to_vec()))),
+        ),
+        (b"HTTP/1.1 20 OK", Err(ParseError::Malformed)),
+        (b"HTTP/1.1 2000 OK", Err(ParseError::Malformed)),
+        (b"HTTP/1.1 2O0 OK", Err(ParseError::Malformed)),
+        (b"HTTP/1.1 099 Low", Err(ParseError::Malformed)),
+        (b"HTTP/1.1 600 High", Err(ParseError::Malformed)),
+        (b"HTTP/1.1  200 OK", Err(ParseError::Malformed)),
+        (b"HTTP/1.1 200 O\x01K", Err(ParseError::Malformed)),
+        (b"http/1.1 200 OK", Err(ParseError::Malformed)),
+        (b"HTTP/2.0 200 OK", Err(ParseError::Version)),
+    ] {
+        assert_eq!(parse(line), expected, "{}", line.escape_ascii());
+    }
+}
+
+/// Each request head has the exact bytes of RFC 9112: the request line, the fields in their
+/// order, the framing field, and the empty line. A request with no content has no
+/// Content-Length when its method gives content no meaning, and `content-length: 0` when it
+/// does (RFC 9110, section 8.6). A request cannot have close framing. A response with close
+/// framing has no framing field.
+#[test]
+fn request_heads_and_close_framed_responses_have_the_exact_bytes() {
+    let host = [Field::new(b"Host", b"a.example").unwrap()];
+    let request = |method, framing| {
+        let mut out = WriteLoan::new(Vec::with_capacity(256));
+        write_request(&mut out, method, Target::new(b"/a?b").unwrap(), &host, framing).map(|()| out.into_inner())
+    };
+    assert_eq!(
+        request(Method::GET, Framing::Length(0)),
+        Ok(b"GET /a?b HTTP/1.1\r\nHost: a.example\r\n\r\n".to_vec())
+    );
+    assert_eq!(
+        request(Method::DELETE, Framing::Length(0)),
+        Ok(b"DELETE /a?b HTTP/1.1\r\nHost: a.example\r\n\r\n".to_vec())
+    );
+    assert_eq!(
+        request(Method::POST, Framing::Length(0)),
+        Ok(b"POST /a?b HTTP/1.1\r\nHost: a.example\r\ncontent-length: 0\r\n\r\n".to_vec())
+    );
+    assert_eq!(
+        request(Method::new(b"PURGE").unwrap(), Framing::Chunked),
+        Ok(b"PURGE /a?b HTTP/1.1\r\nHost: a.example\r\ntransfer-encoding: chunked\r\n\r\n".to_vec())
+    );
+    assert_eq!(request(Method::POST, Framing::Close), Err(WriteError::Framing));
+
+    let close = [Field::new(b"connection", b"close").unwrap()];
+    let mut out = WriteLoan::new(Vec::with_capacity(256));
+    write_head(&mut out, Status::new(200).unwrap(), &close, Framing::Close).unwrap();
+    assert_eq!(out.into_inner(), b"HTTP/1.1 200 \r\nconnection: close\r\n\r\n");
 }

@@ -50,7 +50,7 @@ const EXCHANGES: [(&[u8], &[u8]); 3] = [
     ),
     (
         b"GET /n002 HTTP/1.0\r\n\r\n",
-        b"HTTP/1.1 505 \r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+        b"HTTP/1.1 200 \r\nconnection: close\r\ncontent-length: 5\r\n\r\n/n002",
     ),
 ];
 

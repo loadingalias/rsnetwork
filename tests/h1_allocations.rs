@@ -82,7 +82,10 @@ fn kept_heads_hold_their_one_slot_until_the_last_drops() {
     drop(first);
     assert_eq!(pool.acquire().unwrap_err(), PoolEmpty);
 
-    assert_eq!(second.head().authority().as_bytes(), b"b.example");
+    assert_eq!(
+        second.head().authority().map(|authority| authority.as_bytes()),
+        Some(&b"b.example"[..])
+    );
     drop(second);
     pool.acquire().unwrap();
 }

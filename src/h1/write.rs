@@ -1,4 +1,4 @@
-//! The response head writer and the chunk framing.
+//! The head writers and the chunk framing.
 
 use core::fmt;
 use core::num::NonZeroUsize;
@@ -6,15 +6,16 @@ use core::num::NonZeroUsize;
 use rstypes::buffer::{BufferMut, WriteLoan};
 
 use super::Framing;
-use crate::value::{Field, Status};
+use crate::value::{Field, Method, Status, Target};
 
 /// Writes a response head into the free capacity of `out`, after the bytes that it holds.
 ///
 /// The head is the status line `HTTP/1.1 <status> `, the field lines of `fields` in their order,
 /// the framing field, and the empty line. The status line has no reason phrase, which RFC 9112,
-/// section 4, permits. `Length(n)` writes `content-length: n`, and `Chunked` writes
-/// `transfer-encoding: chunked`. A 204 or 304 response has no body: give `Length(0)`, and the
-/// head then has no framing field, as RFC 9110, section 8.6, requires.
+/// section 4, permits. `Length(n)` writes `content-length: n`, `Chunked` writes
+/// `transfer-encoding: chunked`, and `Close` writes no framing field: the close of the connection
+/// ends the body. A 204 or 304 response has no body: give `Length(0)`, and the head then has no
+/// framing field, as RFC 9110, section 8.6, requires.
 ///
 /// Refuses, and writes nothing, if the status is informational (100 to 199), if a 204 or 304 has
 /// other framing, if a field is a framing field, or if `out` has too little free capacity.
@@ -29,24 +30,75 @@ pub fn write_head<B: BufferMut>(
     if code < 200 || (no_body && framing != Framing::Length(0)) {
         return Err(WriteError::Status);
     }
+    let mut status_digits = [0; 20];
+    let status = digits(u64::from(code), 10, &mut status_digits);
+    write_message(
+        out,
+        [b"HTTP/1.1 ", status, b" \r\n"],
+        fields,
+        (!no_body).then_some(framing),
+    )
+}
+
+/// Writes a request head into the free capacity of `out`, after the bytes that it holds.
+///
+/// The head is the request line `<method> <target> HTTP/1.1`, the field lines of `fields` in
+/// their order, the framing field, and the empty line. Give the Host field in `fields`: RFC 9112,
+/// section 3.2, requires it. `Length(n)` writes `content-length: n`, and `Chunked` writes
+/// `transfer-encoding: chunked`. `Length(0)` writes no framing field for GET, HEAD, DELETE,
+/// OPTIONS, TRACE, and CONNECT, whose content has no meaning, and `content-length: 0` for other
+/// methods (RFC 9110, section 8.6).
+///
+/// Refuses, and writes nothing, if the framing is `Close`, which a request cannot have, if a
+/// field is a framing field, or if `out` has too little free capacity.
+pub fn write_request<B: BufferMut>(
+    out: &mut WriteLoan<B>,
+    method: Method<'_>,
+    target: Target<'_>,
+    fields: &[Field<'_>],
+    framing: Framing,
+) -> Result<(), WriteError> {
+    if framing == Framing::Close {
+        return Err(WriteError::Framing);
+    }
+    let no_content = framing == Framing::Length(0)
+        && [
+            Method::GET,
+            Method::HEAD,
+            Method::DELETE,
+            Method::OPTIONS,
+            Method::TRACE,
+            Method::CONNECT,
+        ]
+        .contains(&method);
+    let start = [method.as_bytes(), b" ", target.as_bytes(), b" HTTP/1.1\r\n"];
+    write_message(out, start, fields, (!no_content).then_some(framing))
+}
+
+/// Writes a head: the pieces of `start`, the field lines of `fields`, the framing field of
+/// `framing`, and the empty line. Refuses a field that is a framing field.
+fn write_message<B: BufferMut, const N: usize>(
+    out: &mut WriteLoan<B>,
+    start: [&[u8]; N],
+    fields: &[Field<'_>],
+    framing: Option<Framing>,
+) -> Result<(), WriteError> {
     let framing_field = |field: &Field<'_>| {
         field.name.eq_ignore_ascii_case(b"content-length") || field.name.eq_ignore_ascii_case(b"transfer-encoding")
     };
     if fields.iter().any(framing_field) {
         return Err(WriteError::FramingField);
     }
-    let mut status_digits = [0; 20];
-    let status = digits(u64::from(code), 10, &mut status_digits);
     let mut length_digits = [0; 20];
     let framing: [&[u8]; 3] = match framing {
-        _ if no_body => [b"", b"", b""],
-        Framing::Length(length) => [b"content-length: ", digits(length, 10, &mut length_digits), b"\r\n"],
-        Framing::Chunked => [b"transfer-encoding: chunked\r\n", b"", b""],
+        None | Some(Framing::Close) => [b"", b"", b""],
+        Some(Framing::Length(length)) => [b"content-length: ", digits(length, 10, &mut length_digits), b"\r\n"],
+        Some(Framing::Chunked) => [b"transfer-encoding: chunked\r\n", b"", b""],
     };
     write(out, |put| {
-        put(b"HTTP/1.1 ");
-        put(status);
-        put(b" \r\n");
+        for piece in start {
+            put(piece);
+        }
         for field in fields {
             put(field.name);
             put(b": ");
@@ -134,6 +186,8 @@ pub enum WriteError {
     /// A field is `Content-Length` or `Transfer-Encoding`. The framing argument writes the
     /// framing field.
     FramingField,
+    /// The framing does not fit the message: a request cannot have `Close`.
+    Framing,
 }
 
 impl fmt::Display for WriteError {
@@ -145,6 +199,7 @@ impl fmt::Display for WriteError {
             ),
             Self::Status => f.write_str("the status is informational, or it does not permit the framing"),
             Self::FramingField => f.write_str("a field is a framing field, which the framing argument writes"),
+            Self::Framing => f.write_str("the framing does not fit the message"),
         }
     }
 }
