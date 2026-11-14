@@ -8,7 +8,7 @@ use core::num::{NonZeroU64, NonZeroUsize};
 use rsnetwork::body::Outcome;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Progress, Received, TurnLimits};
-use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
+use rsnetwork::h1::{BodyLimits, Framing, Limits, RequestParser, Server, ServerEvent};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::value::{Field, Status};
 use rstypes::capacity::Budget;
@@ -288,6 +288,39 @@ fn an_http_1_0_client_gets_no_chunks_and_a_close_unless_keep_alive() {
     assert_eq!(
         host.sent(),
         b"HTTP/1.1 400 \r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+    );
+}
+
+/// A server ignores `Expect: 100-continue` and Upgrade in an HTTP/1.0 request (RFC 9110, sections
+/// 10.1.1 and 7.8). Thus its head neither waits for 100 nor asks to change the protocol. The server
+/// reads the body at once, with no `100 Continue`, and the request gets its normal response, after
+/// which the connection closes. A head that asks to upgrade leads an application to answer 101,
+/// which the engine refuses, and the request then never gets a response.
+#[test]
+fn an_http_1_0_request_never_waits_for_100_or_asks_to_upgrade() {
+    let bytes = b"POST /chat HTTP/1.0\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\
+                  Expect: 100-continue\r\nContent-Length: 2\r\n\r\nhi";
+    let head = RequestParser::new(LIMITS).parse(bytes).unwrap().unwrap();
+    assert_eq!((head.expects_continue(), head.upgrade()), (false, false));
+
+    let mut host = Host::new(BODY);
+    host.receive(bytes);
+    assert_eq!(
+        host.drive(),
+        (
+            vec![
+                request(b"POST", b"/chat"),
+                Seen::Data(b"hi".to_vec()),
+                Seen::End(Vec::new())
+            ],
+            WAIT
+        )
+    );
+    host.respond(200, &[], Framing::Length(2), b"ok");
+    assert_eq!(host.drive(), (Vec::new(), Progress::Terminal(Ok(()))));
+    assert_eq!(
+        host.sent(),
+        b"HTTP/1.1 200 \r\nconnection: close\r\ncontent-length: 2\r\n\r\nok"
     );
 }
 

@@ -94,8 +94,10 @@ fn check<'a>(head: &'a [u8], limits: &Limits) -> Result<RequestHead<'a>, ParseEr
             framing,
             version,
             persistent: !facts.close && (version == Version::Http11 || facts.keep_alive),
-            expect_continue: facts.expect_continue,
-            upgrade: facts.upgrade,
+            // A server ignores Expect: 100-continue and Upgrade in an HTTP/1.0 request (RFC 9110,
+            // sections 10.1.1 and 7.8).
+            expect_continue: facts.expect_continue && version == Version::Http11,
+            upgrade: facts.upgrade && version == Version::Http11,
         },
     })
 }
@@ -200,13 +202,16 @@ impl<'a> RequestHead<'a> {
         self.layout.persistent
     }
 
-    /// Whether the request has `Expect: 100-continue` (RFC 9110, section 10.1.1).
+    /// Whether the request waits for `100 Continue`: an HTTP/1.1 request with
+    /// `Expect: 100-continue` (RFC 9110, section 10.1.1). An HTTP/1.0 request never waits, because
+    /// a server ignores its expectation.
     pub fn expects_continue(&self) -> bool {
         self.layout.expect_continue
     }
 
-    /// Whether the request asks to change the protocol: it has an Upgrade field and the `upgrade`
-    /// connection option (RFC 9110, section 7.8).
+    /// Whether the request asks to change the protocol: an HTTP/1.1 request with an Upgrade field
+    /// and the `upgrade` connection option (RFC 9110, section 7.8). An HTTP/1.0 request never asks,
+    /// because a server ignores its Upgrade field.
     pub fn upgrade(&self) -> bool {
         self.layout.upgrade
     }

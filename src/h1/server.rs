@@ -451,9 +451,8 @@ impl Server {
             version: Some(version),
             head: head.method() == Method::HEAD,
             connect: head.method() == Method::CONNECT,
-            // An HTTP/1.0 client does not wait for 100 (RFC 9110, section 10.1.1).
-            expect: head.expects_continue() && version == Version::Http11 && framing != Framing::Length(0),
-            upgrade: head.upgrade() && version == Version::Http11,
+            expect: head.expects_continue() && framing != Framing::Length(0),
+            upgrade: head.upgrade(),
             switch: false,
         };
         self.close = !head.persistent();
