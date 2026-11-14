@@ -44,7 +44,8 @@ pub(super) enum Step {
 /// the end of the section in the joined bytes.
 ///
 /// `end` reads the joined bytes from the start of the section, and gives the length of the
-/// section when they hold all of it. The join consumes from `inbound` only the bytes of the
+/// section when they hold all of it. It can rewrite the bytes of a complete section in place,
+/// with no change of their length, as the client does to unfold a response head. The join consumes from `inbound` only the bytes of the
 /// section, so the bytes after it keep their owner. It starts in `slot` when it has no join yet:
 /// it reserves `limit` units of `budget` before it allocates.
 pub(super) fn join(
@@ -52,7 +53,7 @@ pub(super) fn join(
     budget: &Budget,
     limit: usize,
     inbound: &mut Inbound,
-    mut end: impl FnMut(&[u8]) -> Result<Option<usize>, ParseError>,
+    mut end: impl FnMut(&mut [u8]) -> Result<Option<usize>, ParseError>,
 ) -> Result<Step, ParseError> {
     loop {
         let Some(front) = inbound.front() else {
@@ -75,7 +76,7 @@ pub(super) fn join(
         let before = join.bytes.len();
         let take = front.region.initialized().min(limit - before);
         join.bytes.extend_from_slice(&front.region.bytes()[..take]);
-        match end(&join.bytes)? {
+        match end(&mut join.bytes)? {
             Some(len) => {
                 let used = len.checked_sub(before).ok_or(ParseError::Malformed)?;
                 inbound.consume(used).map_err(|_| ParseError::Malformed)?;

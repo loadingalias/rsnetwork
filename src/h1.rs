@@ -12,8 +12,9 @@
 //! of an unread body, cancellation, and the handoff after an upgrade or a CONNECT tunnel. The
 //! caller gives the region of each head that the engine writes, and the size line of each chunk
 //! comes from a small pool of the engine. Thus an engine allocates only for a received head or
-//! trailer section that continues in the next region, which it joins into one region that the
-//! caller's budget pays for.
+//! trailer section that continues in the next region, and the client also for a response head
+//! with obsolete line folding. It joins their bytes into one region that the caller's budget pays
+//! for.
 //!
 //! The parsers and writers that the engines use are public too: [`RequestParser`],
 //! [`ResponseParser`], [`ChunkDecoder`], [`write_head`], [`write_request`], and the chunk

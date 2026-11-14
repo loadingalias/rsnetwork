@@ -56,6 +56,7 @@ wrong shows it as a request that the application must not see.
 | Empty lines before a request line and before the end of input | RFC 9112, section 2.2 | The server ignores them |
 | Client: two `Content-Length` values, both framing fields, a chunk size past `u64`, and a bare LF in a chunk line | RFC 9112, sections 6.3 and 7.1 | The client discards the response or ends its body as malformed, and closes. It never reads the `Content-Length` body when `Transfer-Encoding` is present |
 | Client: a response to HEAD with a `Content-Length`, then the next response | RFC 9112, section 6.3 | No body for HEAD, and the next response whole |
+| Client: obsolete line folding in a response | RFC 9112, section 5.2 | The fold becomes a space |
 
 ## How each vector runs
 

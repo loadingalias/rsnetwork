@@ -1,6 +1,7 @@
 //! The client engine: one connection to an HTTP/1.1 or HTTP/1.0 server.
 
 use core::fmt;
+use core::ops::Range;
 
 use rstypes::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use rstypes::capacity::Budget;
@@ -26,6 +27,10 @@ use crate::value::{Authority, Field, Method, Target};
 /// the size lines of chunks come from a pool of the engine. The engine allocates after
 /// [`new`](Self::new) only to join a response head or trailer section that continues in the next
 /// region, and the budget pays for the join.
+///
+/// A response head with obsolete line folding gets one copy in a join, in which each folding
+/// becomes SP before the engine reads the fields (RFC 9112, section 5.2). A head with no folding
+/// has no copy. The [`ResponseParser`] itself refuses a folding, as the server does.
 pub struct Client {
     limits: Limits,
     body: BodyLimits,
@@ -403,17 +408,32 @@ impl Client {
         if self.join.is_none() {
             let Some(front) = inbound.front() else { return Ok(None) };
             let region = front.region.clone();
-            if let Some(head) = self.parser.parse(region.bytes(), self.method)? {
-                let consumed = head.consumed();
-                let event = self.accept(head, &region)?;
-                inbound.consume(consumed).map_err(|_| ParseError::Malformed)?;
-                return Ok(Some(event));
+            match self.parser.parse(region.bytes(), self.method) {
+                Ok(Some(head)) => {
+                    let consumed = head.consumed();
+                    let event = self.accept(head, &region)?;
+                    inbound.consume(consumed).map_err(|_| ParseError::Malformed)?;
+                    return Ok(Some(event));
+                }
+                // A head with obsolete line folding gets a copy in the join, which unfolds it.
+                Err(ParseError::Malformed) if folded(region.bytes()) => {}
+                Ok(None) => {}
+                Err(refusal) => return Err(refusal),
             }
         }
         let (parser, method) = (&mut self.parser, self.method);
-        let step = join(&mut self.join, &self.budget, self.limits.head_bytes, inbound, |bytes| {
-            Ok(parser.parse(bytes, method)?.map(|head| head.consumed()))
-        })?;
+        let step = join(
+            &mut self.join,
+            &self.budget,
+            self.limits.head_bytes,
+            inbound,
+            |bytes| match parser.parse(bytes, method).map(|head| head.map(|head| head.consumed())) {
+                Err(ParseError::Malformed) if unfold(bytes) => {
+                    Ok(parser.parse(bytes, method)?.map(|head| head.consumed()))
+                }
+                parsed => parsed,
+            },
+        )?;
         let region = match step {
             Step::Complete(region) => region,
             Step::Wait if inbound.ended() => {
@@ -474,4 +494,43 @@ impl fmt::Debug for Client {
             .field("end", &self.end)
             .finish_non_exhaustive()
     }
+}
+
+/// The positions of the field lines of the complete head at the start of `bytes`, from the start
+/// of the first field line to the empty line, or `None` while the head is not complete.
+fn field_lines(bytes: &[u8]) -> Option<Range<usize>> {
+    let end = bytes.windows(4).position(|window| window == b"\r\n\r\n")?;
+    let start = bytes.windows(2).position(|window| window == b"\r\n")? + 2;
+    Some(start.min(end)..end)
+}
+
+/// Whether an obsolete line folding starts at `at`: the CR LF of a field line before SP or HTAB
+/// (RFC 9112, section 5.2).
+fn fold_at(bytes: &[u8], at: usize) -> bool {
+    bytes[at..].starts_with(b"\r\n") && matches!(bytes.get(at + 2), Some(b' ' | b'\t'))
+}
+
+/// Whether the complete head at the start of `bytes` has an obsolete line folding. Whitespace
+/// right after the start line is not a folding, and it stays an error (RFC 9112, section 2.2).
+fn folded(bytes: &[u8]) -> bool {
+    field_lines(bytes).is_some_and(|mut lines| lines.any(|at| fold_at(bytes, at)))
+}
+
+/// Replaces each obsolete line folding of the complete head at the start of `bytes` with SP: its
+/// CR LF and the SP or HTAB after it. A user agent does this before it reads a field value (RFC
+/// 9112, section 5.2). The head keeps its length. Gives whether the head had a folding.
+fn unfold(bytes: &mut [u8]) -> bool {
+    let Some(lines) = field_lines(bytes) else { return false };
+    let mut found = false;
+    for at in lines {
+        if fold_at(bytes, at) {
+            found = true;
+            let blank = bytes[at + 2..]
+                .iter()
+                .take_while(|&&byte| byte == b' ' || byte == b'\t')
+                .count();
+            bytes[at..at + 2 + blank].fill(b' ');
+        }
+    }
+    found
 }

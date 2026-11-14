@@ -762,6 +762,19 @@ pub(crate) fn client() -> Vec<Fetch> {
             ])],
         ),
         Fetch::new(
+            "obsolete line folding in a response",
+            // A user agent replaces each obs-fold with one or more SP before it reads the value.
+            "RFC 9112, section 5.2",
+            &[(
+                Method::GET,
+                b"HTTP/1.1 200 OK\r\nX: a\r\n b\r\nContent-Length: 5\r\n\r\nhello",
+            )],
+            vec![
+                ok(vec![complete("200\r\nX: a b\r\nContent-Length: 5", b"hello")]),
+                ok(vec![complete("200\r\nX: a   b\r\nContent-Length: 5", b"hello")]),
+            ],
+        ),
+        Fetch::new(
             "a response chunk size past u64 that wraps to 5",
             "RFC 9112, section 7.1",
             &[(
