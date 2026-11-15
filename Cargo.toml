@@ -16,6 +16,8 @@ rstypes = { version = "=0.1.0-alpha.2", default-features = false }
 # a current-thread runtime and TCP, with no other feature.
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["rt", "net"] }
+# The independent head and chunk parser of the differential test (tests/h1_differential.rs).
+httparse = "1.10.1"
 
 # The proof runs the parser on the io_uring driver of rsasync, at the alpha of
 # its P0.3 path. The driver needs Linux on x86_64 or aarch64.

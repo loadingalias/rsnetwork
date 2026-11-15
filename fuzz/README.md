@@ -14,6 +14,7 @@ writes. The module documentation of each target gives its input format and its c
 | `response` | `h1::Client` | A cut input gives the result of the whole input. Each complete body has the length of its framing. The bounds of the transport hold. |
 | `chunked` | `h1::ChunkDecoder` | Pieces give the result of the whole input. No step allocates. The data and the trailers stay in their limits. |
 | `values` | The constructors of `value`, `write_request`, `write_head`, `RequestParser`, and `ResponseParser` | No constructor allocates. A host name obeys its rules. Each accepted value passes through a writer and a parser with no change. |
+| `differential` | `RequestParser` and `ChunkDecoder`, against `httparse` | Each head that rsnetwork accepts has the same method, target, version, field lines, and length for `httparse`. Each chunked body after it has the same data, trailer section, and length. |
 
 The transport checks the bounds of [Bound the memory and the work of a connection](../docs/content/limits.md)
 on each drive: the engine holds at most one charged join of a head or a trailer section, no drive
@@ -21,6 +22,11 @@ allocates more than one section, each charge returns when the engine drops, and 
 progress. The allocation bound also permits 256 bytes (`RECORD` in `src/lib.rs`) for the record
 that `Lease::from_owner` allocates with a join. This is a stated tolerance, not a value measured
 from the code.
+
+`differential` and `tests/h1_differential.rs` share the module `tests/differential/mod.rs`, which
+gives the two readings and their class. The test also compares the server engine with llhttp, the
+parser of Node.js, through a record of its readings. Its module documentation tells how to make
+the record again.
 
 The host-name check of `values` applies the "ends in a number" rule of the WHATWG URL Standard,
 which `Authority` documents, to the name that `host()` gives. It is a consistency check between
@@ -58,6 +64,19 @@ cause. The fix adds a regression test to `tests/`.
 `seeds/<target>/` holds the seed inputs. Each file starts with the control bytes of its target. The
 name of a file gives its source: an RFC and its section, or `n010-` for the input of an N010
 conformance vector in `tests/conformance/mod.rs`, taken at `b43defd`.
+
+`differential` has no control bytes and no seeds of its own. Its corpus starts from the seeds of
+`request` and `chunked`, with their control bytes removed and a chunked request head before each
+chunked body:
+
+```bash
+mkdir -p fuzz/corpus/differential
+for f in fuzz/seeds/request/*; do tail -c +3 "$f" >"fuzz/corpus/differential/request-${f##*/}"; done
+for f in fuzz/seeds/chunked/*; do
+  { printf 'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n'; tail -c +2 "$f"; } \
+    >"fuzz/corpus/differential/chunked-${f##*/}"
+done
+```
 
 ## Add a target
 
@@ -133,3 +152,45 @@ result when it ends.
   response before the next request, which the regression tests of `5a1d3bd` cover.
 - Next campaign: bring the minimized corpus back from the host into the evidence directory of the
   run, so that the next campaign starts from it.
+
+### N011: differential parsing against `httparse`
+
+- Risk: request smuggling between two parsers. That is a head or a chunked body that rsnetwork
+  accepts and `httparse` reads with another meaning: another method, target, version, field line,
+  head length, chunk data, trailer section, or body length.
+- Code: the commit of N011, on the toolchain of `rust-toolchain.toml`. `httparse` 1.10.1 is
+  approved as a dev-dependency (2026-11-15). It has no dependency and no native code. Its build
+  script only selects its SIMD code.
+- Host: the maintainer Mac (Apple silicon, macOS, aarch64), with cargo-fuzz 0.13.2. The run starts
+  only when the load average of `uptime` is below 16.
+- Budget: `-fork=4 -max_total_time=1800 -timeout=5 -rss_limit_mb=2048 -max_len=4096` and
+  AddressSanitizer. That is 30 minutes with 4 workers, and a wall limit of 35 minutes.
+- Stop condition: the time budget, or the first disagreement, crash, leak, timeout, or
+  out-of-memory error. A disagreement fails the assertion of the target, and libFuzzer writes its
+  input to `fuzz/artifacts/differential/`.
+- Command, from the root of the checkout, after the corpus of [Seeds](#seeds):
+
+  ```bash
+  timeout 2100 cargo fuzz run --target aarch64-apple-darwin --fuzz-dir fuzz differential \
+    fuzz/corpus/differential -- -fork=4 -max_total_time=1800 -timeout=5 -rss_limit_mb=2048 \
+    -max_len=4096
+  ```
+
+- After the run: minimize the corpus with `cargo fuzz cmin`. Then llhttp reads each input of the
+  minimized corpus, and `llhttp_gives_each_accepted_request_stream_the_same_meaning` compares the
+  server engine with it. The test reads the corpora and the record under `CARGO_MANIFEST_DIR`, so
+  a copy of the root with the corpus in `fuzz/seeds/request/` serves it. Each input there starts
+  with two control bytes.
+- Result (2026-11-15): pass. The run was at `f63a048`, on an Apple M1 Pro with macOS 27.2.1
+  (`Darwin 27.2.0 arm64`), `rustc 1.101.0-nightly (3e92e1a2d 2026-11-01)`, and cargo-fuzz 0.13.2.
+  The load average was 7.31 at the start. The target ran its full budget: 1821 seconds in 117
+  jobs, 201,787,657 runs, `cov` 1440, `ft` 5218, and a corpus of 1823. It had 0 disagreements,
+  crashes, timeouts, and out-of-memory errors, and it wrote no artifact. The later refusal of a
+  framing field in a trailer section only refuses more inputs. Thus each input that the final code
+  accepts has the reading that the run checked.
+- llhttp after the run: `cargo fuzz cmin` kept 1721 inputs. llhttp and the server engine read them
+  and the 64 seeds: 1368 the same, 374 refusals by rsnetwork, and 43 refusals by llhttp, with no
+  input that has two meanings. 40 of the refusals by llhttp are methods that are not in its table
+  (`HPE_INVALID_METHOD`), and 3 are whitespace before a chunk extension. The seed
+  `request/rfc3253-7.1-update` keeps the first class in the record of `tests/h1_differential.rs`.
+  The minimized corpus is in `~/.local/state/fuzz-evidence/rsnetwork/N011/` on the maintainer Mac.
