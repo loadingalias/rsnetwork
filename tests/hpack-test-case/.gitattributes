@@ -1,0 +1,2 @@
+# Test data from hpack-test-case, kept byte for byte as the source gives it: no whitespace check.
+* -whitespace

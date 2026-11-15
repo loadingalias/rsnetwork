@@ -14,6 +14,7 @@ writes. The module documentation of each target gives its input format and its c
 | `response` | `h1::Client` | A cut input gives the result of the whole input. Each complete body has the length of its framing. The bounds of the transport hold. |
 | `chunked` | `h1::ChunkDecoder` | Pieces give the result of the whole input. No step allocates. The data and the trailers stay in their limits. |
 | `values` | The constructors of `value`, `write_request`, `write_head`, `RequestParser`, and `ResponseParser` | No constructor allocates. A host name obeys its rules. Each accepted value passes through a writer and a parser with no change. |
+| `hpack` | `hpack::Decoder` and `hpack::Encoder` | No decode allocates or changes the charge. The lines of a block stay in the list limit. A decoder that fails gives the same error for each later block. The encoder sends each decoded block to a second decoder, which reads the same lines and marks. |
 | `differential` | `RequestParser` and `ChunkDecoder`, against `httparse` | Each head that rsnetwork accepts has the same method, target, version, field lines, and length for `httparse`. Each chunked body after it has the same data, trailer section, and length. |
 
 The transport checks the bounds of [Bound the memory and the work of a connection](../docs/content/limits.md)
@@ -64,6 +65,10 @@ cause. The fix adds a regression test to `tests/`.
 `seeds/<target>/` holds the seed inputs. Each file starts with the control bytes of its target. The
 name of a file gives its source: an RFC and its section, or `n010-` for the input of an N010
 conformance vector in `tests/conformance/mod.rs`, taken at `b43defd`.
+
+The seeds of `hpack` are the blocks of RFC 7541, Appendix C (`rfc7541-c2` to `rfc7541-c6`), and
+the first 12 blocks of `story_02.json` of four encoders of `tests/hpack-test-case`, each after the
+two control bytes of the target.
 
 `differential` has no control bytes and no seeds of its own. Its corpus starts from the seeds of
 `request` and `chunked`, with their control bytes removed and a chunked request head before each
@@ -194,3 +199,43 @@ result when it ends.
   (`HPE_INVALID_METHOD`), and 3 are whitespace before a chunk extension. The seed
   `request/rfc3253-7.1-update` keeps the first class in the record of `tests/h1_differential.rs`.
   The minimized corpus is in `~/.local/state/fuzz-evidence/rsnetwork/N011/` on the maintainer Mac.
+
+### N201: the HPACK decoder
+
+- Risk: a header block that makes the decoder allocate, keep state past its limits, or do work
+  past its work limit, such as an expansion through references to a large entry. A table that
+  falls out of step with the encoder, so that a later block decodes to other lines. A panic on
+  malformed input.
+- Code: the commit of N201, on the toolchain of `rust-toolchain.toml`, with cargo-fuzz 0.13.2 and
+  the `libfuzzer-sys` closure of N009. The target adds no dependency.
+- Host: one `aws-linux-arm64-ubuntu2604` host (c8g.4xlarge, 16 cores), with `dev-machine run
+  --ephemeral`. The run installs cargo-fuzz on the host, which the run then discards.
+- Budget: `-fork=14 -max_total_time=1200 -timeout=5 -rss_limit_mb=2048 -max_len=4096` and
+  AddressSanitizer. That is 20 minutes with 14 workers, a wall limit of 25 minutes for the target,
+  and a lease of 35 minutes for the host.
+- Stop condition: the time budget, or the first crash, failed assertion, leak, timeout, or
+  out-of-memory error. The run prints each artifact in base64, so the run record keeps it.
+- Command, from the root of the checkout:
+
+  ```bash
+  DEV_MACHINE_MAX_LEASE_MINUTES=35 ~/dev-machines/dev-machine run rsnetwork \
+    aws-linux-arm64-ubuntu2604 --ephemeral --execute bash -c '
+    set -u; uname -srm; rustc -V
+    cargo install cargo-fuzz --version 0.13.2 --locked --quiet && cargo fuzz --version || exit 1
+    mkdir -p fuzz/corpus/hpack
+    timeout 1500 cargo fuzz run --fuzz-dir fuzz hpack fuzz/corpus/hpack fuzz/seeds/hpack -- \
+      -fork=14 -max_total_time=1200 -timeout=5 -rss_limit_mb=2048 -max_len=4096 >fuzz/hpack.log 2>&1
+    status=$?
+    grep -m1 -A60 -E "panicked|ERROR:" fuzz/hpack.log; tail -n 4 fuzz/hpack.log
+    for f in fuzz/artifacts/hpack/*; do [ -f "$f" ] && { echo "== $f"; base64 -w0 "$f"; echo; }; done
+    exit $status'
+  ```
+- Result (2026-11-15): pass. Run `20261115T075158Z-72714` at `c766996`, on c8g.4xlarge,
+  `ami-06b1a03fa3561aefb`, Linux `7.0.0-1016-aws` aarch64, `rustc 1.101.0-nightly (3e92e1a2d
+  2026-11-01)`, and cargo-fuzz 0.13.2. The target ran its full budget: 1210 seconds in 176 jobs,
+  33,185,549 runs, `cov` 494, `ft` 2684, and a corpus of 562. It had 0 crashes, failed
+  assertions, leaks, timeouts, and out-of-memory errors, and it wrote no artifact. The host ran
+  for about 23 minutes, and `dev-machine status rsnetwork` then showed no instance and no volume.
+  Limit: the working corpus stayed on the discarded host. After the run, the decoder writes into
+  the `Lines` that the caller lends to each decode, not into a buffer of its own. The target
+  changed only its calls, and the decode code that it reaches is the same.

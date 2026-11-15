@@ -20,6 +20,9 @@ before the engine parses its first byte.
 | `Outbound` queue | `limit` entries of an output region | `Outbound::new(limit, &budget)` |
 | Chunk-size line pool of an engine | One 16-byte slot for each `Outbound` entry | `Server::new` and `Client::new` |
 | Join of a head or a trailer section that continues in the next received region | `head_bytes` or `trailer_bytes` | When the section continues in a later region, until the last view of it drops |
+| HPACK decoder | Its dynamic table: see [HPACK](hpack.md#limits) | `hpack::Decoder::new(limits, &budget)` |
+| HPACK lines | The space for the decoded lines of one block, which you lend to each decode | `hpack::Lines::new(limits, &budget)` |
+| HPACK encoder | Its dynamic table | `hpack::Encoder::new(table_bytes, &budget)` |
 
 A join that the budget cannot pay for does not fail the connection: the turn is
 `Progress::Blocked(Blocked::Capacity(n))`, and the engine tries again in a later drive. The received
@@ -59,5 +62,6 @@ deadline for it, and end the connection when it passes.
 | --- | --- | --- |
 | `h1::Limits` | The bytes, field lines, names, and values of a head | [HTTP/1.1](http1.md#limits) |
 | `h1::BodyLimits` | The body, the drain, the chunk extensions, and the trailers | [HTTP/1.1](http1.md#limits) |
+| `hpack::Limits` | The dynamic table, the decoded lines, and the work of one HTTP/2 header block | [HPACK](hpack.md#limits) |
 | `drive::TurnLimits` | The work of one drive | This page |
 | `Inbound::new`, `Outbound::new` | The regions that each queue holds | [Drive a protocol engine](drive.md) |

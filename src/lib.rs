@@ -12,6 +12,9 @@
 //! model that each protocol shares: terminal outcomes, trailers, a consumer that reads a body
 //! into regions of the caller, bounded collection, and the bodies that a sender gives.
 //!
+//! [`hpack`] is the header compression of HTTP/2: an encoder and a decoder, each the one owner of
+//! its dynamic table.
+//!
 //! [`host`] is the caller-driven host: one connection that the application drives from its own
 //! event loop, with no runtime.
 //!
@@ -25,4 +28,5 @@ pub mod body;
 pub mod drive;
 pub mod h1;
 pub mod host;
+pub mod hpack;
 pub mod value;
