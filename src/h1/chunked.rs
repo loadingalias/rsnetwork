@@ -117,7 +117,8 @@ impl ChunkDecoder {
     /// Reads the start of the body bytes that remain, and gives what it found there.
     ///
     /// Refuses a size or an extension that RFC 9112 does not permit, a line end that is not CR
-    /// LF, data that is not followed by CR LF, and each limit of [`BodyLimits`].
+    /// LF, data that is not followed by CR LF, a `Content-Length` or `Transfer-Encoding` trailer
+    /// field, and each limit of [`BodyLimits`].
     pub fn decode(&mut self, input: &[u8]) -> Result<ChunkStep, ParseError> {
         let mut at = 0;
         while let Some(&byte) = input.get(at) {
@@ -221,7 +222,12 @@ impl ChunkDecoder {
                         fields: self.limits.trailer_fields,
                         ..self.fields
                     };
-                    scan(&section[..lines], &limits)?;
+                    let facts = scan(&section[..lines], &limits)?;
+                    // A sender must not send a framing field as a trailer field (RFC 9110,
+                    // section 6.5.1). A peer that merges the trailers could frame by it.
+                    if facts.length.is_some() || facts.coding.is_some() {
+                        return Err(ParseError::Framing);
+                    }
                     section.len()
                 }
                 None => return Ok(ChunkStep::More),

@@ -50,7 +50,7 @@ wrong shows it as a request that the application must not see.
 | Bare LF and bare CR in a head | RFC 9112, section 2.2 | `400`, or the LF as a line end and the CR as a space |
 | Bare LF in a chunk line, chunk sizes with `0x`, a sign, no digit, or a value past `u64`, and chunk data longer than its size | RFC 9112, section 7.1 | `End(Malformed)`, `400`, and the close |
 | Chunk sizes with leading zeros and both letter cases, chunk extensions, and whitespace before an extension | RFC 9112, sections 7.1 and 7.1.1 | The chunked body |
-| A `Content-Length` trailer field | RFC 9110, section 6.5.1 | The framing does not change |
+| A `Content-Length` trailer field | RFC 9110, section 6.5.1 | `End(Malformed)`, `400`, and the close |
 | HTTP/1.0: `Transfer-Encoding`, no `Host`, and `keep-alive` | RFC 9112, sections 3.2, 6.1, 9.3, and appendix C.2 | As the RFC states for HTTP/1.0 |
 | HTTP/1.1 with no `Host` or two `Host` lines | RFC 9112, section 3.2 | `400` |
 | Pipelining: four requests and a `close` option | RFC 9112, sections 9.3.2 and 9.6 | Each response in the order of the requests, and no request after the close |

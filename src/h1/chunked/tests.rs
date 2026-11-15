@@ -112,6 +112,8 @@ fn each_chunk_framing_defect_refuses() {
         (b"0\r\n\n", ParseError::Malformed),
         (b"0\r\nX a\r\n\r\n", ParseError::Malformed),
         (b"0\r\n X: a\r\n\r\n", ParseError::Malformed),
+        (b"0\r\nContent-Length: 5\r\n\r\n", ParseError::Framing),
+        (b"0\r\nTransfer-Encoding: chunked\r\n\r\n", ParseError::Framing),
     ] {
         assert_eq!(decode(BODY, input, &[]), Err(expected), "{}", input.escape_ascii());
     }

@@ -544,17 +544,9 @@ pub(crate) fn server() -> Vec<Vector> {
             name: "a Content-Length trailer field",
             rfc: "RFC 9110, section 6.5.1",
             input: chunked(b"5\r\nhello\r\n0\r\nContent-Length: 50\r\n\r\n"),
-            // The trailer does not change the framing. The recipient can keep or discard it.
-            permitted: vec![
-                served(vec![
-                    Exchange {
-                        end: Some(End::Complete(b"Content-Length: 50\r\n".to_vec())),
-                        ..complete("POST /", b"hello")
-                    },
-                    complete("GET /smuggled", b""),
-                ]),
-                both(b"hello"),
-            ],
+            // A sender must not send a framing field as a trailer field. A peer that merges the
+            // trailers could frame by it, so the body refuses.
+            permitted: vec![bad_chunk()],
         },
         Vector {
             name: "Transfer-Encoding and Content-Length in HTTP/1.0",

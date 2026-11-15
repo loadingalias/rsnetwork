@@ -301,7 +301,8 @@ pub enum ParseError {
     Version,
     /// The body framing is not clear: both `Content-Length` and `Transfer-Encoding`, more than one
     /// `Content-Length`, a length that is not a `u64`, codings that do not end with `chunked` in a
-    /// request, or a `Transfer-Encoding` in an HTTP/1.0 message. Respond with 400.
+    /// request, a `Transfer-Encoding` in an HTTP/1.0 message, or a framing field in a trailer
+    /// section. Respond with 400.
     Framing,
     /// The message has a transfer coding other than `chunked`, which this parser does not decode.
     /// Respond with 501.

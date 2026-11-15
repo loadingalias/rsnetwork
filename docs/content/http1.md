@@ -184,6 +184,8 @@ These messages refuse, because two readers could read two different bodies:
 - More than one `Content-Length`, or a length that is not a decimal `u64`.
 - A transfer coding other than one `chunked` (501).
 - A `Transfer-Encoding` field in an HTTP/1.0 message (RFC 9112, section 6.1).
+- A `Content-Length` or `Transfer-Encoding` field in a trailer section. A sender must not send it
+  (RFC 9110, section 6.5.1), and a peer that merges the trailers could frame by it.
 - A chunk size that is not 1 to 16 hexadecimal digits, a chunk extension outside the grammar of
   RFC 9112, section 7.1.1, a line end that is not CR LF, or chunk data that CR LF does not end.
 
