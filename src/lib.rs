@@ -13,7 +13,8 @@
 //! into regions of the caller, bounded collection, and the bodies that a sender gives.
 //!
 //! [`hpack`] is the header compression of HTTP/2: an encoder and a decoder, each the one owner of
-//! its dynamic table.
+//! its dynamic table. [`h2`] is HTTP/2: the frame codec, and the frame and connection layer of
+//! the engine.
 //!
 //! [`host`] is the caller-driven host: one connection that the application drives from its own
 //! event loop, with no runtime.
@@ -27,6 +28,7 @@ pub use rstypes::{buffer, capacity, time};
 pub mod body;
 pub mod drive;
 pub mod h1;
+pub mod h2;
 pub mod host;
 pub mod hpack;
 pub mod value;

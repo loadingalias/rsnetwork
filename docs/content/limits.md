@@ -23,6 +23,8 @@ before the engine parses its first byte.
 | HPACK decoder | Its dynamic table: see [HPACK](hpack.md#limits) | `hpack::Decoder::new(limits, &budget)` |
 | HPACK lines | The space for the decoded lines of one block, which you lend to each decode | `hpack::Lines::new(limits, &budget)` |
 | HPACK encoder | Its dynamic table | `hpack::Encoder::new(table_bytes, &budget)` |
+| HTTP/2 connection | Its HPACK decoder of at least 4096 bytes, its HPACK encoder, and a frame pool of one 64-byte slot for each `Outbound` entry and one more | `h2::Connection::new` |
+| Join of an HTTP/2 header block that does not decode in place | Its bytes for a block in one frame, or `work` for a block that continues: see [HTTP/2](http2.md#header-blocks) | When the block arrives, until its decode |
 
 A join that the budget cannot pay for does not fail the connection: the turn is
 `Progress::Blocked(Blocked::Capacity(n))`, and the engine tries again in a later drive. The received
@@ -36,7 +38,7 @@ One drive call is one turn. `TurnLimits` bounds the work of each turn:
 | Limit | Counts |
 | --- | --- |
 | `bytes` | The received bytes that the turn reads: framing, body bytes, and bytes that a drain discards |
-| `frames` | The frames that the turn decodes, for example the chunks of an HTTP/1.1 body |
+| `frames` | The frames that the turn decodes, for example the chunks of an HTTP/1.1 body or the frames of an HTTP/2 connection |
 
 The engine counts its work in each turn. At a limit, it stops between two steps, and the turn gives
 `Progress::Pending`: work remains, so drive the engine again with no wait for input. Between the
@@ -63,5 +65,6 @@ deadline for it, and end the connection when it passes.
 | `h1::Limits` | The bytes, field lines, names, and values of a head | [HTTP/1.1](http1.md#limits) |
 | `h1::BodyLimits` | The body, the drain, the chunk extensions, and the trailers | [HTTP/1.1](http1.md#limits) |
 | `hpack::Limits` | The dynamic table, the decoded lines, and the work of one HTTP/2 header block | [HPACK](hpack.md#limits) |
+| `h2::Limits` | The settings that an HTTP/2 endpoint sends, the largest header block, and the encoder table | [HTTP/2](http2.md#limits) |
 | `drive::TurnLimits` | The work of one drive | This page |
 | `Inbound::new`, `Outbound::new` | The regions that each queue holds | [Drive a protocol engine](drive.md) |

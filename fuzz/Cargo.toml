@@ -62,6 +62,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "h2"
+path = "fuzz_targets/h2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "differential"
 path = "fuzz_targets/differential.rs"
 test = false

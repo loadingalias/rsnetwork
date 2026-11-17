@@ -16,6 +16,11 @@ use crate::drive::{Error, Kind};
 pub struct Decoder {
     table: Table,
     limits: Limits,
+    /// The largest maximum size that a size update can set: at most the memory of the table.
+    limit: usize,
+    /// The next block must start with a size update, because the limit fell below the maximum
+    /// size of the table.
+    update: bool,
     /// The error that ended the decoder.
     failed: Option<DecodeError>,
     _charge: Permit,
@@ -92,9 +97,22 @@ impl Decoder {
         Ok(Self {
             table,
             limits,
+            limit: limits.table_bytes,
+            update: false,
             failed: None,
             _charge: charge,
         })
+    }
+
+    /// Sets the largest maximum size that a size update can set, at most the `table_bytes` of
+    /// [`new`](Self::new). HTTP/2 calls it when the peer acknowledges a new
+    /// `SETTINGS_HEADER_TABLE_SIZE` (RFC 9113, section 4.3.1).
+    ///
+    /// When the maximum size of the table is above the new limit, the next block must start with
+    /// a size update to at most the limit. A block that does not is [`DecodeError::Malformed`].
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.min(self.table.limit());
+        self.update = self.table.max() > self.limit;
     }
 
     /// Decodes one complete header block, the bytes of a HEADERS frame and its CONTINUATION
@@ -122,7 +140,15 @@ impl Decoder {
             work: 0,
             limit: self.limits.work,
         };
-        match run(&mut self.table, &mut buffer, self.limits.list_bytes, block) {
+        let result = if self.update && block.first().is_none_or(|&byte| byte & 0xe0 != 0x20) {
+            Err(DecodeError::Malformed)
+        } else {
+            run(&mut self.table, &mut buffer, self.limits.list_bytes, self.limit, block)
+        };
+        // A block that decodes started with its size update. After any other result, the decoder
+        // failed.
+        self.update = false;
+        match result {
             Ok(()) => {
                 let lines: &'l Lines = lines;
                 Ok(Block {
@@ -139,8 +165,15 @@ impl Decoder {
     }
 }
 
-/// Decodes `block` with `table` into `buffer`.
-fn run(table: &mut Table, buffer: &mut Buffer, list_bytes: usize, block: &[u8]) -> Result<(), DecodeError> {
+/// Decodes `block` with `table` into `buffer`, within a list of `list_bytes` and size updates to at
+/// most `limit`.
+fn run(
+    table: &mut Table,
+    buffer: &mut Buffer,
+    list_bytes: usize,
+    limit: usize,
+    block: &[u8],
+) -> Result<(), DecodeError> {
     buffer.out.clear();
     buffer.lines.clear();
     buffer.work = 0;
@@ -157,7 +190,7 @@ fn run(table: &mut Table, buffer: &mut Buffer, list_bytes: usize, block: &[u8]) 
             let (max, used) = integer::decode(rest, 5).ok_or(DecodeError::Malformed)?;
             let max = usize::try_from(max)
                 .ok()
-                .filter(|&max| first && max <= table.limit())
+                .filter(|&max| first && max <= limit)
                 .ok_or(DecodeError::Malformed)?;
             table.set_max(max);
             rest = &rest[used..];
@@ -379,6 +412,7 @@ impl fmt::Debug for Decoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Decoder")
             .field("limits", &self.limits)
+            .field("limit", &self.limit)
             .field("entries", &self.table.len())
             .field("failed", &self.failed)
             .finish_non_exhaustive()

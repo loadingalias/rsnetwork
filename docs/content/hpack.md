@@ -5,8 +5,9 @@ The `rsnetwork::hpack` module is HPACK (RFC 7541), the header compression of HTT
 reads a header block and gives its field lines. Each is the one owner of its dynamic table: the
 table of recent field lines that a block can name with one small index.
 
-rsnetwork is in development and has no release. The HTTP/2 engine is not in the core yet, so today
-you call the encoder and the decoder yourself.
+rsnetwork is in development and has no release. The [HTTP/2 connection layer](http2.md) owns one
+encoder and one decoder for each connection and calls them for you. Call them yourself when you
+need HPACK alone.
 
 ## Example
 
@@ -77,6 +78,11 @@ the encoder does not check names or values. HTTP/2 needs lowercase names (RFC 91
 3. Join the payloads of a HEADERS frame and its CONTINUATION frames into one block.
 4. Call `decoder.decode(&block, &mut lines)`. On success, `block.lines()` gives the field lines in
    their order.
+5. When the peer acknowledges a new `SETTINGS_HEADER_TABLE_SIZE`, give it to
+   `Decoder::set_limit(limit)`, at most `table_bytes`. The HTTP/2 connection layer calls it for
+   you. A later size update above it is malformed.
+   When the table is larger than the new limit, the next block must start with a size update to at
+   most the limit (RFC 9113, section 4.3.1), or it is malformed.
 
 The block borrows the `Lines`. Copy each value that you keep before the next decode into them. A line has the
 `never_indexed` mark when the peer sent it as a literal that is never indexed. HPACK carries any
@@ -90,7 +96,7 @@ only its decoder, so an idle connection holds only its dynamic table there.
 
 | Limit | Bounds | Memory that it sets |
 | --- | --- | --- |
-| `table_bytes` | The dynamic table. Send it as your `SETTINGS_HEADER_TABLE_SIZE`. A size update above it is malformed | `Decoder::new` charges `table_bytes`, and the positions of at most `table_bytes / 32` entries |
+| `table_bytes` | The dynamic table. Send it as your `SETTINGS_HEADER_TABLE_SIZE`. A size update above it, or above the limit of `set_limit`, is malformed | `Decoder::new` charges `table_bytes`, and the positions of at most `table_bytes / 32` entries |
 | `list_bytes` | The decoded lines of one block, in the size of RFC 7541, section 4.1: each name and value, and 32 for each line. Send it as your `SETTINGS_MAX_HEADER_LIST_SIZE` | `Lines::new` charges the larger of `list_bytes` and `table_bytes`, and the positions of at most `list_bytes / 32` lines. A line on its way to the dynamic table also uses this space, so it has at least `table_bytes` |
 | `work` | The work of one block: its bytes, and each byte that the decoder copies to the decoded lines and to the dynamic table | None. The decoder checks the work before each copy |
 
@@ -112,7 +118,7 @@ the end of the block refuses before the decoder copies it.
 | `DecodeError` | Cause | What to do |
 | --- | --- | --- |
 | `TooLarge` | The decoded lines are larger than `list_bytes` | Refuse the stream, for example with a 431 response (RFC 9113, section 10.5.1). The block still changed the dynamic table as the encoder expects, so the connection continues, and the next block decodes |
-| `Malformed` | The block breaks RFC 7541: a bad index, a string or an integer past the end of the block, an EOS symbol or bad padding in a Huffman string, or a size update after a line or above `table_bytes` | End the connection with `COMPRESSION_ERROR` |
+| `Malformed` | The block breaks RFC 7541: a bad index, a string or an integer past the end of the block, an EOS symbol or bad padding in a Huffman string, a size update after a line or above the limit, or no size update at the start of the block after `set_limit` lowered the limit below the table | End the connection with `COMPRESSION_ERROR` |
 | `Overload` | The block needs more work than `work` | End the connection: the table cannot stay in step with the encoder |
 | `Misuse` | The `Lines` are smaller than the limits of the decoder need | Make the lines with `Lines::new` and the limits of the decoder. The decoder did not change, so decode the block again |
 

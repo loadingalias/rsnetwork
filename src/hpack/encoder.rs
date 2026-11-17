@@ -62,6 +62,23 @@ impl Encoder {
         }
     }
 
+    /// The longest block that [`encode`](Self::encode) can give for `lines` now: the free bytes
+    /// that it needs in its output region.
+    pub(crate) fn needed<'a>(&self, lines: impl Iterator<Item = FieldLine<'a>>) -> usize {
+        let max = self.table.max();
+        let updates = self
+            .low
+            .map_or(0, |low| integer::len(low as u64, 5) + integer::len(max as u64, 5));
+        // The largest index in the block: the dynamic table holds at most `max / 32` entries.
+        let index = (STATIC.len() + max / OVERHEAD) as u64;
+        lines.fold(updates, |needed, line| {
+            needed
+                .saturating_add(integer::len(index, 4))
+                .saturating_add(string_len(line.name))
+                .saturating_add(string_len(line.value))
+        })
+    }
+
     /// Encodes `lines` as one header block, in their order, after the filled bytes of `out`.
     ///
     /// A line is indexed when an entry has its name and value. Otherwise, it is a literal with
@@ -79,17 +96,7 @@ impl Encoder {
         out: &mut WriteLoan<B>,
     ) -> Result<(), EncodeError> {
         let max = self.table.max();
-        let updates = self
-            .low
-            .map_or(0, |low| integer::len(low as u64, 5) + integer::len(max as u64, 5));
-        // The largest index in the block: the dynamic table holds at most `max / 32` entries.
-        let index = (STATIC.len() + max / OVERHEAD) as u64;
-        let needed = lines.clone().fold(updates, |needed, line| {
-            needed
-                .saturating_add(integer::len(index, 4))
-                .saturating_add(string_len(line.name))
-                .saturating_add(string_len(line.value))
-        });
+        let needed = self.needed(lines.clone());
         let available = out.capacity() - out.filled().len();
         if needed > available {
             return Err(EncodeError::Full { needed, available });
