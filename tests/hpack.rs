@@ -4,6 +4,7 @@
 mod counting;
 mod json;
 
+use core::assert_matches;
 use core::num::NonZeroU64;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -728,7 +729,7 @@ fn an_encode_into_a_short_region_refuses_and_changes_nothing() {
     let mut encoder = Encoder::new(4096, &budget).expect("the budget pays for the encoder");
     let mut out = WriteLoan::new(Backing::from(Vec::with_capacity(8)));
     let refused = encoder.encode(lines.iter().copied(), &mut out);
-    assert!(matches!(refused, Err(EncodeError::Full { needed, available: 8 }) if needed > 8));
+    assert_matches!(refused, Err(EncodeError::Full { needed, available: 8 }) if needed > 8);
     assert!(out.filled().is_empty());
     let mut fresh = Encoder::new(4096, &budget).expect("the budget pays for the encoder");
     assert_eq!(

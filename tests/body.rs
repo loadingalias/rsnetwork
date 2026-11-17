@@ -2,6 +2,7 @@
 //! outcomes, the order of the outcome after the bytes, and bounded collection. Each expected byte
 //! and outcome comes from RFC 9112 and the bytes that the test gives, not from the code under test.
 
+use core::assert_matches;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 
@@ -200,14 +201,11 @@ fn the_outcome_comes_after_the_last_byte() {
     assert!(consumer.data(Lease::from(b"x".to_vec())).is_err(), "a part waits");
     consumer.end(Outcome::Complete(None));
     let mut first = WriteLoan::new(Vec::with_capacity(4));
-    assert!(matches!(consumer.read_into(&mut first), Read::Bytes(4)));
-    assert!(matches!(consumer.read_into(&mut first), Read::Full));
+    assert_matches!(consumer.read_into(&mut first), Read::Bytes(4));
+    assert_matches!(consumer.read_into(&mut first), Read::Full);
     let mut second = WriteLoan::new(Vec::with_capacity(16));
-    assert!(matches!(consumer.read_into(&mut second), Read::Bytes(6)));
-    assert!(matches!(
-        consumer.read_into(&mut second),
-        Read::Done(Outcome::Complete(None))
-    ));
+    assert_matches!(consumer.read_into(&mut second), Read::Bytes(6));
+    assert_matches!(consumer.read_into(&mut second), Read::Done(Outcome::Complete(None)));
     assert_eq!([first.filled(), second.filled()].concat(), b"0123456789");
 }
 
@@ -220,13 +218,10 @@ fn collection_past_its_bound_refuses_and_keeps_its_first_bytes() {
     consumer.data(Lease::from(b"0123456789ab".to_vec())).unwrap();
     consumer.end(Outcome::Complete(None));
     let mut region = WriteLoan::new(Vec::with_capacity(8));
-    assert!(matches!(
-        consumer.collect(&mut region),
-        Collect::TooLarge { collected: 8 }
-    ));
+    assert_matches!(consumer.collect(&mut region), Collect::TooLarge { collected: 8 });
     assert_eq!(region.filled(), b"01234567");
     let mut rest = WriteLoan::new(Vec::with_capacity(8));
-    assert!(matches!(consumer.collect(&mut rest), Collect::Complete(None)));
+    assert_matches!(consumer.collect(&mut rest), Collect::Complete(None));
     assert_eq!(rest.filled(), b"89ab");
 }
 

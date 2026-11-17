@@ -55,7 +55,7 @@ fn decode(body: &[u8], pieces: Cut) -> (Vec<u8>, End) {
             Some(Ok(ChunkStep::End { len, trailers })) => {
                 let trailers = input[trailers].to_vec();
                 assert!(trailers.len() <= BODY.trailer_bytes, "the trailers passed their limit");
-                let lines = trailers.windows(2).filter(|pair| pair == b"\r\n").count();
+                let lines = trailers.array_windows().filter(|&pair| pair == b"\r\n").count();
                 assert!(lines <= BODY.trailer_fields, "the trailers passed their line limit");
                 return (
                     data,

@@ -155,8 +155,8 @@ impl<'a> Target<'a> {
             let (path, query) = split_query(bytes);
             return TargetForm::Origin { path, query };
         }
-        if let Some(colon) = bytes.iter().position(|&byte| byte == b':')
-            && let Some(rest) = bytes[colon + 1..].strip_prefix(b"//")
+        if let Some((scheme, rest)) = bytes.split_once(|&byte| byte == b':')
+            && let Some(rest) = rest.strip_prefix(b"//")
         {
             let end = rest
                 .iter()
@@ -164,7 +164,7 @@ impl<'a> Target<'a> {
                 .unwrap_or(rest.len());
             let (path, query) = split_query(&rest[end..]);
             return TargetForm::Absolute {
-                scheme: Scheme(&bytes[..colon]),
+                scheme: Scheme(scheme),
                 authority: Authority(&rest[..end]),
                 path,
                 query,
@@ -194,8 +194,8 @@ impl fmt::Debug for TargetForm<'_> {
 
 /// Splits `bytes` at its first `?` into the path and the query.
 fn split_query(bytes: &[u8]) -> (&[u8], Option<&[u8]>) {
-    match bytes.iter().position(|&byte| byte == b'?') {
-        Some(at) => (&bytes[..at], Some(&bytes[at + 1..])),
+    match bytes.split_once(|&byte| byte == b'?') {
+        Some((path, query)) => (path, Some(query)),
         None => (bytes, None),
     }
 }
@@ -405,7 +405,7 @@ fn parse<T: core::str::FromStr>(bytes: &[u8]) -> Option<T> {
 /// Whether the last label of `name` is a number: decimal digits, or `0x` and hexadecimal digits.
 /// A WHATWG URL parser and `inet_aton` read such a name as an IPv4 address.
 fn ends_in_number(name: &[u8]) -> bool {
-    let name = name.strip_suffix(b".").unwrap_or(name);
+    let name = name.trim_suffix(b".");
     let last = name.rsplit(|&byte| byte == b'.').next().unwrap_or(name);
     match last {
         [b'0', b'x' | b'X', hex @ ..] => hex.iter().all(u8::is_ascii_hexdigit),

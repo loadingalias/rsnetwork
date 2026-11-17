@@ -118,8 +118,7 @@ impl Search {
 
 /// Splits a complete head into its start line and its field lines, each with its CR LF.
 pub(super) fn split_head(head: &[u8]) -> Result<(&[u8], &[u8]), ParseError> {
-    let lines = head.strip_suffix(b"\r\n").unwrap_or(head);
-    split_line(lines).ok_or(ParseError::Malformed)
+    split_line(head.trim_suffix(b"\r\n")).ok_or(ParseError::Malformed)
 }
 
 /// The transfer codings of a message.
@@ -220,15 +219,14 @@ fn list(value: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 /// Splits the first line from `bytes` at its LF. The line has no CR LF.
 pub(super) fn split_line(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
-    let lf = bytes.iter().position(|&byte| byte == b'\n')?;
-    let line = &bytes[..lf];
-    Some((line.strip_suffix(b"\r").unwrap_or(line), &bytes[lf + 1..]))
+    let (line, rest) = bytes.split_once(|&byte| byte == b'\n')?;
+    Some((line.trim_suffix(b"\r"), rest))
 }
 
 /// Splits a field line at its first colon into the name and the value with no whitespace around it.
 fn field_parts(line: &[u8]) -> Option<(&[u8], &[u8])> {
-    let colon = line.iter().position(|&byte| byte == b':')?;
-    Some((&line[..colon], trim_whitespace(&line[colon + 1..])))
+    let (name, value) = line.split_once(|&byte| byte == b':')?;
+    Some((name, trim_whitespace(value)))
 }
 
 /// Removes the spaces and HTABs at the start and at the end of `bytes`.

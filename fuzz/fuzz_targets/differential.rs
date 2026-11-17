@@ -12,13 +12,16 @@
 #[path = "../../tests/differential/mod.rs"]
 mod differential;
 
+use core::assert_matches;
+
 use differential::Verdict;
 
 libfuzzer_sys::fuzz_target!(|input: &[u8]| {
     let (rsnetwork, httparse) = differential::heads_and_chunks(input);
     let verdict = differential::judge(&rsnetwork, &httparse);
-    assert!(
-        matches!(verdict, Verdict::Same | Verdict::RsnetworkRefuses),
-        "{verdict:?}: rsnetwork {rsnetwork:?}, httparse {httparse:?}"
+    assert_matches!(
+        verdict,
+        Verdict::Same | Verdict::RsnetworkRefuses,
+        "rsnetwork {rsnetwork:?}, httparse {httparse:?}"
     );
 });

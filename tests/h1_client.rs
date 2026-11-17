@@ -2,6 +2,7 @@
 //! responses, reuse, HTTP/1.0 servers, the end of the connection, and cancellation. Each expected
 //! byte and event comes from RFC 9112 and RFC 9110, not from the code under test.
 
+use core::assert_matches;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 
@@ -368,12 +369,9 @@ fn bytes_after_a_response_never_become_the_next_response() {
     let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", forged.len());
     host.receive(&[head.as_bytes(), forged].concat());
     let (response, _) = host.client.drive(&mut host.inbound);
-    assert!(matches!(response, Some(ClientEvent::Response(_))), "{response:?}");
+    assert_matches!(response, Some(ClientEvent::Response(_)));
     let (end, _) = host.client.drive(&mut host.inbound);
-    assert!(
-        matches!(end, Some(ClientEvent::End(Outcome::Complete(None)))),
-        "{end:?}"
-    );
+    assert_matches!(end, Some(ClientEvent::End(Outcome::Complete(None))));
     let next = host.client.request(
         &mut host.outbound,
         Method::GET,

@@ -3,6 +3,7 @@
 //! with its RFC 9113 code, and frames that parse in place. Each expected byte and code comes from
 //! RFC 9113 or RFC 7541, as each test states, not from the code under test.
 
+use core::assert_matches;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 
@@ -799,7 +800,7 @@ fn a_turn_stops_at_its_frame_limit() {
     };
     assert!(inbound.push(received).is_ok(), "the queue has room");
     let (event, _) = server.drive(&mut inbound, &mut outbound, &mut lines, NOW);
-    assert!(matches!(event, Some(Event::Settings(_))), "the peer's settings");
+    assert_matches!(event, Some(Event::Settings(_)), "the peer's settings");
     // Ten frames of 9 bytes, in turns of 3 frames: 3, 3, 3, and then the last frame and a wait.
     for left in [63, 36, 9] {
         let (event, turn) = server.drive(&mut inbound, &mut outbound, &mut lines, NOW);

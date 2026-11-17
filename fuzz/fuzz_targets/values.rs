@@ -21,10 +21,7 @@ libfuzzer_sys::fuzz_target!(|input: &[u8]| {
     let (method, rest) = rest.split_at(usize::from(*method).min(rest.len()));
     let (target, rest) = rest.split_at(usize::from(*target).min(rest.len()));
     let (authority, field) = rest.split_at(usize::from(*authority).min(rest.len()));
-    let (name, value) = field
-        .iter()
-        .position(|&byte| byte == b':')
-        .map_or((field, &[][..]), |colon| (&field[..colon], &field[colon + 1..]));
+    let (name, value) = field.split_once(|&byte| byte == b':').unwrap_or((field, &[]));
     let (values, bytes) = allocated(|| {
         let target = Target::new(target).map(|target| (target, target.form()));
         let authority = Authority::new(authority).map(|authority| (authority, authority.host(), authority.port()));
@@ -72,7 +69,7 @@ fn check_host(host: Host<'_>) {
                 .all(|&byte| byte.is_ascii_alphanumeric() || b"-._".contains(&byte)),
         "a host name has a byte that the rules do not permit"
     );
-    let name = name.strip_suffix(b".").unwrap_or(name);
+    let name = name.trim_suffix(b".");
     let last = name.rsplit(|&byte| byte == b'.').next().unwrap_or(name);
     let number = match last {
         [b'0', b'x' | b'X', hex @ ..] => hex.iter().all(u8::is_ascii_hexdigit),

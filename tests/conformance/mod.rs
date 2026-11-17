@@ -189,7 +189,7 @@ pub(crate) fn statuses(sent: &[u8]) -> Vec<u16> {
     let mut rest = sent;
     while !rest.is_empty() {
         let end = rest
-            .windows(4)
+            .array_windows()
             .position(|window| window == b"\r\n\r\n")
             .expect("each response ends at an empty line");
         let line = rest.strip_prefix(b"HTTP/1.1 ").expect("an HTTP/1.1 status line");

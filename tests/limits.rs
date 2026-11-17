@@ -2,6 +2,7 @@
 //! work than its limit, and a refused admission. Each expected charge and count comes from the
 //! limits that the test sets, not from the code under test.
 
+use core::assert_matches;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 
@@ -85,11 +86,8 @@ fn a_slow_peer_retains_one_charged_head_and_is_refused_at_its_limit() {
             assert_eq!(budget.available(), admitted - LIMITS.head_bytes as u64, "byte {at}");
             assert!(inbound.front().is_none(), "byte {at}");
         } else {
-            assert!(
-                matches!(turn.progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Overload),
-                "byte {at}: {:?}",
-                turn.progress
-            );
+            assert_matches!(turn.progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Overload, "byte {at}: {:?}",
+                turn.progress);
             break;
         }
     }
@@ -146,7 +144,7 @@ fn a_turn_with_more_work_than_its_limit_stops_and_reports_the_rest() {
     loop {
         let (event, turn) = server.drive(&mut inbound, &mut outbound, NOW);
         if let Some(event) = event {
-            assert!(matches!(event, ServerEvent::Request(_)), "{event:?}");
+            assert_matches!(event, ServerEvent::Request(_));
             break;
         }
         assert_eq!(turn.progress, Progress::Pending);
@@ -231,13 +229,10 @@ fn empty_lines_before_a_request_line_count_against_the_head_limit() {
         inbound.push(received(&input)).unwrap();
         let (event, turn) = server.drive(&mut inbound, &mut outbound, NOW);
         if accepted {
-            assert!(matches!(event, Some(ServerEvent::Request(_))), "{turn:?}");
+            assert_matches!(event, Some(ServerEvent::Request(_)), "{turn:?}");
         } else {
             assert!(event.is_none());
-            assert!(
-                matches!(turn.progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Overload),
-                "{turn:?}"
-            );
+            assert_matches!(turn.progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Overload, "{turn:?}");
             let response = outbound.submit().unwrap();
             assert_eq!(
                 response.region.bytes(),

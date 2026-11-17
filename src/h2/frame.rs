@@ -246,8 +246,8 @@ impl Head {
             return Err(protocol);
         }
         let length = self.length as usize;
-        let settings =
-            self.kind == Kind::Settings && (self.length % 6 != 0 || (self.flags & ACK != 0 && self.length != 0));
+        let settings = self.kind == Kind::Settings
+            && (!self.length.is_multiple_of(6) || (self.flags & ACK != 0 && self.length != 0));
         if settings || length < fixed || (exact && length != fixed) {
             return Err(size);
         }
@@ -550,13 +550,12 @@ impl<'a> Frame<'a> {
     /// refuses with only its 9 bytes. A [`FrameError::Stream`] is for a complete frame of
     /// `HEAD + length` bytes.
     pub fn parse(bytes: &'a [u8], max: u32) -> Result<Option<(Self, usize)>, FrameError> {
-        let Some(&head) = bytes.first_chunk::<HEAD>() else {
+        let Some((&head, tail)) = bytes.split_first_chunk::<HEAD>() else {
             return Ok(None);
         };
         let head = Head::parse(head);
         let fixed_len = head.check(max)?;
-        let end = HEAD + head.length as usize;
-        let Some(payload) = bytes.get(HEAD..end) else {
+        let Some(payload) = tail.get(..head.length as usize) else {
             return Ok(None);
         };
         let (fixed_bytes, rest) = payload.split_at(fixed_len);
@@ -617,7 +616,7 @@ impl<'a> Frame<'a> {
                 payload: variable,
             },
         };
-        Ok(Some((frame, end)))
+        Ok(Some((frame, HEAD + payload.len())))
     }
 
     /// Writes the frame into the free capacity of `out`, after the bytes that it holds. Padding

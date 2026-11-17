@@ -532,8 +532,8 @@ impl fmt::Debug for Client {
 /// The positions of the field lines of the complete head at the start of `bytes`, from the start
 /// of the first field line to the empty line, or `None` while the head is not complete.
 fn field_lines(bytes: &[u8]) -> Option<Range<usize>> {
-    let end = bytes.windows(4).position(|window| window == b"\r\n\r\n")?;
-    let start = bytes.windows(2).position(|window| window == b"\r\n")? + 2;
+    let end = bytes.array_windows().position(|window| window == b"\r\n\r\n")?;
+    let start = bytes.array_windows().position(|window| window == b"\r\n")? + 2;
     Some(start.min(end)..end)
 }
 

@@ -3,6 +3,7 @@
 //! timeout, the clock refusals, and the report of a connection that drops before its release.
 //! Each expected byte, deadline, and outcome comes from the test's own input and clock.
 
+use core::assert_matches;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
@@ -126,10 +127,10 @@ fn a_client_and_a_server_exchange_through_memory_with_injected_time() {
     wire(&mut client, &mut server);
 
     let events = drive(&mut server, at(1));
-    assert!(matches!(
+    assert_matches!(
         &events[..],
         [ServerEvent::Request(_), ServerEvent::End(Outcome::Complete(None))]
-    ));
+    );
     let (engine, outbound) = server.parts();
     let head = Backing::from(Vec::with_capacity(256));
     engine
@@ -195,7 +196,7 @@ fn the_head_timeout_closes_an_idle_connection_and_answers_a_slow_head_with_408()
     server.receive(received(b"GET /slow HTTP/1.1\r\nHo")).unwrap();
     drive(&mut server, at(2));
     drive(&mut server, at(5));
-    assert!(matches!(server.wait(), Wait::Ended(Err(error)) if error.kind() == Kind::Deadline));
+    assert_matches!(server.wait(), Wait::Ended(Err(error)) if error.kind() == Kind::Deadline);
     assert_eq!(server.release(), None);
     let response = server.output().unwrap();
     assert_eq!(
@@ -203,7 +204,7 @@ fn the_head_timeout_closes_an_idle_connection_and_answers_a_slow_head_with_408()
         b"HTTP/1.1 408 \r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
     );
     server.ack(response.id, response.region.initialized()).unwrap();
-    assert!(matches!(server.release(), Some(Err(error)) if error.kind() == Kind::Deadline));
+    assert_matches!(server.release(), Some(Err(error)) if error.kind() == Kind::Deadline);
 
     let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
     let inbound = Inbound::new(NonZeroUsize::new(16).unwrap(), &budget).unwrap();
@@ -235,7 +236,7 @@ fn the_head_timeout_closes_an_idle_connection_and_answers_a_slow_head_with_408()
     assert_eq!(response.region.bytes(), b"HTTP/1.1 200 \r\ncontent-length: 0\r\n\r\n");
     server.ack(response.id, response.region.initialized()).unwrap();
     drive(&mut server, at(6));
-    assert!(matches!(server.wait(), Wait::Ended(Err(error)) if error.kind() == Kind::Deadline));
+    assert_matches!(server.wait(), Wait::Ended(Err(error)) if error.kind() == Kind::Deadline);
     let response = server.output().unwrap();
     assert_eq!(
         response.region.bytes(),
@@ -357,7 +358,7 @@ fn a_client_and_a_server_exchange_over_loopback_std_sockets() {
             match event {
                 ClientEvent::Data(data) => body.extend_from_slice(data.bytes()),
                 ClientEvent::End(outcome) => {
-                    assert!(matches!(outcome, Outcome::Complete(None)), "{outcome:?}");
+                    assert_matches!(outcome, Outcome::Complete(None));
                     assert_eq!(body, b"over loopback");
                     return;
                 }

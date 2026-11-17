@@ -2,6 +2,7 @@
 //! clients, refusals, `100 Continue`, cancellation, and a chunked body with no allocation. Each
 //! expected byte comes from RFC 9112 and RFC 9110, not from the code under test.
 
+use core::assert_matches;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 
@@ -284,7 +285,7 @@ fn an_http_1_0_client_gets_no_chunks_and_a_close_unless_keep_alive() {
     host.receive(b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
     let (seen, progress) = host.drive();
     assert_eq!(seen, Vec::new());
-    assert!(matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Malformed));
+    assert_matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Malformed);
     assert_eq!(
         host.sent(),
         b"HTTP/1.1 400 \r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
@@ -346,10 +347,7 @@ fn a_refused_request_gets_its_error_response_and_the_connection_ends() {
         host.receive(input);
         let (seen, progress) = host.drive();
         assert_eq!(seen, Vec::new());
-        assert!(
-            matches!(progress, Progress::Terminal(Err(error)) if error.kind() == kind),
-            "{progress:?}"
-        );
+        assert_matches!(progress, Progress::Terminal(Err(error)) if error.kind() == kind);
         let expected = [
             b"HTTP/1.1 ",
             response,
@@ -369,7 +367,7 @@ fn after_a_refusal_the_error_response_is_the_last_output() {
     host.receive(b"POST /a HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n");
     let (seen, progress) = host.drive();
     assert_eq!(seen, [request(b"POST", b"/a"), Seen::Malformed]);
-    assert!(matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Malformed));
+    assert_matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Malformed);
     let head = Backing::from(Vec::with_capacity(256));
     let response = host.server.respond(
         &mut host.outbound,
@@ -438,7 +436,7 @@ fn a_cancelled_response_ends_with_no_end_of_its_body() {
         host.server.cancel();
         let (seen, progress) = host.drive();
         assert_eq!(seen, Vec::new());
-        assert!(matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Cancelled));
+        assert_matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Cancelled);
         assert_eq!(host.sent(), expected);
     }
 }
@@ -457,7 +455,7 @@ fn a_cancel_inside_the_request_body_ends_it_cancelled() {
     host.server.cancel();
     let (seen, progress) = host.drive();
     assert_eq!(seen, vec![Seen::Cancelled]);
-    assert!(matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Cancelled));
+    assert_matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Cancelled);
 }
 
 /// After construction, the engine sends a long chunked body with no allocation: each size line
@@ -527,7 +525,7 @@ fn the_close_of_the_client_ends_the_connection() {
         seen,
         vec![request(b"PUT", b"/"), Seen::Data(b"ab".to_vec()), Seen::Truncated]
     );
-    assert!(matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Partial));
+    assert_matches!(progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Partial);
 }
 
 /// A 101 response to a request that asks to upgrade, and a 2xx response to CONNECT, change the

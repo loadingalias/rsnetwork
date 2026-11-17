@@ -179,7 +179,7 @@ fn check_refusals(sent: &[u8]) {
             .and_then(|code| core::str::from_utf8(code).ok()?.parse::<u16>().ok());
         let status = status.expect("each status line has a status of three digits");
         let head = rest
-            .windows(4)
+            .array_windows()
             .position(|window| window == b"\r\n\r\n")
             .expect("each response head ends at an empty line");
         rest = &rest[head + 4..];
