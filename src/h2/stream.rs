@@ -14,13 +14,21 @@
 //! held streams together stay within the endpoint's `SETTINGS_MAX_CONCURRENT_STREAMS`. The slot is
 //! free when the application closes the stream, after its handler ended. Thus the handlers in
 //! flight never pass the limit, however fast the peer opens and resets streams.
+//!
+//! The send scheduler sends the body of each stream from its own slot: one chunk, which the
+//! application gives. A ring of the streams whose chunk can go out serves them in turn, one DATA
+//! frame for each visit (round-robin). A stream with no send window leaves the ring until a
+//! WINDOW_UPDATE gives it credit. Thus the output queue holds only frames that can go now, and a
+//! slow consumer of the peer holds back only its own stream.
 
 use core::alloc::Layout;
+use std::collections::VecDeque;
 
+use rstypes::buffer::{Buffer as _, Lease};
 use rstypes::capacity::{Budget, Permit};
 
 use super::connection::Fault;
-use super::frame::{ErrorCode, MAX_STREAM};
+use super::frame::{ErrorCode, MAX_STREAM, MIN_FRAME_SIZE};
 use super::{Role, Settings};
 use crate::drive::{Error, Kind};
 use crate::hpack::FieldLine;
@@ -31,6 +39,10 @@ pub(super) const INITIAL_WINDOW: u32 = 65_535;
 
 /// The largest flow-control window: 2^31 - 1.
 const MAX: i64 = MAX_STREAM as i64;
+
+/// The most DATA bytes of one visit of the send scheduler: one frame of 16,384 bytes, the
+/// smallest `SETTINGS_MAX_FRAME_SIZE`, so each peer takes it. It is the DATA size of nghttp2.
+const QUANTUM: i64 = MIN_FRAME_SIZE as i64;
 
 /// The part of a message that one side of a stream sends next (RFC 9113, section 8.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +111,22 @@ impl Credit {
     }
 }
 
+/// The send slot of a stream: the chunk of its body that waits to go out.
+#[derive(Debug)]
+enum Body {
+    /// No chunk waits.
+    Idle,
+    /// A chunk waits. `queued` tells whether the ring of the scheduler holds the stream: a stream
+    /// with no send window leaves the ring.
+    Chunk {
+        data: Lease,
+        end_stream: bool,
+        queued: bool,
+    },
+    /// The chunk went into the output queue, and its `Event::Sent` waits.
+    Sent,
+}
+
 /// One stream that is open or half-closed.
 #[derive(Debug)]
 struct Stream {
@@ -109,6 +137,20 @@ struct Stream {
     /// `SETTINGS_INITIAL_WINDOW_SIZE` smaller (section 6.9.2).
     window: i64,
     credit: Credit,
+    body: Body,
+}
+
+impl Stream {
+    const fn new(id: u32, sending: Part, receiving: Part, window: i64, credit: i64) -> Self {
+        Self {
+            id,
+            sending,
+            receiving,
+            window,
+            credit: Credit::new(credit),
+            body: Body::Idle,
+        }
+    }
 }
 
 /// The shutdown of the endpoint.
@@ -158,6 +200,10 @@ pub(super) struct Streams {
     /// application closes it, so a peer that resets streams starts no more handlers than the
     /// limit (CVE-2023-44487), also when it makes the endpoint reset them (CVE-2025-8671).
     held: Vec<u32>,
+    /// The streams whose chunk can go out, in the order of their next visit.
+    ready: VecDeque<u32>,
+    /// The streams whose chunk went out, in order, for their `Event::Sent`.
+    sent: VecDeque<u32>,
     /// The most streams of the table and of `held` together: the endpoint's
     /// `SETTINGS_MAX_CONCURRENT_STREAMS`.
     limit: usize,
@@ -185,26 +231,30 @@ pub(super) struct Streams {
 impl Streams {
     /// Makes the streams of a connection of `role` with the endpoint's settings `local` and a
     /// connection receive window of `connection_window`. It charges a table of
-    /// `max_concurrent_streams` entries, and as many held identifiers, to `budget` before it
-    /// allocates them.
+    /// `max_concurrent_streams` entries, and as many held identifiers and entries of each ring of
+    /// the scheduler, to `budget` before it allocates them.
     pub(super) fn new(role: Role, local: &Settings, connection_window: u32, budget: &Budget) -> Result<Self, Error> {
         let limit = usize::try_from(local.max_concurrent_streams).unwrap_or(usize::MAX);
         let too_large = Error::new(Kind::Overload, "the stream table is too large");
         let bytes = Layout::array::<Stream>(limit)
-            .and_then(|table| Ok(table.extend(Layout::array::<u32>(limit)?)?.0.size()))
+            .and_then(|table| Ok(table.extend(Layout::array::<u32>(limit)?.repeat(3)?.0)?.0.size()))
             .map_err(|_| too_large)?;
         let charge = budget
             .reserve(u64::try_from(bytes).map_err(|_| too_large)?)
             .map_err(|_| Error::new(Kind::Overload, "the budget refused the stream table"))?;
-        let (mut table, mut held) = (Vec::new(), Vec::new());
+        let (mut table, mut held, mut ready, mut sent) = (Vec::new(), Vec::new(), VecDeque::new(), VecDeque::new());
         table
             .try_reserve_exact(limit)
             .and_then(|()| held.try_reserve_exact(limit))
+            .and_then(|()| ready.try_reserve_exact(limit))
+            .and_then(|()| sent.try_reserve_exact(limit))
             .map_err(|_| Error::new(Kind::Overload, "the memory for the stream table is not available"))?;
         Ok(Self {
             role,
             table,
             held,
+            ready,
+            sent,
             limit,
             _charge: charge,
             highest: 0,
@@ -237,18 +287,30 @@ impl Streams {
         id.is_multiple_of(2) || id > self.highest
     }
 
+    /// Removes the stream at `index` from the table and from the rings of the scheduler. Its
+    /// chunk drops.
+    fn remove(&mut self, index: usize) -> Stream {
+        let stream = self.table.remove(index);
+        match stream.body {
+            Body::Chunk { queued: true, .. } => self.ready.retain(|&id| id != stream.id),
+            Body::Sent => self.sent.retain(|&id| id != stream.id),
+            Body::Idle | Body::Chunk { .. } => {}
+        }
+        stream
+    }
+
     /// Removes the stream at `index` when both of its sides sent END_STREAM.
     fn close_done(&mut self, index: usize) {
         let stream = &self.table[index];
         if stream.sending == Part::Done && stream.receiving == Part::Done {
-            self.table.remove(index);
+            self.remove(index);
         }
     }
 
     /// Ends the stream at `index` with a reset of the peer or of the endpoint. The stream is
     /// closed, and its slot stays held until the application closes it.
     fn hold(&mut self, index: usize) {
-        let stream = self.table.remove(index);
+        let stream = self.remove(index);
         assert!(
             self.table.len() + self.held.len() < self.limit,
             "the open and the held streams together fit in the limit"
@@ -349,13 +411,9 @@ impl Streams {
             self.table.len() + self.held.len() < self.limit,
             "a new stream waits at its HEADERS frame until a slot is free"
         );
-        self.table.push(Stream {
-            id,
-            sending: Part::Head,
-            receiving: if end_stream { Part::Done } else { Part::Body },
-            window: self.send_initial,
-            credit: Credit::new(self.recv_initial),
-        });
+        let receiving = if end_stream { Part::Done } else { Part::Body };
+        let stream = Stream::new(id, Part::Head, receiving, self.send_initial, self.recv_initial);
+        self.table.push(stream);
         self.last_stream = id;
         Ok(Section::Head)
     }
@@ -453,9 +511,9 @@ impl Streams {
     }
 
     /// Acts on a WINDOW_UPDATE of `increment` on stream `id`, or on the connection for 0
-    /// (section 6.9). Gives `Ok(None)` when it changed no window that the endpoint uses, and the
-    /// code of a stream error.
-    pub(super) fn window(&mut self, id: u32, increment: u32) -> Result<Option<Result<(), ErrorCode>>, Fault> {
+    /// (section 6.9). A stream whose chunk waits for credit goes back into the ring of the
+    /// scheduler. Gives the code of a stream error.
+    pub(super) fn window(&mut self, id: u32, increment: u32) -> Result<Option<ErrorCode>, Fault> {
         let increment = i64::from(increment);
         if id == 0 {
             if self.window + increment > MAX {
@@ -465,7 +523,7 @@ impl Streams {
                 ));
             }
             self.window += increment;
-            return Ok(Some(Ok(())));
+            return Ok(None);
         }
         if self.idle(id) {
             return Err(Fault::peer(
@@ -480,10 +538,11 @@ impl Streams {
         let stream = &mut self.table[index];
         if stream.window + increment > MAX {
             self.hold(index);
-            return Ok(Some(Err(ErrorCode::FLOW_CONTROL_ERROR)));
+            return Ok(Some(ErrorCode::FLOW_CONTROL_ERROR));
         }
         stream.window += increment;
-        Ok(Some(Ok(())))
+        self.requeue(index);
+        Ok(None)
     }
 
     /// Acts on a WINDOW_UPDATE of 0 on stream `id`, and gives whether it ended a stream with a
@@ -513,8 +572,12 @@ impl Streams {
                 "SETTINGS_INITIAL_WINDOW_SIZE takes a stream window past 2^31 - 1",
             ));
         }
-        for stream in self.table.iter_mut().filter(|stream| stream.sending != Part::Done) {
-            stream.window += initial - self.send_initial;
+        for index in 0..self.table.len() {
+            let stream = &mut self.table[index];
+            if stream.sending != Part::Done {
+                stream.window += initial - self.send_initial;
+                self.requeue(index);
+            }
         }
         self.send_initial = initial;
         Ok(())
@@ -542,6 +605,8 @@ impl Streams {
         self.peer_goaway = Some(last);
         if self.role == Role::Client {
             self.table.retain(|stream| stream.id <= last);
+            self.ready.retain(|&id| id <= last);
+            self.sent.retain(|&id| id <= last);
         }
         Ok(())
     }
@@ -591,21 +656,21 @@ impl Streams {
     pub(super) fn opened(&mut self, id: u32, end_stream: bool) {
         assert!(id > self.highest, "a stream opens above each earlier stream");
         self.highest = id;
-        self.table.push(Stream {
-            id,
-            sending: if end_stream { Part::Done } else { Part::Body },
-            receiving: Part::Head,
-            window: self.send_initial,
-            credit: Credit::new(self.recv_initial),
-        });
+        let sending = if end_stream { Part::Done } else { Part::Body };
+        let stream = Stream::new(id, sending, Part::Head, self.send_initial, self.recv_initial);
+        self.table.push(stream);
     }
 
     /// Checks that the endpoint can send a header section on stream `id`: an interim response
     /// (`interim`), the header section, or the trailer section, which ends the stream.
     pub(super) fn sendable(&self, id: u32, interim: bool, end_stream: bool) -> Result<(), Error> {
-        let index = self.open_index(id)?;
-        match (self.table[index].sending, interim, end_stream) {
+        let stream = &self.table[self.open_index(id)?];
+        match (stream.sending, interim, end_stream) {
             (Part::Head, true, true) => Err(Error::new(Kind::Misuse, "an interim response cannot end the stream")),
+            (Part::Body, _, true) if !matches!(stream.body, Body::Idle) => Err(Error::new(
+                Kind::Misuse,
+                "a chunk of the body waits: send the trailer section after its Event::Sent",
+            )),
             (Part::Head, ..) | (Part::Body, _, true) => Ok(()),
             (Part::Body, ..) => Err(Error::new(Kind::Misuse, "a trailer section must end the stream")),
             (Part::Done, ..) => Err(Error::new(Kind::Misuse, "the stream sent its end")),
@@ -625,32 +690,144 @@ impl Streams {
         }
     }
 
-    /// The DATA bytes of `len` that the endpoint can send on stream `id` now, in a frame of at
-    /// most `max_frame` bytes: the smaller of the two windows.
-    pub(super) fn credit(&self, id: u32, len: usize, max_frame: u32) -> Result<usize, Error> {
+    /// Checks that the endpoint can send DATA on stream `id`, and gives whether a chunk of `len`
+    /// bytes goes into its send slot: an empty DATA frame with `end_stream` needs no slot and no
+    /// credit (section 6.9.1), so it goes out at once.
+    pub(super) fn sendable_data(&self, id: u32, len: usize, end_stream: bool) -> Result<bool, Error> {
         let stream = &self.table[self.open_index(id)?];
         match stream.sending {
             Part::Head => Err(Error::new(Kind::Misuse, "send the header section first")),
             Part::Done => Err(Error::new(Kind::Misuse, "the stream sent its end")),
-            Part::Body => {
-                let credit = self.window.min(stream.window).clamp(0, i64::from(max_frame));
-                Ok(len.min(usize::try_from(credit).unwrap_or(usize::MAX)))
+            Part::Body if !matches!(stream.body, Body::Idle) => Err(Error::new(
+                Kind::Misuse,
+                "a chunk of the body waits: give the next one after its Event::Sent",
+            )),
+            Part::Body if len == 0 && !end_stream => {
+                Err(Error::new(Kind::Misuse, "a chunk has bytes or ends the stream"))
             }
+            Part::Body => Ok(len > 0),
         }
     }
 
-    /// Records `len` DATA bytes that the endpoint sent on stream `id`.
-    pub(super) fn sent_data(&mut self, id: u32, len: u32, end_stream: bool) {
-        let len = i64::from(len);
-        self.window -= len;
+    /// Puts `data` into the send slot of stream `id`, which [`sendable_data`](Self::sendable_data)
+    /// checked. The stream joins the end of the ring when it has send credit.
+    pub(super) fn chunk(&mut self, id: u32, data: Lease, end_stream: bool) {
         if let Some(index) = self.find(id) {
+            self.table[index].body = Body::Chunk {
+                data,
+                end_stream,
+                queued: false,
+            };
+            self.requeue(index);
+        }
+    }
+
+    /// Puts the stream at `index` back at the end of the ring when its chunk waits outside it and
+    /// its send window has credit.
+    fn requeue(&mut self, index: usize) {
+        let stream = &mut self.table[index];
+        if let Body::Chunk {
+            queued: queued @ false, ..
+        } = &mut stream.body
+            && stream.window > 0
+        {
+            *queued = true;
+            assert!(
+                self.ready.len() < self.limit,
+                "each stream is in the ring at most one time"
+            );
+            self.ready.push_back(stream.id);
+        }
+    }
+
+    /// The index of stream `id` of a ring of the scheduler, which holds only streams of the table.
+    fn ringed(&self, id: u32) -> usize {
+        let (Ok(index) | Err(index)) = self.table.binary_search_by_key(&id, |stream| stream.id);
+        assert!(
+            self.table.get(index).is_some_and(|stream| stream.id == id),
+            "each stream of a ring is in the table"
+        );
+        index
+    }
+
+    /// Whether a stream of the ring can send when the output queue has room: the ring has a
+    /// stream, and the connection window has credit.
+    pub(super) fn ready(&self) -> bool {
+        !self.ready.is_empty() && self.window > 0
+    }
+
+    /// The next DATA frame of the scheduler: the stream at the front of the ring sends at most
+    /// [`QUANTUM`] bytes of its chunk, within the two send windows, and goes to the end of the
+    /// ring. Gives the stream, the bytes, and whether the frame ends the stream. A stream that has
+    /// no send window leaves the ring. Gives `None` when the ring is empty or the connection
+    /// window has no credit.
+    pub(super) fn next_frame(&mut self) -> Option<(u32, Lease, bool)> {
+        while let Some(&id) = self.ready.front() {
+            if self.window <= 0 {
+                return None;
+            }
+            let index = self.ringed(id);
             let stream = &mut self.table[index];
-            stream.window -= len;
-            if end_stream {
+            assert!(
+                matches!(stream.body, Body::Chunk { queued: true, .. }),
+                "each stream of the ring has a chunk that waits"
+            );
+            let Body::Chunk {
+                data,
+                end_stream,
+                queued,
+            } = &mut stream.body
+            else {
+                return None;
+            };
+            if stream.window <= 0 {
+                // The peer made its initial window smaller: the stream waits for credit.
+                *queued = false;
+                self.ready.pop_front();
+                continue;
+            }
+            // Each chunk in the ring has a byte, so the frame has at least one.
+            let sent = i64::try_from(data.initialized())
+                .unwrap_or(MAX)
+                .min(QUANTUM)
+                .min(self.window)
+                .min(stream.window);
+            let len = usize::try_from(sent).unwrap_or_default();
+            let (Some(part), Some(rest)) = (data.view(..len), data.view(len..)) else {
+                return None;
+            };
+            self.ready.pop_front();
+            self.window -= sent;
+            stream.window -= sent;
+            let end = *end_stream && rest.initialized() == 0;
+            if rest.initialized() > 0 {
+                *data = rest;
+                *queued = false;
+                self.requeue(index);
+            } else if end {
+                stream.body = Body::Idle;
                 stream.sending = Part::Done;
                 self.close_done(index);
+            } else {
+                stream.body = Body::Sent;
+                assert!(
+                    self.sent.len() < self.limit,
+                    "each stream waits for one Event::Sent at most"
+                );
+                self.sent.push_back(id);
             }
+            return Some((id, part, end));
         }
+        None
+    }
+
+    /// The next stream whose chunk went into the output queue, for its `Event::Sent`. Its send
+    /// slot is free again.
+    pub(super) fn take_sent(&mut self) -> Option<u32> {
+        let id = self.sent.pop_front()?;
+        let index = self.ringed(id);
+        self.table[index].body = Body::Idle;
+        Some(id)
     }
 
     /// Checks that the endpoint can reset stream `id` with `code`.
@@ -666,10 +843,10 @@ impl Streams {
         Ok(())
     }
 
-    /// Ends stream `id`, which the endpoint reset.
+    /// Ends stream `id`, which the endpoint reset. Its chunk drops.
     pub(super) fn close(&mut self, id: u32) {
         if let Some(index) = self.find(id) {
-            self.table.remove(index);
+            self.remove(index);
         }
     }
 

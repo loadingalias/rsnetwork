@@ -105,7 +105,6 @@ enum Seen {
     /// The joined bytes of consecutive DATA events of one stream, and the end.
     Data(u32, Vec<u8>, bool),
     Reset(u32, ErrorCode),
-    WindowUpdate(u32, u32),
     Settings(Settings),
     PingAck([u8; 8]),
     GoAway(u32, ErrorCode),
@@ -341,7 +340,7 @@ fn drive(
             consumer.reset.insert(stream);
             (Seen::StreamError(stream, code), Some(stream))
         }
-        Event::WindowUpdate { stream, increment } => (Seen::WindowUpdate(stream, increment), None),
+        Event::Sent { stream } => panic!("a Sent event on {stream}, which has no body to send"),
         Event::Settings(settings) => (Seen::Settings(settings), None),
         Event::PingAck(opaque) => (Seen::PingAck(opaque), None),
         Event::GoAway { last_stream, code } => (Seen::GoAway(last_stream, code), None),

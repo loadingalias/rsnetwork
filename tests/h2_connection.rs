@@ -7,6 +7,7 @@
 use core::assert_matches;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
 
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
@@ -133,6 +134,15 @@ fn grants(bytes: &[u8], stream: u32) -> Vec<u32> {
         .collect()
 }
 
+/// The payload length of each DATA frame on `stream` in `bytes`.
+fn payloads(bytes: &[u8], stream: u32) -> Vec<usize> {
+    frames(bytes)
+        .into_iter()
+        .filter(|(kind, id, _)| *kind == 0x0 && *id == stream)
+        .map(|(_, _, payload)| payload.len())
+        .collect()
+}
+
 /// What the layer above saw: each event, with its bytes copied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Seen {
@@ -140,7 +150,7 @@ enum Seen {
     Trailers(u32, Option<Vec<(Vec<u8>, Vec<u8>)>>),
     Data(u32, Vec<u8>, bool),
     Reset(u32, ErrorCode),
-    WindowUpdate(u32, u32),
+    Sent(u32),
     Settings(Settings),
     PingAck([u8; 8]),
     GoAway(u32, ErrorCode),
@@ -169,7 +179,7 @@ fn seen(event: Event<'_>) -> Seen {
             end_stream,
         } => Seen::Data(stream, data.bytes().to_vec(), end_stream),
         Event::Reset { stream, code } => Seen::Reset(stream, code),
-        Event::WindowUpdate { stream, increment } => Seen::WindowUpdate(stream, increment),
+        Event::Sent { stream } => Seen::Sent(stream),
         Event::Settings(settings) => Seen::Settings(settings),
         Event::PingAck(opaque) => Seen::PingAck(opaque),
         Event::GoAway { last_stream, code } => Seen::GoAway(last_stream, code),
@@ -198,8 +208,13 @@ struct Peer {
 
 impl Peer {
     fn new(role: Role, limits: Limits) -> Self {
+        Self::with_queue(role, limits, 64)
+    }
+
+    /// An endpoint whose input and output queues each hold `queue` regions.
+    fn with_queue(role: Role, limits: Limits, queue: usize) -> Self {
         let budget = Budget::new(NonZeroU64::new(1 << 24).expect("not zero"));
-        let queue = NonZeroUsize::new(64).expect("not zero");
+        let queue = NonZeroUsize::new(queue).expect("not zero");
         let inbound = Inbound::new(queue, &budget).expect("the budget pays for the queue");
         let mut outbound = Outbound::new(queue, &budget).expect("the budget pays for the queue");
         let connection =
@@ -301,11 +316,11 @@ impl Peer {
             .map_err(|error| error.kind())
     }
 
-    /// Sends `bytes` on `stream` as DATA, and gives the number of bytes that went out.
-    fn send(&mut self, stream: u32, bytes: &[u8], end_stream: bool) -> Result<usize, Kind> {
+    /// Gives `bytes` to `stream` as the next chunk of its body.
+    fn send(&mut self, stream: u32, bytes: &[u8], end_stream: bool) -> Result<(), Kind> {
         let lease = Lease::from(bytes.to_vec());
         self.connection
-            .data(&mut self.outbound, stream, &lease, end_stream)
+            .data(&mut self.outbound, stream, lease, end_stream)
             .map_err(|error| error.kind())
     }
 
@@ -790,7 +805,9 @@ fn a_client_refuses_push_with_protocol_error() {
     }
 }
 
-/// RST_STREAM, WINDOW_UPDATE, and GOAWAY go up with their fields. The debug data of a GOAWAY is
+/// RST_STREAM and GOAWAY go up with their fields. A WINDOW_UPDATE gives no event, and the reserved
+/// bit of its increment is ignored (RFC 9113, section 6.9), so 2^31 + 4096 is no
+/// FLOW_CONTROL_ERROR. The debug data of a GOAWAY is
 /// discarded, also across regions. A WINDOW_UPDATE of 0 on a stream is a stream error of type
 /// PROTOCOL_ERROR: a RST_STREAM ends the stream, and the connection goes on (RFC 9113, section
 /// 6.9). After the GOAWAY, no stream is open, so the connection sends its own GOAWAY and ends
@@ -816,8 +833,6 @@ fn stream_and_control_frames_go_up_with_their_fields() {
         (
             vec![
                 Seen::Reset(1, ErrorCode::CANCEL),
-                // The reserved bit of the increment is ignored.
-                Seen::WindowUpdate(0, 0x1000),
                 Seen::StreamError(3, ErrorCode::PROTOCOL_ERROR),
                 Seen::GoAway(5, ErrorCode::ENHANCE_YOUR_CALM),
             ],
@@ -1036,8 +1051,9 @@ fn data_goes_out_with_no_copy() {
     let stream = client.open(false);
     client.sent();
     let data = Lease::from(b"hello".to_vec());
-    let sent = client.connection.data(&mut client.outbound, stream, &data, true);
-    assert_eq!(sent, Ok(5));
+    let sent = client.connection.data(&mut client.outbound, stream, data.clone(), true);
+    assert_eq!(sent.map_err(|error| error.kind()), Ok(()));
+    assert_eq!(client.run(), (vec![], WAIT));
     let header = client.outbound.submit().expect("the header");
     assert_eq!(header.region.bytes(), head(5, 0x0, 0x1, 1));
     client.outbound.ack(header.id, 9).expect("outstanding");
@@ -1132,7 +1148,7 @@ fn each_stream_state_transition_gives_the_rfc_result() {
             "5.1 half-closed (remote): WINDOW_UPDATE and PRIORITY are permitted",
             Role::Server,
             [request(1, true), window_update(1, 10), priority(1)].concat(),
-            vec![headers(1, true), Seen::WindowUpdate(1, 10)],
+            vec![headers(1, true)],
             Ok(vec![]),
         ),
         (
@@ -1469,16 +1485,7 @@ fn a_window_past_2_31_minus_1_gives_flow_control_error() {
     let stream = client.open(false);
     client.sent();
     client.receive(&[window_update(stream, max - 65_535), window_update(stream, 1)].concat());
-    assert_eq!(
-        client.run(),
-        (
-            vec![
-                Seen::WindowUpdate(stream, max - 65_535),
-                Seen::StreamError(stream, flow)
-            ],
-            WAIT
-        )
-    );
+    assert_eq!(client.run(), (vec![Seen::StreamError(stream, flow)], WAIT));
     assert_eq!(client.sent(), rst(stream, flow));
     client.receive(&window_update(0, max - 65_535 + 1));
     ended(client.run().1, Kind::Malformed);
@@ -1490,46 +1497,51 @@ fn a_window_past_2_31_minus_1_gives_flow_control_error() {
     let settings = frame(0x4, 0, 0, &[&b"\x00\x04"[..], &max.to_be_bytes()].concat());
     client.receive(&[window_update(stream, 1000), settings].concat());
     let (events, progress) = client.run();
-    assert_eq!(events, [Seen::WindowUpdate(stream, 1000)]);
+    assert_eq!(events, []);
     ended(progress, Kind::Malformed);
     assert_eq!(client.sent(), goaway(0, flow));
 }
 
 /// A sender sends DATA only within the stream window and the connection window, in frames of at
-/// most the peer's `SETTINGS_MAX_FRAME_SIZE` (RFC 9113, sections 4.2 and 6.9.1). A smaller
-/// `SETTINGS_INITIAL_WINDOW_SIZE` can make a window negative, and the sender then waits for a
-/// WINDOW_UPDATE that makes it positive: the example of section 6.9.2.
+/// most 16,384 bytes (RFC 9113, sections 4.2 and 6.9.1). A smaller `SETTINGS_INITIAL_WINDOW_SIZE`
+/// can make a window negative, and the sender then waits for a WINDOW_UPDATE that makes it
+/// positive: the example of section 6.9.2. When the last byte of the chunk goes out, the drive
+/// gives `Sent`. Until then, a second chunk or a trailer section refuses, so the body keeps its
+/// order (section 8.1).
 #[test]
 fn data_waits_for_both_windows() {
     let mut client = Peer::client();
     let stream = client.open(false);
-    let body = vec![b'x'; 100_000];
-    let mut sent = 0;
-    while let Ok(len @ 1..) = client.send(stream, &body[sent..], false) {
-        assert!(len <= 16_384, "a frame of {len} bytes");
-        sent += len;
-    }
-    assert_eq!(sent, 65_535, "the initial windows");
+    client.sent();
+    // The initial windows, 10,000 bytes, and 1 byte. Until its `Sent` event, no other chunk and
+    // no trailer section can go before it.
+    assert_eq!(client.send(stream, &[b'x'; 75_536], false), Ok(()));
+    assert_eq!(client.send(stream, b"x", false), Err(Kind::Misuse));
+    assert_eq!(client.section(stream, "x-t", "1", true), Err(Kind::Misuse));
+    assert_eq!(client.run(), (vec![], WAIT));
+    let lengths = payloads(&client.sent(), stream);
+    assert!(lengths.iter().all(|&len| len <= 16_384), "{lengths:?}");
+    assert_eq!(lengths.iter().sum::<usize>(), 65_535, "the initial windows");
     // Credit on the stream alone sends nothing: the connection window is empty.
     client.receive(&window_update(stream, 10_000));
-    assert_eq!(client.run().1, WAIT);
-    assert_eq!(client.send(stream, &body[sent..], false), Ok(0));
+    assert_eq!(client.run(), (vec![], WAIT));
+    assert_eq!(client.sent(), b"");
     client.receive(&window_update(0, 100_000));
-    assert_eq!(client.run().1, WAIT);
-    assert_eq!(client.send(stream, &body[sent..], false), Ok(10_000));
+    assert_eq!(client.run(), (vec![], WAIT));
+    assert_eq!(payloads(&client.sent(), stream), [10_000]);
     // An initial window of 16,384 makes the stream window 0 + 16,384 - 65,535 = -49,151.
     client.receive(&frame(0x4, 0, 0, b"\x00\x04\x00\x00\x40\x00"));
     assert_eq!(client.run().1, WAIT);
+    assert_eq!(client.sent(), SETTINGS_ACK);
     client.receive(&window_update(stream, 49_151));
-    assert_eq!(client.run().1, WAIT);
-    assert_eq!(client.send(stream, b"x", false), Ok(0), "a window of 0");
+    assert_eq!(client.run(), (vec![], WAIT));
+    assert_eq!(client.sent(), b"", "a window of 0");
     client.receive(&window_update(stream, 1));
-    assert_eq!(client.run().1, WAIT);
-    assert_eq!(client.send(stream, b"xx", true), Ok(1));
+    assert_eq!(client.run(), (vec![Seen::Sent(stream)], WAIT));
+    assert_eq!(payloads(&client.sent(), stream), [1]);
     // An empty DATA frame with END_STREAM needs no credit (section 6.9.1).
-    assert_eq!(client.send(stream, b"", true), Ok(0));
-    let output = client.sent();
-    assert!(output.ends_with(&data(stream, true, b"")), "the end of the stream");
+    assert_eq!(client.send(stream, b"", true), Ok(()));
+    assert_eq!(client.sent(), data(stream, true, b""));
 }
 
 /// A message is a header section, DATA, and an optional trailer section that ends the stream. A
@@ -1634,7 +1646,7 @@ fn a_goaway_of_the_peer_drains_the_streams_at_or_below_its_last_stream() {
             continue;
         }
         for stream in [1, 3] {
-            assert_eq!(client.send(stream, b"", true), Ok(0));
+            assert_eq!(client.send(stream, b"", true), Ok(()));
             client.receive(&frame(0x1, 0x5, stream, b"\x88"));
         }
         let (events, progress) = client.run();
@@ -1748,7 +1760,7 @@ fn each_control_flood_keeps_the_charges_of_new_and_the_frame_limit_of_each_turn(
     let floods: [(&str, Vec<u8>, usize, &[u8]); 7] = [
         ("PING", ping, 65, &pong),
         ("SETTINGS", settings, 1, SETTINGS_ACK),
-        ("WINDOW_UPDATE on the connection", window_update(0, 1), 1, b""),
+        ("WINDOW_UPDATE on the connection", window_update(0, 1), 1024, b""),
         ("WINDOW_UPDATE on a closed stream", window_update(1, 1), 1024, b""),
         ("PRIORITY on an idle stream", priority(5), 1024, b""),
         ("empty DATA on an open stream", data(3, false, b""), 1024, b""),
@@ -1960,5 +1972,349 @@ fn a_rapid_reset_flood_starts_no_more_handlers_than_the_stream_limit() {
             }
         }
         assert_eq!(handled, 10_000, "{form}");
+    }
+}
+
+/// DATA frames fill at most half of the output queue, so the calls of the application between two
+/// drives find room while bodies wait (the design: reserved progress for essential control).
+/// Four responses of 1 MiB wait for a transport that takes 4 regions before each drive. After
+/// each drive, a `release` that gives back a stream window with two WINDOW_UPDATE frames, a
+/// response header section, and a reset each succeed.
+#[test]
+fn calls_between_drives_find_room_while_bodies_wait() {
+    let mut server = Peer::acknowledged(LIMITS);
+    // The client raises its windows: an initial window of 2^20, and 2^24 on the connection.
+    let mut input = [frame(0x4, 0, 0, b"\x00\x04\x00\x10\x00\x00"), window_update(0, 1 << 24)].concat();
+    for stream in [1, 3, 5, 7] {
+        input.extend(request(stream, true));
+    }
+    // Stream 9 fills its receive window of 65,535 bytes, and the connection window.
+    input.extend(request(9, false));
+    for len in [16_384, 16_384, 16_384, 16_383] {
+        input.extend(data(9, false, &vec![b'x'; len]));
+    }
+    input.extend([request(11, true), request(13, true)].concat());
+    server.receive(&input);
+    assert_eq!(server.run().1, WAIT);
+    server.sent();
+    for stream in [1, 3, 5, 7] {
+        assert_eq!(server.section(stream, ":status", "200", false), Ok(()));
+        assert_eq!(server.send(stream, &vec![b'y'; 1 << 20], true), Ok(()));
+    }
+    for call in ["release", "headers", "reset"] {
+        for _ in 0..4 {
+            let output = server.outbound.submit().expect("the output waits");
+            server
+                .outbound
+                .ack(output.id, output.region.initialized())
+                .expect("the output is outstanding");
+        }
+        assert_eq!(
+            server.drive(),
+            (None, Progress::Blocked(Blocked::Output)),
+            "the bodies wait"
+        );
+        let result = match call {
+            "release" => server.release(9, 65_535),
+            "headers" => server.section(11, ":status", "200", true),
+            _ => server
+                .connection
+                .reset(&mut server.outbound, 13, ErrorCode::CANCEL)
+                .map_err(|error| error.kind()),
+        };
+        assert_eq!(result, Ok(()), "{call}");
+    }
+}
+
+/// The bytes that the link of the multiplexing tests carries in each direction in each round.
+const LINK: usize = 16 * 1024;
+
+/// The streams of the multiplexing tests, and the bytes of the body of each.
+const STREAMS: usize = 100;
+const BODY: usize = 128 * 1024;
+
+/// The endpoint that sends the bodies of a multiplexing test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bodies {
+    /// The server sends 100 responses.
+    Responses,
+    /// The client sends 100 requests with bodies.
+    Requests,
+}
+
+/// A client and a server on a link that carries `LINK` bytes in each direction in each round,
+/// with `STREAMS` streams of a body of `BODY` bytes. The consumer of each body releases each byte
+/// at once, except the consumer of stream 1, which releases nothing.
+struct Multiplex {
+    client: Peer,
+    server: Peer,
+    bodies: Bodies,
+    /// The body of stream 1. Only this owner and the views of the engine keep it.
+    stalled: Arc<[u8]>,
+    /// The bodies of the other streams: views of one region.
+    body: Lease,
+    /// The bytes that the consumer of each stream received, at index (stream - 1) / 2.
+    received: Vec<usize>,
+    /// The round in which each body ended.
+    ended: Vec<Option<usize>>,
+    /// The bytes that the link carried from the sender of the bodies, and in the last round to it.
+    wire: Vec<u8>,
+    back: Vec<u8>,
+    round: usize,
+}
+
+impl Multiplex {
+    /// The consumer of the bodies has a connection window of `connection_window`, and each stream
+    /// a window of 65,535, the initial value of RFC 9113.
+    fn new(bodies: Bodies, connection_window: u32) -> Self {
+        let receiver = Limits {
+            connection_window,
+            ..LIMITS
+        };
+        let (client_limits, server_limits) = match bodies {
+            Bodies::Responses => (receiver, LIMITS),
+            Bodies::Requests => (LIMITS, receiver),
+        };
+        // Room for the HEADERS frame of each stream at once.
+        let mut multiplex = Self {
+            client: Peer::with_queue(Role::Client, client_limits, 256),
+            server: Peer::with_queue(Role::Server, server_limits, 256),
+            bodies,
+            stalled: Arc::from(vec![b'1'; BODY]),
+            body: Lease::from(vec![b'x'; BODY]),
+            received: vec![0; STREAMS],
+            ended: vec![None; STREAMS],
+            wire: Vec::new(),
+            back: Vec::new(),
+            round: 0,
+        };
+        for n in 0..STREAMS {
+            let stream = multiplex.client.open(bodies == Bodies::Responses);
+            assert_eq!(stream as usize, 2 * n + 1);
+            if bodies == Bodies::Requests {
+                let chunk = multiplex.chunk(stream);
+                let client = &mut multiplex.client;
+                let given = client.connection.data(&mut client.outbound, stream, chunk, true);
+                assert_eq!(given.map_err(|error| error.kind()), Ok(()));
+            }
+        }
+        multiplex
+    }
+
+    /// The body of `stream`.
+    fn chunk(&self, stream: u32) -> Lease {
+        if stream == 1 {
+            Lease::from_owner(Arc::clone(&self.stalled), BODY)
+        } else {
+            self.body.clone()
+        }
+    }
+
+    /// One round: the link carries the bytes of the sender of the bodies, the other endpoint
+    /// reads them and answers, and the link carries its answers back. Gives whether the link
+    /// carried a byte.
+    fn round(&mut self) -> bool {
+        self.round += 1;
+        let forward = match self.bodies {
+            Bodies::Responses => carry(&mut self.server, &mut self.client),
+            Bodies::Requests => carry(&mut self.client, &mut self.server),
+        };
+        let receiver = self.receiver();
+        self.serve(receiver);
+        self.back = match self.bodies {
+            Bodies::Responses => carry(&mut self.client, &mut self.server),
+            Bodies::Requests => carry(&mut self.server, &mut self.client),
+        };
+        self.serve(match receiver {
+            Role::Client => Role::Server,
+            Role::Server => Role::Client,
+        });
+        let moved = !forward.is_empty() || !self.back.is_empty();
+        self.wire.extend(forward);
+        moved
+    }
+
+    /// The endpoint that receives the bodies.
+    const fn receiver(&self) -> Role {
+        match self.bodies {
+            Bodies::Responses => Role::Client,
+            Bodies::Requests => Role::Server,
+        }
+    }
+
+    /// Drives the endpoint of `role` until it waits, and acts on its events: the consumer counts
+    /// and releases DATA, and a server answers each request of `Bodies::Responses` with its body.
+    /// At the reset of a stream, its handler ends at once, and its consumer releases what it
+    /// holds.
+    fn serve(&mut self, role: Role) {
+        let consumer = role == self.receiver();
+        let peer = match role {
+            Role::Client => &mut self.client,
+            Role::Server => &mut self.server,
+        };
+        let (events, progress) = peer.run();
+        assert_matches!(progress, Progress::Blocked(_), "{role:?}");
+        let mut requests = Vec::new();
+        for event in events {
+            match event {
+                Seen::Data(stream, data, end_stream) => {
+                    let index = (stream as usize - 1) / 2;
+                    self.received[index] += data.len();
+                    if stream != 1 {
+                        let bytes = u32::try_from(data.len()).expect("a frame");
+                        assert_eq!(peer.release(stream, bytes), Ok(()));
+                    }
+                    if end_stream {
+                        self.ended[index] = Some(self.round);
+                    }
+                }
+                Seen::Headers(stream, true, _) if role == Role::Server => requests.push(stream),
+                Seen::Reset(stream, ErrorCode::CANCEL) => {
+                    let held = if consumer && stream == 1 { self.received[0] } else { 0 };
+                    if held > 0 {
+                        let held = u32::try_from(held).expect("a window");
+                        assert_eq!(peer.release(stream, held), Ok(()));
+                    }
+                    assert_eq!(peer.connection.close(stream).map_err(|error| error.kind()), Ok(()));
+                }
+                Seen::Settings(_) | Seen::Headers(..) | Seen::Sent(_) => {}
+                other => panic!("{role:?}: {other:?}"),
+            }
+        }
+        // A server answers the requests of one drive together, so that each body is in the ring
+        // before the first visit.
+        for stream in requests {
+            assert_eq!(self.server.section(stream, ":status", "200", false), Ok(()));
+            let chunk = self.chunk(stream);
+            let server = &mut self.server;
+            let given = server.connection.data(&mut server.outbound, stream, chunk, true);
+            assert_eq!(given.map_err(|error| error.kind()), Ok(()));
+        }
+    }
+}
+
+/// Carries at most `LINK` bytes of the output of `from` to the input of `to`, as one region, and
+/// gives them.
+fn carry(from: &mut Peer, to: &mut Peer) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while bytes.len() < LINK
+        && let Some(output) = from.outbound.submit()
+    {
+        let len = output.region.initialized().min(LINK - bytes.len());
+        bytes.extend_from_slice(&output.region.bytes()[..len]);
+        from.outbound.ack(output.id, len).expect("the output is outstanding");
+    }
+    if !bytes.is_empty() {
+        to.receive(&bytes);
+    }
+    bytes
+}
+
+/// A slow consumer holds back only its own stream (the design: slow body isolation), for each
+/// sender of bodies. 100 streams carry a body of 128 KiB each, and the consumer of stream 1
+/// releases nothing. The consumer has a connection window of 2 x 65,535: the rule of the
+/// multiplexing page for one stalled consumer, (1 + 1) x the stream window.
+///
+/// - Stream 1 holds back only itself: its consumer gets 65,535 bytes, its initial window (RFC
+///   9113, section 6.9.2), and no more.
+/// - Each other stream ends at the rate of the link within 2%: by the round in which the link has
+///   carried the DATA frames of all streams, each payload with its 9-byte header in frames of at
+///   most 16,384 bytes.
+/// - The sender visits the streams in turn, one DATA frame for each visit (round-robin, the
+///   lead's rule): between two frames of a stream, no other stream sends two.
+///
+/// A scheduler with one shared queue of chunks waits behind the chunk of stream 1, and the other
+/// streams never end.
+#[test]
+fn a_stalled_consumer_holds_back_only_its_own_stream() {
+    let frames_per_body = BODY.div_ceil(16_384);
+    let wire = (STREAMS - 1) * (BODY + 9 * frames_per_body) + 65_535 + 9 * 65_535_usize.div_ceil(16_384);
+    let rounds = wire.div_ceil(LINK) * 102 / 100;
+    for bodies in [Bodies::Responses, Bodies::Requests] {
+        let mut multiplex = Multiplex::new(bodies, 2 * 65_535);
+        while multiplex.round < rounds && multiplex.ended[1..].contains(&None) {
+            multiplex.round();
+        }
+        assert_eq!(multiplex.received[0], 65_535, "{bodies:?}: the window of stream 1");
+        assert_eq!(multiplex.ended[0], None, "{bodies:?}");
+        for (index, ended) in multiplex.ended.iter().enumerate().skip(1) {
+            assert!(
+                ended.is_some_and(|round| round <= rounds),
+                "{bodies:?}: stream {} ended at {ended:?}, after round {rounds}",
+                2 * index + 1
+            );
+        }
+        // Between two DATA frames of a stream, each other stream sends at most one. A client
+        // sends the preface first.
+        let wire = multiplex
+            .wire
+            .strip_prefix(PREFACE.as_slice())
+            .unwrap_or(&multiplex.wire);
+        let order: Vec<u32> = frames(wire)
+            .into_iter()
+            .filter(|(kind, ..)| *kind == 0x0)
+            .map(|(_, stream, _)| stream)
+            .collect();
+        let mut last = vec![None; STREAMS];
+        for (at, &stream) in order.iter().enumerate() {
+            let index = (stream as usize - 1) / 2;
+            if let Some(before) = last[index] {
+                let mut between = [false; STREAMS];
+                for &other in &order[before + 1..at] {
+                    let other = (other as usize - 1) / 2;
+                    assert!(!between[other], "{bodies:?}: two frames of stream {}", 2 * other + 1);
+                    between[other] = true;
+                }
+            }
+            last[index] = Some(at);
+        }
+    }
+}
+
+/// The limit of the multiplexing page: with a connection window of one stream window, 65,535,
+/// the stalled consumer holds the whole connection window, so the other streams stop and the
+/// link carries nothing. The cancel of the stalled stream frees its charge, and the connection
+/// goes on (the design: H2 cancellation ends the affected stream), when either endpoint cancels.
+/// The server drops the rest of the body of stream 1, and the consumer releases its 65,535 bytes,
+/// so they come back in one WINDOW_UPDATE on the connection. Then each other stream ends.
+#[test]
+fn a_stalled_consumer_that_holds_the_connection_window_stops_the_others_until_its_cancel() {
+    for canceller in [Role::Client, Role::Server] {
+        let mut multiplex = Multiplex::new(Bodies::Responses, 65_535);
+        for _ in 0..10_000 {
+            if !multiplex.round() {
+                break;
+            }
+        }
+        assert!(!multiplex.round(), "the link carries nothing");
+        assert_eq!(multiplex.received[0], 65_535, "the window of stream 1");
+        assert_eq!(multiplex.ended, vec![None; STREAMS], "no body ends");
+        match canceller {
+            Role::Client => {
+                let client = &mut multiplex.client;
+                let reset = client.connection.reset(&mut client.outbound, 1, ErrorCode::CANCEL);
+                assert_eq!(reset.map_err(|error| error.kind()), Ok(()));
+                assert_eq!(client.release(1, 65_535), Ok(()));
+            }
+            Role::Server => {
+                let server = &mut multiplex.server;
+                let reset = server.connection.reset(&mut server.outbound, 1, ErrorCode::CANCEL);
+                assert_eq!(reset.map_err(|error| error.kind()), Ok(()));
+                assert_eq!(Arc::strong_count(&multiplex.stalled), 1, "the server dropped the body");
+            }
+        }
+        assert!(multiplex.round());
+        assert_eq!(grants(&multiplex.back, 0), [65_535], "{canceller:?}");
+        assert_eq!(Arc::strong_count(&multiplex.stalled), 1, "the server dropped the body");
+        for _ in 0..10_000 {
+            if !multiplex.ended[1..].contains(&None) {
+                break;
+            }
+            assert!(multiplex.round(), "{canceller:?}: the connection goes on");
+        }
+        assert!(
+            !multiplex.ended[1..].contains(&None),
+            "{canceller:?}: each other body ends"
+        );
     }
 }

@@ -23,7 +23,7 @@ before the engine parses its first byte.
 | HPACK decoder | Its dynamic table: see [HPACK](hpack.md#limits) | `hpack::Decoder::new(limits, &budget)` |
 | HPACK lines | The space for the decoded lines of one block, which you lend to each decode | `hpack::Lines::new(limits, &budget)` |
 | HPACK encoder | Its dynamic table | `hpack::Encoder::new(table_bytes, &budget)` |
-| HTTP/2 connection | Its HPACK decoder of at least 4096 bytes, its HPACK encoder, a stream table of `max_concurrent_streams` entries and as many 4-byte identifiers of reset streams, and a frame pool of one 64-byte slot for each `Outbound` entry and one more | `h2::Connection::new` |
+| HTTP/2 connection | Its HPACK decoder of at least 4096 bytes, its HPACK encoder, a stream table of `max_concurrent_streams` entries, three lists of as many 4-byte identifiers (reset streams and the two rings of the send scheduler), and a frame pool of one 64-byte slot for each `Outbound` entry and one more | `h2::Connection::new` |
 | Join of an HTTP/2 header block that does not decode in place | Its bytes for a block in one frame, or `work` for a block that continues: see [HTTP/2](http2.md#header-blocks) | When the block arrives, until its decode |
 
 A join that the budget cannot pay for does not fail the connection: the turn is
@@ -53,7 +53,8 @@ bounds it. Each turn makes at least one step, so a small limit slows an engine b
 | A head that arrives slowly or never completes | At most one join, charged to the budget, and the queued regions | `head_bytes`: at the limit, the head refuses with 431, and the connection ends |
 | A slow request or response body | No state of its own: the body bytes are views of the received regions, and a consumer holds one waiting part | The `Inbound` limit: when the queue is full, `push` gives the region back, so stop receiving |
 | An unread body after a response | The drain of the rest | `drain_bytes`: above it, the connection closes |
-| A slow consumer of an HTTP/2 stream | No state of its own: the data bytes are views of the received regions | The receive window of the stream and of the connection: the peer gets more credit only for bytes that the consumer releases. See [HTTP/2](http2.md#receive-credit) |
+| A slow consumer of an HTTP/2 stream | No state of its own: the data bytes are views of the received regions | The receive window of the stream and of the connection: the peer gets more credit only for bytes that the consumer releases. The other streams go on when `connection_window` follows the rule of [isolate a slow consumer](multiplexing.md#isolate-a-slow-consumer) |
+| An HTTP/2 peer whose consumer of a stream is slow | The chunk of that stream, a view of your region, in its send slot | The send window of the stream: the stream waits, and the other streams go on. See [multiplexing](multiplexing.md) |
 | An HTTP/2 peer that floods resets, CONTINUATION, SETTINGS, PING, WINDOW_UPDATE, or empty frames | No state of its own, and at most one answer that waits | Handlers in flight, header blocks, and answers: see [HTTP/2 floods](http2.md#floods) |
 
 The head timeout of the server bounds the time of a slow head: see

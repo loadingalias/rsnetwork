@@ -26,6 +26,13 @@ const SLOT: usize = 64;
 /// A SETTINGS frame with the flag ACK.
 const SETTINGS_ACK: &[u8] = &[0, 0, 0, 0x4, 0x1, 0, 0, 0, 0];
 
+/// DATA frames fill at most the limit of the output queue divided by this value: one half. The
+/// other half stays free between drives for the calls of the application (header sections, the
+/// grants of `release`, resets, and pings) and for the answers of the next drive: the reserved
+/// progress of the design. Without it, each drive fills the room that the transport freed, and
+/// each call refuses while a body waits.
+const DATA_SHARE: usize = 2;
+
 /// The initial `SETTINGS_HEADER_TABLE_SIZE`. The peer's encoder can use it until the peer
 /// acknowledges the settings of the preface (RFC 9113, section 4.3.1).
 const INITIAL_TABLE: usize = 4096;
@@ -41,7 +48,8 @@ pub const SHUTDOWN_PING: [u8; 8] = *b"shutdown";
 /// frames in the host's [`Inbound`] queue and gives one [`Event`]. It checks each frame (RFC 9113,
 /// sections 4 to 6), applies and acknowledges the peer's SETTINGS frames, answers each PING,
 /// joins and decodes each header block, and applies the rules of each stream state (section 5.1)
-/// and of flow control at the stream and the connection level (sections 5.2 and 6.9).
+/// and of flow control at the stream and the connection level (sections 5.2 and 6.9). Then it
+/// sends the chunks that [`data`](Self::data) gave, one DATA frame for each stream in turn.
 ///
 /// A frame that breaks RFC 9113 is a connection error: the connection queues a GOAWAY with the
 /// code of the error and the last stream that it gave up, and the turn is terminal when the GOAWAY
@@ -132,13 +140,11 @@ pub enum Event<'l> {
         /// Why the stream ends.
         code: ErrorCode,
     },
-    /// WINDOW_UPDATE: the peer gave more send credit. Send more DATA on the stream, or on each
-    /// stream for the connection.
-    WindowUpdate {
-        /// The stream, or 0 for the connection.
+    /// The chunk that [`Connection::data`] gave to the stream is all in the output queue. Give
+    /// the next chunk of the body, or the trailer section.
+    Sent {
+        /// The stream.
         stream: u32,
-        /// The increment: 1 to 2^31 - 1.
-        increment: u32,
     },
     /// The peer's SETTINGS frame, applied. The connection queued its acknowledgement.
     Settings(Settings),
@@ -197,11 +203,7 @@ impl fmt::Debug for Event<'_> {
                 .field("stream", stream)
                 .field("code", code)
                 .finish(),
-            Self::WindowUpdate { stream, increment } => f
-                .debug_struct("WindowUpdate")
-                .field("stream", stream)
-                .field("increment", increment)
-                .finish(),
+            Self::Sent { stream } => f.debug_struct("Sent").field("stream", stream).finish(),
             Self::Settings(settings) => f.debug_tuple("Settings").field(settings).finish(),
             Self::PingAck(_) => f.write_str("PingAck"),
             Self::GoAway { last_stream, code } => f
@@ -497,6 +499,23 @@ impl Connection {
                     Ok(Next::Limit) => progress = Progress::Pending,
                     Err(fault) => self.fail(fault),
                 }
+                // The scheduler sends after the reader, so the answers of the reader go first.
+                // No frame follows the GOAWAY of a connection error.
+                if self.end.is_none() {
+                    match self.send(outbound) {
+                        Ok(true) if matches!(progress, Progress::Blocked(_)) => {
+                            progress = Progress::Blocked(Blocked::Output);
+                        }
+                        Ok(_) => {}
+                        Err(fault) => self.fail(fault),
+                    }
+                }
+                if event.is_none()
+                    && self.end.is_none()
+                    && let Some(stream) = self.streams.take_sent()
+                {
+                    (event, progress) = (Some(Event::Sent { stream }), Progress::Pending);
+                }
             }
         }
         if event.is_none()
@@ -638,45 +657,70 @@ impl Connection {
         Ok(())
     }
 
-    /// Sends the start of `data` on `stream` as one DATA frame, with no copy: a frame header from
-    /// the pool, and then a view of `data`. Gives the number of bytes that it sent: as many as
-    /// the stream window, the connection window, and the peer's `SETTINGS_MAX_FRAME_SIZE` permit.
-    /// Send the rest after a [`Event::WindowUpdate`]. `end_stream` sets the flag END_STREAM when
-    /// the frame holds each byte of `data`. An empty `data` with `end_stream` needs no credit.
+    /// Gives `data`, the next chunk of the body of `stream`, to the send scheduler, with no copy.
+    /// `end_stream` ends the body with the last byte of the chunk. In each drive, the scheduler
+    /// sends one DATA frame of at most 16,384 bytes for each stream in turn, within the two send
+    /// windows, as views of `data`. When the chunk is all in the output queue, the drive gives
+    /// [`Event::Sent`]: give the next chunk then. A stream holds one chunk at a time, so a
+    /// stream that waits for credit holds back only itself.
     ///
-    /// Refuses, and queues nothing, when the output queue or the pool has no room, when the
-    /// stream is not open or sent its end, and before the header section of the stream.
-    pub fn data(
-        &mut self,
-        outbound: &mut Outbound,
-        stream: u32,
-        data: &Lease,
-        end_stream: bool,
-    ) -> Result<usize, Error> {
-        self.writable(outbound)?;
-        let len = self
-            .streams
-            .credit(stream, data.initialized(), self.peer.max_frame_size)?;
-        let end_stream = end_stream && len == data.initialized();
-        if len == 0 && !end_stream {
-            return Ok(0);
+    /// An empty `data` with `end_stream` needs no credit, so its DATA frame goes into the output
+    /// queue at once. Refuses, and changes nothing, after the end of the connection, when the
+    /// stream is not open, sent its end, or sent no header section, from an earlier `data` to its
+    /// `Event::Sent`, and for an empty `data` with no `end_stream`
+    /// ([`Kind::Misuse`](crate::drive::Kind::Misuse)). The empty frame also refuses when the
+    /// output queue or the pool is full ([`Kind::Overload`](crate::drive::Kind::Overload)).
+    pub fn data(&mut self, outbound: &mut Outbound, stream: u32, data: Lease, end_stream: bool) -> Result<(), Error> {
+        if self.end.is_some() {
+            return Err(Error::new(ErrorKind::Misuse, "the connection ended"));
         }
-        if outbound.free() < 1 + usize::from(len > 0) {
+        if self.streams.sendable_data(stream, data.initialized(), end_stream)? {
+            self.streams.chunk(stream, data, end_stream);
+            return Ok(());
+        }
+        // The empty frame goes after the answer that waits, so the frames stay in their order.
+        self.writable(outbound)?;
+        if outbound.free() == 0 {
             return Err(full());
         }
         let head = Head {
-            length: narrow(len),
+            length: 0,
             kind: Kind::Data,
-            flags: flag(end_stream, END_STREAM),
+            flags: END_STREAM,
             stream,
         };
-        let part = data.view(..len).ok_or_else(full)?;
         let mut slot = WriteLoan::new(self.pool.acquire().map_err(|_| full())?);
         slot.fill_from(&head.encode());
         push_region(outbound, Lease::from(slot.into_inner()))?;
-        push_region(outbound, part)?;
-        self.streams.sent_data(stream, narrow(len), end_stream);
-        Ok(len)
+        self.streams.sent(stream, false, true);
+        Ok(())
+    }
+
+    /// Writes the DATA frames of the send scheduler into `outbound` while they fill at most its
+    /// share of [`DATA_SHARE`]. Each frame takes two entries: a 9-byte header from the pool and a
+    /// view of a chunk. Gives whether a frame waits for room.
+    fn send(&mut self, outbound: &mut Outbound) -> Result<bool, Fault> {
+        while outbound.free() >= 2 + outbound.limit() / DATA_SHARE {
+            let Ok(slot) = self.pool.acquire() else {
+                return Ok(self.streams.ready());
+            };
+            let Some((stream, part, end_stream)) = self.streams.next_frame() else {
+                return Ok(false);
+            };
+            let head = Head {
+                length: narrow(part.initialized()),
+                kind: Kind::Data,
+                flags: flag(end_stream, END_STREAM),
+                stream,
+            };
+            let mut slot = WriteLoan::new(slot);
+            slot.fill_from(&head.encode());
+            // The loop checked the room of both regions.
+            for region in [Lease::from(slot.into_inner()), part] {
+                outbound.push(region).map_err(|_| internal())?;
+            }
+        }
+        Ok(self.streams.ready())
     }
 
     /// Resets an open `stream` with RST_STREAM of `code`, and ends it (RFC 9113, section 6.4).
@@ -1220,14 +1264,9 @@ impl Connection {
             }
             Fixed::WindowUpdate(increment) => {
                 self.read = Read::Head;
-                match self.streams.window(head.stream, increment)? {
-                    None => None,
-                    Some(Ok(())) => Some(Event::WindowUpdate {
-                        stream: head.stream,
-                        increment,
-                    }),
-                    Some(Err(code)) => Some(self.reset_by_error(head.stream, code)),
-                }
+                self.streams
+                    .window(head.stream, increment)?
+                    .map(|code| self.reset_by_error(head.stream, code))
             }
             Fixed::Priority(_) => {
                 self.read = Read::Head;

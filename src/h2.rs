@@ -19,6 +19,11 @@
 //! decoder reads one contiguous block. The receive credit follows the consumer: the peer gets
 //! more credit only for the bytes that the consumer releases.
 //!
+//! The application gives the body of each stream in chunks. In each drive, the send scheduler
+//! sends one DATA frame of at most 16,384 bytes for each stream in turn, within the two send
+//! windows, as views of the chunks. A stream with no send credit waits in its own slot, so a slow
+//! consumer of the peer holds back only its stream.
+//!
 //! ```
 //! use core::net::{Ipv4Addr, SocketAddr};
 //! use core::num::{NonZeroU64, NonZeroUsize};
@@ -69,10 +74,12 @@
 //! let fields: Vec<_> = block.lines().map(|line| (line.name, line.value)).collect();
 //! assert_eq!(fields[3], (&b":authority"[..], &b"www.example.com"[..]));
 //!
-//! // The response on stream 1: a header section, and its body in one DATA frame that ends it.
+//! // The response on stream 1: a header section, and its body, which ends the stream. The next
+//! // drive sends the body in one DATA frame.
 //! let status = FieldLine { name: b":status", value: b"200", never_indexed: false };
 //! server.headers(&mut outbound, 1, [status].into_iter(), false, Backing::from(Vec::with_capacity(64)))?;
-//! assert_eq!(server.data(&mut outbound, 1, &Lease::from(b"hello".to_vec()), true)?, 5);
+//! server.data(&mut outbound, 1, Lease::from(b"hello".to_vec()), true)?;
+//! assert!(server.drive(&mut inbound, &mut outbound, &mut lines, now).0.is_none());
 //!
 //! // The output: the server's SETTINGS frame and WINDOW_UPDATE, the acknowledgement of the
 //! // client's SETTINGS frame, the HEADERS frame, and last the DATA frame.

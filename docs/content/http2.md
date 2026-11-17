@@ -23,9 +23,10 @@ message.
 1. `Connection::new` queues the preface in your `Outbound` queue.
 2. Your host pushes each received region into an `Inbound` queue.
 3. Each `drive` call reads the queued frames in place and gives one `Event`, or none.
-4. You answer with `open`, `headers`, `data`, `reset`, `release`, `ping`, and `shutdown`, which
-   push frames into the `Outbound` queue. When the handler of a reset stream ends, you call
-   `close`.
+4. You answer with `open`, `headers`, `reset`, `release`, `ping`, and `shutdown`, which push
+   frames into the `Outbound` queue. You give each body to `data` in chunks, and each drive sends
+   the chunks of all streams in turn: see [multiplexing](multiplexing.md). When the handler of a
+   reset stream ends, you call `close`.
 5. The host sends each `Output` and acknowledges the bytes that the transport accepted.
 6. When the drive gives a terminal turn, the host sends the rest of the `Outbound` queue and closes
    the connection.
@@ -91,10 +92,12 @@ else {
 let fields: Vec<_> = block.lines().map(|line| (line.name, line.value)).collect();
 assert_eq!(fields[3], (&b":authority"[..], &b"www.example.com"[..]));
 
-// The response on stream 1: a header section, and its body in one DATA frame that ends it.
+// The response on stream 1: a header section, and its body, which ends the stream. The next
+// drive sends the body in one DATA frame.
 let status = FieldLine { name: b":status", value: b"200", never_indexed: false };
 server.headers(&mut outbound, 1, [status].into_iter(), false, Backing::from(Vec::with_capacity(64)))?;
-assert_eq!(server.data(&mut outbound, 1, &Lease::from(b"hello".to_vec()), true)?, 5);
+server.data(&mut outbound, 1, Lease::from(b"hello".to_vec()), true)?;
+assert!(server.drive(&mut inbound, &mut outbound, &mut lines, now).0.is_none());
 
 // The output: the server's SETTINGS frame and WINDOW_UPDATE, the acknowledgement of the
 // client's SETTINGS frame, the HEADERS frame, and last the DATA frame.
@@ -163,8 +166,9 @@ connection with `Kind::Unsupported`.
 
 ## Read frames
 
-Each drive gives at most one event. A frame with no event, such as a PING, a PRIORITY, a frame of
-an unknown type, or a frame on a closed stream, gives none, and the drive reads the next frame. A
+Each drive gives at most one event. A frame with no event, such as a PING, a PRIORITY, a
+WINDOW_UPDATE, a frame of an unknown type, or a frame on a closed stream, gives none, and the drive
+reads the next frame. A
 header block that gives no event ends the turn as `Pending`: drive again with no wait.
 
 | Event | Frame | What to do |
@@ -174,7 +178,7 @@ header block that gives no event ends the turn as `Pending`: drive again with no
 | `Data { stream, data, end_stream }` | A DATA frame | `data` is a view of a received region, with no padding. A frame gives one event for each region that holds its bytes. `end_stream` is on the last event of the frame that ends the body. Call `release` when the consumer is done with the bytes |
 | `Reset { stream, code }` | RST_STREAM of the peer | The stream ended. End its body with `Outcome::Reset`. Call `close(stream)` when its handler ends: see [handler slots](#handler-slots) |
 | `StreamError { stream, code }` | A frame that is a stream error | The connection reset the stream with RST_STREAM of `code`. The body is malformed. Call `close(stream)` when its handler ends. See [stream errors](#stream-errors) |
-| `WindowUpdate { stream, increment }` | WINDOW_UPDATE | The peer gave more send credit: send the rest of a body. Stream 0 is the connection |
+| `Sent { stream }` | None: the chunk that you gave to `data` is all in the output queue | Give the next chunk of the body, or the trailer section. See [multiplexing](multiplexing.md) |
 | `Settings(settings)` | SETTINGS | The peer's settings now in effect |
 | `PingAck(opaque)` | PING with the flag ACK | The answer to your `ping` |
 | `GoAway { last_stream, code }` | GOAWAY | The peer processes no stream of yours after `last_stream`. See [shutdown](#shutdown-and-drain) |
@@ -289,7 +293,9 @@ The peer gets receive credit only for capacity that your consumer admits:
 A WINDOW_UPDATE goes out when the free credit reaches the credit that the peer still has. This is
 the rule of nghttp2, so no small increment goes out. No WINDOW_UPDATE goes on a stream after its
 END_STREAM. Thus the peer can make you hold at most the window of each stream, and
-`connection_window` in all.
+`connection_window` in all. A consumer that releases nothing holds up to one stream window of the
+connection window, so choose `connection_window` with the rule in
+[isolate a slow consumer](multiplexing.md#isolate-a-slow-consumer).
 
 Release the bytes of a stream that ended too: they still count at the connection level. `release`
 refuses with `Kind::Misuse`, and changes nothing, when the consumer holds fewer bytes.
@@ -299,20 +305,21 @@ connection error past the connection window (the rule of nghttp2).
 
 ### Send credit
 
-`data` sends at most the smaller of the two send windows and the peer's `SETTINGS_MAX_FRAME_SIZE`,
-and gives the number of bytes that it sent. Send the rest after a `WindowUpdate` event. A window
-can be negative after the peer makes its initial window smaller: then `data` sends nothing until
-WINDOW_UPDATE frames make it positive. A WINDOW_UPDATE that takes a window past 2^31 - 1 is a
-stream error or a connection error of type `FLOW_CONTROL_ERROR` (RFC 9113, section 6.9.1).
+Each DATA frame that the connection sends fits in the stream window and the connection window, and
+has at most 16,384 bytes. A stream with no credit waits, and the WINDOW_UPDATE frames of the peer
+start it again: see [multiplexing](multiplexing.md). A window can be negative after the peer makes
+its initial window smaller: then the stream sends nothing until WINDOW_UPDATE frames make it
+positive. A WINDOW_UPDATE that takes a window past 2^31 - 1 is a stream error or a connection error
+of type `FLOW_CONTROL_ERROR` (RFC 9113, section 6.9.1).
 
 ## Send frames
 
 | Call | Frames | Refusal |
 | --- | --- | --- |
 | `open(&mut outbound, lines, end_stream, region)` | A client opens the next odd stream with a request, and gets its identifier | A server, no free stream in the table or under the peer's `SETTINGS_MAX_CONCURRENT_STREAMS`, or a GOAWAY that went or came (`Kind::Overload`, or `Kind::Misuse` for a server). Each refusal of `headers` |
-| `headers(&mut outbound, stream, lines, end_stream, region)` | A header section on an open stream: HEADERS, and CONTINUATION frames when the block is larger than the peer's `SETTINGS_MAX_FRAME_SIZE` | The region or the output queue has too little room (`Kind::Overload`). The stream is not open or sent its end, an interim response has `end_stream`, or a trailer section has none (`Kind::Misuse`) |
-| `data(&mut outbound, stream, &data, end_stream)` | One DATA frame with the start of `data`. `end_stream` sets END_STREAM when the frame holds each byte | The output queue or the frame pool is full (`Kind::Overload`). The stream is not open, sent its end, or sent no header section (`Kind::Misuse`) |
-| `reset(&mut outbound, stream, code)` | RST_STREAM, and the stream closes | The output queue or the frame pool is full (`Kind::Overload`). The stream is not open, or a server gives `REFUSED_STREAM` (`Kind::Misuse`) |
+| `headers(&mut outbound, stream, lines, end_stream, region)` | A header section on an open stream: HEADERS, and CONTINUATION frames when the block is larger than the peer's `SETTINGS_MAX_FRAME_SIZE` | The region or the output queue has too little room (`Kind::Overload`). The stream is not open or sent its end, an interim response has `end_stream`, a trailer section has none, or a chunk of the body waits (`Kind::Misuse`) |
+| `data(&mut outbound, stream, data, end_stream)` | None now: the chunk `data` goes to the send slot of the stream, and the drives send it in DATA frames. `end_stream` ends the body with its last byte. An empty `data` with `end_stream` goes out at once as one DATA frame | The stream is not open, sent its end, or sent no header section, a chunk of the stream waits, or `data` is empty with no `end_stream` (`Kind::Misuse`). The output queue or the frame pool is full, for the empty frame (`Kind::Overload`) |
+| `reset(&mut outbound, stream, code)` | RST_STREAM, and the stream closes. Its chunk drops | The output queue or the frame pool is full (`Kind::Overload`). The stream is not open, or a server gives `REFUSED_STREAM` (`Kind::Misuse`) |
 | `close(stream)` | None: the handler of a stream that a reset ended has ended, and its slot is free | No reset holds the slot of the stream: it is open, or it was closed (`Kind::Misuse`) |
 | `release(&mut outbound, stream, bytes)` | WINDOW_UPDATE frames when credit is due | The consumer holds fewer bytes (`Kind::Misuse`). The output queue or the pool has no room for the frames (`Kind::Overload`) |
 | `ping(&mut outbound, opaque)` | One PING | The output queue or the frame pool is full (`Kind::Overload`) |
@@ -327,13 +334,14 @@ it: a client can retry a refused request on a new connection, also a POST (RFC 9
 `headers` and `open` write the frames into the free capacity of your region: the HPACK block after
 a frame header, and the header of each CONTINUATION frame after the block. They go out as views of
 that region, with no copy. The region needs room for the longest block of the lines and 9 bytes for
-each frame. `data` sends a 9-byte frame header from the frame pool, and then a view of your data
-with no copy. Keep the rest of your data, from the offset that `data` gives, for the next call.
+each frame. Each DATA frame is a 9-byte frame header from the frame pool, and then a view of your
+chunk with no copy.
 
 The connection keeps at most one answer that the output queue has no room for: a SETTINGS
 acknowledgement, a PING answer, a RST_STREAM, a WINDOW_UPDATE, or a GOAWAY. While it keeps one, it
 reads no frame, and the turn is `Blocked(Blocked::Output)`. Each send first queues that answer, so
-the frames stay in their order.
+the frames stay in their order. DATA frames use at most half of the output queue, so the other
+frames find room: see [multiplexing](multiplexing.md#how-the-connection-shares-its-streams).
 
 ## Shutdown and drain
 
@@ -411,8 +419,9 @@ no event: see [streams](#streams).
 | `connection_window` | The DATA bytes of all streams that your consumers admit: the connection receive window, from 65,535 to 2^31 - 1 |
 
 `Connection::new` charges the HPACK decoder, the HPACK encoder, the stream table, and the frame
-pool to your budget. The stream table has `max_concurrent_streams` entries and as many 4-byte
-identifiers of held streams. The pool has one slot of 64 bytes for each entry of the output queue,
+pool to your budget. The stream table has `max_concurrent_streams` entries, and as many 4-byte
+identifiers in each of three lists: the held streams and the two rings of the send scheduler. The
+pool has one slot of 64 bytes for each entry of the output queue,
 and one more. `TurnLimits` bounds the work of each drive: `frames` counts each frame header, and
 `bytes` each received byte that the drive reads. See [limits](limits.md).
 
@@ -431,7 +440,7 @@ not charge.
 | PING and SETTINGS frames, and frames that the connection answers with RST_STREAM, from a peer that does not read | One answer for each `Outbound` entry, and one that waits. The connection reads no frame while an answer waits | None |
 | Frames with no answer and no event: empty DATA, PRIORITY, frames of unknown types, and DATA, RST_STREAM, and WINDOW_UPDATE on a closed stream | `frames` for each turn, with no state | None |
 | Header blocks on closed or refused streams | One block for each turn, because the turn ends after its decode. Each block within `work` | `COMPRESSION_ERROR` for a block past `work` |
-| WINDOW_UPDATE on an open stream or the connection | One event for each turn | `FLOW_CONTROL_ERROR` for a window past 2^31 - 1 |
+| WINDOW_UPDATE on an open stream or the connection | `frames` for each turn, with no state. A stream that waits for credit joins the ring of the send scheduler one time | `FLOW_CONTROL_ERROR` for a window past 2^31 - 1 |
 | SETTINGS | One frame for each turn, because its event ends the turn. A change of `SETTINGS_INITIAL_WINDOW_SIZE` visits each open stream one time | None |
 
 The connection does not end a flood with `ENHANCE_YOUR_CALM`. RFC 9113, section 10.5, permits

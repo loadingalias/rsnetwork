@@ -16,6 +16,7 @@ writes. The module documentation of each target gives its input format and its c
 | `values` | The constructors of `value`, `write_request`, `write_head`, `RequestParser`, and `ResponseParser` | No constructor allocates. A host name obeys its rules. Each accepted value passes through a writer and a parser with no change. |
 | `hpack` | `hpack::Decoder` and `hpack::Encoder` | No decode allocates or changes the charge. The lines of a block stay in the list limit. A decoder that fails gives the same error for each later block. The encoder sends each decoded block to a second decoder, which reads the same lines and marks. |
 | `h2` | `h2::Connection`, with its stream layer, `hpack::Decoder`, and the frame codec | A cut input gives the events, the output, and the end of the whole input. No drive allocates past the work limit. Each charge returns when the connection drops. No frame follows a GOAWAY, and a connection error ends with one. A body goes up only on a stream after its header section and before its end, and no event follows a reset. No frame follows a reset of the endpoint, and no reset goes on an idle stream. The WINDOW_UPDATE frames of each stream and of the connection give back at most the DATA bytes of the input. The last stream of a GOAWAY never increases. A server has at most 4 handlers in flight: a stream that a reset ended keeps its slot until the target closes it, at the wait for a free slot. |
+| `h2_send` | The send scheduler of `h2::Connection`, under the frames of a hostile peer | Each DATA frame has 1 to 16,384 bytes, fits in its stream window and the connection window of a model that reads the frames of the peer, and comes before the end, the reset, or the GOAWAY of its stream. Its payload is the next bytes of the body that the application gave. `Sent` comes only after each byte of its chunk went out. When the connection waits for input, no stream has body bytes that both windows admit. No drive allocates past the work limit, and each charge returns when the connection drops. |
 | `differential` | `RequestParser` and `ChunkDecoder`, against `httparse` | Each head that rsnetwork accepts has the same method, target, version, field lines, and length for `httparse`. Each chunked body after it has the same data, trailer section, and length. |
 
 The transport checks the bounds of [Bound the memory and the work of a connection](../docs/content/limits.md)
@@ -76,6 +77,11 @@ blocks of RFC 7541, C.3.1 and C.4. Each name gives the RFC section that it exerc
 sections 5.1, 5.1.2, 6.8, 6.9, and 8.1 pass the stream states, the stream limit, GOAWAY, the
 windows, and the parts of a message. The seeds of section 10.5 are floods: streams that open and
 reset at line rate, past the 4 slots, and empty CONTINUATION frames past a work limit of 64 bytes.
+
+The seeds of `h2_send` are frame sequences of a peer that change the send windows of the endpoint,
+each after the control byte of the target: WINDOW_UPDATE on the connection and on streams, a
+smaller and a larger `SETTINGS_INITIAL_WINDOW_SIZE`, a reset, a GOAWAY, and the stream errors of a
+WINDOW_UPDATE of 0 and of a window past 2^31 - 1. Each name gives the RFC 9113 section.
 
 `differential` has no control bytes and no seeds of its own. Its corpus starts from the seeds of
 `request` and `chunked`, with their control bytes removed and a chunked request head before each
@@ -361,3 +367,19 @@ result when it ends.
   assertions, leaks, timeouts, and out-of-memory errors, and it wrote no artifact. `dev-machine
   status rsnetwork` then showed no instance and no volume. Limit: the working corpus stayed on the
   discarded host.
+
+### N204: the HTTP/2 send scheduler
+
+- Risk: a frame sequence of the peer that makes the scheduler send DATA past a send window, after
+  the end or the reset of its stream, or after a GOAWAY, or send bytes out of order. A ring of the
+  scheduler out of step with the stream table: a stream that a WINDOW_UPDATE or a SETTINGS frame
+  gives credit and that the ring never visits again, a stream in the ring twice, or a stream of the
+  ring that is not in the table, which an assertion of the engine ends. A `Sent` event before its
+  chunk went out, or a panic.
+- Code: the commit of N204, on the toolchain of `rust-toolchain.toml`, with the `libfuzzer-sys`
+  closure of N009. The new target `h2_send` adds no dependency. A body of 70,000 bytes passes the
+  initial window of 65,535, and a server takes 4 streams.
+- Host, budget, stop condition, and command: as for N210, on one `aws-linux-arm64-ubuntu2604`
+  host, with the target `h2_send` and its seeds in place of `h2`. That is `-fork=14
+  -max_total_time=1200` with AddressSanitizer, 20 minutes, and a lease of 45 minutes. Stop at the
+  time budget, or at the first crash, failed assertion, leak, timeout, or out-of-memory error.
