@@ -54,6 +54,8 @@ use rsnetwork::time::{ClockDomain, Instant, Suspend};
 let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
 let queue = NonZeroUsize::new(16).expect("not zero");
 let (mut inbound, mut outbound) = (Inbound::new(queue, &budget)?, Outbound::new(queue, &budget)?);
+// Local settings choose each bound that the budget pays for. RFC 9113, section 6.5.2,
+// recommends at least 100 concurrent streams. A header list of 16 KiB costs lines of 32 KiB.
 let settings = Settings { max_concurrent_streams: 100, max_header_list_size: 16 * 1024, ..Settings::INITIAL };
 let limits = Limits { settings, work: 64 * 1024, encoder_table_bytes: 4096, connection_window: 1 << 20 };
 let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
@@ -122,8 +124,16 @@ bytes of the client preface. A wrong preface ends the connection with `PROTOCOL_
 ### Settings
 
 `Settings` holds the five settings of RFC 9113, section 6.5.2. `Settings::INITIAL` holds their
-initial values. `u32::MAX` is the initial value of `max_concurrent_streams` and
-`max_header_list_size`, which start with no limit.
+initial values: the settings of a peer before its SETTINGS frame. `u32::MAX` is the initial value
+of `max_concurrent_streams` and `max_header_list_size`, which start with no limit.
+
+Your local settings choose these two bounds, because your budget pays for them, as the
+[HTTP/1.1 limits](http1.md#limits) do. `Connection::new` charges a stream table of
+`max_concurrent_streams` entries, and `Lines::new` charges space for a header list of
+`max_header_list_size` bytes, so `u32::MAX` makes the budget refuse. The example sets 100
+streams, the smallest value that RFC 9113, section 6.5.2, recommends, and a header list of 16 KiB,
+whose lines cost 32 KiB for each drive. A larger list lets a peer send larger header sections,
+such as large cookies, and costs more for each drive.
 
 | Setting | Effect on this endpoint |
 | --- | --- |

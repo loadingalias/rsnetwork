@@ -29,6 +29,8 @@
 //! let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
 //! let queue = NonZeroUsize::new(16).expect("not zero");
 //! let (mut inbound, mut outbound) = (Inbound::new(queue, &budget)?, Outbound::new(queue, &budget)?);
+//! // Local settings choose each bound that the budget pays for. RFC 9113, section 6.5.2,
+//! // recommends at least 100 concurrent streams. A header list of 16 KiB costs lines of 32 KiB.
 //! let settings = Settings { max_concurrent_streams: 100, max_header_list_size: 16 * 1024, ..Settings::INITIAL };
 //! let limits = Limits { settings, work: 64 * 1024, encoder_table_bytes: 4096, connection_window: 1 << 20 };
 //! let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
@@ -128,7 +130,12 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// The initial values of RFC 9113, section 6.5.2.
+    /// The initial values of RFC 9113, section 6.5.2: the settings of a peer before its SETTINGS
+    /// frame. Local settings must give `max_concurrent_streams` and `max_header_list_size`
+    /// finite values, because the budget pays for them: [`Connection::new`] charges a stream
+    /// table of `max_concurrent_streams` entries, and [`Lines::new`](crate::hpack::Lines::new)
+    /// charges space for a header list of `max_header_list_size` bytes. With `u32::MAX`, the
+    /// budget refuses.
     pub const INITIAL: Self = Self {
         header_table_size: 4096,
         max_concurrent_streams: u32::MAX,
