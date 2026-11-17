@@ -64,7 +64,7 @@ backings, because `Init` chooses the layout.
 
 | Part | Model |
 | --- | --- |
-| Backings | The layout `of[s]` gives the backing of each slice, and no step changes it. `Init` has each layout up to a renaming of the backings: with two slices, one backing of two slices, or two backings of one slice each. Each backing is charged once when it is created. Each holder keeps its own view of each backing that it uses |
+| Backings | The layout `of[s]` gives the backing of each slice, and no step changes it. `Init` has each layout up to a renaming of the backings: with two slices, one backing of two slices, or two backings of one slice each. Each backing is charged once when it is created. A pool slot is a backing whose charge its pool took once, at the construction of the pool. For a slot, `charge[b]` counts the one slot that the backing holds, and the release returns that slot to the pool with no change of the pool's charge. Each holder keeps its own view of each backing that it uses |
 | Writer | It gives its region of `Slices` slices, in stream order, to the protocol. `wr` is the stable offset: the first slice that the protocol has not accepted. The writer keeps a view of each backing of the suffix (`wv`) until it drops the suffix (`wgone`) |
 | Retransmit store | `st[s]`: `wait` (not accepted), `store` (accepted, not acknowledged), `acked`, or `dropped` (the stream ended first). The store keeps a view of each slice in `store` (`sv`) |
 | Outputs | Each slice goes out in up to `Copies` datagrams: the first one and each retransmission, each with a new packet number. One datagram is one output. It gathers the next copy of each slice in a set of stored slices, so it can hold views of two backings. `fl` holds the outputs in the kernel |
@@ -108,12 +108,21 @@ Each known-bad variant still fails its own property under all of them (see the e
      that it gathers. The output's result and notice change all of its copies in one step, so
      the projection has them in one step too.
    - A backing can have slices in two regions, for example one payload on two streams. Its views
-     are then the sum of the views of the regions. No step adds a view of a backing of which its
-     region holds none: `Accept` needs the writer's suffix, which `SuffixKept` ties to a view,
-     and `Send` needs the store's view. So the views of a region are positive exactly while an
-     obligation of that region holds, by `AliveWhileHeld` and `ReleasedAfterLast`. The sum is
-     positive exactly while an obligation of any region holds. The one release, and the end of
-     the one charge, then follow the last obligation of all regions.
+     are then the sum of the views of the regions. An output that gathers slices of both regions
+     can keep one view of the backing for both. Only a positive count matters (reduction 6), so
+     the projection gives that view to each region, and it drops in the same step in each.
+
+     No step adds a view of a backing of which its region holds none. `Accept` needs the
+     writer's suffix, which `SuffixKept` ties to a view. `Send` needs `st[s] = "store"`, which
+     holds exactly when `s \in sv`: `Init` starts both empty, and only `Accept`, `PeerAck`, and
+     `End` change them, together (`BackingRelease.tla` lines 159-160, 249-250, and 268-269). A
+     later region gets its first view of a shared backing as a clone or a view of a live `Lease`
+     of `rstypes`, so no region adds a view to a backing whose count is zero.
+
+     So the views of a region are positive exactly while an obligation of that region holds, by
+     `AliveWhileHeld` and `ReleasedAfterLast`. The sum is positive exactly while an obligation of
+     any region holds. The one release, and the end of the one charge, then follow the last
+     obligation of all regions.
 
    No property reads another region. So each behavior with more regions projects to a behavior
    of this model for each region, and each property holds for each projection. The failure that
@@ -145,7 +154,9 @@ build, and N604 replaces it with its code. A change to either side reopens this 
 
 HTTP/2 (N202) is the first writer of two backings. `h2::Connection::data` (`src/h2/connection.rs`)
 pushes a DATA frame to `Outbound` as two regions: the frame header in a slot of its pool, and a
-view of the caller's payload. That frame is the layout `<<1, 2>>`.
+view of the caller's payload. That frame is the layout `<<1, 2>>`. The header's backing is a pool
+slot: `ChargedOnce` reads its `charge` as the slot that it holds, which its release returns to the
+pool.
 
 | Action | Design rule | N004 transition | N604 transition | R000 action |
 | --- | --- | --- | --- | --- |
@@ -162,7 +173,7 @@ view of the caller's payload. That frame is the layout `<<1, 2>>`.
 | Property | Acceptance text | Kind |
 | --- | --- | --- |
 | `AliveWhileHeld` | Each retained reference and kernel obligation keeps its backing alive | Invariant |
-| `ChargedOnce` | The budget charges each backing once while it is alive, and not after its release | Invariant |
+| `ChargedOnce` | The budget charges each backing once while it is alive, and not after its release. A pool slot holds one slot of its pool while it is alive, and its release returns that slot | Invariant |
 | `ReleaseAtMostOnce` | Release occurs once: the hook of a backing never runs a second time | Invariant |
 | `ReleasedAfterLast` | Release occurs after the last obligation ends: when no obligation of a backing remains, its hook has run. It runs in the step that drops the last view, so a leak shows as a violation | Invariant |
 | `SuffixKept` | Partial acceptance preserves the suffix: the writer keeps a view of each backing of a slice that the protocol has not accepted, until the writer drops it | Invariant |
@@ -210,8 +221,11 @@ property, at the declared bounds.
 | `GatherOneView_bad` | The driver keeps a view of the backing of the first slice of an output only. So the other backing of a gathered output is released while the kernel reads it | `AliveWhileHeld` |
 | `SpanRelease_bad` | A partial acceptance that covers the first region of the output, the run of slices of one backing, drops each view of the writer. So the next backing is released while the protocol has not accepted its bytes | `AliveWhileHeld` |
 
-`SpanRelease_bad` differs from `WholeRelease_bad` only at the end of a backing: in the layout of
-one backing, its partial acceptance keeps the suffix.
+`SpanRelease_bad` stays for its own defect: a release of the next backing at a partial acceptance
+that ends at the end of a backing. At two slices, its counterexample state equals the state of
+`WholeRelease_bad`. So it shows that `AliveWhileHeld` also catches the header-and-payload case,
+which `WholeRelease_bad` shows with `SuffixKept`. In the layout of one backing, its partial
+acceptance keeps the suffix.
 
 ## Reachability
 
@@ -230,7 +244,7 @@ Each witness profile must reach its target at the declared bounds.
 | `RefusedRelease_reach` | A backing is released while a refused copy of its slice was never sent | Refusal, then the end of the stream |
 | `SuffixLater_reach` | The protocol accepts the last slice after the peer acknowledged the first slice | Partial acceptance keeps the suffix for a later acceptance |
 | `GatherWait_reach` | An output that gathers two backings waits for its notice, and no other holder keeps either backing | The kernel use of one output keeps both backings |
-| `SplitRelease_reach` | One backing is released while the writer still holds the next backing | Partial acceptance at the end of a backing, and a release of each backing at its own last obligation |
+| `SplitRelease_reach` | One backing is released while the writer still holds the next backing | Partial acceptance at the end of a backing, and the release of backing 1 at its own last obligation while backing 2 is held |
 
 No submission follows the end of the stream, so a release at a notice after an end shows that
 the notice was pending at the end.
@@ -302,8 +316,18 @@ Two hosts ran the profiles:
 | `BackingRelease.Copies3.cfg` | this Mac | ok: complete, 0 states left on the queue | 2,760,450 | 21 | 243.66 s |
 | `BackingRelease.Slices3.cfg` | EC2 | ok: complete, 0 states left on the queue | 25,161,615 | 22 | 335.02 s |
 
-Each of the nine known-bad profiles violated only its own property on this Mac, in 1.45 to 5.89
-seconds. Each of the twelve witnesses reached its target on this Mac, in 1.74 to 15.74 seconds.
+Each known-bad profile checks one property, and on this Mac it violated that property, in 1.45
+to 5.89 seconds:
+
+- `AliveWhileHeld`: `ReleaseAtAck_bad`, `DeadlineRelease_bad`, `GatherOneView_bad`, and
+  `SpanRelease_bad`.
+- `SuffixKept`: `WholeRelease_bad`.
+- `ChargedOnce`: `ChargePerCopy_bad`.
+- `ReleasedAfterLast`: `RefusalLeak_bad`.
+- `ReleaseAtMostOnce`: `DoubleRelease_bad`.
+- `AckKeepsOwnership`: `UnknownAck_bad`.
+
+Each of the twelve witnesses reached its target on this Mac, in 1.74 to 15.74 seconds.
 A first run of `Slices3` on this Mac stopped after its 10-minute sample, at 7,191,954 distinct
 states with work on the queue, because it could not finish within its cap there. It is not
 evidence.
