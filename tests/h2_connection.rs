@@ -1544,6 +1544,29 @@ fn data_waits_for_both_windows() {
     assert_eq!(client.sent(), data(stream, true, b""));
 }
 
+/// A larger `SETTINGS_INITIAL_WINDOW_SIZE` adds the difference to each stream window (RFC 9113,
+/// section 6.9.2). A stream that used all of its window then sends the rest of its chunk with no
+/// WINDOW_UPDATE on the stream.
+#[test]
+fn a_larger_initial_window_alone_lets_a_stream_with_no_window_send() {
+    let mut client = Peer::client();
+    let stream = client.open(false);
+    client.sent();
+    assert_eq!(client.send(stream, &[b'x'; 75_536], false), Ok(()));
+    client.receive(&window_update(0, 100_000));
+    assert_eq!(client.run(), (vec![], WAIT));
+    let sent = payloads(&client.sent(), stream).iter().sum::<usize>();
+    assert_eq!(sent, 65_535, "the initial stream window");
+    // An initial window of 75,536 makes the stream window 0 + 75,536 - 65,535 = 10,001.
+    client.receive(&frame(0x4, 0, 0, b"\x00\x04\x00\x01\x27\x10"));
+    let applied = Settings {
+        initial_window_size: 75_536,
+        ..Settings::INITIAL
+    };
+    assert_eq!(client.run(), (vec![Seen::Settings(applied), Seen::Sent(stream)], WAIT));
+    assert_eq!(payloads(&client.sent(), stream), [10_001]);
+}
+
 /// A message is a header section, DATA, and an optional trailer section that ends the stream. A
 /// response can start with interim (1xx) responses. A trailer section with no END_STREAM, DATA
 /// before the header section, and an interim response with END_STREAM are malformed: stream
