@@ -59,6 +59,7 @@ Wait only for the cause that `Until` names:
 | `Blocked::Input` | Bytes arrive, or the input ends |
 | `Blocked::Output` | The transport accepts output |
 | `Blocked::Capacity(n)` | `n` more bytes of capacity are free |
+| `Blocked::Streams` | HTTP/2 only: your code closes a stream that a reset ended |
 
 Also wake it at `deadline`. A socket can almost always take output, so a binding that waits for
 that while the engine waits for input wakes again and again with no work.

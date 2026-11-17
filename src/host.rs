@@ -148,6 +148,7 @@ pub enum Wait {
     /// - [`Blocked::Input`]: when bytes arrive, or the peer closes its side.
     /// - [`Blocked::Output`]: when the transport accepts output.
     /// - [`Blocked::Capacity`]: when that much capacity is free again.
+    /// - [`Blocked::Streams`]: when the application closes an HTTP/2 stream that a reset ended.
     ///
     /// A host that waits only for this cause does not wake for an event that cannot help, for
     /// example a socket that can take output while the engine waits for input. Send each

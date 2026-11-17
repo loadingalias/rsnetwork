@@ -20,6 +20,9 @@
 //! - The WINDOW_UPDATE frames of a stream, and of the connection, give back at most the DATA bytes
 //!   that the input has for it, with their padding: no credit passes the admitted capacity.
 //! - The last stream of the GOAWAY frames of the endpoint never increases.
+//! - A server has at most 4 handlers in flight: a request starts one, and only the close of a
+//!   stream that a reset ended ends it. The target closes the lowest such stream only when the
+//!   connection waits for a free slot, so the connection waits at the same frame in each cut.
 
 #![no_main]
 
@@ -130,6 +133,10 @@ struct Consumer {
     closed: BTreeSet<u32>,
     /// The data bytes of each stream that the consumer holds.
     held: BTreeMap<u32, u32>,
+    /// The streams that a reset ended, which the consumer did not close.
+    reset: BTreeSet<u32>,
+    /// The handlers of a server that run: its requests, less the streams that it closed.
+    running: u32,
 }
 
 impl Consumer {
@@ -230,6 +237,11 @@ fn run(role: Role, limits: Limits, input: &[u8], cut: usize) -> Run {
                     None => inbound.end(),
                 },
                 Progress::Blocked(Blocked::Capacity(units)) => panic!("the budget refused {units} units"),
+                Progress::Blocked(Blocked::Streams) => {
+                    let stream = consumer.reset.pop_first().expect("a reset holds the slot");
+                    connection.close(stream).expect("the slot of the stream is held");
+                    consumer.running -= 1;
+                }
                 Progress::Terminal(end) => {
                     result.end = Some(end.map_err(|error| error.kind()));
                     break;
@@ -276,7 +288,11 @@ fn drive(
             end_stream,
             lines,
         } => {
-            consumer.opened.insert(stream);
+            // A client opened each of its streams, so a new stream is a request to a server.
+            if consumer.opened.insert(stream) {
+                consumer.running += 1;
+                assert!(consumer.running <= 4, "{} handlers in flight", consumer.running);
+            }
             consumer.live(stream, false);
             assert!(
                 !consumer.finished.contains(&stream),
@@ -316,11 +332,13 @@ fn drive(
         Event::Reset { stream, code } => {
             consumer.live(stream, false);
             consumer.closed.insert(stream);
+            consumer.reset.insert(stream);
             (Seen::Reset(stream, code), Some(stream))
         }
         Event::StreamError { stream, code } => {
             consumer.live(stream, false);
             consumer.closed.insert(stream);
+            consumer.reset.insert(stream);
             (Seen::StreamError(stream, code), Some(stream))
         }
         Event::WindowUpdate { stream, increment } => (Seen::WindowUpdate(stream, increment), None),

@@ -33,6 +33,7 @@ your loop:
 | `Blocked::Input` | Received bytes, or the end of the input |
 | `Blocked::Output` | The socket to accept output: the engine has output that must go first |
 | `Blocked::Capacity(n)` | `n` more bytes of capacity, for example after your code consumes a body |
+| `Blocked::Streams` | HTTP/2 only: a free stream slot. Your code closes a stream that a reset ended, when its handler ends. The HTTP/1.1 engines never give it |
 
 Wait only for the cause that `blocked` names. A socket can almost always take output, so a loop
 that also waits for that while the engine waits for input wakes at once, again and again. Write

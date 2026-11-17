@@ -505,6 +505,10 @@ pub enum Blocked {
     Output,
     /// This many more bytes of capacity.
     Capacity(u64),
+    /// A free stream slot: the engine reads no new stream of the peer until the application
+    /// closes a stream that a reset ended, with
+    /// [`h2::Connection::close`](crate::h2::Connection::close).
+    Streams,
 }
 
 /// The error of an engine or a binding: a [`Kind`], which names the recovery, and a fixed reason.

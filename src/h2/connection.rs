@@ -124,7 +124,8 @@ pub enum Event<'l> {
         /// The frame had the flag END_STREAM, and this is its last event: the body is complete.
         end_stream: bool,
     },
-    /// RST_STREAM: the peer ended a stream.
+    /// RST_STREAM: the peer ended a stream. The stream keeps its slot until
+    /// [`Connection::close`], when its handler ends.
     Reset {
         /// The stream.
         stream: u32,
@@ -153,7 +154,8 @@ pub enum Event<'l> {
     },
     /// A frame of the peer on a stream is a stream error (RFC 9113, section 5.4.2), for example
     /// DATA past the stream window. The connection reset the stream with RST_STREAM of the code,
-    /// and the stream ended. Its body is malformed.
+    /// and the stream ended. Its body is malformed. The stream keeps its slot until
+    /// [`Connection::close`], when its handler ends.
     StreamError {
         /// The stream.
         stream: u32,
@@ -243,6 +245,9 @@ struct Carry {
 struct Assembly {
     stream: u32,
     end_stream: bool,
+    /// The bytes of the fragments, and 9 bytes for each CONTINUATION frame: the size that the
+    /// block bound `work` limits. Thus empty CONTINUATION frames cannot continue a block forever.
+    size: usize,
     /// The fragments, when the block does not decode in place.
     join: Option<Join>,
 }
@@ -693,6 +698,17 @@ impl Connection {
         Ok(())
     }
 
+    /// Closes `stream`, which a reset ended, when its handler ends: after [`Event::Reset`] or
+    /// [`Event::StreamError`]. Until then, the stream keeps its slot in the stream table, so a
+    /// peer that opens and resets streams at line rate starts at most `max_concurrent_streams`
+    /// handlers (CVE-2023-44487). It sends nothing.
+    ///
+    /// Refuses, and changes nothing, when no reset holds the slot of the stream: the stream is
+    /// open, or it was closed.
+    pub fn close(&mut self, stream: u32) -> Result<(), Error> {
+        self.streams.free(stream)
+    }
+
     /// Releases `bytes` data bytes of `stream` that the consumer is done with: the bytes of
     /// [`Event::Data`] that it copied out or dropped. The connection gives their credit back to
     /// the peer at the stream and the connection level, with a WINDOW_UPDATE when the free
@@ -910,9 +926,13 @@ impl Connection {
                         return Ok(self.wait(inbound, boundary));
                     }
                     let head = Head::parse(self.carry.bytes);
+                    let fixed = self.begin(&head)?;
+                    if head.kind == Kind::Headers && self.streams.waits(head.stream) {
+                        // The header stays in the carry, and a later drive reads it again.
+                        return Ok(Next::Wait(Blocked::Streams));
+                    }
                     self.carry.len = 0;
                     work.add(0, 1);
-                    let fixed = self.begin(&head)?;
                     self.read = Read::Fixed(head, fixed);
                 }
                 Read::Fixed(head, len) => {
@@ -1130,24 +1150,29 @@ impl Connection {
                 }
             }
             Fixed::Headers { .. } | Fixed::Continuation => {
-                let joined = self
+                // A CONTINUATION frame follows a HEADERS frame of its block (`begin`).
+                let size = self
                     .block
                     .as_ref()
-                    .and_then(|block| block.join.as_ref())
-                    .map_or(0, |join| join.bytes.len());
-                if joined.saturating_add(variable as usize) > self.header.work {
+                    .map_or(0, |block| block.size.saturating_add(HEAD))
+                    .saturating_add(variable as usize);
+                if size > self.header.work {
                     return Err(Fault {
                         code: ErrorCode::COMPRESSION_ERROR,
                         kind: ErrorKind::Overload,
                         reason: "a header block is larger than its bound",
                     });
                 }
-                if head.kind == Kind::Headers {
-                    self.block = Some(Assembly {
-                        stream: head.stream,
-                        end_stream: head.flags & END_STREAM != 0,
-                        join: None,
-                    });
+                match &mut self.block {
+                    Some(block) => block.size = size,
+                    None => {
+                        self.block = Some(Assembly {
+                            stream: head.stream,
+                            end_stream: head.flags & END_STREAM != 0,
+                            size,
+                            join: None,
+                        });
+                    }
                 }
                 None
             }

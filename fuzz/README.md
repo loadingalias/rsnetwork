@@ -15,7 +15,7 @@ writes. The module documentation of each target gives its input format and its c
 | `chunked` | `h1::ChunkDecoder` | Pieces give the result of the whole input. No step allocates. The data and the trailers stay in their limits. |
 | `values` | The constructors of `value`, `write_request`, `write_head`, `RequestParser`, and `ResponseParser` | No constructor allocates. A host name obeys its rules. Each accepted value passes through a writer and a parser with no change. |
 | `hpack` | `hpack::Decoder` and `hpack::Encoder` | No decode allocates or changes the charge. The lines of a block stay in the list limit. A decoder that fails gives the same error for each later block. The encoder sends each decoded block to a second decoder, which reads the same lines and marks. |
-| `h2` | `h2::Connection`, with its stream layer, `hpack::Decoder`, and the frame codec | A cut input gives the events, the output, and the end of the whole input. No drive allocates past the work limit. Each charge returns when the connection drops. No frame follows a GOAWAY, and a connection error ends with one. A body goes up only on a stream after its header section and before its end, and no event follows a reset. No frame follows a reset of the endpoint, and no reset goes on an idle stream. The WINDOW_UPDATE frames of each stream and of the connection give back at most the DATA bytes of the input. The last stream of a GOAWAY never increases. |
+| `h2` | `h2::Connection`, with its stream layer, `hpack::Decoder`, and the frame codec | A cut input gives the events, the output, and the end of the whole input. No drive allocates past the work limit. Each charge returns when the connection drops. No frame follows a GOAWAY, and a connection error ends with one. A body goes up only on a stream after its header section and before its end, and no event follows a reset. No frame follows a reset of the endpoint, and no reset goes on an idle stream. The WINDOW_UPDATE frames of each stream and of the connection give back at most the DATA bytes of the input. The last stream of a GOAWAY never increases. A server has at most 4 handlers in flight: a stream that a reset ended keeps its slot until the target closes it, at the wait for a free slot. |
 | `differential` | `RequestParser` and `ChunkDecoder`, against `httparse` | Each head that rsnetwork accepts has the same method, target, version, field lines, and length for `httparse`. Each chunked body after it has the same data, trailer section, and length. |
 
 The transport checks the bounds of [Bound the memory and the work of a connection](../docs/content/limits.md)
@@ -74,7 +74,8 @@ two control bytes of the target.
 The seeds of `h2` are frame sequences that follow the figures of RFC 9113, section 6, with the
 blocks of RFC 7541, C.3.1 and C.4. Each name gives the RFC section that it exercises. The seeds of
 sections 5.1, 5.1.2, 6.8, 6.9, and 8.1 pass the stream states, the stream limit, GOAWAY, the
-windows, and the parts of a message.
+windows, and the parts of a message. The seeds of section 10.5 are floods: streams that open and
+reset at line rate, past the 4 slots, and empty CONTINUATION frames past a work limit of 64 bytes.
 
 `differential` has no control bytes and no seeds of its own. Its corpus starts from the seeds of
 `request` and `chunked`, with their control bytes removed and a chunked request head before each
@@ -338,3 +339,25 @@ result when it ends.
   a padded DATA frame, and the target did not count that frame, which the connection counts at its
   header (RFC 9113, section 6.9.1). The target now counts it, and the input is the seed
   `rfc9113-6.9.1-padding-of-a-cut-frame`. Limit: the working corpus stayed on the discarded host.
+
+### N203: HTTP/2 floods
+
+- Risk: a frame sequence that starts more handlers than the stream limit, because a reset frees a
+  slot before the consumer closes it or a new stream takes a held slot. A wait for a slot that no
+  reset holds, or a wait at another frame in a cut input. A panic, an allocation past the work
+  limit, or a charge that does not return, on the paths of held slots and of CONTINUATION frames
+  that count toward the block bound.
+- Code: the commit of N203, on the toolchain of `rust-toolchain.toml`, with the `libfuzzer-sys`
+  closure of N009. The target adds no dependency. A server takes 4 streams, so a short input can
+  reset more streams than the slots.
+- Host, budget, stop condition, and command: as for N210, on one `aws-linux-arm64-ubuntu2604`
+  host. That is `-fork=14 -max_total_time=1200` with AddressSanitizer, 20 minutes, and a lease of
+  45 minutes. Stop at the time budget, or at the first crash, failed assertion, leak, timeout, or
+  out-of-memory error.
+- Result (2026-11-17): pass. Run `20261117T055844Z-70390` at `be9ecce`, whose code is the code of
+  the N203 commit, on c8g.4xlarge, `ami-06b1a03fa3561aefb`, Linux `7.0.0-1016-aws` aarch64, and
+  `rustc 1.101.0-nightly (3e92e1a2d 2026-11-01)`. The target ran its full budget: 1211 seconds in
+  176 jobs, 20,182,778 runs, `cov` 1925, `ft` 7013, and a corpus of 831. It had 0 crashes, failed
+  assertions, leaks, timeouts, and out-of-memory errors, and it wrote no artifact. `dev-machine
+  status rsnetwork` then showed no instance and no volume. Limit: the working corpus stayed on the
+  discarded host.

@@ -9,6 +9,10 @@
 //! then the connection ends. A stream error resets its stream. Server push is off: a client sends
 //! `SETTINGS_ENABLE_PUSH` 0, and a PUSH_PROMISE is a connection error in each role.
 //!
+//! A stream that a reset ended keeps its slot in the stream table until the application closes
+//! it, when its handler ends. Thus a peer that opens and resets streams at line rate starts at
+//! most `SETTINGS_MAX_CONCURRENT_STREAMS` handlers at a time (CVE-2023-44487).
+//!
 //! The engine reads frames in place in the received regions: a DATA payload goes up as views of
 //! the regions, with no copy. A header block in one HEADERS frame inside one region decodes in
 //! place. Other blocks join into one buffer that the caller's budget pays for, because the HPACK
@@ -176,9 +180,11 @@ pub struct Limits {
     /// `header_table_size` and a list limit of `max_header_list_size`, so give a list limit that
     /// the budget can pay for. The connection refuses each frame larger than `max_frame_size`.
     pub settings: Settings,
-    /// The most work of one header block, and the largest header block. The work is the bytes of
-    /// the block and each byte that the HPACK decoder copies. A block of HEADERS and CONTINUATION
-    /// fragments past it ends the connection before the connection copies it.
+    /// The most work of one header block, and the largest header block. The size of a block is
+    /// the bytes of its fragments and 9 bytes for each CONTINUATION frame, so empty CONTINUATION
+    /// frames cannot continue a block forever. The work is the bytes of the block and each byte
+    /// that the HPACK decoder copies. A block past it ends the connection at the header of the
+    /// frame that passes it, before the connection copies it.
     pub work: usize,
     /// The largest dynamic table of the HPACK encoder. The encoder uses at most the smaller of it
     /// and the peer's `SETTINGS_HEADER_TABLE_SIZE`.

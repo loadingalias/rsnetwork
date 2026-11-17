@@ -1,8 +1,8 @@
 //! The contracts of the HTTP/2 engine: the preface, SETTINGS and their acknowledgement, PING,
 //! GOAWAY and drain, header blocks across CONTINUATION frames, each connection error with its RFC
-//! 9113 code, frames that parse in place, the stream states, and flow control at both levels.
-//! Each expected byte and code comes from RFC 9113 or RFC 7541, as each test states, not from the
-//! code under test.
+//! 9113 code, frames that parse in place, the stream states, flow control at both levels, and the
+//! bounds of floods. Each expected byte, code, and count comes from RFC 9113, RFC 7541, or a
+//! declared limit, as each test states, not from the code under test.
 
 use core::assert_matches;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -314,6 +314,28 @@ impl Peer {
         self.connection
             .release(&mut self.outbound, stream, bytes)
             .map_err(|error| error.kind())
+    }
+
+    /// Drives until the connection waits or ends, and gives the number of events and the last
+    /// progress. It copies no event, so the drives allocate only what the connection allocates.
+    fn flood(&mut self) -> (usize, Progress) {
+        let mut events = 0;
+        for _ in 0..100_000 {
+            let (event, turn) = self
+                .connection
+                .drive(&mut self.inbound, &mut self.outbound, &mut self.lines, self.now);
+            match (event, turn.progress) {
+                (Some(_), _) => events += 1,
+                (None, Progress::Pending) => {}
+                (None, progress) => return (events, progress),
+            }
+        }
+        panic!("the connection makes no progress")
+    }
+
+    /// The received bytes that the connection did not read.
+    fn unread(&self) -> usize {
+        self.inbound.front().map_or(0, |front| front.region.initialized())
     }
 
     /// The bytes of each output, which the transport accepts in full.
@@ -1249,17 +1271,15 @@ fn a_refused_stream_still_updates_hpack_state_and_the_next_stream_decodes() {
     // The peer cannot know the limit before it acknowledges the settings, so the code permits a
     // retry (section 8.7).
     assert_eq!(server.sent(), [rst(3, refused), rst(5, refused)].concat());
-    // Indices 62 and 63 are the two newest entries (RFC 7541, section 2.3.3).
+    // Indices 62 and 63 are the two newest entries (RFC 7541, section 2.3.3). Stream 7 waits for
+    // the slot of stream 1 until the handler of stream 1 ends.
+    let slot = Progress::Blocked(Blocked::Streams);
     server.receive(&[rst(1, ErrorCode::CANCEL), frame(0x1, 0x5, 7, b"\xbe\xbf")].concat());
+    assert_eq!(server.run(), (vec![Seen::Reset(1, ErrorCode::CANCEL)], slot));
+    server.connection.close(1).expect("a reset holds the slot");
     assert_eq!(
         server.run(),
-        (
-            vec![
-                Seen::Reset(1, ErrorCode::CANCEL),
-                Seen::Headers(7, true, lines(&[("x-b", "w"), ("x-a", "v")])),
-            ],
-            WAIT
-        )
+        (vec![Seen::Headers(7, true, lines(&[("x-b", "w"), ("x-a", "v")]))], WAIT)
     );
     // After the acknowledgement, the peer knows the limit: PROTOCOL_ERROR. Stream 9 adds
     // `x-c: u`, and stream 11 reads it.
@@ -1272,15 +1292,11 @@ fn a_refused_stream_still_updates_hpack_state_and_the_next_stream_decodes() {
         ]
         .concat(),
     );
+    assert_eq!(server.run(), (vec![Seen::Reset(7, ErrorCode::CANCEL)], slot));
+    server.connection.close(7).expect("a reset holds the slot");
     assert_eq!(
         server.run(),
-        (
-            vec![
-                Seen::Reset(7, ErrorCode::CANCEL),
-                Seen::Headers(11, true, lines(&[("x-c", "u")])),
-            ],
-            WAIT
-        )
+        (vec![Seen::Headers(11, true, lines(&[("x-c", "u")]))], WAIT)
     );
     // The last stream of the GOAWAY is 11, which went up, and not the refused stream 13.
     server.receive(&[frame(0x1, 0x5, 13, STATIC), frame(0x6, 0, 1, &[0; 8])].concat());
@@ -1658,4 +1674,258 @@ fn a_server_shutdown_drains_accepted_streams_and_discards_later_ones() {
     let (events, progress) = server.run();
     assert_eq!(events, [Seen::Data(1, Vec::new(), true)]);
     assert_eq!(progress, Progress::Terminal(Ok(())));
+}
+
+/// A flood of empty CONTINUATION frames ends at the block bound (RFC 9113, section 10.5). Each
+/// CONTINUATION frame counts 9 bytes toward `limits.work`, so the 7,282nd empty frame takes the
+/// block past 65,536 bytes (65,536 / 9 = 7,281.8), and the connection ends with
+/// COMPRESSION_ERROR, the error of a block that it does not decode (section 4.3). The flood
+/// allocates nothing and keeps no charge.
+#[test]
+fn a_continuation_flood_ends_at_the_block_bound() {
+    let mut server = Peer::server();
+    let available = server.budget.available();
+    // A HEADERS frame with an empty fragment and no END_HEADERS, and empty CONTINUATION frames.
+    let empty = frame(0x9, 0, 1, b"");
+    server.receive(&[frame(0x1, 0, 1, b""), empty.repeat(100_000)].concat());
+    let ((events, progress), count) = allocations(|| server.flood());
+    assert_eq!(count, 0);
+    assert_eq!(events, 0);
+    ended(progress, Kind::Overload);
+    assert_eq!(server.budget.available(), available);
+    assert_eq!(server.unread(), (100_000 - 7_282) * 9);
+    assert_eq!(server.sent(), goaway(0, ErrorCode::COMPRESSION_ERROR));
+}
+
+/// A peer that sends PING and SETTINGS frames at line rate and reads nothing (the PING flood and
+/// the SETTINGS flood of CVE-2019-9512 and CVE-2019-9515) gets one answer for each entry of the
+/// output queue, and one more, which waits in the connection. Then the connection reads no frame.
+/// The answers come from static bytes and the frame pool, which `new` charged, so the flood
+/// allocates nothing and charges nothing. When the peer reads, each frame gets its answer in its
+/// order (RFC 9113, sections 6.5.3 and 6.7).
+#[test]
+fn an_answer_flood_from_a_peer_that_does_not_read_stops_at_the_output_queue() {
+    let mut server = Peer::acknowledged(LIMITS);
+    let available = server.budget.available();
+    let ping = frame(0x6, 0, 0, b"12345678");
+    // SETTINGS_INITIAL_WINDOW_SIZE of 65,535, its initial value.
+    let settings = frame(0x4, 0, 0, b"\x00\x04\x00\x00\xff\xff");
+    server.receive(&[ping, settings].concat().repeat(10_000));
+    let ((events, progress), count) = allocations(|| server.flood());
+    assert_eq!(count, 0);
+    assert_eq!(progress, Progress::Blocked(Blocked::Output));
+    // The queue of 64 entries holds 64 answers, and the answer to the 65th frame waits: 33 PING
+    // frames of 17 bytes and 32 SETTINGS frames of 15 bytes, each with its event.
+    assert_eq!(server.outbound.outstanding().regions, 64);
+    assert_eq!(server.unread(), 10_000 * 32 - (33 * 17 + 32 * 15));
+    assert_eq!(events, 32);
+    assert_eq!(server.budget.available(), available);
+    let pong = frame(0x6, 0x1, 0, b"12345678");
+    let mut sent = Vec::new();
+    loop {
+        sent.extend(server.sent());
+        if server.flood().1 == WAIT {
+            break;
+        }
+    }
+    sent.extend(server.sent());
+    assert_eq!(sent, [pong, SETTINGS_ACK.to_vec()].concat().repeat(10_000));
+}
+
+/// Each control flood at line rate, from a peer that reads each answer (RFC 9113, section 10.5):
+/// 10,000 frames of one kind. The empty frames are the flood of CVE-2019-9518. Each frame counts
+/// toward the frame limit of the turn, 1024. An event ends the turn, and an answer that the output
+/// queue of 64 entries has no room for ends it too. The flood keeps its state at the charges of
+/// `new`: it allocates nothing and charges nothing. Each PING and SETTINGS frame gets its answer,
+/// and no other frame gets one.
+#[test]
+fn each_control_flood_keeps_the_charges_of_new_and_the_frame_limit_of_each_turn() {
+    let ping = frame(0x6, 0, 0, b"12345678");
+    // SETTINGS_INITIAL_WINDOW_SIZE of 65,535, its initial value.
+    let settings = frame(0x4, 0, 0, b"\x00\x04\x00\x00\xff\xff");
+    let pong = frame(0x6, 0x1, 0, b"12345678");
+    // Each flood: its frame, the most frames of one turn, and the answer to each frame.
+    let floods: [(&str, Vec<u8>, usize, &[u8]); 7] = [
+        ("PING", ping, 65, &pong),
+        ("SETTINGS", settings, 1, SETTINGS_ACK),
+        ("WINDOW_UPDATE on the connection", window_update(0, 1), 1, b""),
+        ("WINDOW_UPDATE on a closed stream", window_update(1, 1), 1024, b""),
+        ("PRIORITY on an idle stream", priority(5), 1024, b""),
+        ("empty DATA on an open stream", data(3, false, b""), 1024, b""),
+        ("a frame of an unknown type", frame(0xfa, 0, 0, b""), 1024, b""),
+    ];
+    for (flood, bytes, most, answer) in floods {
+        let mut server = Peer::acknowledged(LIMITS);
+        // Stream 3 opens, so stream 1 is closed (RFC 9113, section 5.1.1).
+        server.receive(&request(3, false));
+        assert_eq!(server.run().0.len(), 1, "{flood}: a request");
+        let available = server.budget.available();
+        server.receive(&bytes.repeat(10_000));
+        let mut sent = Vec::new();
+        while server.unread() > 0 {
+            let before = server.unread();
+            let (progress, count) = allocations(|| {
+                server
+                    .connection
+                    .drive(&mut server.inbound, &mut server.outbound, &mut server.lines, NOW)
+                    .1
+                    .progress
+            });
+            assert_eq!(count, 0, "{flood}");
+            assert!(
+                progress != WAIT || server.unread() == 0,
+                "{flood}: the connection waits with unread frames"
+            );
+            let read = (before - server.unread()) / bytes.len();
+            assert!(read <= most, "{flood}: {read} frames in one turn");
+            sent.extend(server.sent());
+        }
+        assert_eq!(server.drive(), (None, WAIT), "{flood}");
+        sent.extend(server.sent());
+        assert_eq!(sent, answer.repeat(10_000), "{flood}");
+        assert_eq!(server.budget.available(), available, "{flood}");
+    }
+}
+
+/// A connection that waits for a free slot reads nothing behind the HEADERS frame of the new
+/// stream: a PING after it waits too. When the handler of the reset stream ends, the connection
+/// takes the new stream, and then answers the PING (RFC 9113, section 6.7).
+#[test]
+fn a_connection_that_waits_for_a_slot_goes_on_after_a_close() {
+    let limits = Limits {
+        settings: Settings {
+            max_concurrent_streams: 1,
+            ..SETTINGS
+        },
+        ..LIMITS
+    };
+    let mut server = Peer::acknowledged(limits);
+    let ping = frame(0x6, 0, 0, b"12345678");
+    server.receive(&[request(1, false), rst(1, ErrorCode::CANCEL), request(3, true), ping].concat());
+    let (events, progress) = server.run();
+    assert_eq!(events.len(), 2, "the request and its reset");
+    assert_eq!(events[1], Seen::Reset(1, ErrorCode::CANCEL));
+    assert_eq!(progress, Progress::Blocked(Blocked::Streams));
+    assert_eq!(server.sent(), b"", "the PING waits");
+    server.connection.close(1).expect("a reset holds the slot");
+    assert_eq!(server.run(), (vec![Seen::Headers(3, true, lines(&C31_LINES))], WAIT));
+    assert_eq!(server.sent(), frame(0x6, 0x1, 0, b"12345678"));
+}
+
+/// A stream that the application ends frees its slot at once, with no `close`: a stream whose two
+/// sides sent END_STREAM, and a stream that the application resets. `close` refuses each of them,
+/// because no reset holds their slots.
+#[test]
+fn a_stream_that_the_application_ends_frees_its_slot_at_once() {
+    let limits = Limits {
+        settings: Settings {
+            max_concurrent_streams: 1,
+            ..SETTINGS
+        },
+        ..LIMITS
+    };
+    let mut server = Peer::acknowledged(limits);
+    server.receive(&request(1, true));
+    assert_eq!(server.run().0.len(), 1, "a request");
+    assert_eq!(server.section(1, ":status", "200", true), Ok(()));
+    server.receive(&request(3, false));
+    assert_eq!(server.run(), (vec![Seen::Headers(3, false, lines(&C31_LINES))], WAIT));
+    server
+        .connection
+        .reset(&mut server.outbound, 3, ErrorCode::CANCEL)
+        .expect("the queue has room");
+    server.receive(&request(5, true));
+    assert_eq!(server.run(), (vec![Seen::Headers(5, true, lines(&C31_LINES))], WAIT));
+    for stream in [1, 3] {
+        let closed = server.connection.close(stream).map_err(|error| error.kind());
+        assert_eq!(closed, Err(Kind::Misuse), "stream {stream}");
+    }
+}
+
+/// Drives `server` until it waits or ends, and gives the last progress. It adds the stream of
+/// each `Headers` event (each handler start) to `started`, and of each reset to `reset`.
+fn starts(server: &mut Peer, started: &mut Vec<u32>, reset: &mut Vec<u32>) -> Progress {
+    for _ in 0..100_000 {
+        let (event, turn) = server
+            .connection
+            .drive(&mut server.inbound, &mut server.outbound, &mut server.lines, NOW);
+        match (event, turn.progress) {
+            (Some(Event::Headers { stream, .. }), _) => started.push(stream),
+            (Some(Event::Reset { stream, .. } | Event::StreamError { stream, .. }), _) => reset.push(stream),
+            (Some(_), _) | (None, Progress::Pending) => {}
+            (None, progress) => return progress,
+        }
+    }
+    panic!("the connection makes no progress")
+}
+
+/// Rapid reset (CVE-2023-44487): a client opens streams and resets them at line rate. A stream
+/// that a reset ended keeps its slot until the application closes it, when its handler ends, so
+/// the handlers in flight never pass `max_concurrent_streams`, 100: the rule of Go. The client can
+/// also make the server reset its streams with a stream error (CVE-2025-8671): here each second
+/// stream gets a WINDOW_UPDATE of 0, a stream error PROTOCOL_ERROR (RFC 9113, section 6.9). The
+/// client is within its limit, so the server refuses no stream: its input waits for a free slot.
+/// The flood allocates nothing and charges nothing.
+#[test]
+fn a_rapid_reset_flood_starts_no_more_handlers_than_the_stream_limit() {
+    let mut server = Peer::acknowledged(LIMITS);
+    let available = server.budget.available();
+    let flood: Vec<u8> = (0..10_000)
+        .flat_map(|n: u32| {
+            let stream = 2 * n + 1;
+            let end = if n.is_multiple_of(2) {
+                rst(stream, ErrorCode::CANCEL)
+            } else {
+                window_update(stream, 0)
+            };
+            [request(stream, false), end].concat()
+        })
+        .collect();
+    server.receive(&flood);
+    let (mut started, mut reset) = (Vec::with_capacity(10_000), Vec::with_capacity(10_000));
+    let (progress, count) = allocations(|| starts(&mut server, &mut started, &mut reset));
+    let first: Vec<u32> = (0..100).map(|n| 2 * n + 1).collect();
+    assert_eq!(started, first, "the handler starts");
+    assert_eq!(reset, first);
+    assert_eq!(progress, Progress::Blocked(Blocked::Streams));
+    assert_eq!(count, 0);
+    assert_eq!(server.budget.available(), available);
+    // The server reset each stream with a WINDOW_UPDATE of 0.
+    let errors: Vec<u8> = (0..50)
+        .flat_map(|n| rst(4 * n + 3, ErrorCode::PROTOCOL_ERROR))
+        .collect();
+    assert_eq!(server.sent(), errors);
+    // The handler of stream 1 ends, so exactly one more handler starts, and its stream resets.
+    assert_eq!(server.connection.close(1).map_err(|error| error.kind()), Ok(()));
+    assert_eq!(
+        server.connection.close(1).map_err(|error| error.kind()),
+        Err(Kind::Misuse)
+    );
+    let mut held = reset.split_off(1);
+    reset.clear();
+    started.clear();
+    let progress = starts(&mut server, &mut started, &mut reset);
+    assert_eq!(
+        (&started[..], &reset[..], progress),
+        (&[201][..], &[201][..], Progress::Blocked(Blocked::Streams))
+    );
+    // Each handler ends when its stream resets: the flood goes on, at most 100 handlers at a
+    // time, and each stream gets its handler.
+    held.append(&mut reset);
+    let mut handled = 101;
+    loop {
+        for stream in held.drain(..) {
+            server.connection.close(stream).expect("a reset holds the slot");
+        }
+        server.sent();
+        started.clear();
+        let progress = starts(&mut server, &mut started, &mut held);
+        assert!(started.len() <= 100, "{} handlers in flight", started.len());
+        assert_eq!(started, held);
+        handled += started.len();
+        if progress == WAIT {
+            break;
+        }
+    }
+    assert_eq!(handled, 10_000);
 }

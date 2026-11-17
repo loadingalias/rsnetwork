@@ -133,6 +133,7 @@ Each drive gives a `Turn`:
 | `Blocked(Blocked::Input)` | Receive more bytes, then drive again |
 | `Blocked(Blocked::Output)` | Acknowledge the outstanding output, then drive again |
 | `Blocked(Blocked::Capacity(n))` | Admit `n` more bytes of capacity, then drive again |
+| `Blocked(Blocked::Streams)` | Close each HTTP/2 stream that a reset ended and whose handler ended, then drive again. See [handler slots](http2.md#handler-slots) |
 | `Pending` | The engine gave an event, or it stopped at a [turn limit](limits.md) with more work. Drive it again with no wait |
 | `Terminal(Ok(()))` | The engine completed |
 | `Terminal(Err(error))` | The engine failed. See [errors](errors.md) |

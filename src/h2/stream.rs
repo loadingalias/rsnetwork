@@ -9,6 +9,11 @@
 //! keeps no state, and each frame on it gets the minimal processing of section 5.1: its header
 //! block decodes and is discarded, its DATA counts toward the connection window and is
 //! discarded, and other frames change nothing.
+//!
+//! A stream that a reset closed keeps only its identifier, which holds its slot: the open and the
+//! held streams together stay within the endpoint's `SETTINGS_MAX_CONCURRENT_STREAMS`. The slot is
+//! free when the application closes the stream, after its handler ended. Thus the handlers in
+//! flight never pass the limit, however fast the peer opens and resets streams.
 
 use core::alloc::Layout;
 
@@ -149,7 +154,12 @@ pub(super) struct Streams {
     role: Role,
     /// The open and half-closed streams, in the order of their identifiers.
     table: Vec<Stream>,
-    /// The most entries of the table: the endpoint's `SETTINGS_MAX_CONCURRENT_STREAMS`.
+    /// The streams that a reset ended, whose handlers did not end. Each keeps its slot until the
+    /// application closes it, so a peer that resets streams starts no more handlers than the
+    /// limit (CVE-2023-44487), also when it makes the endpoint reset them (CVE-2025-8671).
+    held: Vec<u32>,
+    /// The most streams of the table and of `held` together: the endpoint's
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS`.
     limit: usize,
     _charge: Permit,
     /// The highest stream identifier that the client used. Each client stream at or below it
@@ -175,21 +185,26 @@ pub(super) struct Streams {
 impl Streams {
     /// Makes the streams of a connection of `role` with the endpoint's settings `local` and a
     /// connection receive window of `connection_window`. It charges a table of
-    /// `max_concurrent_streams` entries to `budget` before it allocates it.
+    /// `max_concurrent_streams` entries, and as many held identifiers, to `budget` before it
+    /// allocates them.
     pub(super) fn new(role: Role, local: &Settings, connection_window: u32, budget: &Budget) -> Result<Self, Error> {
         let limit = usize::try_from(local.max_concurrent_streams).unwrap_or(usize::MAX);
         let too_large = Error::new(Kind::Overload, "the stream table is too large");
-        let bytes = Layout::array::<Stream>(limit).map_err(|_| too_large)?.size();
+        let bytes = Layout::array::<Stream>(limit)
+            .and_then(|table| Ok(table.extend(Layout::array::<u32>(limit)?)?.0.size()))
+            .map_err(|_| too_large)?;
         let charge = budget
             .reserve(u64::try_from(bytes).map_err(|_| too_large)?)
             .map_err(|_| Error::new(Kind::Overload, "the budget refused the stream table"))?;
-        let mut table = Vec::new();
+        let (mut table, mut held) = (Vec::new(), Vec::new());
         table
             .try_reserve_exact(limit)
+            .and_then(|()| held.try_reserve_exact(limit))
             .map_err(|_| Error::new(Kind::Overload, "the memory for the stream table is not available"))?;
         Ok(Self {
             role,
             table,
+            held,
             limit,
             _charge: charge,
             highest: 0,
@@ -230,6 +245,27 @@ impl Streams {
         }
     }
 
+    /// Ends the stream at `index` with a reset of the peer or of the endpoint. The stream is
+    /// closed, and its slot stays held until the application closes it.
+    fn hold(&mut self, index: usize) {
+        let stream = self.table.remove(index);
+        assert!(
+            self.table.len() + self.held.len() < self.limit,
+            "the open and the held streams together fit in the limit"
+        );
+        self.held.push(stream.id);
+    }
+
+    /// Frees the slot of stream `id`, which a reset ended, when its handler ended.
+    pub(super) fn free(&mut self, id: u32) -> Result<(), Error> {
+        let index = self.held.iter().position(|&held| held == id).ok_or(Error::new(
+            Kind::Misuse,
+            "the stream holds no slot: no reset ended it, or it was closed",
+        ))?;
+        self.held.swap_remove(index);
+        Ok(())
+    }
+
     /// Acts on a decoded header block on stream `id`, whose first line is `first`. `acknowledged`
     /// tells whether the peer acknowledged the endpoint's settings, so that it knows the
     /// concurrency limit.
@@ -262,11 +298,22 @@ impl Streams {
                 stream.receiving = part;
                 self.close_done(index);
             }
-            None => {
-                self.table.remove(index);
-            }
+            None => self.hold(index),
         }
         Ok(section)
+    }
+
+    /// Whether a HEADERS frame on stream `id` opens a new stream of the peer that must wait for
+    /// a free slot: the peer is within its limit, and streams that a reset ended hold the other
+    /// slots. A stream that the endpoint discards after its GOAWAY needs no slot.
+    pub(super) fn waits(&self, id: u32) -> bool {
+        let discarded = matches!(self.drain, Drain::Sent(last) if id > last);
+        self.role == Role::Server
+            && !id.is_multiple_of(2)
+            && id > self.highest
+            && !discarded
+            && self.table.len() < self.limit
+            && self.table.len() + self.held.len() >= self.limit
     }
 
     /// Acts on a header block on a stream with no entry: a new stream of the client on a server,
@@ -298,6 +345,10 @@ impl Streams {
                 ErrorCode::REFUSED_STREAM
             }));
         }
+        assert!(
+            self.table.len() + self.held.len() < self.limit,
+            "a new stream waits at its HEADERS frame until a slot is free"
+        );
         self.table.push(Stream {
             id,
             sending: Part::Head,
@@ -346,7 +397,7 @@ impl Streams {
                 };
                 match code {
                     Some(code) => {
-                        self.table.remove(index);
+                        self.hold(index);
                         Flow::Reset(code)
                     }
                     None => {
@@ -398,7 +449,7 @@ impl Streams {
                 "RST_STREAM came on an idle stream",
             ));
         }
-        Ok(self.find(id).map(|index| self.table.remove(index)).is_some())
+        Ok(self.find(id).map(|index| self.hold(index)).is_some())
     }
 
     /// Acts on a WINDOW_UPDATE of `increment` on stream `id`, or on the connection for 0
@@ -428,7 +479,7 @@ impl Streams {
         };
         let stream = &mut self.table[index];
         if stream.window + increment > MAX {
-            self.table.remove(index);
+            self.hold(index);
             return Ok(Some(Err(ErrorCode::FLOW_CONTROL_ERROR)));
         }
         stream.window += increment;
@@ -444,7 +495,7 @@ impl Streams {
                 "WINDOW_UPDATE came on an idle stream",
             ));
         }
-        Ok(self.find(id).map(|index| self.table.remove(index)).is_some())
+        Ok(self.find(id).map(|index| self.hold(index)).is_some())
     }
 
     /// Applies the peer's `SETTINGS_INITIAL_WINDOW_SIZE` of `initial` at the end of a SETTINGS
@@ -519,6 +570,12 @@ impl Streams {
         }
         if self.table.len() >= self.limit.min(usize::try_from(peer_limit).unwrap_or(usize::MAX)) {
             return Err(Error::new(Kind::Overload, "the connection has its most streams open"));
+        }
+        if self.table.len() + self.held.len() >= self.limit {
+            return Err(Error::new(
+                Kind::Overload,
+                "each free stream is held by a reset stream: close it when its handler ends",
+            ));
         }
         let id = if self.highest == 0 { 1 } else { self.highest + 2 };
         if id > MAX_STREAM {

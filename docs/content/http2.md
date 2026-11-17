@@ -24,7 +24,8 @@ message.
 2. Your host pushes each received region into an `Inbound` queue.
 3. Each `drive` call reads the queued frames in place and gives one `Event`, or none.
 4. You answer with `open`, `headers`, `data`, `reset`, `release`, `ping`, and `shutdown`, which
-   push frames into the `Outbound` queue.
+   push frames into the `Outbound` queue. When the handler of a reset stream ends, you call
+   `close`.
 5. The host sends each `Output` and acknowledges the bytes that the transport accepted.
 6. When the drive gives a terminal turn, the host sends the rest of the `Outbound` queue and closes
    the connection.
@@ -171,8 +172,8 @@ header block that gives no event ends the turn as `Pending`: drive again with no
 | `Headers { stream, end_stream, lines }` | A header section: HEADERS and its CONTINUATION frames, decoded | For a server, a request on a new stream. For a client, an interim (1xx) response or the final response. `end_stream` tells that the message has no body. `lines` is `None` when the decoded lines are larger than `max_header_list_size`: refuse the stream, for example with a 431 response (RFC 9113, section 10.5.1) |
 | `Trailers { stream, lines }` | The trailer section: a header block with END_STREAM after the header section | The body is complete. `lines` is `None` when the lines are too large: the message is not complete |
 | `Data { stream, data, end_stream }` | A DATA frame | `data` is a view of a received region, with no padding. A frame gives one event for each region that holds its bytes. `end_stream` is on the last event of the frame that ends the body. Call `release` when the consumer is done with the bytes |
-| `Reset { stream, code }` | RST_STREAM of the peer | The stream ended. End its body with `Outcome::Reset` |
-| `StreamError { stream, code }` | A frame that is a stream error | The connection reset the stream with RST_STREAM of `code`. The body is malformed. See [stream errors](#stream-errors) |
+| `Reset { stream, code }` | RST_STREAM of the peer | The stream ended. End its body with `Outcome::Reset`. Call `close(stream)` when its handler ends: see [handler slots](#handler-slots) |
+| `StreamError { stream, code }` | A frame that is a stream error | The connection reset the stream with RST_STREAM of `code`. The body is malformed. Call `close(stream)` when its handler ends. See [stream errors](#stream-errors) |
 | `WindowUpdate { stream, increment }` | WINDOW_UPDATE | The peer gave more send credit: send the rest of a body. Stream 0 is the connection |
 | `Settings(settings)` | SETTINGS | The peer's settings now in effect |
 | `PingAck(opaque)` | PING with the flag ACK | The answer to your `ping` |
@@ -190,6 +191,11 @@ A header block is a HEADERS frame and the CONTINUATION frames after it, up to th
 END_HEADERS. The connection decodes each block, also of a stream that it refuses or that is
 closed, so the HPACK state stays in step (RFC 9113, section 4.3). A block that the decode cannot
 do within `limits.work` ends the connection with `COMPRESSION_ERROR`.
+
+The size of a block is the bytes of its fragments, and 9 bytes for each CONTINUATION frame. A
+block larger than `limits.work` ends the connection with `COMPRESSION_ERROR` at the header of the
+frame that passes it. Thus empty CONTINUATION frames cannot continue a block forever: with a
+`work` of 64 KiB, the 7,282nd empty frame ends the connection.
 
 A block in one HEADERS frame inside one received region decodes in place, with no copy. Another
 block joins into one buffer, because the HPACK decoder reads one contiguous block: a block in one
@@ -220,11 +226,30 @@ frames that the peer sent before it read your RST_STREAM are not errors, and the
 no state for a closed stream. The cost: a faulty client that sends a request on a lower stream
 than its last gets no response and no error, where section 5.1.1 permits `PROTOCOL_ERROR`.
 
-A server takes at most `max_concurrent_streams` streams. It refuses each new stream past the limit
-with RST_STREAM and no event. The code is `REFUSED_STREAM` before the peer acknowledges your
-settings, so the client can retry the request. After the acknowledgement, the peer knows the
-limit, and the code is `PROTOCOL_ERROR` (RFC 9113, section 5.1.2). This is the rule of nghttp2 and
-Go. The block of a refused stream still decodes.
+A server takes at most `max_concurrent_streams` open streams of the peer. It refuses each new
+stream past the limit with RST_STREAM and no event. The code is `REFUSED_STREAM` before the peer
+acknowledges your settings, so the client can retry the request. After the acknowledgement, the
+peer knows the limit, and the code is `PROTOCOL_ERROR` (RFC 9113, section 5.1.2). This is the rule
+of nghttp2 and Go. The block of a refused stream still decodes.
+
+### Handler slots
+
+A server starts a handler for each request: the `Headers` event of a new stream. A stream that a
+reset ends keeps its slot in the stream table until you call `close(stream)`, when its handler
+ends. The reset can come from the peer (`Reset`), or from the connection after a stream error
+(`StreamError`). Thus the handlers in flight never pass `max_concurrent_streams`, however fast a
+peer opens and resets streams. This stops the rapid reset attack (CVE-2023-44487) and its form
+with stream errors (CVE-2025-8671). It is the rule of Go.
+
+When the open and the held streams fill the table, the connection stops at the HEADERS frame of
+the next new stream, and the turn is `Blocked(Blocked::Streams)`. Close each stream whose handler
+ended, and drive again. The connection refuses nothing, because the peer closed the held streams
+and is within its limit. Its input waits for your handlers, as the TCP window makes the peer
+wait. The other frames of the connection wait too, so end the handler of a reset stream soon.
+
+A stream that ends with END_STREAM in both directions, or with your `reset`, frees its slot at
+once. A client holds the slots of reset streams too: `open` refuses with `Kind::Overload` until
+you close one.
 
 ### Messages
 
@@ -288,6 +313,7 @@ stream error or a connection error of type `FLOW_CONTROL_ERROR` (RFC 9113, secti
 | `headers(&mut outbound, stream, lines, end_stream, region)` | A header section on an open stream: HEADERS, and CONTINUATION frames when the block is larger than the peer's `SETTINGS_MAX_FRAME_SIZE` | The region or the output queue has too little room (`Kind::Overload`). The stream is not open or sent its end, an interim response has `end_stream`, or a trailer section has none (`Kind::Misuse`) |
 | `data(&mut outbound, stream, &data, end_stream)` | One DATA frame with the start of `data`. `end_stream` sets END_STREAM when the frame holds each byte | The output queue or the frame pool is full (`Kind::Overload`). The stream is not open, sent its end, or sent no header section (`Kind::Misuse`) |
 | `reset(&mut outbound, stream, code)` | RST_STREAM, and the stream closes | The output queue or the frame pool is full (`Kind::Overload`). The stream is not open, or a server gives `REFUSED_STREAM` (`Kind::Misuse`) |
+| `close(stream)` | None: the handler of a stream that a reset ended has ended, and its slot is free | No reset holds the slot of the stream: it is open, or it was closed (`Kind::Misuse`) |
 | `release(&mut outbound, stream, bytes)` | WINDOW_UPDATE frames when credit is due | The consumer holds fewer bytes (`Kind::Misuse`). The output queue or the pool has no room for the frames (`Kind::Overload`) |
 | `ping(&mut outbound, opaque)` | One PING | The output queue or the frame pool is full (`Kind::Overload`) |
 | `shutdown(&mut outbound)` | GOAWAY: see [shutdown](#shutdown-and-drain) | The output queue or the frame pool is full (`Kind::Overload`) |
@@ -347,7 +373,7 @@ GOAWAY too.
 | `FRAME_SIZE_ERROR` | A frame larger than `max_frame_size`. A frame too short for its fixed fields, or a PING, PRIORITY, RST_STREAM, or WINDOW_UPDATE of another length. A SETTINGS frame whose length is not a multiple of 6, or an acknowledgement with a setting | `Malformed` |
 | `FLOW_CONTROL_ERROR` | `SETTINGS_INITIAL_WINDOW_SIZE` above 2^31 - 1, or a value that takes a send window past it. DATA past the connection window. A WINDOW_UPDATE that takes the connection window past 2^31 - 1 | `Malformed` |
 | `COMPRESSION_ERROR` | A block that breaks RFC 7541, or a block with no size update after the acknowledgement of a smaller table | `Malformed` |
-| `COMPRESSION_ERROR` | A header block larger than `limits.work`, which the connection refuses at the header of the frame that passes it, before any copy. A block that needs more HPACK work than `limits.work` | `Overload` |
+| `COMPRESSION_ERROR` | A header block larger than `limits.work`, with 9 bytes for each CONTINUATION frame, which the connection refuses at the header of the frame that passes it, before any copy. A block that needs more HPACK work than `limits.work` | `Overload` |
 | `SETTINGS_TIMEOUT` | No acknowledgement of the settings before their deadline | `Deadline` |
 
 RFC 9113 makes a PRIORITY frame of a wrong length a stream error. Its stream can be idle, where a
@@ -380,14 +406,38 @@ no event: see [streams](#streams).
 | Limit | Bounds |
 | --- | --- |
 | `settings` | The settings that the endpoint sends, which bound the peer: see [settings](#settings) |
-| `work` | The largest header block, and the HPACK work of one block: its bytes and each byte that the decoder copies |
+| `work` | The largest header block, with 9 bytes for each CONTINUATION frame, and the HPACK work of one block: its bytes and each byte that the decoder copies |
 | `encoder_table_bytes` | The dynamic table of the HPACK encoder. The encoder uses at most the smaller of it and the peer's `SETTINGS_HEADER_TABLE_SIZE` |
 | `connection_window` | The DATA bytes of all streams that your consumers admit: the connection receive window, from 65,535 to 2^31 - 1 |
 
 `Connection::new` charges the HPACK decoder, the HPACK encoder, the stream table, and the frame
-pool to your budget: one slot of 64 bytes for each entry of the output queue, and one more.
-`TurnLimits` bounds the work of each drive: `frames` counts each frame header, and `bytes` each
-received byte that the drive reads. See [limits](limits.md).
+pool to your budget. The stream table has `max_concurrent_streams` entries and as many 4-byte
+identifiers of held streams. The pool has one slot of 64 bytes for each entry of the output queue,
+and one more. `TurnLimits` bounds the work of each drive: `frames` counts each frame header, and
+`bytes` each received byte that the drive reads. See [limits](limits.md).
+
+### Floods
+
+A peer can send frames that cost work and give nothing, at the rate of its link (RFC 9113,
+section 10.5). Each frame counts toward `TurnLimits::frames`, an event ends the turn, and the
+connection keeps at most one answer that the output queue has no room for. Thus no flood makes a
+turn do more work than its limits, and no flood makes the connection keep state that `new` did
+not charge.
+
+| Flood | Bound | End |
+| --- | --- | --- |
+| Rapid reset: the peer opens streams and resets them, or makes the connection reset them with stream errors | At most `max_concurrent_streams` handlers in flight: see [handler slots](#handler-slots) | None. The input waits for a free slot |
+| Empty CONTINUATION frames | `work` / 9 frames for each header block | `COMPRESSION_ERROR` |
+| PING and SETTINGS frames, and frames that the connection answers with RST_STREAM, from a peer that does not read | One answer for each `Outbound` entry, and one that waits. The connection reads no frame while an answer waits | None |
+| Frames with no answer and no event: empty DATA, PRIORITY, frames of unknown types, and DATA, RST_STREAM, and WINDOW_UPDATE on a closed stream | `frames` for each turn, with no state | None |
+| Header blocks on closed or refused streams | One block for each turn, because the turn ends after its decode. Each block within `work` | `COMPRESSION_ERROR` for a block past `work` |
+| WINDOW_UPDATE on an open stream or the connection | One event for each turn | `FLOW_CONTROL_ERROR` for a window past 2^31 - 1 |
+| SETTINGS | One frame for each turn, because its event ends the turn. A change of `SETTINGS_INITIAL_WINDOW_SIZE` visits each open stream one time | None |
+
+The connection does not end a flood with `ENHANCE_YOUR_CALM`. RFC 9113, section 10.5, permits
+that, but each flood costs the work of the bytes that carry it, within the limits of each turn.
+Your host divides its time between connections at the end of each turn. To bound the connections
+of one source or principal together, give them one budget.
 
 ## Frame codec
 
