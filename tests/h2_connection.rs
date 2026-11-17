@@ -1,7 +1,8 @@
-//! The contracts of the HTTP/2 frame and connection layer: the preface, SETTINGS and their
-//! acknowledgement, PING, GOAWAY, header blocks across CONTINUATION frames, each connection error
-//! with its RFC 9113 code, and frames that parse in place. Each expected byte and code comes from
-//! RFC 9113 or RFC 7541, as each test states, not from the code under test.
+//! The contracts of the HTTP/2 engine: the preface, SETTINGS and their acknowledgement, PING,
+//! GOAWAY and drain, header blocks across CONTINUATION frames, each connection error with its RFC
+//! 9113 code, frames that parse in place, the stream states, and flow control at both levels.
+//! Each expected byte and code comes from RFC 9113 or RFC 7541, as each test states, not from the
+//! code under test.
 
 use core::assert_matches;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -12,7 +13,7 @@ use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Progress, Received, TurnLimits};
 use rsnetwork::h2::frame::{ErrorCode, PREFACE};
 use rsnetwork::h2::{Connection, Event, Limits, Role, Settings};
-use rsnetwork::hpack::{FieldLine, Lines};
+use rsnetwork::hpack::{Block, FieldLine, Lines};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 
 mod counting;
@@ -36,16 +37,21 @@ const ENDPOINT: Endpoint = Endpoint {
     segment: None,
 };
 
-/// The settings of each endpoint in the tests: a list limit, and the initial values.
+/// The settings of each endpoint in the tests: a stream limit, a list limit, and the initial
+/// values.
 const SETTINGS: Settings = Settings {
+    max_concurrent_streams: 100,
     max_header_list_size: 16 * 1024,
     ..Settings::INITIAL
 };
 
+/// The limits of each endpoint in the tests. The connection window is the initial window of RFC
+/// 9113, so the preface has no WINDOW_UPDATE.
 const LIMITS: Limits = Limits {
     settings: SETTINGS,
     work: 64 * 1024,
     encoder_table_bytes: 4096,
+    connection_window: 65_535,
 };
 
 /// An empty SETTINGS frame (RFC 9113, section 6.5).
@@ -84,11 +90,55 @@ fn goaway(last_stream: u32, code: ErrorCode) -> Vec<u8> {
     frame(0x7, 0, 0, &[last_stream.to_be_bytes(), code.0.to_be_bytes()].concat())
 }
 
+/// A HEADERS frame on `stream` with END_HEADERS and the block of RFC 7541, C.3.1, and END_STREAM
+/// when `end_stream` (RFC 9113, figure 7).
+fn request(stream: u32, end_stream: bool) -> Vec<u8> {
+    frame(0x1, 0x4 | u8::from(end_stream), stream, C31)
+}
+
+/// A DATA frame with no padding (RFC 9113, figure 3).
+fn data(stream: u32, end_stream: bool, bytes: &[u8]) -> Vec<u8> {
+    frame(0x0, u8::from(end_stream), stream, bytes)
+}
+
+/// A RST_STREAM (RFC 9113, figure 6).
+fn rst(stream: u32, code: ErrorCode) -> Vec<u8> {
+    frame(0x3, 0, stream, &code.0.to_be_bytes())
+}
+
+/// A WINDOW_UPDATE (RFC 9113, figure 12).
+fn window_update(stream: u32, increment: u32) -> Vec<u8> {
+    frame(0x8, 0, stream, &increment.to_be_bytes())
+}
+
+/// The frames of `bytes`, each as its type, its stream, and its payload.
+fn frames(mut bytes: &[u8]) -> Vec<(u8, u32, Vec<u8>)> {
+    let mut frames = Vec::new();
+    while let Some((head, rest)) = bytes.split_first_chunk::<9>() {
+        let length = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+        frames.push((head[3], stream, rest[..length].to_vec()));
+        bytes = &rest[length..];
+    }
+    assert!(bytes.is_empty(), "the output ends inside a frame");
+    frames
+}
+
+/// The increments of the WINDOW_UPDATE frames on `stream` in `bytes`.
+fn grants(bytes: &[u8], stream: u32) -> Vec<u32> {
+    frames(bytes)
+        .into_iter()
+        .filter(|(kind, id, _)| *kind == 0x8 && *id == stream)
+        .map(|(_, _, payload)| u32::from_be_bytes(payload[..4].try_into().expect("4 bytes")))
+        .collect()
+}
+
 /// What the layer above saw: each event, with its bytes copied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Seen {
     Headers(u32, bool, Option<Vec<(Vec<u8>, Vec<u8>)>>),
-    Data(u32, Vec<u8>, u32, bool),
+    Trailers(u32, Option<Vec<(Vec<u8>, Vec<u8>)>>),
+    Data(u32, Vec<u8>, bool),
     Reset(u32, ErrorCode),
     WindowUpdate(u32, u32),
     Settings(Settings),
@@ -98,27 +148,26 @@ enum Seen {
 }
 
 fn seen(event: Event<'_>) -> Seen {
+    let copy = |lines: Option<Block<'_>>| {
+        lines.map(|block| {
+            block
+                .lines()
+                .map(|line| (line.name.to_vec(), line.value.to_vec()))
+                .collect()
+        })
+    };
     match event {
         Event::Headers {
             stream,
             end_stream,
             lines,
-        } => Seen::Headers(
-            stream,
-            end_stream,
-            lines.map(|block| {
-                block
-                    .lines()
-                    .map(|line| (line.name.to_vec(), line.value.to_vec()))
-                    .collect()
-            }),
-        ),
+        } => Seen::Headers(stream, end_stream, copy(lines)),
+        Event::Trailers { stream, lines } => Seen::Trailers(stream, copy(lines)),
         Event::Data {
             stream,
             data,
-            flow,
             end_stream,
-        } => Seen::Data(stream, data.bytes().to_vec(), flow, end_stream),
+        } => Seen::Data(stream, data.bytes().to_vec(), end_stream),
         Event::Reset { stream, code } => Seen::Reset(stream, code),
         Event::WindowUpdate { stream, increment } => Seen::WindowUpdate(stream, increment),
         Event::Settings(settings) => Seen::Settings(settings),
@@ -209,6 +258,64 @@ impl Peer {
         panic!("the connection makes no progress")
     }
 
+    /// A server that also read the acknowledgement of its settings.
+    fn acknowledged(limits: Limits) -> Self {
+        let mut server = Self::server_with(limits);
+        server.receive(SETTINGS_ACK);
+        assert_eq!(server.run(), (vec![], WAIT));
+        server
+    }
+
+    /// A client that read the empty SETTINGS frame of a server, and sent its acknowledgement.
+    fn client() -> Self {
+        let mut client = Self::new(Role::Client, LIMITS);
+        client.receive(EMPTY_SETTINGS);
+        assert_eq!(client.run(), (vec![Seen::Settings(Settings::INITIAL)], WAIT));
+        client.sent();
+        client
+    }
+
+    /// Opens a stream of a client with the lines of RFC 7541, C.3.1.
+    fn open(&mut self, end_stream: bool) -> u32 {
+        let lines = C31_LINES.map(|(name, value)| FieldLine {
+            name: name.as_bytes(),
+            value: value.as_bytes(),
+            never_indexed: false,
+        });
+        let region = Backing::from(Vec::with_capacity(256));
+        self.connection
+            .open(&mut self.outbound, lines.into_iter(), end_stream, region)
+            .expect("the connection opens the stream")
+    }
+
+    /// Sends a header section with the single line `name: value` on `stream`.
+    fn section(&mut self, stream: u32, name: &str, value: &str, end_stream: bool) -> Result<(), Kind> {
+        let line = FieldLine {
+            name: name.as_bytes(),
+            value: value.as_bytes(),
+            never_indexed: false,
+        };
+        let region = Backing::from(Vec::with_capacity(256));
+        self.connection
+            .headers(&mut self.outbound, stream, [line].into_iter(), end_stream, region)
+            .map_err(|error| error.kind())
+    }
+
+    /// Sends `bytes` on `stream` as DATA, and gives the number of bytes that went out.
+    fn send(&mut self, stream: u32, bytes: &[u8], end_stream: bool) -> Result<usize, Kind> {
+        let lease = Lease::from(bytes.to_vec());
+        self.connection
+            .data(&mut self.outbound, stream, &lease, end_stream)
+            .map_err(|error| error.kind())
+    }
+
+    /// Releases `bytes` bytes of `stream` that the consumer held.
+    fn release(&mut self, stream: u32, bytes: u32) -> Result<(), Kind> {
+        self.connection
+            .release(&mut self.outbound, stream, bytes)
+            .map_err(|error| error.kind())
+    }
+
     /// The bytes of each output, which the transport accepts in full.
     fn sent(&mut self) -> Vec<u8> {
         let mut sent = Vec::new();
@@ -238,14 +345,30 @@ fn ended(progress: Progress, kind: Kind) {
 #[test]
 fn each_preface_has_its_settings_and_a_client_disables_push() {
     let mut client = Peer::new(Role::Client, LIMITS);
-    // SETTINGS_MAX_HEADER_LIST_SIZE (0x6) 16384, then SETTINGS_ENABLE_PUSH (0x2) 0.
-    let settings = frame(0x4, 0, 0, b"\x00\x06\x00\x00\x40\x00\x00\x02\x00\x00\x00\x00");
+    // SETTINGS_MAX_CONCURRENT_STREAMS (0x3) 100, SETTINGS_MAX_HEADER_LIST_SIZE (0x6) 16384, then
+    // SETTINGS_ENABLE_PUSH (0x2) 0.
+    let settings = b"\x00\x03\x00\x00\x00\x64\x00\x06\x00\x00\x40\x00";
     assert_eq!(
         client.sent(),
-        [&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..], settings.as_slice()].concat()
+        [
+            &b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..],
+            &frame(0x4, 0, 0, &[&settings[..], b"\x00\x02\x00\x00\x00\x00"].concat()),
+        ]
+        .concat()
     );
-    let mut server = Peer::new(Role::Server, LIMITS);
-    assert_eq!(server.sent(), frame(0x4, 0, 0, b"\x00\x06\x00\x00\x40\x00"));
+    // A connection window of 1 MiB follows the SETTINGS frame as a WINDOW_UPDATE on stream 0 of
+    // 2^20 - 65,535 (RFC 9113, section 6.9.2).
+    let mut server = Peer::new(
+        Role::Server,
+        Limits {
+            connection_window: 1 << 20,
+            ..LIMITS
+        },
+    );
+    assert_eq!(
+        server.sent(),
+        [frame(0x4, 0, 0, settings), window_update(0, (1 << 20) - 65_535)].concat()
+    );
 }
 
 /// An invalid preface is a connection error of type PROTOCOL_ERROR (RFC 9113, section 3.4): the
@@ -559,23 +682,21 @@ fn frames_parse_in_place_with_no_copy() {
     assert_eq!(data.as_ptr(), address.wrapping_add(29 + 9));
 }
 
-/// The bytes of a DATA frame go up in order as each region arrives. The first event of a frame
-/// counts its whole payload against flow control, its padding too (RFC 9113, section 6.1), and
-/// the last event of the frame has its END_STREAM.
+/// The bytes of a DATA frame go up in order as each region arrives, with no padding, and the
+/// last event of the frame has its END_STREAM (RFC 9113, section 6.1).
 #[test]
-fn data_goes_up_in_pieces_with_the_flow_of_the_whole_frame() {
+fn data_goes_up_in_pieces_and_the_last_has_the_end() {
     let mut server = Peer::server();
-    // PADDED and END_STREAM: pad length 3, "abcdef", 3 bytes of padding. The payload is 10 bytes.
+    server.receive(&request(1, false));
+    assert_eq!(server.run(), (vec![Seen::Headers(1, false, lines(&C31_LINES))], WAIT));
+    // PADDED and END_STREAM: pad length 3, "abcdef", 3 bytes of padding.
     let data = frame(0x0, 0x9, 1, b"\x03abcdef\x00\x00\x00");
     server.receive(&data[..12]);
-    assert_eq!(server.run(), (vec![Seen::Data(1, b"ab".to_vec(), 10, false)], WAIT));
+    assert_eq!(server.run(), (vec![Seen::Data(1, b"ab".to_vec(), false)], WAIT));
     server.receive(&data[12..18]);
-    assert_eq!(server.run(), (vec![Seen::Data(1, b"cdef".to_vec(), 0, false)], WAIT));
+    assert_eq!(server.run(), (vec![Seen::Data(1, b"cdef".to_vec(), false)], WAIT));
     server.receive(&data[18..]);
-    assert_eq!(server.run(), (vec![Seen::Data(1, Vec::new(), 0, true)], WAIT));
-    // A DATA frame with only padding still counts its payload.
-    server.receive(&frame(0x0, 0x8, 3, b"\x01\x00"));
-    assert_eq!(server.run(), (vec![Seen::Data(3, Vec::new(), 2, false)], WAIT));
+    assert_eq!(server.run(), (vec![Seen::Data(1, Vec::new(), true)], WAIT));
 }
 
 /// A PING gets a PING with the flag ACK and the same data (RFC 9113, section 6.7). A PING with
@@ -649,16 +770,20 @@ fn a_client_refuses_push_with_protocol_error() {
 
 /// RST_STREAM, WINDOW_UPDATE, and GOAWAY go up with their fields. The debug data of a GOAWAY is
 /// discarded, also across regions. A WINDOW_UPDATE of 0 on a stream is a stream error of type
-/// PROTOCOL_ERROR, and the connection goes on (RFC 9113, section 6.9).
+/// PROTOCOL_ERROR: a RST_STREAM ends the stream, and the connection goes on (RFC 9113, section
+/// 6.9). After the GOAWAY, no stream is open, so the connection sends its own GOAWAY and ends
+/// (section 6.8).
 #[test]
 fn stream_and_control_frames_go_up_with_their_fields() {
     let mut server = Peer::server();
+    server.receive(&[request(1, false), request(3, false)].concat());
+    assert_eq!(server.run().0.len(), 2, "two requests");
     let away = frame(0x7, 0, 0, b"\x00\x00\x00\x05\x00\x00\x00\x0bdebug data");
     server.receive(
         &[
-            frame(0x3, 0, 1, b"\x00\x00\x00\x08"),
+            rst(1, ErrorCode::CANCEL),
             frame(0x8, 0, 0, b"\x80\x00\x10\x00"),
-            frame(0x8, 0, 3, b"\x00\x00\x00\x00"),
+            window_update(3, 0),
             away[..20].to_vec(),
         ]
         .concat(),
@@ -674,8 +799,12 @@ fn stream_and_control_frames_go_up_with_their_fields() {
                 Seen::StreamError(3, ErrorCode::PROTOCOL_ERROR),
                 Seen::GoAway(5, ErrorCode::ENHANCE_YOUR_CALM),
             ],
-            WAIT
+            Progress::Terminal(Ok(()))
         )
+    );
+    assert_eq!(
+        server.sent(),
+        [rst(3, ErrorCode::PROTOCOL_ERROR), goaway(3, ErrorCode::NO_ERROR)].concat()
     );
 }
 
@@ -755,15 +884,17 @@ fn settings_with_no_acknowledgement_end_the_connection_at_their_deadline() {
     assert_eq!(off.run(), (vec![Seen::Settings(Settings::INITIAL)], WAIT));
 }
 
-/// The end of the input at a frame boundary ends the connection with no error, and the end inside
-/// a frame or a header block ends it as partial.
+/// The end of the input at a frame boundary ends the connection with no error. The end inside a
+/// frame or a header block, or with an open stream, ends it as partial: an open stream cannot be
+/// retried (RFC 9113, section 5.4.3).
 #[test]
-fn the_end_of_the_input_inside_a_frame_is_partial() {
+fn the_end_of_the_input_inside_a_frame_or_a_stream_is_partial() {
     let headers = frame(0x1, 0x0, 1, &C31[..3]);
     for (input, partial) in [
         (Vec::new(), false),
         (frame(0x6, 0, 0, &[0; 8])[..12].to_vec(), true),
         (headers, true),
+        (request(1, true), true),
     ] {
         let mut server = Peer::server();
         server.receive(&input);
@@ -833,13 +964,14 @@ fn a_large_header_block_goes_out_as_continuation_frames() {
         },
     ];
     let region = Backing::from(Vec::with_capacity(64 * 1024));
-    client
+    let stream = client
         .connection
-        .headers(&mut client.outbound, 1, sent.iter().copied(), true, region)
+        .open(&mut client.outbound, sent.iter().copied(), true, region)
         .expect("the region and the queue have room");
+    assert_eq!(stream, 1, "the first stream of a client (RFC 9113, section 5.1.1)");
     let output = client.sent();
-    // After the client preface and its SETTINGS frame of 2 settings: each frame of the block.
-    let mut at = PREFACE.len() + 9 + 12;
+    // After the client preface and its SETTINGS frame of 3 settings: each frame of the block.
+    let mut at = PREFACE.len() + 9 + 18;
     let mut kinds = Vec::new();
     while let Some(&[l0, l1, l2, kind, flags]) = output.get(at..at + 5).and_then(|bytes| bytes.first_chunk()) {
         let length = u32::from_be_bytes([0, l0, l1, l2]);
@@ -875,23 +1007,622 @@ fn a_large_header_block_goes_out_as_continuation_frames() {
 }
 
 /// A DATA frame goes out as a 9-byte header from the pool and the caller's region, with no copy
-/// (RFC 9113, section 6.1). A payload larger than the peer's frame size refuses.
+/// (RFC 9113, section 6.1).
 #[test]
 fn data_goes_out_with_no_copy() {
-    let mut server = Peer::server();
-    server.sent();
+    let mut client = Peer::client();
+    let stream = client.open(false);
+    client.sent();
     let data = Lease::from(b"hello".to_vec());
+    let sent = client.connection.data(&mut client.outbound, stream, &data, true);
+    assert_eq!(sent, Ok(5));
+    let header = client.outbound.submit().expect("the header");
+    assert_eq!(header.region.bytes(), head(5, 0x0, 0x1, 1));
+    client.outbound.ack(header.id, 9).expect("outstanding");
+    let payload = client.outbound.submit().expect("the payload");
+    assert_eq!(payload.region.as_ptr(), data.as_ptr());
+}
+
+/// A block that adds `x-a: v` to the dynamic table: a literal with incremental indexing and a
+/// new name (RFC 7541, section 6.2.1).
+const INSERT: &[u8] = b"\x40\x03x-a\x01v";
+
+/// A block that reads the newest entry of the dynamic table: index 62 (RFC 7541, section 2.3.3).
+const NEWEST: &[u8] = b"\xbe";
+
+/// A block of `:method: GET`, `:scheme: http`, and `:path: /`, all in the static table, so it
+/// changes no dynamic table (RFC 7541, Appendix A).
+const STATIC: &[u8] = b"\x82\x86\x84";
+
+/// A PRIORITY frame on `stream` that depends on stream 0 (RFC 9113, figure 5).
+fn priority(stream: u32) -> Vec<u8> {
+    frame(0x2, 0, stream, b"\x00\x00\x00\x00\x10")
+}
+
+/// Each transition of the stream states of RFC 9113, sections 5.1 and 5.1.1, that frames of the
+/// peer cause, on a server and on a client. Each case gives the events, the output, and the end
+/// that the rule of its name requires. On a closed stream, each frame gets the minimal
+/// processing of section 5.1, which the lead decided for each closed stream (the rule of
+/// nghttp2): no error.
+#[test]
+fn each_stream_state_transition_gives_the_rfc_result() {
+    let protocol = || Err(ErrorCode::PROTOCOL_ERROR);
+    let closed = ErrorCode::STREAM_CLOSED;
+    let headers = |stream: u32, end_stream: bool| Seen::Headers(stream, end_stream, lines(&C31_LINES));
+    // Each case: the rule, the role, the input, the events, and the RST_STREAM codes of the
+    // output, or the code of the GOAWAY that ends the connection.
+    type Case = (
+        &'static str,
+        Role,
+        Vec<u8>,
+        Vec<Seen>,
+        Result<Vec<(u32, ErrorCode)>, ErrorCode>,
+    );
+    let cases: Vec<Case> = vec![
+        ("5.1 idle: DATA", Role::Server, data(1, false, b"x"), vec![], protocol()),
+        (
+            "6.4 idle: RST_STREAM",
+            Role::Server,
+            rst(1, ErrorCode::CANCEL),
+            vec![],
+            protocol(),
+        ),
+        (
+            "5.1 idle: WINDOW_UPDATE",
+            Role::Server,
+            window_update(1, 1),
+            vec![],
+            protocol(),
+        ),
+        (
+            "5.1.1 a client stream is odd",
+            Role::Server,
+            request(2, true),
+            vec![],
+            protocol(),
+        ),
+        (
+            "6.3 PRIORITY changes no state, so stream 1 can open after stream 9",
+            Role::Server,
+            [priority(9), request(1, true)].concat(),
+            vec![headers(1, true)],
+            Ok(vec![]),
+        ),
+        (
+            "5.1 idle to open, and to half-closed (remote) at END_STREAM, where DATA is a STREAM_CLOSED stream error",
+            Role::Server,
+            [request(1, false), data(1, true, b"a"), data(1, false, b"b")].concat(),
+            vec![
+                headers(1, false),
+                Seen::Data(1, b"a".to_vec(), true),
+                Seen::StreamError(1, closed),
+            ],
+            Ok(vec![(1, closed)]),
+        ),
+        (
+            "5.1 half-closed (remote): HEADERS is a STREAM_CLOSED stream error",
+            Role::Server,
+            [request(1, true), request(1, true)].concat(),
+            vec![headers(1, true), Seen::StreamError(1, closed)],
+            Ok(vec![(1, closed)]),
+        ),
+        (
+            "5.1 half-closed (remote): WINDOW_UPDATE and PRIORITY are permitted",
+            Role::Server,
+            [request(1, true), window_update(1, 10), priority(1)].concat(),
+            vec![headers(1, true), Seen::WindowUpdate(1, 10)],
+            Ok(vec![]),
+        ),
+        (
+            "5.1 open to closed at RST_STREAM, and later frames on the closed stream change nothing",
+            Role::Server,
+            [
+                request(1, false),
+                rst(1, ErrorCode::CANCEL),
+                data(1, false, b"x"),
+                window_update(1, 1),
+                rst(1, ErrorCode::CANCEL),
+                priority(1),
+            ]
+            .concat(),
+            vec![headers(1, false), Seen::Reset(1, ErrorCode::CANCEL)],
+            Ok(vec![]),
+        ),
+        (
+            "5.1.1 a skipped stream is closed: its block decodes and is discarded",
+            Role::Server,
+            [
+                frame(0x1, 0x5, 5, STATIC),
+                frame(0x1, 0x5, 3, INSERT),
+                frame(0x1, 0x5, 7, NEWEST),
+            ]
+            .concat(),
+            vec![
+                Seen::Headers(
+                    5,
+                    true,
+                    lines(&[(":method", "GET"), (":scheme", "http"), (":path", "/")]),
+                ),
+                Seen::Headers(7, true, lines(&[("x-a", "v")])),
+            ],
+            Ok(vec![]),
+        ),
+        (
+            "5.1 a client: HEADERS on an idle stream",
+            Role::Client,
+            request(1, true),
+            vec![],
+            protocol(),
+        ),
+        (
+            "5.1 a client: HEADERS on a stream of the server, which push makes idle",
+            Role::Client,
+            request(2, true),
+            vec![],
+            protocol(),
+        ),
+    ];
+    for (rule, role, input, events, output) in cases {
+        let mut peer = match role {
+            Role::Server => Peer::server(),
+            Role::Client => Peer::client(),
+        };
+        peer.receive(&input);
+        let (seen, progress) = peer.run();
+        assert_eq!(seen, events, "{rule}");
+        let sent = peer.sent();
+        match output {
+            Ok(resets) => {
+                assert_eq!(progress, WAIT, "{rule}");
+                let expected: Vec<u8> = resets.iter().flat_map(|&(stream, code)| rst(stream, code)).collect();
+                assert_eq!(sent, expected, "{rule}");
+            }
+            Err(code) => {
+                ended(progress, Kind::Malformed);
+                assert_eq!(sent, goaway(0, code), "{rule}");
+            }
+        }
+    }
+}
+
+/// The stream of a client goes from idle to half-closed (local) when its request has END_STREAM,
+/// and to closed when the response ends (RFC 9113, sections 5.1 and 8.8.1). A frame on the closed
+/// stream then changes nothing.
+#[test]
+fn a_client_stream_closes_after_the_request_and_the_response_end() {
+    let mut client = Peer::client();
+    let stream = client.open(true);
+    assert_eq!(
+        client.send(stream, b"x", false),
+        Err(Kind::Misuse),
+        "half-closed (local)"
+    );
+    // `:status: 200`, index 8 of the static table.
+    client.receive(&[frame(0x1, 0x4, stream, b"\x88"), data(stream, true, b"ok")].concat());
+    let status = lines(&[(":status", "200")]);
+    assert_eq!(
+        client.run(),
+        (
+            vec![
+                Seen::Headers(stream, false, status),
+                Seen::Data(stream, b"ok".to_vec(), true),
+            ],
+            WAIT
+        )
+    );
+    client.sent();
+    client.receive(&data(stream, false, b"late"));
+    assert_eq!(client.run(), (vec![], WAIT));
+    assert_eq!(client.sent(), b"");
+}
+
+/// A stream that the connection refuses still decodes its header block, so the HPACK state stays
+/// in step and the next stream decodes (RFC 9113, sections 4.3 and 5.1.2). A refused block adds
+/// an entry, and the next stream reads it. An engine that skips the decode of a refused block
+/// fails here: the next block reads an entry that it does not have. The GOAWAY of a later error
+/// names the last stream that went up, not the refused one (section 8.7).
+#[test]
+fn a_refused_stream_still_updates_hpack_state_and_the_next_stream_decodes() {
+    let limits = Limits {
+        settings: Settings {
+            max_concurrent_streams: 1,
+            ..SETTINGS
+        },
+        ..LIMITS
+    };
+    let mut server = Peer::server_with(limits);
+    server.receive(&[frame(0x1, 0x4, 1, STATIC), frame(0x1, 0x5, 3, INSERT)].concat());
+    let get = lines(&[(":method", "GET"), (":scheme", "http"), (":path", "/")]);
+    assert_eq!(server.run(), (vec![Seen::Headers(1, false, get)], WAIT));
+    // The peer cannot know the limit before it acknowledges the settings, so the code permits a
+    // retry (section 8.7).
+    assert_eq!(server.sent(), rst(3, ErrorCode::REFUSED_STREAM));
+    server.receive(&[rst(1, ErrorCode::CANCEL), frame(0x1, 0x5, 5, NEWEST)].concat());
+    assert_eq!(
+        server.run(),
+        (
+            vec![
+                Seen::Reset(1, ErrorCode::CANCEL),
+                Seen::Headers(5, true, lines(&[("x-a", "v")])),
+            ],
+            WAIT
+        )
+    );
+    // After the acknowledgement, the peer knows the limit: PROTOCOL_ERROR. The last stream of
+    // the GOAWAY is 5, which went up, and not the refused stream 7.
+    server.receive(&[SETTINGS_ACK, &frame(0x1, 0x5, 7, INSERT), &frame(0x6, 0, 1, &[0; 8])].concat());
+    ended(server.run().1, Kind::Malformed);
+    assert_eq!(
+        server.sent(),
+        [rst(7, ErrorCode::PROTOCOL_ERROR), goaway(5, ErrorCode::PROTOCOL_ERROR)].concat()
+    );
+    // A refused block past the work bound cannot keep the HPACK state, so the connection ends
+    // with COMPRESSION_ERROR (section 4.3).
+    let mut server = Peer::server_with(Limits { work: 1024, ..limits });
+    server.receive(&[frame(0x1, 0x4, 1, STATIC), head(1025, 0x1, 0x5, 3)].concat());
+    let (_, progress) = server.run();
+    ended(progress, Kind::Overload);
+    assert_eq!(server.sent(), goaway(1, ErrorCode::COMPRESSION_ERROR));
+}
+
+/// After the endpoint resets a stream, the peer can still send frames that it sent before it read
+/// the reset. The connection processes them minimally and discards them (RFC 9113, section 5.1,
+/// closed): a header block decodes, so the next stream reads its entry, and DATA counts toward
+/// the connection window, so its credit comes back. A server cannot refuse a stream that went up
+/// (section 8.7).
+#[test]
+fn frames_after_a_reset_keep_hpack_and_the_connection_window_in_step() {
+    let mut server = Peer::server();
+    server.receive(&request(1, false));
+    assert_eq!(server.run().0.len(), 1, "a request");
+    assert_eq!(
+        server
+            .connection
+            .reset(&mut server.outbound, 1, ErrorCode::REFUSED_STREAM)
+            .map_err(|error| error.kind()),
+        Err(Kind::Misuse)
+    );
     server
         .connection
-        .data(&mut server.outbound, 1, &data, true)
+        .reset(&mut server.outbound, 1, ErrorCode::CANCEL)
         .expect("the queue has room");
-    let header = server.outbound.submit().expect("the header");
-    assert_eq!(header.region.bytes(), head(5, 0x0, 0x1, 1));
-    server.outbound.ack(header.id, 9).expect("outstanding");
-    let payload = server.outbound.submit().expect("the payload");
-    assert_eq!(payload.region.as_ptr(), data.as_ptr());
-    server.outbound.ack(payload.id, 5).expect("outstanding");
-    let large = Lease::from(vec![0; 16_385]);
-    let refused = server.connection.data(&mut server.outbound, 1, &large, false);
-    assert_eq!(refused.map_err(|error| error.kind()), Err(Kind::Misuse));
+    assert_eq!(server.sent(), rst(1, ErrorCode::CANCEL));
+    // The whole connection window of 65,535 bytes on the reset stream, then its trailers.
+    let chunk = vec![b'x'; 16_383];
+    let mut input: Vec<u8> = (0..4).flat_map(|_| data(1, false, &chunk)).collect();
+    input.extend(data(1, false, b"xxx"));
+    input.extend(frame(0x1, 0x5, 1, INSERT));
+    server.receive(&input);
+    assert_eq!(server.run(), (vec![], WAIT));
+    let returned: u32 = grants(&server.sent(), 0).iter().sum();
+    assert!(returned > 0 && returned <= 65_535, "{returned} bytes returned");
+    server.receive(&frame(0x1, 0x5, 3, NEWEST));
+    assert_eq!(
+        server.run(),
+        (vec![Seen::Headers(3, true, lines(&[("x-a", "v")]))], WAIT)
+    );
+}
+
+/// The limits of a server whose streams each admit `window` bytes.
+fn windowed(window: u32) -> Limits {
+    Limits {
+        settings: Settings {
+            initial_window_size: window,
+            ..SETTINGS
+        },
+        ..LIMITS
+    }
+}
+
+/// DATA past a window is a FLOW_CONTROL_ERROR: a stream error past the stream window, and a
+/// connection error past the connection window, as the lead decided (the rule of nghttp2). The
+/// whole payload counts, with the pad length and the padding (RFC 9113, section 6.1). Before the
+/// peer acknowledges a smaller `SETTINGS_INITIAL_WINDOW_SIZE`, it can still use 65,535 (section
+/// 6.9.3), and at the acknowledgement each window changes by the difference (section 6.9.2).
+#[test]
+fn data_past_a_window_is_a_flow_control_error() {
+    let flow = ErrorCode::FLOW_CONTROL_ERROR;
+    // 17 bytes of data, and 10 bytes of data with a pad length of 6: 17 bytes of payload.
+    for past in [
+        data(1, false, &[b'x'; 17]),
+        frame(0x0, 0x8, 1, b"\x06xxxxxxxxxx\0\0\0\0\0\0"),
+    ] {
+        let mut server = Peer::acknowledged(windowed(16));
+        server.receive(&[request(1, false), past].concat());
+        let (events, progress) = server.run();
+        assert_eq!(events[1..], [Seen::StreamError(1, flow)]);
+        assert_eq!(progress, WAIT, "the connection goes on");
+        assert_eq!(server.sent(), rst(1, flow));
+    }
+    // Four frames of 16,384 bytes are one byte past the connection window of 65,535.
+    let mut server = Peer::acknowledged(windowed(1 << 20));
+    let chunk = vec![b'x'; 16_384];
+    let input: Vec<u8> = (0..4).flat_map(|_| data(1, false, &chunk)).collect();
+    server.receive(&[request(1, false), input].concat());
+    ended(server.run().1, Kind::Malformed);
+    assert_eq!(server.sent(), goaway(1, flow));
+    // Before the acknowledgement of a window of 16, a stream can take 1000 bytes. The
+    // acknowledgement makes its window 65,535 - 1000 + 16 - 65,535 = -984, so one more byte is
+    // past it.
+    let mut server = Peer::server_with(windowed(16));
+    server.receive(&[request(1, false), data(1, false, &[b'x'; 1000])].concat());
+    assert_eq!(server.run().0.len(), 2, "the request and its data");
+    server.receive(&[SETTINGS_ACK, &data(1, false, b"x")].concat());
+    assert_eq!(server.run(), (vec![Seen::StreamError(1, flow)], WAIT));
+}
+
+/// A WINDOW_UPDATE goes to the peer only for bytes that the consumer released, so the peer can
+/// never send more than the capacity that the consumer admitted (the design: transport windows
+/// grant only capacity that the next owner can admit). A release while the peer has no credit
+/// gives credit (RFC 9113, section 6.9.1), and the padding, which no consumer holds, comes back
+/// too.
+#[test]
+fn a_window_grant_never_exceeds_the_capacity_that_the_consumer_admitted() {
+    let mut server = Peer::acknowledged(windowed(1000));
+    // A frame of 100 bytes in two regions: the consumer holds only the bytes that went up.
+    let split = data(1, false, &[b'w'; 100]);
+    server.receive(&[&request(1, false), &split[..59]].concat());
+    assert_eq!(server.run().0[1..], [Seen::Data(1, vec![b'w'; 50], false)]);
+    assert_eq!(server.release(1, 51), Err(Kind::Misuse), "50 bytes went up");
+    server.receive(
+        &[
+            &split[59..],
+            &data(1, false, &[b'x'; 500]),
+            &data(1, false, &[b'y'; 400]),
+        ]
+        .concat(),
+    );
+    assert_eq!(server.run().0.len(), 3, "the rest of the data");
+    assert_eq!(server.sent(), b"", "no credit before a release");
+    // The peer has no credit, so the first release gives some, and no release gives more than its
+    // bytes.
+    let (mut released, mut granted) = (0, 0);
+    for bytes in [50, 50, 900] {
+        server.release(1, bytes).expect("the consumer holds the bytes");
+        released += bytes;
+        granted += grants(&server.sent(), 1).iter().sum::<u32>();
+        assert!(granted > 0 && granted <= released, "{granted} for {released} bytes");
+    }
+    assert_eq!(server.release(1, 1), Err(Kind::Misuse), "the consumer holds no byte");
+    // The peer's credit is 1000 - 1000 + the grants (RFC 9113, section 6.9.1). It can send that,
+    // and no byte more.
+    server.receive(&data(1, false, &vec![b'z'; granted as usize]));
+    assert_eq!(server.run().1, WAIT);
+    server.receive(&data(1, false, b"z"));
+    assert_eq!(server.run().0, [Seen::StreamError(1, ErrorCode::FLOW_CONTROL_ERROR)]);
+    // A frame of 1 byte of data and 999 bytes of padding and its pad length uses the window of a
+    // new stream. The consumer holds 1 byte, so the 999 other bytes come back with no release.
+    let mut server = Peer::acknowledged(windowed(1000));
+    let padded = [&b"\xfex"[..], &[0; 254]].concat();
+    let input = [
+        request(1, false),
+        frame(0x0, 0x8, 1, &padded),
+        frame(0x0, 0x8, 1, &padded),
+        frame(0x0, 0x8, 1, &padded),
+        frame(0x0, 0x8, 1, &[&b"\xe6x"[..], &[0; 230]].concat()),
+    ]
+    .concat();
+    server.receive(&input);
+    assert_eq!(server.run().1, WAIT);
+    let granted: u32 = grants(&server.sent(), 1).iter().sum();
+    assert!(granted > 0 && granted <= 996, "{granted} bytes of padding");
+}
+
+/// A WINDOW_UPDATE that takes a window past 2^31 - 1 ends the stream with RST_STREAM
+/// FLOW_CONTROL_ERROR, or the connection with GOAWAY FLOW_CONTROL_ERROR (RFC 9113, section
+/// 6.9.1). A `SETTINGS_INITIAL_WINDOW_SIZE` that takes a window past it is a connection error
+/// of the same code (section 6.9.2). A window of exactly 2^31 - 1 is valid.
+#[test]
+fn a_window_past_2_31_minus_1_gives_flow_control_error() {
+    let flow = ErrorCode::FLOW_CONTROL_ERROR;
+    let max = (1 << 31) - 1;
+    let mut client = Peer::client();
+    let stream = client.open(false);
+    client.sent();
+    client.receive(&[window_update(stream, max - 65_535), window_update(stream, 1)].concat());
+    assert_eq!(
+        client.run(),
+        (
+            vec![
+                Seen::WindowUpdate(stream, max - 65_535),
+                Seen::StreamError(stream, flow)
+            ],
+            WAIT
+        )
+    );
+    assert_eq!(client.sent(), rst(stream, flow));
+    client.receive(&window_update(0, max - 65_535 + 1));
+    ended(client.run().1, Kind::Malformed);
+    assert_eq!(client.sent(), goaway(0, flow));
+    // A window of 65,535 + 1000, and then an initial window of 2^31 - 1.
+    let mut client = Peer::client();
+    let stream = client.open(false);
+    client.sent();
+    let settings = frame(0x4, 0, 0, &[&b"\x00\x04"[..], &max.to_be_bytes()].concat());
+    client.receive(&[window_update(stream, 1000), settings].concat());
+    let (events, progress) = client.run();
+    assert_eq!(events, [Seen::WindowUpdate(stream, 1000)]);
+    ended(progress, Kind::Malformed);
+    assert_eq!(client.sent(), goaway(0, flow));
+}
+
+/// A sender sends DATA only within the stream window and the connection window, in frames of at
+/// most the peer's `SETTINGS_MAX_FRAME_SIZE` (RFC 9113, sections 4.2 and 6.9.1). A smaller
+/// `SETTINGS_INITIAL_WINDOW_SIZE` can make a window negative, and the sender then waits for a
+/// WINDOW_UPDATE that makes it positive: the example of section 6.9.2.
+#[test]
+fn data_waits_for_both_windows() {
+    let mut client = Peer::client();
+    let stream = client.open(false);
+    let body = vec![b'x'; 100_000];
+    let mut sent = 0;
+    while let Ok(len @ 1..) = client.send(stream, &body[sent..], false) {
+        assert!(len <= 16_384, "a frame of {len} bytes");
+        sent += len;
+    }
+    assert_eq!(sent, 65_535, "the initial windows");
+    // Credit on the stream alone sends nothing: the connection window is empty.
+    client.receive(&window_update(stream, 10_000));
+    assert_eq!(client.run().1, WAIT);
+    assert_eq!(client.send(stream, &body[sent..], false), Ok(0));
+    client.receive(&window_update(0, 100_000));
+    assert_eq!(client.run().1, WAIT);
+    assert_eq!(client.send(stream, &body[sent..], false), Ok(10_000));
+    // An initial window of 16,384 makes the stream window 0 + 16,384 - 65,535 = -49,151.
+    client.receive(&frame(0x4, 0, 0, b"\x00\x04\x00\x00\x40\x00"));
+    assert_eq!(client.run().1, WAIT);
+    client.receive(&window_update(stream, 49_151));
+    assert_eq!(client.run().1, WAIT);
+    assert_eq!(client.send(stream, b"x", false), Ok(0), "a window of 0");
+    client.receive(&window_update(stream, 1));
+    assert_eq!(client.run().1, WAIT);
+    assert_eq!(client.send(stream, b"xx", true), Ok(1));
+    // An empty DATA frame with END_STREAM needs no credit (section 6.9.1).
+    assert_eq!(client.send(stream, b"", true), Ok(0));
+    let output = client.sent();
+    assert!(output.ends_with(&data(stream, true, b"")), "the end of the stream");
+}
+
+/// A message is a header section, DATA, and an optional trailer section that ends the stream. A
+/// response can start with interim (1xx) responses. A trailer section with no END_STREAM, DATA
+/// before the header section, and an interim response with END_STREAM are malformed: stream
+/// errors of type PROTOCOL_ERROR (RFC 9113, sections 8.1 and 8.1.1). A sender cannot make these
+/// messages.
+#[test]
+fn trailers_end_the_body_and_a_message_out_of_order_is_malformed() {
+    let protocol = ErrorCode::PROTOCOL_ERROR;
+    // `x-t: 1`, a literal with no indexing and a new name (RFC 7541, section 6.2.2).
+    let trailer = b"\x00\x03x-t\x011";
+    let mut server = Peer::server();
+    server.receive(
+        &[
+            request(1, false),
+            data(1, false, b"x"),
+            frame(0x1, 0x5, 1, trailer),
+            request(3, false),
+            frame(0x1, 0x4, 3, trailer),
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        server.run(),
+        (
+            vec![
+                Seen::Headers(1, false, lines(&C31_LINES)),
+                Seen::Data(1, b"x".to_vec(), false),
+                Seen::Trailers(1, lines(&[("x-t", "1")])),
+                Seen::Headers(3, false, lines(&C31_LINES)),
+                Seen::StreamError(3, protocol),
+            ],
+            WAIT
+        )
+    );
+    assert_eq!(server.sent(), rst(3, protocol));
+    // The sender: an interim response cannot end the stream, DATA waits for the final response,
+    // and a trailer section must end the stream.
+    assert_eq!(server.section(1, ":status", "103", true), Err(Kind::Misuse));
+    assert_eq!(server.section(1, ":status", "103", false), Ok(()));
+    assert_eq!(server.send(1, b"x", false), Err(Kind::Misuse));
+    assert_eq!(server.section(1, ":status", "200", false), Ok(()));
+    assert_eq!(server.section(1, "x-t", "1", false), Err(Kind::Misuse));
+    assert_eq!(server.section(1, "x-t", "1", true), Ok(()));
+    // The client: `:status: 103` is a literal with no indexing of the name of index 8, and
+    // `:status: 200` is index 8 (RFC 7541, Appendix A).
+    let interim = b"\x08\x03103";
+    let mut client = Peer::client();
+    let (one, three, five) = (client.open(true), client.open(true), client.open(true));
+    client.receive(
+        &[
+            frame(0x1, 0x4, one, interim),
+            frame(0x1, 0x4, one, b"\x88"),
+            data(one, false, b"x"),
+            frame(0x1, 0x5, one, trailer),
+            data(three, false, b"x"),
+            frame(0x1, 0x5, five, interim),
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        client.run(),
+        (
+            vec![
+                Seen::Headers(one, false, lines(&[(":status", "103")])),
+                Seen::Headers(one, false, lines(&[(":status", "200")])),
+                Seen::Data(one, b"x".to_vec(), false),
+                Seen::Trailers(one, lines(&[("x-t", "1")])),
+                Seen::StreamError(three, protocol),
+                Seen::StreamError(five, protocol),
+            ],
+            WAIT
+        )
+    );
+}
+
+/// A GOAWAY of the peer ends each stream of the endpoint above its last stream, and no new stream
+/// opens (RFC 9113, section 6.8). The streams at or below it complete, and then the connection
+/// sends its own GOAWAY and ends with no error. A later GOAWAY cannot raise the last stream: a
+/// PROTOCOL_ERROR, as the lead decided (the rule of nghttp2).
+#[test]
+fn a_goaway_of_the_peer_drains_the_streams_at_or_below_its_last_stream() {
+    let no_error = ErrorCode::NO_ERROR;
+    for raise in [false, true] {
+        let mut client = Peer::client();
+        let streams = [client.open(false), client.open(false), client.open(false)];
+        assert_eq!(streams, [1, 3, 5]);
+        client.sent();
+        client.receive(&goaway(3, no_error));
+        assert_eq!(client.run(), (vec![Seen::GoAway(3, no_error)], WAIT));
+        assert_eq!(client.send(5, b"x", true), Err(Kind::Misuse), "stream 5 ended");
+        let region = Backing::from(Vec::with_capacity(256));
+        let refused = client
+            .connection
+            .open(&mut client.outbound, [].into_iter(), true, region);
+        assert_eq!(refused.map_err(|error| error.kind()), Err(Kind::Overload));
+        if raise {
+            client.receive(&goaway(5, no_error));
+            ended(client.run().1, Kind::Malformed);
+            assert_eq!(client.sent(), goaway(0, ErrorCode::PROTOCOL_ERROR));
+            continue;
+        }
+        for stream in [1, 3] {
+            assert_eq!(client.send(stream, b"", true), Ok(0));
+            client.receive(&frame(0x1, 0x5, stream, b"\x88"));
+        }
+        let (events, progress) = client.run();
+        assert_eq!(events.len(), 2, "two responses");
+        assert_eq!(progress, Progress::Terminal(Ok(())));
+        assert!(
+            client.sent().ends_with(&goaway(0, no_error)),
+            "the GOAWAY of the client"
+        );
+    }
+}
+
+/// The shutdown of a server: a GOAWAY with the last stream 2^31 - 1 and a PING, and at the PING's
+/// answer the GOAWAY with the last stream that went up (RFC 9113, section 6.8). A request in
+/// flight before the answer is accepted, and a request after it is discarded with no reset. The
+/// accepted streams complete, and then the connection ends with no error.
+#[test]
+fn a_server_shutdown_drains_accepted_streams_and_discards_later_ones() {
+    let no_error = ErrorCode::NO_ERROR;
+    let mut server = Peer::server();
+    server.receive(&request(1, false));
+    assert_eq!(server.run().0.len(), 1, "a request");
+    server
+        .connection
+        .shutdown(&mut server.outbound)
+        .expect("the queue has room");
+    assert_eq!(
+        server.sent(),
+        [goaway((1 << 31) - 1, no_error), frame(0x6, 0, 0, b"shutdown")].concat()
+    );
+    server.receive(&[request(3, true), frame(0x6, 0x1, 0, b"shutdown"), request(5, true)].concat());
+    assert_eq!(server.run(), (vec![Seen::Headers(3, true, lines(&C31_LINES))], WAIT));
+    assert_eq!(server.sent(), goaway(3, no_error));
+    assert_eq!(server.section(3, ":status", "200", true), Ok(()));
+    assert_eq!(server.section(1, ":status", "200", true), Ok(()));
+    server.receive(&data(1, true, b""));
+    let (events, progress) = server.run();
+    assert_eq!(events, [Seen::Data(1, Vec::new(), true)]);
+    assert_eq!(progress, Progress::Terminal(Ok(())));
 }

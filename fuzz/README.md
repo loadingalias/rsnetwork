@@ -15,7 +15,7 @@ writes. The module documentation of each target gives its input format and its c
 | `chunked` | `h1::ChunkDecoder` | Pieces give the result of the whole input. No step allocates. The data and the trailers stay in their limits. |
 | `values` | The constructors of `value`, `write_request`, `write_head`, `RequestParser`, and `ResponseParser` | No constructor allocates. A host name obeys its rules. Each accepted value passes through a writer and a parser with no change. |
 | `hpack` | `hpack::Decoder` and `hpack::Encoder` | No decode allocates or changes the charge. The lines of a block stay in the list limit. A decoder that fails gives the same error for each later block. The encoder sends each decoded block to a second decoder, which reads the same lines and marks. |
-| `h2` | `h2::Connection`, with `hpack::Decoder` and the frame codec | A cut input gives the events, the output, and the end of the whole input. No drive allocates past the work limit. Each charge returns when the connection drops. No frame follows a GOAWAY, and a connection error ends with one. |
+| `h2` | `h2::Connection`, with its stream layer, `hpack::Decoder`, and the frame codec | A cut input gives the events, the output, and the end of the whole input. No drive allocates past the work limit. Each charge returns when the connection drops. No frame follows a GOAWAY, and a connection error ends with one. A body goes up only on a stream after its header section and before its end, and no event follows a reset. No frame follows a reset of the endpoint, and no reset goes on an idle stream. The WINDOW_UPDATE frames of each stream and of the connection give back at most the DATA bytes of the input. The last stream of a GOAWAY never increases. |
 | `differential` | `RequestParser` and `ChunkDecoder`, against `httparse` | Each head that rsnetwork accepts has the same method, target, version, field lines, and length for `httparse`. Each chunked body after it has the same data, trailer section, and length. |
 
 The transport checks the bounds of [Bound the memory and the work of a connection](../docs/content/limits.md)
@@ -72,7 +72,9 @@ the first 12 blocks of `story_02.json` of four encoders of `tests/hpack-test-cas
 two control bytes of the target.
 
 The seeds of `h2` are frame sequences that follow the figures of RFC 9113, section 6, with the
-blocks of RFC 7541, C.3.1 and C.4. Each name gives the RFC section that it exercises.
+blocks of RFC 7541, C.3.1 and C.4. Each name gives the RFC section that it exercises. The seeds of
+sections 5.1, 5.1.2, 6.8, 6.9, and 8.1 pass the stream states, the stream limit, GOAWAY, the
+windows, and the parts of a message.
 
 `differential` has no control bytes and no seeds of its own. Its corpus starts from the seeds of
 `request` and `chunked`, with their control bytes removed and a chunked request head before each
@@ -283,3 +285,56 @@ result when it ends.
   artifact. `dev-machine status rsnetwork` then showed no instance and no volume. Limits: the
   working corpus stayed on the discarded host. The time of each drive is constant, so the settings
   timeout never ends a run.
+
+### N210: the HTTP/2 stream layer
+
+- Risk: a frame sequence that makes the stream layer give a body on an idle or closed stream, send
+  a frame on a stream after its reset or a reset on an idle stream, grant more credit than the DATA
+  bytes that arrived, raise the last stream of a GOAWAY, or read differently when frames cross
+  regions. A header block of a refused or closed stream that puts the HPACK state out of step. A
+  panic on hostile input.
+- Code: the commit of N210, on the toolchain of `rust-toolchain.toml`, with the `libfuzzer-sys`
+  closure of N009. The target adds no dependency. Each stream admits 1024 bytes and a server
+  takes 4 streams, so an input of at most 4096 bytes can pass a window and the stream limit.
+- Host: one `aws-linux-arm64-ubuntu2604` host (c8g.4xlarge, 16 cores), with `dev-machine run
+  --ephemeral`. The host has no cargo-fuzz, and the run installs nothing. Plain cargo builds the
+  target with the flags that `cargo fuzz build -v` (cargo-fuzz 0.13.2) gave on the maintainer Mac,
+  and the run gives libFuzzer the arguments that `cargo fuzz run` gives.
+- Budget: `-fork=14 -max_total_time=1200 -timeout=5 -rss_limit_mb=2048 -max_len=4096` and
+  AddressSanitizer. That is 20 minutes with 14 workers, a wall limit of 25 minutes for the target,
+  and a lease of 45 minutes for the host, with the build.
+- Stop condition: the time budget, or the first crash, failed assertion, leak, timeout, or
+  out-of-memory error. The run prints each artifact in base64, so the run record keeps it.
+- Command, from the root of the checkout:
+
+  ```bash
+  DEV_MACHINE_MAX_LEASE_MINUTES=45 ~/dev-machines/dev-machine run rsnetwork \
+    aws-linux-arm64-ubuntu2604 --ephemeral --execute bash -c '
+    set -u; uname -srm; rustc -V
+    export RUSTFLAGS="-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4 \
+      -Cllvm-args=-sanitizer-coverage-inline-8bit-counters -Cllvm-args=-sanitizer-coverage-pc-table \
+      -Cllvm-args=-sanitizer-coverage-trace-compares --cfg fuzzing \
+      -Cllvm-args=-simplifycfg-branch-fold-threshold=0 -Zsanitizer=address -Cdebug-assertions \
+      -Ccodegen-units=1"
+    CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --manifest-path fuzz/Cargo.toml --locked \
+      --release --target aarch64-unknown-linux-gnu --bin h2 || exit 1
+    mkdir -p fuzz/corpus/h2 fuzz/artifacts/h2
+    ASAN_OPTIONS=detect_odr_violation=0 timeout 1500 fuzz/target/aarch64-unknown-linux-gnu/release/h2 \
+      -artifact_prefix=fuzz/artifacts/h2/ fuzz/corpus/h2 fuzz/seeds/h2 \
+      -fork=14 -max_total_time=1200 -timeout=5 -rss_limit_mb=2048 -max_len=4096 >fuzz/h2.log 2>&1
+    status=$?
+    grep -m1 -A60 -E "panicked|ERROR:" fuzz/h2.log; tail -n 4 fuzz/h2.log
+    for f in fuzz/artifacts/h2/*; do [ -f "$f" ] && { echo "== $f"; base64 -w0 "$f"; echo; }; done
+    exit $status'
+  ```
+
+- Result (2026-11-17): pass. Run `20261117T045047Z-90354` at `9f86d1d`, whose code is the code of
+  the N210 commit, on c8g.4xlarge, `ami-06b1a03fa3561aefb`, Linux `7.0.0-1016-aws` aarch64, and
+  `rustc 1.101.0-nightly (3e92e1a2d 2026-11-01)`. The target ran its full budget: 1212 seconds in
+  176 jobs, 20,583,384 runs, `cov` 1898, `ft` 6846, and a corpus of 815. It had 0 crashes, failed
+  assertions, leaks, timeouts, and out-of-memory errors, and it wrote no artifact. `dev-machine
+  status rsnetwork` then showed no instance and no volume. A first run, `20261117T044352Z-63320`,
+  stopped after 2 seconds at an assertion of the target, not of rsnetwork: the input ended inside
+  a padded DATA frame, and the target did not count that frame, which the connection counts at its
+  header (RFC 9113, section 6.9.1). The target now counts it, and the input is the seed
+  `rfc9113-6.9.1-padding-of-a-cut-frame`. Limit: the working corpus stayed on the discarded host.

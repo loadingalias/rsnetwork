@@ -5,7 +5,7 @@ The `rsnetwork::hpack` module is HPACK (RFC 7541), the header compression of HTT
 reads a header block and gives its field lines. Each is the one owner of its dynamic table: the
 table of recent field lines that a block can name with one small index.
 
-rsnetwork is in development and has no release. The [HTTP/2 connection layer](http2.md) owns one
+rsnetwork is in development and has no release. The [HTTP/2 engine](http2.md) owns one
 encoder and one decoder for each connection and calls them for you. Call them yourself when you
 need HPACK alone.
 
@@ -79,7 +79,7 @@ the encoder does not check names or values. HTTP/2 needs lowercase names (RFC 91
 4. Call `decoder.decode(&block, &mut lines)`. On success, `block.lines()` gives the field lines in
    their order.
 5. When the peer acknowledges a new `SETTINGS_HEADER_TABLE_SIZE`, give it to
-   `Decoder::set_limit(limit)`, at most `table_bytes`. The HTTP/2 connection layer calls it for
+   `Decoder::set_limit(limit)`, at most `table_bytes`. The HTTP/2 engine calls it for
    you. A later size update above it is malformed.
    When the table is larger than the new limit, the next block must start with a size update to at
    most the limit (RFC 9113, section 4.3.1), or it is malformed.

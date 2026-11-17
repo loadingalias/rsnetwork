@@ -82,7 +82,7 @@ A `Received` is one received region with its facts:
 | --- | --- |
 | `region` | The exact initialized bytes, as a `Lease`. A view of it keeps the backing alive |
 | `endpoint` | An `Endpoint`: the `peer` address, the `local` address that the bytes came to, the `ecn` codepoint, and the `segment` size when one region holds several datagrams of one size (`None` for one datagram or a byte stream) |
-| `capacity` | The bytes that the host can still admit after this region. The engine grants no more receive credit than this |
+| `capacity` | The bytes that the host can still admit after this region. An engine that grants receive credit as input arrives grants no more than this. The [HTTP/2 engine](http2.md#receive-credit) grants credit only for bytes that no consumer holds: the bytes that the consumer releases with `Connection::release`, padding, and discarded DATA |
 
 `Inbound` holds the received regions that no drive consumed, in their order:
 

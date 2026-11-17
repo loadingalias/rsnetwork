@@ -105,8 +105,10 @@ pub struct Received {
     pub region: Lease,
     /// Where the bytes came from and where they went.
     pub endpoint: Endpoint,
-    /// The bytes that the host can still admit after this region. The engine grants no more
-    /// receive credit than this.
+    /// The bytes that the host can still admit after this region. An engine that grants receive
+    /// credit as input arrives grants no more than this. The HTTP/2 engine grants credit only for
+    /// bytes that no consumer holds: the bytes that the consumer releases with
+    /// [`Connection::release`](crate::h2::Connection::release), padding, and discarded DATA.
     pub capacity: u64,
 }
 

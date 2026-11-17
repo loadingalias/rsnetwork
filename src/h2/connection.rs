@@ -1,4 +1,5 @@
-//! The frame and connection layer of the HTTP/2 engine.
+//! The HTTP/2 engine of one connection: its frame and connection layer, on which the stream layer
+//! of `stream` acts.
 
 use core::alloc::Layout;
 use core::fmt;
@@ -10,9 +11,10 @@ use rstypes::capacity::{Budget, Permit};
 use rstypes::time::{Deadline, Instant};
 
 use super::frame::{
-    self, ACK, ENABLE_PUSH, END_HEADERS, END_STREAM, Entries, ErrorCode, Fixed, Frame, FrameError, HEAD, Head, Kind,
-    MAX_STREAM, PREFACE, flag,
+    self, ACK, ENABLE_PUSH, END_HEADERS, END_STREAM, Entries, ErrorCode, Fixed, Frame, FrameError, HEAD, Head,
+    INITIAL_WINDOW_SIZE, Kind, MAX_STREAM, PREFACE, flag,
 };
+use super::stream::{self, Drain, Flow, INITIAL_WINDOW, Section, Streams};
 use super::{Limits, Role, SETTINGS_TIMEOUT, Settings};
 use crate::drive::{Blocked, Error, Inbound, Kind as ErrorKind, Outbound, Progress, Turn, TurnLimits, Work};
 use crate::hpack::{self, Block, DecodeError, Decoder, Encoder, FieldLine, Lines};
@@ -28,25 +30,30 @@ const SETTINGS_ACK: &[u8] = &[0, 0, 0, 0x4, 0x1, 0, 0, 0, 0];
 /// acknowledges the settings of the preface (RFC 9113, section 4.3.1).
 const INITIAL_TABLE: usize = 4096;
 
-/// The frame and connection layer of one HTTP/2 connection, with no I/O.
+/// The opaque data of the PING of a server's shutdown. Its acknowledgement tells that the peer
+/// read the first GOAWAY, so the server sends the GOAWAY with its last stream (RFC 9113, section
+/// 6.8).
+pub const SHUTDOWN_PING: [u8; 8] = *b"shutdown";
+
+/// One HTTP/2 connection, with no I/O: its frames, its streams, and its flow control.
 ///
 /// [`new`](Self::new) queues the connection preface. In each drive, the connection reads the
 /// frames in the host's [`Inbound`] queue and gives one [`Event`]. It checks each frame (RFC 9113,
 /// sections 4 to 6), applies and acknowledges the peer's SETTINGS frames, answers each PING,
-/// joins and decodes each header block, and gives the stream frames up. The checks of the stream
-/// state are the layer above.
+/// joins and decodes each header block, and applies the rules of each stream state (section 5.1)
+/// and of flow control at the stream and the connection level (sections 5.2 and 6.9).
 ///
 /// A frame that breaks RFC 9113 is a connection error: the connection queues a GOAWAY with the
 /// code of the error and the last stream that it gave up, and the turn is terminal when the GOAWAY
-/// is in the queue. A frame
-/// of a type that RFC 9113 does not define is discarded, also its payload with no copy, unless it
-/// interrupts a header block.
+/// is in the queue. A stream error resets only its stream, with RST_STREAM. A frame of a type that
+/// RFC 9113 does not define is discarded, also its payload with no copy, unless it interrupts a
+/// header block.
 ///
 /// The connection keeps at most one answer that the output queue has no room for: a SETTINGS
-/// acknowledgement, a PING answer, or a GOAWAY. It reads no frame while it keeps one, so a peer
-/// that does not read cannot make it keep more. Each frame that it writes from its own memory
-/// comes from a pool that [`new`](Self::new) makes: one slot of 64 bytes for each entry of the
-/// output queue, and one more, charged to the caller's budget.
+/// acknowledgement, a PING answer, a RST_STREAM, a WINDOW_UPDATE, or a GOAWAY. It reads no frame
+/// while it keeps one, so a peer that does not read cannot make it keep more. Each frame that it
+/// writes from its own memory comes from a pool that [`new`](Self::new) makes: one slot of 64
+/// bytes for each entry of the output queue, and one more, charged to the caller's budget.
 pub struct Connection {
     role: Role,
     /// The settings that the endpoint sent.
@@ -69,43 +76,52 @@ pub struct Connection {
     carry: Carry,
     /// The header block that the connection reads.
     block: Option<Assembly>,
-    /// The flow-control bytes of the current DATA frame that no event gave yet.
-    flow: u32,
     /// The answer that waits for room in the output queue.
     owed: Option<Owed>,
+    /// The streams and the flow-control windows.
+    streams: Streams,
+    /// The largest `SETTINGS_INITIAL_WINDOW_SIZE` of the peer in the SETTINGS frame that the
+    /// connection reads, with the value before the frame.
+    window_peak: u32,
     settings_timeout: Option<Duration>,
     /// The deadline of the acknowledgement of the endpoint's settings.
     deadline: Option<Deadline>,
-    /// The last stream of the peer whose header block went up.
-    last_stream: u32,
     /// The end of the connection.
     end: Option<Result<(), Error>>,
 }
 
 /// An event of the connection.
 pub enum Event<'l> {
-    /// A complete header block on a stream: a HEADERS frame and its CONTINUATION frames, decoded.
+    /// A header section on a stream: a HEADERS frame and its CONTINUATION frames, decoded. For a
+    /// server, it is a request on a new stream. For a client, it is a response: an interim (1xx)
+    /// response, with more to come, or the final response.
     Headers {
         /// The stream.
         stream: u32,
-        /// The flag END_STREAM of the HEADERS frame.
+        /// The flag END_STREAM of the HEADERS frame: the message has no body.
         end_stream: bool,
         /// The decoded lines, which borrow the [`Lines`] of the drive. `None` when they are larger
         /// than `SETTINGS_MAX_HEADER_LIST_SIZE`: the decode kept the HPACK state in step, so the
         /// connection continues. Refuse the stream.
         lines: Option<Block<'l>>,
     },
+    /// The trailer section of a stream (RFC 9113, section 8.1). It ends the body.
+    Trailers {
+        /// The stream.
+        stream: u32,
+        /// The decoded lines, as in [`Event::Headers`]. `None` when they are larger than
+        /// `SETTINGS_MAX_HEADER_LIST_SIZE`: the message is not complete.
+        lines: Option<Block<'l>>,
+    },
     /// Bytes of a DATA frame: a view of a received region, with no copy. A frame can give more
-    /// than one event, one for each region that holds its bytes.
+    /// than one event, one for each region that holds its bytes. Give the bytes back to flow
+    /// control with [`Connection::release`] when the consumer is done with them.
     Data {
         /// The stream.
         stream: u32,
         /// The bytes, which can be empty.
         data: Lease,
-        /// The bytes of this event that count against flow control: the payload length of the
-        /// frame, with its padding, on its first event, and 0 on each later event of the frame.
-        flow: u32,
-        /// The frame had the flag END_STREAM, and this is its last event.
+        /// The frame had the flag END_STREAM, and this is its last event: the body is complete.
         end_stream: bool,
     },
     /// RST_STREAM: the peer ended a stream.
@@ -115,7 +131,8 @@ pub enum Event<'l> {
         /// Why the stream ends.
         code: ErrorCode,
     },
-    /// WINDOW_UPDATE.
+    /// WINDOW_UPDATE: the peer gave more send credit. Send more DATA on the stream, or on each
+    /// stream for the connection.
     WindowUpdate {
         /// The stream, or 0 for the connection.
         stream: u32,
@@ -134,9 +151,9 @@ pub enum Event<'l> {
         /// Why the peer ends the connection.
         code: ErrorCode,
     },
-    /// A frame on a stream is a stream error (RFC 9113, section 5.4.2), for example a
-    /// WINDOW_UPDATE of 0. Reset the stream with the code, or end the connection when the
-    /// stream state requires it.
+    /// A frame of the peer on a stream is a stream error (RFC 9113, section 5.4.2), for example
+    /// DATA past the stream window. The connection reset the stream with RST_STREAM of the code,
+    /// and the stream ended. Its body is malformed.
     StreamError {
         /// The stream.
         stream: u32,
@@ -158,16 +175,19 @@ impl fmt::Debug for Event<'_> {
                 .field("end_stream", end_stream)
                 .field("lines", lines)
                 .finish(),
+            Self::Trailers { stream, lines } => f
+                .debug_struct("Trailers")
+                .field("stream", stream)
+                .field("lines", lines)
+                .finish(),
             Self::Data {
                 stream,
                 data,
-                flow,
                 end_stream,
             } => f
                 .debug_struct("Data")
                 .field("stream", stream)
                 .field("len", &data.initialized())
-                .field("flow", flow)
                 .field("end_stream", end_stream)
                 .finish(),
             Self::Reset { stream, code } => f
@@ -246,7 +266,12 @@ impl fmt::Debug for Join {
 enum Owed {
     SettingsAck,
     PingAck([u8; 8]),
-    GoAway(ErrorCode),
+    /// A RST_STREAM on a stream, with its code.
+    Reset(u32, ErrorCode),
+    /// A WINDOW_UPDATE on a stream, with its increment.
+    Window(u32, u32),
+    /// A GOAWAY with its code and its last stream.
+    GoAway(ErrorCode, u32),
 }
 
 impl fmt::Debug for Owed {
@@ -255,14 +280,16 @@ impl fmt::Debug for Owed {
         match self {
             Self::SettingsAck => f.write_str("SettingsAck"),
             Self::PingAck(_) => f.write_str("PingAck"),
-            Self::GoAway(code) => f.debug_tuple("GoAway").field(code).finish(),
+            Self::Reset(stream, code) => f.debug_tuple("Reset").field(stream).field(code).finish(),
+            Self::Window(stream, increment) => f.debug_tuple("Window").field(stream).field(increment).finish(),
+            Self::GoAway(code, last_stream) => f.debug_tuple("GoAway").field(code).field(last_stream).finish(),
         }
     }
 }
 
 /// A connection error: its RFC 9113 code, the kind of the local error, and a fixed reason.
 #[derive(Clone, Copy, Debug)]
-struct Fault {
+pub(super) struct Fault {
     code: ErrorCode,
     kind: ErrorKind,
     reason: &'static str,
@@ -270,7 +297,7 @@ struct Fault {
 
 impl Fault {
     /// A connection error that the peer caused.
-    const fn peer(code: ErrorCode, reason: &'static str) -> Self {
+    pub(super) const fn peer(code: ErrorCode, reason: &'static str) -> Self {
         Self {
             code,
             kind: ErrorKind::Malformed,
@@ -303,15 +330,17 @@ impl Connection {
     /// Makes the connection of `role` within `limits` and drives within `turn`, and queues its
     /// preface in `outbound`: for a client the 24 bytes of [`PREFACE`] and a SETTINGS frame, and
     /// for a server a SETTINGS frame. The frame has each setting that is not its initial value,
-    /// in the order of the identifiers, and then for a client `SETTINGS_ENABLE_PUSH` 0.
+    /// in the order of the identifiers, and then for a client `SETTINGS_ENABLE_PUSH` 0. When
+    /// `limits.connection_window` is above 65,535, a WINDOW_UPDATE on stream 0 follows, which
+    /// raises the connection window to it.
     ///
-    /// It charges its HPACK tables and its frame pool to `budget`, which also pays for the join of
-    /// each header block later. The decoder table holds at least 4096 bytes, because the peer's
-    /// encoder can use 4096 until the peer acknowledges the settings. Refuses with
-    /// [`Kind::Misuse`](crate::drive::Kind::Misuse) when a setting is past its range or the output
-    /// queue has fewer than 2 entries, and with [`Kind::Overload`](crate::drive::Kind::Overload)
-    /// when the budget, the memory, or the free room of the queue refuses. A refusal keeps no
-    /// memory and no charge.
+    /// It charges its HPACK tables, its stream table, and its frame pool to `budget`, which also
+    /// pays for the join of each header block later. The decoder table holds at least 4096 bytes,
+    /// because the peer's encoder can use 4096 until the peer acknowledges the settings. Refuses
+    /// with [`Kind::Misuse`](crate::drive::Kind::Misuse) when a limit is past its range or the
+    /// output queue has fewer than 3 entries, and with
+    /// [`Kind::Overload`](crate::drive::Kind::Overload) when the budget, the memory, or the free
+    /// room of the queue refuses. A refusal keeps no memory and no charge.
     pub fn new(
         role: Role,
         limits: Limits,
@@ -327,10 +356,13 @@ impl Connection {
         if !(frame::MIN_FRAME_SIZE..=(1 << 24) - 1).contains(&local.max_frame_size) {
             return misuse("SETTINGS_MAX_FRAME_SIZE is outside 2^14 to 2^24 - 1");
         }
-        if outbound.limit() < 2 {
-            return misuse("the output queue has fewer than 2 entries");
+        if !(INITIAL_WINDOW..=MAX_STREAM).contains(&limits.connection_window) {
+            return misuse("the connection window is outside 65,535 to 2^31 - 1");
         }
-        if outbound.free() < 2 {
+        if outbound.limit() < 3 {
+            return misuse("the output queue has fewer than 3 entries");
+        }
+        if outbound.free() < 3 {
             return Err(Error::new(
                 ErrorKind::Overload,
                 "the output queue has no room for the preface",
@@ -370,11 +402,11 @@ impl Connection {
             },
             carry: Carry::default(),
             block: None,
-            flow: 0,
             owed: None,
+            streams: Streams::new(role, &local, limits.connection_window, budget)?,
+            window_peak: INITIAL_WINDOW,
             settings_timeout: Some(SETTINGS_TIMEOUT),
             deadline: None,
-            last_stream: 0,
             end: None,
         };
         // The settings that differ from their initial values, and then the push setting.
@@ -398,10 +430,21 @@ impl Connection {
         let frame = connection
             .pooled(&Frame::Settings { ack: false, settings })
             .ok_or(Error::new(ErrorKind::Overload, "the frame pool is empty"))?;
+        let grant = match connection.streams.initial_grant() {
+            Some(increment) => Some(
+                connection
+                    .pooled(&Frame::WindowUpdate { stream: 0, increment })
+                    .ok_or(Error::new(ErrorKind::Overload, "the frame pool is empty"))?,
+            ),
+            None => None,
+        };
         if role == Role::Client {
             push_region(outbound, Lease::from(PREFACE.as_slice()))?;
         }
         push_region(outbound, frame)?;
+        if let Some(grant) = grant {
+            push_region(outbound, grant)?;
+        }
         Ok(connection)
     }
 
@@ -440,11 +483,15 @@ impl Connection {
         self.expire(now);
         let (mut event, mut progress) = (None, Progress::Blocked(Blocked::Output));
         if self.flush(outbound) && self.end.is_none() {
-            match self.step(inbound, outbound, lines) {
-                Ok(Next::Event(next)) => (event, progress) = (Some(next), Progress::Pending),
-                Ok(Next::Wait(blocked)) => progress = Progress::Blocked(blocked),
-                Ok(Next::Limit) => progress = Progress::Pending,
-                Err(fault) => self.fail(fault),
+            if self.streams.drained() {
+                self.finish();
+            } else {
+                match self.step(inbound, outbound, lines) {
+                    Ok(Next::Event(next)) => (event, progress) = (Some(next), Progress::Pending),
+                    Ok(Next::Wait(blocked)) => progress = Progress::Blocked(blocked),
+                    Ok(Next::Limit) => progress = Progress::Pending,
+                    Err(fault) => self.fail(fault),
+                }
             }
         }
         if event.is_none()
@@ -467,21 +514,46 @@ impl Connection {
         (event, Turn { progress, deadline })
     }
 
-    /// Sends a PING with `opaque`. Its answer comes as [`Event::PingAck`].
+    /// Sends a PING with `opaque`. Its answer comes as [`Event::PingAck`]. During the shutdown of
+    /// a server, the connection takes the answer to a PING with [`SHUTDOWN_PING`] as its own.
     pub fn ping(&mut self, outbound: &mut Outbound, opaque: [u8; 8]) -> Result<(), Error> {
         self.writable(outbound)?;
         let frame = self.pooled(&Frame::Ping { ack: false, opaque }).ok_or_else(full)?;
         push_region(outbound, frame)
     }
 
-    /// Sends a header block on `stream`: a HEADERS frame, and CONTINUATION frames when the block
-    /// is larger than the peer's `SETTINGS_MAX_FRAME_SIZE`. `end_stream` sets the flag END_STREAM.
+    /// Opens a stream of a client with a request: a header block, as [`headers`](Self::headers)
+    /// sends it, on the next free odd stream. Gives the stream.
+    ///
+    /// Refuses, and writes and changes nothing, for a server, when the stream table or the peer's
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` has no free stream, after a GOAWAY went or came, when no
+    /// stream identifier is free, and in each case where `headers` refuses.
+    pub fn open<'a>(
+        &mut self,
+        outbound: &mut Outbound,
+        lines: impl Iterator<Item = FieldLine<'a>> + Clone,
+        end_stream: bool,
+        region: Backing,
+    ) -> Result<u32, Error> {
+        self.writable(outbound)?;
+        let stream = self.streams.next(self.peer.max_concurrent_streams)?;
+        self.block(outbound, stream, lines, end_stream, region)?;
+        self.streams.opened(stream, end_stream);
+        Ok(stream)
+    }
+
+    /// Sends a header section on an open `stream`: a HEADERS frame, and CONTINUATION frames when
+    /// the block is larger than the peer's `SETTINGS_MAX_FRAME_SIZE`. `end_stream` sets the flag
+    /// END_STREAM. A server sends its response with it: interim (1xx) responses, and then the
+    /// final response. After the final response or the request, a header section is the trailer
+    /// section, which ends the stream.
     ///
     /// The frames go into the free capacity of `region`, after the bytes that it holds, and go out
     /// as views of it, with no copy: the HPACK block after a frame header, and the header of each
     /// CONTINUATION frame after the block. Thus the region needs room for the longest block of
     /// `lines` and for 9 bytes for each frame. Refuses, and writes and changes nothing, when the
-    /// region or the output queue has too little room, or when `stream` is 0 or past 2^31 - 1.
+    /// region or the output queue has too little room, when the stream is not open or sent its
+    /// end, when an interim response has `end_stream`, and when a trailer section does not.
     pub fn headers<'a>(
         &mut self,
         outbound: &mut Outbound,
@@ -490,8 +562,23 @@ impl Connection {
         end_stream: bool,
         region: Backing,
     ) -> Result<(), Error> {
-        check_stream(stream)?;
         self.writable(outbound)?;
+        let interim = stream::interim(lines.clone().next());
+        self.streams.sendable(stream, interim, end_stream)?;
+        self.block(outbound, stream, lines, end_stream, region)?;
+        self.streams.sent(stream, interim, end_stream);
+        Ok(())
+    }
+
+    /// Writes a header block on `stream` into `region`, and queues its frames.
+    fn block<'a>(
+        &mut self,
+        outbound: &mut Outbound,
+        stream: u32,
+        lines: impl Iterator<Item = FieldLine<'a>> + Clone,
+        end_stream: bool,
+        region: Backing,
+    ) -> Result<(), Error> {
         let max = self.peer.max_frame_size as usize;
         let needed = self.encoder.needed(lines.clone());
         let frames = needed.div_ceil(max).max(1);
@@ -546,35 +633,143 @@ impl Connection {
         Ok(())
     }
 
-    /// Sends `data` as one DATA frame on `stream`, with no copy: a frame header from the pool, and
-    /// then a view of `data`. `end_stream` sets the flag END_STREAM. The flow control of the
-    /// stream is the layer above.
+    /// Sends the start of `data` on `stream` as one DATA frame, with no copy: a frame header from
+    /// the pool, and then a view of `data`. Gives the number of bytes that it sent: as many as
+    /// the stream window, the connection window, and the peer's `SETTINGS_MAX_FRAME_SIZE` permit.
+    /// Send the rest after a [`Event::WindowUpdate`]. `end_stream` sets the flag END_STREAM when
+    /// the frame holds each byte of `data`. An empty `data` with `end_stream` needs no credit.
     ///
-    /// Refuses, and queues nothing, when the output queue or the pool has no room, when `data` is
-    /// larger than the peer's `SETTINGS_MAX_FRAME_SIZE`, or when `stream` is 0 or past 2^31 - 1.
-    pub fn data(&mut self, outbound: &mut Outbound, stream: u32, data: &Lease, end_stream: bool) -> Result<(), Error> {
-        check_stream(stream)?;
-        let length = u32::try_from(data.initialized())
-            .ok()
-            .filter(|&length| length <= self.peer.max_frame_size)
-            .ok_or(Error::new(
-                ErrorKind::Misuse,
-                "the data is larger than the peer's frame size",
-            ))?;
+    /// Refuses, and queues nothing, when the output queue or the pool has no room, when the
+    /// stream is not open or sent its end, and before the header section of the stream.
+    pub fn data(
+        &mut self,
+        outbound: &mut Outbound,
+        stream: u32,
+        data: &Lease,
+        end_stream: bool,
+    ) -> Result<usize, Error> {
         self.writable(outbound)?;
-        if outbound.free() < 1 + usize::from(length > 0) {
+        let len = self
+            .streams
+            .credit(stream, data.initialized(), self.peer.max_frame_size)?;
+        let end_stream = end_stream && len == data.initialized();
+        if len == 0 && !end_stream {
+            return Ok(0);
+        }
+        if outbound.free() < 1 + usize::from(len > 0) {
             return Err(full());
         }
         let head = Head {
-            length,
+            length: narrow(len),
             kind: Kind::Data,
             flags: flag(end_stream, END_STREAM),
             stream,
         };
+        let part = data.view(..len).ok_or_else(full)?;
         let mut slot = WriteLoan::new(self.pool.acquire().map_err(|_| full())?);
         slot.fill_from(&head.encode());
         push_region(outbound, Lease::from(slot.into_inner()))?;
-        push_region(outbound, data.clone())
+        push_region(outbound, part)?;
+        self.streams.sent_data(stream, narrow(len), end_stream);
+        Ok(len)
+    }
+
+    /// Resets an open `stream` with RST_STREAM of `code`, and ends it (RFC 9113, section 6.4).
+    /// The connection discards each later frame of the peer on it, and keeps the HPACK state and
+    /// the connection window in step.
+    ///
+    /// Refuses, and queues nothing, when the output queue or the pool has no room, when the
+    /// stream is not open, and for a server with `REFUSED_STREAM`: each stream that a server
+    /// knows went up to it, so it is not "unprocessed" (section 8.7).
+    pub fn reset(&mut self, outbound: &mut Outbound, stream: u32, code: ErrorCode) -> Result<(), Error> {
+        self.writable(outbound)?;
+        self.streams.resettable(stream, code)?;
+        if outbound.free() == 0 {
+            return Err(full());
+        }
+        let frame = self.pooled(&Frame::RstStream { stream, code }).ok_or_else(full)?;
+        push_region(outbound, frame)?;
+        self.streams.close(stream);
+        Ok(())
+    }
+
+    /// Releases `bytes` data bytes of `stream` that the consumer is done with: the bytes of
+    /// [`Event::Data`] that it copied out or dropped. The connection gives their credit back to
+    /// the peer at the stream and the connection level, with a WINDOW_UPDATE when the free
+    /// credit reaches the credit that the peer still has. No other credit goes to the peer, so
+    /// the peer can send at most the windows that the limits admit.
+    ///
+    /// Release the bytes of a stream that ended too. Refuses, and changes nothing, when the
+    /// consumer of the stream or of the connection holds fewer bytes, and when the output queue or
+    /// the pool has no room for the frames.
+    pub fn release(&mut self, outbound: &mut Outbound, stream: u32, bytes: u32) -> Result<(), Error> {
+        self.writable(outbound)?;
+        let mut slots = [0, 1].map(|frames| {
+            if outbound.free() > frames {
+                self.pool.acquire().ok()
+            } else {
+                None
+            }
+        });
+        let room = slots.iter().flatten().count();
+        let grants = self.streams.release(stream, bytes, room)?;
+        for ((stream, increment), slot) in grants
+            .into_iter()
+            .flatten()
+            .zip(slots.iter_mut().filter_map(Option::take))
+        {
+            let mut out = WriteLoan::new(slot);
+            Frame::WindowUpdate { stream, increment }
+                .write(&mut out)
+                .map_err(|_| full())?;
+            push_region(outbound, Lease::from(out.into_inner()))?;
+        }
+        Ok(())
+    }
+
+    /// Starts the shutdown of the connection (RFC 9113, section 6.8): no new stream opens, each
+    /// open stream completes, and then the connection ends with no error.
+    ///
+    /// A client sends GOAWAY with `NO_ERROR` and the last stream 0. A server first sends GOAWAY
+    /// with `NO_ERROR` and the last stream 2^31 - 1, and a PING with [`SHUTDOWN_PING`]. At its
+    /// answer, the server sends GOAWAY with the last stream that went up, and discards each later
+    /// stream. Thus no request in flight is lost. Refuses, and queues nothing, when the output
+    /// queue or the pool has no room. A second call changes nothing.
+    pub fn shutdown(&mut self, outbound: &mut Outbound) -> Result<(), Error> {
+        self.writable(outbound)?;
+        if self.streams.drain != Drain::Open {
+            return Ok(());
+        }
+        let (last_stream, drain) = match self.role {
+            Role::Client => (self.streams.last_stream, Drain::Sent(self.streams.last_stream)),
+            Role::Server => (MAX_STREAM, Drain::Notice),
+        };
+        let frames = 1 + usize::from(drain == Drain::Notice);
+        if outbound.free() < frames {
+            return Err(full());
+        }
+        let goaway = Frame::GoAway {
+            last_stream,
+            code: ErrorCode::NO_ERROR,
+            debug: &[],
+        };
+        let goaway = self.pooled(&goaway).ok_or_else(full)?;
+        let ping = match drain {
+            Drain::Notice => Some(
+                self.pooled(&Frame::Ping {
+                    ack: false,
+                    opaque: SHUTDOWN_PING,
+                })
+                .ok_or_else(full)?,
+            ),
+            _ => None,
+        };
+        push_region(outbound, goaway)?;
+        if let Some(ping) = ping {
+            push_region(outbound, ping)?;
+        }
+        self.streams.drain = drain;
+        Ok(())
     }
 
     /// Refuses a write after the end of the connection, and sends the answer that waits first, so
@@ -593,46 +788,63 @@ impl Connection {
         Some(Lease::from(out.into_inner()))
     }
 
-    /// Queues the answer that waits, and gives whether none waits.
+    /// Queues the answer that waits, and then the free credit of the connection when it is due.
+    /// Gives whether no answer waits.
     fn flush(&mut self, outbound: &mut Outbound) -> bool {
-        let Some(owed) = self.owed else { return true };
-        if outbound.free() == 0 {
-            return false;
-        }
-        let region = match owed {
-            Owed::SettingsAck => Lease::from(SETTINGS_ACK),
-            Owed::PingAck(opaque) => match self.pooled(&Frame::Ping { ack: true, opaque }) {
-                Some(region) => region,
-                None => return false,
-            },
-            Owed::GoAway(code) => {
-                let frame = Frame::GoAway {
-                    last_stream: self.last_stream,
+        if let Some(owed) = self.owed {
+            if outbound.free() == 0 {
+                return false;
+            }
+            let region = match owed {
+                Owed::SettingsAck => Some(Lease::from(SETTINGS_ACK)),
+                Owed::PingAck(opaque) => self.pooled(&Frame::Ping { ack: true, opaque }),
+                Owed::Reset(stream, code) => self.pooled(&Frame::RstStream { stream, code }),
+                Owed::Window(stream, increment) => self.pooled(&Frame::WindowUpdate { stream, increment }),
+                Owed::GoAway(code, last_stream) => self.pooled(&Frame::GoAway {
+                    last_stream,
                     code,
                     debug: &[],
-                };
-                match self.pooled(&frame) {
-                    Some(region) => region,
-                    None => return false,
-                }
+                }),
+            };
+            let Some(region) = region else { return false };
+            if outbound.push(region).is_err() {
+                return false;
             }
-        };
-        if outbound.push(region).is_err() {
-            return false;
+            // The peer's table limit holds from the acknowledgement on, and each later block of the
+            // encoder goes after it.
+            if matches!(owed, Owed::SettingsAck) {
+                self.encoder.set_peer_limit(self.peer.header_table_size as usize);
+            }
+            self.owed = None;
         }
-        // The peer's table limit holds from the acknowledgement on, and each later block of the
-        // encoder goes after it.
-        if matches!(owed, Owed::SettingsAck) {
-            self.encoder.set_peer_limit(self.peer.header_table_size as usize);
+        // No frame follows the GOAWAY of a connection error. A grant that finds no room waits for
+        // a later flush.
+        if self.end.is_none()
+            && outbound.free() > 0
+            && let Some(increment) = self.streams.connection_due()
+            && let Some(region) = self.pooled(&Frame::WindowUpdate { stream: 0, increment })
+            && outbound.push(region).is_ok()
+        {
+            self.streams.connection_granted(increment);
         }
-        self.owed = None;
         true
     }
 
     /// Ends the connection with `fault`: a GOAWAY with its code waits for the output queue.
     fn fail(&mut self, fault: Fault) {
-        self.owed = Some(Owed::GoAway(fault.code));
+        self.owed = Some(Owed::GoAway(fault.code, self.streams.last_stream));
         self.end = Some(Err(Error::new(fault.kind, fault.reason)));
+    }
+
+    /// Ends a connection that has no open stream after a GOAWAY: the endpoint sends its own
+    /// GOAWAY first, if it did not yet (RFC 9113, section 6.8).
+    fn finish(&mut self) {
+        if !matches!(self.streams.drain, Drain::Sent(_)) {
+            let last_stream = self.streams.last_stream;
+            self.owed = Some(Owed::GoAway(ErrorCode::NO_ERROR, last_stream));
+            self.streams.drain = Drain::Sent(last_stream);
+        }
+        self.end = Some(Ok(()));
     }
 
     /// Ends the connection at `now` when the peer did not acknowledge the settings by their
@@ -709,20 +921,21 @@ impl Connection {
                     }
                     let fixed = Fixed::parse(&head, &self.carry.bytes[..len]);
                     self.carry.len = 0;
-                    let fixed = match fixed {
-                        Ok(fixed) => fixed,
+                    match fixed {
+                        Ok(fixed) => {
+                            let variable = head.length - narrow(len) - u32::from(fixed.padding());
+                            if let Some(event) = self.fixed(&head, fixed, variable)? {
+                                return Ok(Next::Event(event));
+                            }
+                        }
+                        // A WINDOW_UPDATE of 0 on a stream.
                         Err(FrameError::Stream(code)) => {
                             self.read = Read::Head;
-                            return Ok(Next::Event(Event::StreamError {
-                                stream: head.stream,
-                                code,
-                            }));
+                            if self.streams.zero_window(head.stream)? {
+                                return Ok(Next::Event(self.reset_by_error(head.stream, code)));
+                            }
                         }
                         Err(error) => return Err(fault(error)),
-                    };
-                    let variable = head.length - narrow(len) - u32::from(fixed.padding());
-                    if let Some(event) = self.fixed(&head, fixed, variable)? {
-                        return Ok(Next::Event(event));
                     }
                 }
                 Read::Body(head, fixed @ Fixed::Data { .. }, 0) => {
@@ -744,12 +957,9 @@ impl Connection {
                         (0, false) => Read::Padding(head, fixed, padding),
                         (left, _) => Read::Body(head, fixed, left),
                     };
-                    return Ok(Next::Event(Event::Data {
-                        stream: head.stream,
-                        data,
-                        flow: core::mem::take(&mut self.flow),
-                        end_stream: complete && head.flags & END_STREAM != 0,
-                    }));
+                    if let Some(event) = self.delivered(head.stream, data, complete && head.flags & END_STREAM != 0) {
+                        return Ok(Next::Event(event));
+                    }
                 }
                 Read::Body(head, fixed @ (Fixed::Headers { .. } | Fixed::Continuation), left) => {
                     let padding = u32::from(fixed.padding());
@@ -803,6 +1013,7 @@ impl Connection {
                 Read::Body(head, Fixed::Settings, left) => {
                     if left == 0 {
                         self.read = Read::Head;
+                        self.streams.settings(self.window_peak, self.peer.initial_window_size)?;
                         self.owed = Some(Owed::SettingsAck);
                         return Ok(Next::Event(Event::Settings(self.peer)));
                     }
@@ -817,11 +1028,14 @@ impl Connection {
                         return Err(Fault::peer(ErrorCode::PROTOCOL_ERROR, "the server enabled push"));
                     }
                     self.peer.apply(id, value);
+                    if id == INITIAL_WINDOW_SIZE {
+                        self.window_peak = self.window_peak.max(value);
+                    }
                     self.read = Read::Body(head, Fixed::Settings, left - 6);
                 }
                 Read::Body(head, fixed, left) => {
-                    // The debug data of a GOAWAY and the payload of an unknown type: discarded,
-                    // with no copy.
+                    // The debug data of a GOAWAY, the payload of an unknown type, and a DATA
+                    // payload that the stream layer discards: discarded, with no copy.
                     let mut left = left;
                     if !skip(inbound, &mut left, &mut work)? {
                         self.read = Read::Body(head, fixed, left);
@@ -829,6 +1043,7 @@ impl Connection {
                     }
                     self.read = Read::Head;
                     if let Fixed::GoAway { last_stream, code } = fixed {
+                        self.streams.goaway(last_stream)?;
                         return Ok(Next::Event(Event::GoAway { last_stream, code }));
                     }
                 }
@@ -840,15 +1055,10 @@ impl Connection {
                     }
                     self.read = Read::Head;
                     match fixed {
-                        Fixed::Data { .. } => {
-                            let end_stream = head.flags & END_STREAM != 0;
-                            if end_stream || self.flow > 0 {
-                                return Ok(Next::Event(Event::Data {
-                                    stream: head.stream,
-                                    data: Lease::from(<&[u8]>::default()),
-                                    flow: core::mem::take(&mut self.flow),
-                                    end_stream,
-                                }));
+                        Fixed::Data { .. } if head.flags & END_STREAM != 0 => {
+                            let empty = Lease::from(<&[u8]>::default());
+                            if let Some(event) = self.delivered(head.stream, empty, true) {
+                                return Ok(Next::Event(event));
                             }
                         }
                         Fixed::Headers { .. } | Fixed::Continuation if head.flags & END_HEADERS != 0 => {
@@ -901,8 +1111,23 @@ impl Connection {
         self.read = Read::Body(*head, fixed, variable);
         let event = match fixed {
             Fixed::Data { .. } => {
-                self.flow = head.length;
-                None
+                let end_stream = head.flags & END_STREAM != 0;
+                let (flow, grant) = self.streams.data(head.stream, head.length, variable, end_stream)?;
+                if let Some(increment) = grant {
+                    self.owed = Some(Owed::Window(head.stream, increment));
+                }
+                match flow {
+                    Flow::Deliver => None,
+                    Flow::Discard | Flow::Reset(_) => {
+                        // The rest of the frame, with its padding, is discarded with no copy.
+                        let rest = variable + u32::from(fixed.padding());
+                        self.read = Read::Body(*head, Fixed::Unknown, rest);
+                        match flow {
+                            Flow::Reset(code) => Some(self.reset_by_error(head.stream, code)),
+                            _ => None,
+                        }
+                    }
+                }
             }
             Fixed::Headers { .. } | Fixed::Continuation => {
                 let joined = self
@@ -936,35 +1161,48 @@ impl Connection {
                 self.acknowledged = true;
                 self.deadline = None;
                 self.decoder.set_limit(self.local.header_table_size as usize);
+                self.streams.acknowledged();
                 self.read = Read::Head;
                 None
             }
             Fixed::Settings => {
                 self.preface = true;
+                self.window_peak = self.peer.initial_window_size;
                 None
             }
             Fixed::Ping(opaque) => {
                 self.read = Read::Head;
-                if head.flags & ACK != 0 {
-                    Some(Event::PingAck(opaque))
-                } else {
+                if head.flags & ACK == 0 {
                     self.owed = Some(Owed::PingAck(opaque));
                     None
+                } else if self.streams.drain == Drain::Notice && opaque == SHUTDOWN_PING {
+                    // The peer read the first GOAWAY of the shutdown, so each stream that it
+                    // opens later is above the last stream.
+                    let last_stream = self.streams.last_stream;
+                    self.owed = Some(Owed::GoAway(ErrorCode::NO_ERROR, last_stream));
+                    self.streams.drain = Drain::Sent(last_stream);
+                    None
+                } else {
+                    Some(Event::PingAck(opaque))
                 }
             }
             Fixed::RstStream(code) => {
                 self.read = Read::Head;
-                Some(Event::Reset {
+                self.streams.reset(head.stream)?.then_some(Event::Reset {
                     stream: head.stream,
                     code,
                 })
             }
             Fixed::WindowUpdate(increment) => {
                 self.read = Read::Head;
-                Some(Event::WindowUpdate {
-                    stream: head.stream,
-                    increment,
-                })
+                match self.streams.window(head.stream, increment)? {
+                    None => None,
+                    Some(Ok(())) => Some(Event::WindowUpdate {
+                        stream: head.stream,
+                        increment,
+                    }),
+                    Some(Err(code)) => Some(self.reset_by_error(head.stream, code)),
+                }
             }
             Fixed::Priority(_) => {
                 self.read = Read::Head;
@@ -975,7 +1213,8 @@ impl Connection {
         Ok(event)
     }
 
-    /// The event of a decoded header block.
+    /// The event of a decoded header block, or `Next::Limit` when no event goes up: one header
+    /// block decodes in each drive.
     fn decoded<'l>(
         &mut self,
         stream: u32,
@@ -1006,16 +1245,46 @@ impl Connection {
                 });
             }
         };
-        // A client opens each stream, and a server pushes none, so only a server has streams of
-        // the peer.
-        if self.role == Role::Server {
-            self.last_stream = self.last_stream.max(stream);
+        let first = lines.as_ref().and_then(|block| block.lines().next());
+        Ok(
+            match self.streams.headers(stream, end_stream, first, self.acknowledged)? {
+                Section::Head => Next::Event(Event::Headers {
+                    stream,
+                    end_stream,
+                    lines,
+                }),
+                Section::Trailers => Next::Event(Event::Trailers { stream, lines }),
+                Section::Discard => Next::Limit,
+                Section::Refuse(code) => {
+                    self.owed = Some(Owed::Reset(stream, code));
+                    Next::Limit
+                }
+                Section::Reset(code) => Next::Event(self.reset_by_error(stream, code)),
+            },
+        )
+    }
+
+    /// The event of DATA bytes that the peer sent on `stream`, or `None` when the stream no
+    /// longer receives: the application reset it inside the frame.
+    fn delivered(&mut self, stream: u32, data: Lease, end_stream: bool) -> Option<Event<'static>> {
+        if !self.streams.receive(stream, narrow(data.initialized())) {
+            return None;
         }
-        Ok(Next::Event(Event::Headers {
+        if end_stream {
+            self.streams.end(stream);
+        }
+        Some(Event::Data {
             stream,
+            data,
             end_stream,
-            lines,
-        }))
+        })
+    }
+
+    /// Queues the RST_STREAM of a stream error of `code` on `stream`, which the stream layer
+    /// ended, and gives its event.
+    fn reset_by_error(&mut self, stream: u32, code: ErrorCode) -> Event<'static> {
+        self.owed = Some(Owed::Reset(stream, code));
+        Event::StreamError { stream, code }
     }
 
     /// Copies bytes from the front of `inbound` into the carry until it holds `len` bytes, and
@@ -1036,10 +1305,10 @@ impl Connection {
     /// more bytes. The end at a frame boundary (`boundary`) ends the connection with no error.
     fn wait(&mut self, inbound: &Inbound, boundary: bool) -> Next<'static> {
         if inbound.ended() && inbound.front().is_none() {
-            self.end = Some(if boundary {
-                Ok(())
-            } else {
-                Err(Error::new(ErrorKind::Partial, "the connection ended inside a frame"))
+            self.end = Some(match (boundary, self.streams.active()) {
+                (true, false) => Ok(()),
+                (true, true) => Err(Error::new(ErrorKind::Partial, "the connection ended with open streams")),
+                (false, _) => Err(Error::new(ErrorKind::Partial, "the connection ended inside a frame")),
             });
         }
         Next::Wait(Blocked::Input)
@@ -1098,14 +1367,6 @@ const fn narrow(len: usize) -> u32 {
 /// Pushes `region` into the output queue, which has room.
 fn push_region(outbound: &mut Outbound, region: Lease) -> Result<(), Error> {
     outbound.push(region).map_err(|_| full())
-}
-
-/// Refuses a stream identifier that no frame can carry.
-fn check_stream(stream: u32) -> Result<(), Error> {
-    if stream == 0 || stream > MAX_STREAM {
-        return Err(Error::new(ErrorKind::Misuse, "the stream is 0 or past 2^31 - 1"));
-    }
-    Ok(())
 }
 
 /// The refusal of a full output queue or pool.

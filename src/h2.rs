@@ -1,36 +1,38 @@
-//! HTTP/2 (RFC 9113): the frame codec and the frame and connection layer of the engine, with no
-//! I/O.
+//! HTTP/2 (RFC 9113): the frame codec and the engine of one connection, with no I/O.
 //!
 //! [`frame`] reads and writes each frame of RFC 9113, with each check of sections 4 and 6.
-//! [`Connection`] is the frame and connection layer of one connection. It sends and checks the
-//! connection preface, exchanges and acknowledges SETTINGS, answers PING, frames GOAWAY, and joins
-//! a header block across HEADERS and CONTINUATION frames into one HPACK decode. A connection error
-//! sends a GOAWAY with its RFC 9113 code, and then the connection ends. Server push is off: a
-//! client sends `SETTINGS_ENABLE_PUSH` 0, and a PUSH_PROMISE is a connection error in each role.
+//! [`Connection`] is the engine of one connection. It sends and checks the connection preface,
+//! exchanges and acknowledges SETTINGS, answers PING, and joins a header block across HEADERS and
+//! CONTINUATION frames into one HPACK decode. It keeps the state of each stream (section 5.1),
+//! flow control at the stream and the connection level (sections 5.2 and 6.9), and the drain
+//! after a GOAWAY (section 6.8). A connection error sends a GOAWAY with its RFC 9113 code, and
+//! then the connection ends. A stream error resets its stream. Server push is off: a client sends
+//! `SETTINGS_ENABLE_PUSH` 0, and a PUSH_PROMISE is a connection error in each role.
 //!
-//! The layer reads frames in place in the received regions: a DATA payload goes up as views of the
-//! regions, with no copy. A header block in one HEADERS frame inside one region decodes in place.
-//! Other blocks join into one buffer that the caller's budget pays for, because the HPACK decoder
-//! reads one contiguous block. The stream state, flow control, and drain are the layer above.
+//! The engine reads frames in place in the received regions: a DATA payload goes up as views of
+//! the regions, with no copy. A header block in one HEADERS frame inside one region decodes in
+//! place. Other blocks join into one buffer that the caller's budget pays for, because the HPACK
+//! decoder reads one contiguous block. The receive credit follows the consumer: the peer gets
+//! more credit only for the bytes that the consumer releases.
 //!
 //! ```
 //! use core::net::{Ipv4Addr, SocketAddr};
 //! use core::num::{NonZeroU64, NonZeroUsize};
 //!
-//! use rsnetwork::buffer::{Buffer as _, Lease};
+//! use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 //! use rsnetwork::capacity::Budget;
 //! use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received, TurnLimits};
 //! use rsnetwork::h2::{Connection, Event, Limits, Role, Settings};
-//! use rsnetwork::hpack::Lines;
+//! use rsnetwork::hpack::{FieldLine, Lines};
 //! use rsnetwork::time::{ClockDomain, Instant, Suspend};
 //!
 //! let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
 //! let queue = NonZeroUsize::new(16).expect("not zero");
 //! let (mut inbound, mut outbound) = (Inbound::new(queue, &budget)?, Outbound::new(queue, &budget)?);
 //! let settings = Settings { max_concurrent_streams: 100, max_header_list_size: 16 * 1024, ..Settings::INITIAL };
-//! let limits = Limits { settings, work: 64 * 1024, encoder_table_bytes: 4096 };
+//! let limits = Limits { settings, work: 64 * 1024, encoder_table_bytes: 4096, connection_window: 1 << 20 };
 //! let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
-//! // The server sends its SETTINGS frame at once.
+//! // The server sends its SETTINGS frame, and a WINDOW_UPDATE that raises the connection window.
 //! let mut server = Connection::new(Role::Server, limits, turn, &mut outbound, &budget)?;
 //! let mut lines = Lines::new(server.header_limits(), &budget)?;
 //! let now = Some(Instant::new(ClockDomain::new(1, Suspend::Pauses), 0));
@@ -61,22 +63,29 @@
 //! let fields: Vec<_> = block.lines().map(|line| (line.name, line.value)).collect();
 //! assert_eq!(fields[3], (&b":authority"[..], &b"www.example.com"[..]));
 //!
-//! // The output: the server's SETTINGS frame, then the acknowledgement of the client's.
+//! // The response on stream 1: a header section, and its body in one DATA frame that ends it.
+//! let status = FieldLine { name: b":status", value: b"200", never_indexed: false };
+//! server.headers(&mut outbound, 1, [status].into_iter(), false, Backing::from(Vec::with_capacity(64)))?;
+//! assert_eq!(server.data(&mut outbound, 1, &Lease::from(b"hello".to_vec()), true)?, 5);
+//!
+//! // The output: the server's SETTINGS frame and WINDOW_UPDATE, the acknowledgement of the
+//! // client's SETTINGS frame, the HEADERS frame, and last the DATA frame.
 //! let mut sent = Vec::new();
 //! while let Some(output) = outbound.submit() {
 //!     sent.extend_from_slice(output.region.bytes());
 //!     outbound.ack(output.id, output.region.initialized())?;
 //! }
-//! assert_eq!(sent[sent.len() - 9..], [0, 0, 0, 0x04, 0x01, 0, 0, 0, 0]);
+//! assert!(sent.ends_with(b"\0\0\x05\0\x01\0\0\0\x01hello"));
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 mod connection;
 pub mod frame;
+mod stream;
 
 use core::time::Duration;
 
-pub use connection::{Connection, Event};
+pub use connection::{Connection, Event, SHUTDOWN_PING};
 
 use frame::{HEADER_TABLE_SIZE, INITIAL_WINDOW_SIZE, MAX_CONCURRENT_STREAMS, MAX_FRAME_SIZE, MAX_HEADER_LIST_SIZE};
 
@@ -103,10 +112,12 @@ pub enum Role {
 pub struct Settings {
     /// `SETTINGS_HEADER_TABLE_SIZE`: the largest dynamic table of the endpoint's HPACK decoder.
     pub header_table_size: u32,
-    /// `SETTINGS_MAX_CONCURRENT_STREAMS`: the most streams that the peer can have open.
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS`: the most streams that the peer can have open. The
+    /// connection of the endpoint has a stream table of this size, so a client also opens at
+    /// most this many streams. Push is off, so the value has no other effect for a client.
     pub max_concurrent_streams: u32,
     /// `SETTINGS_INITIAL_WINDOW_SIZE`: the initial flow-control window of each stream, at most
-    /// 2^31 - 1.
+    /// 2^31 - 1. For the endpoint, it is the bytes of each stream that the consumer admits.
     pub initial_window_size: u32,
     /// `SETTINGS_MAX_FRAME_SIZE`: the largest frame payload that the endpoint receives, from
     /// 2^14 to 2^24 - 1.
@@ -165,4 +176,8 @@ pub struct Limits {
     /// The largest dynamic table of the HPACK encoder. The encoder uses at most the smaller of it
     /// and the peer's `SETTINGS_HEADER_TABLE_SIZE`.
     pub encoder_table_bytes: usize,
+    /// The connection receive window: the DATA bytes of all streams that the consumers admit,
+    /// from 65,535 to 2^31 - 1. A larger value than 65,535, the initial window of RFC 9113, goes
+    /// to the peer in a WINDOW_UPDATE after the preface.
+    pub connection_window: u32,
 }
