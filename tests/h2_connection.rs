@@ -1862,70 +1862,103 @@ fn starts(server: &mut Peer, started: &mut Vec<u32>, reset: &mut Vec<u32>) -> Pr
 /// Rapid reset (CVE-2023-44487): a client opens streams and resets them at line rate. A stream
 /// that a reset ended keeps its slot until the application closes it, when its handler ends, so
 /// the handlers in flight never pass `max_concurrent_streams`, 100: the rule of Go. The client can
-/// also make the server reset its streams with a stream error (CVE-2025-8671): here each second
-/// stream gets a WINDOW_UPDATE of 0, a stream error PROTOCOL_ERROR (RFC 9113, section 6.9). The
-/// client is within its limit, so the server refuses no stream: its input waits for a free slot.
-/// The flood allocates nothing and charges nothing.
+/// also make the server reset its streams with a stream error (MadeYouReset, CVE-2025-8671). In
+/// each flood, the client resets streams 1, 5, 9, and so on with RST_STREAM. It makes the server
+/// reset streams 3, 7, 11, and so on with one form of the attack, which has its RFC 9113 code:
+///
+/// - A WINDOW_UPDATE of 0: PROTOCOL_ERROR (section 6.9).
+/// - DATA after END_STREAM, on a half-closed (remote) stream: STREAM_CLOSED (section 5.1).
+/// - HEADERS after END_STREAM, on a half-closed (remote) stream: STREAM_CLOSED (section 5.1).
+/// - A WINDOW_UPDATE that takes the stream window past 2^31 - 1: FLOW_CONTROL_ERROR (section
+///   6.9.1).
+///
+/// The client is within its limit, so the server refuses no stream: its input waits for a free
+/// slot. The flood allocates nothing and charges nothing.
 #[test]
 fn a_rapid_reset_flood_starts_no_more_handlers_than_the_stream_limit() {
-    let mut server = Peer::acknowledged(LIMITS);
-    let available = server.budget.available();
-    let flood: Vec<u8> = (0..10_000)
-        .flat_map(|n: u32| {
-            let stream = 2 * n + 1;
-            let end = if n.is_multiple_of(2) {
-                rst(stream, ErrorCode::CANCEL)
-            } else {
-                window_update(stream, 0)
-            };
-            [request(stream, false), end].concat()
-        })
-        .collect();
-    server.receive(&flood);
-    let (mut started, mut reset) = (Vec::with_capacity(10_000), Vec::with_capacity(10_000));
-    let (progress, count) = allocations(|| starts(&mut server, &mut started, &mut reset));
-    let first: Vec<u32> = (0..100).map(|n| 2 * n + 1).collect();
-    assert_eq!(started, first, "the handler starts");
-    assert_eq!(reset, first);
-    assert_eq!(progress, Progress::Blocked(Blocked::Streams));
-    assert_eq!(count, 0);
-    assert_eq!(server.budget.available(), available);
-    // The server reset each stream with a WINDOW_UPDATE of 0.
-    let errors: Vec<u8> = (0..50)
-        .flat_map(|n| rst(4 * n + 3, ErrorCode::PROTOCOL_ERROR))
-        .collect();
-    assert_eq!(server.sent(), errors);
-    // The handler of stream 1 ends, so exactly one more handler starts, and its stream resets.
-    assert_eq!(server.connection.close(1).map_err(|error| error.kind()), Ok(()));
-    assert_eq!(
-        server.connection.close(1).map_err(|error| error.kind()),
-        Err(Kind::Misuse)
-    );
-    let mut held = reset.split_off(1);
-    reset.clear();
-    started.clear();
-    let progress = starts(&mut server, &mut started, &mut reset);
-    assert_eq!(
-        (&started[..], &reset[..], progress),
-        (&[201][..], &[201][..], Progress::Blocked(Blocked::Streams))
-    );
-    // Each handler ends when its stream resets: the flood goes on, at most 100 handlers at a
-    // time, and each stream gets its handler.
-    held.append(&mut reset);
-    let mut handled = 101;
-    loop {
-        for stream in held.drain(..) {
-            server.connection.close(stream).expect("a reset holds the slot");
-        }
-        server.sent();
+    /// The request on a stream, and the frame after it.
+    type Frames = fn(u32) -> Vec<u8>;
+    // Each form: its name, its frames, and the code of the stream error.
+    let forms: [(&str, Frames, ErrorCode); 4] = [
+        (
+            "WINDOW_UPDATE of 0",
+            |stream| [request(stream, false), window_update(stream, 0)].concat(),
+            ErrorCode::PROTOCOL_ERROR,
+        ),
+        (
+            "DATA after END_STREAM",
+            |stream| [request(stream, true), data(stream, false, b"x")].concat(),
+            ErrorCode::STREAM_CLOSED,
+        ),
+        (
+            "HEADERS after END_STREAM",
+            |stream| [request(stream, true), request(stream, true)].concat(),
+            ErrorCode::STREAM_CLOSED,
+        ),
+        (
+            "a stream window past 2^31 - 1",
+            |stream| [request(stream, false), window_update(stream, (1 << 31) - 1)].concat(),
+            ErrorCode::FLOW_CONTROL_ERROR,
+        ),
+    ];
+    for (form, error, code) in forms {
+        let mut server = Peer::acknowledged(LIMITS);
+        let available = server.budget.available();
+        let flood: Vec<u8> = (0..10_000)
+            .flat_map(|n: u32| {
+                let stream = 2 * n + 1;
+                if n.is_multiple_of(2) {
+                    [request(stream, false), rst(stream, ErrorCode::CANCEL)].concat()
+                } else {
+                    error(stream)
+                }
+            })
+            .collect();
+        server.receive(&flood);
+        let (mut started, mut reset) = (Vec::with_capacity(10_000), Vec::with_capacity(10_000));
+        let (progress, count) = allocations(|| starts(&mut server, &mut started, &mut reset));
+        let first: Vec<u32> = (0..100).map(|n| 2 * n + 1).collect();
+        assert_eq!(started, first, "{form}: the handler starts");
+        assert_eq!(reset, first, "{form}");
+        assert_eq!(progress, Progress::Blocked(Blocked::Streams), "{form}");
+        assert_eq!(count, 0, "{form}");
+        assert_eq!(server.budget.available(), available, "{form}");
+        // The server reset each second stream with the code of the form.
+        let errors: Vec<u8> = (0..50).flat_map(|n| rst(4 * n + 3, code)).collect();
+        assert_eq!(server.sent(), errors, "{form}");
+        // The handler of stream 1 ends, so exactly one more handler starts, and its stream resets.
+        assert_eq!(server.connection.close(1).map_err(|error| error.kind()), Ok(()));
+        assert_eq!(
+            server.connection.close(1).map_err(|error| error.kind()),
+            Err(Kind::Misuse)
+        );
+        let mut held = reset.split_off(1);
+        reset.clear();
         started.clear();
-        let progress = starts(&mut server, &mut started, &mut held);
-        assert!(started.len() <= 100, "{} handlers in flight", started.len());
-        assert_eq!(started, held);
-        handled += started.len();
-        if progress == WAIT {
-            break;
+        let progress = starts(&mut server, &mut started, &mut reset);
+        assert_eq!(
+            (&started[..], &reset[..], progress),
+            (&[201][..], &[201][..], Progress::Blocked(Blocked::Streams)),
+            "{form}"
+        );
+        // Each handler ends when its stream resets: the flood goes on, at most 100 handlers at a
+        // time, and each stream gets its handler.
+        held.append(&mut reset);
+        let mut handled = 101;
+        loop {
+            for stream in held.drain(..) {
+                server.connection.close(stream).expect("a reset holds the slot");
+            }
+            server.sent();
+            started.clear();
+            let progress = starts(&mut server, &mut started, &mut held);
+            assert!(started.len() <= 100, "{form}: {} handlers in flight", started.len());
+            assert_eq!(started, held, "{form}");
+            handled += started.len();
+            if progress == WAIT {
+                break;
+            }
         }
+        assert_eq!(handled, 10_000, "{form}");
     }
-    assert_eq!(handled, 10_000);
 }
