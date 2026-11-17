@@ -383,3 +383,11 @@ result when it ends.
   host, with the target `h2_send` and its seeds in place of `h2`. That is `-fork=14
   -max_total_time=1200` with AddressSanitizer, 20 minutes, and a lease of 45 minutes. Stop at the
   time budget, or at the first crash, failed assertion, leak, timeout, or out-of-memory error.
+- Result (2026-11-17): pass. Run `20261117T071742Z-99945` at `6e4fb53`, whose scheduler is the
+  scheduler of the N204 commit: that commit adds only the name `DATA_SHARE` for the share of the
+  output queue, with the same value, and a test. On c8g.4xlarge, `ami-06b1a03fa3561aefb`, Linux
+  `7.0.0-1016-aws` aarch64, and `rustc 1.101.0-nightly (3e92e1a2d 2026-11-01)`. The target ran its
+  full budget: 1211 seconds in 176 jobs, 44,478,079 runs, `cov` 1845, `ft` 8462, and a corpus of
+  1062. It had 0 crashes, failed assertions, leaks, timeouts, and out-of-memory errors, and it wrote
+  no artifact. `dev-machine status rsnetwork` then showed no instance and no volume. Limit: the
+  working corpus stayed on the discarded host.
