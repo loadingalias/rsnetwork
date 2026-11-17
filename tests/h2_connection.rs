@@ -1217,10 +1217,11 @@ fn a_client_stream_closes_after_the_request_and_the_response_end() {
 }
 
 /// A stream that the connection refuses still decodes its header block, so the HPACK state stays
-/// in step and the next stream decodes (RFC 9113, sections 4.3 and 5.1.2). A refused block adds
-/// an entry, and the next stream reads it. An engine that skips the decode of a refused block
-/// fails here: the next block reads an entry that it does not have. The GOAWAY of a later error
-/// names the last stream that went up, not the refused one (section 8.7).
+/// in step and the next stream decodes (RFC 9113, sections 4.3 and 5.1.2). Each refused block
+/// adds an entry, and a later stream reads it: a block in one frame, which decodes in place, and
+/// a block over CONTINUATION frames, which joins first. An engine that skips the decode of a
+/// refused block fails here: the next block reads an entry that it does not have. The GOAWAY of a
+/// later error names the last stream that went up, not a refused one (section 8.7).
 #[test]
 fn a_refused_stream_still_updates_hpack_state_and_the_next_stream_decodes() {
     let limits = Limits {
@@ -1230,31 +1231,63 @@ fn a_refused_stream_still_updates_hpack_state_and_the_next_stream_decodes() {
         },
         ..LIMITS
     };
+    let (refused, protocol) = (ErrorCode::REFUSED_STREAM, ErrorCode::PROTOCOL_ERROR);
     let mut server = Peer::server_with(limits);
-    server.receive(&[frame(0x1, 0x4, 1, STATIC), frame(0x1, 0x5, 3, INSERT)].concat());
+    // Stream 1 fills the table. Stream 3 adds `x-a: v` in one frame, and stream 5 adds `x-b: w`
+    // over a HEADERS frame and a CONTINUATION frame.
+    server.receive(
+        &[
+            frame(0x1, 0x4, 1, STATIC),
+            frame(0x1, 0x5, 3, INSERT),
+            frame(0x1, 0x1, 5, b"\x40\x03x"),
+            frame(0x9, 0x4, 5, b"-b\x01w"),
+        ]
+        .concat(),
+    );
     let get = lines(&[(":method", "GET"), (":scheme", "http"), (":path", "/")]);
     assert_eq!(server.run(), (vec![Seen::Headers(1, false, get)], WAIT));
     // The peer cannot know the limit before it acknowledges the settings, so the code permits a
     // retry (section 8.7).
-    assert_eq!(server.sent(), rst(3, ErrorCode::REFUSED_STREAM));
-    server.receive(&[rst(1, ErrorCode::CANCEL), frame(0x1, 0x5, 5, NEWEST)].concat());
+    assert_eq!(server.sent(), [rst(3, refused), rst(5, refused)].concat());
+    // Indices 62 and 63 are the two newest entries (RFC 7541, section 2.3.3).
+    server.receive(&[rst(1, ErrorCode::CANCEL), frame(0x1, 0x5, 7, b"\xbe\xbf")].concat());
     assert_eq!(
         server.run(),
         (
             vec![
                 Seen::Reset(1, ErrorCode::CANCEL),
-                Seen::Headers(5, true, lines(&[("x-a", "v")])),
+                Seen::Headers(7, true, lines(&[("x-b", "w"), ("x-a", "v")])),
             ],
             WAIT
         )
     );
-    // After the acknowledgement, the peer knows the limit: PROTOCOL_ERROR. The last stream of
-    // the GOAWAY is 5, which went up, and not the refused stream 7.
-    server.receive(&[SETTINGS_ACK, &frame(0x1, 0x5, 7, INSERT), &frame(0x6, 0, 1, &[0; 8])].concat());
+    // After the acknowledgement, the peer knows the limit: PROTOCOL_ERROR. Stream 9 adds
+    // `x-c: u`, and stream 11 reads it.
+    server.receive(
+        &[
+            SETTINGS_ACK,
+            &frame(0x1, 0x5, 9, b"\x40\x03x-c\x01u"),
+            &rst(7, ErrorCode::CANCEL),
+            &frame(0x1, 0x5, 11, NEWEST),
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        server.run(),
+        (
+            vec![
+                Seen::Reset(7, ErrorCode::CANCEL),
+                Seen::Headers(11, true, lines(&[("x-c", "u")])),
+            ],
+            WAIT
+        )
+    );
+    // The last stream of the GOAWAY is 11, which went up, and not the refused stream 13.
+    server.receive(&[frame(0x1, 0x5, 13, STATIC), frame(0x6, 0, 1, &[0; 8])].concat());
     ended(server.run().1, Kind::Malformed);
     assert_eq!(
         server.sent(),
-        [rst(7, ErrorCode::PROTOCOL_ERROR), goaway(5, ErrorCode::PROTOCOL_ERROR)].concat()
+        [rst(9, protocol), rst(13, protocol), goaway(11, protocol)].concat()
     );
     // A refused block past the work bound cannot keep the HPACK state, so the connection ends
     // with COMPRESSION_ERROR (section 4.3).
