@@ -10,12 +10,13 @@ when you change one of its rules or the wire format that the rules constrain.
   consumer reads and the path eventually stays stable. It checks lossy ordinary ACKs, delayed
   final-size arrival, independent endpoint outcomes, and repeated migration attempts. Each
   validation must end even if attempts continue.
-- [`models/backing-release/`](../../models/backing-release/README.md) checks one charged
-  backing across protocol acceptance, retransmission, peer acknowledgement, and kernel release.
-  It checks that each retained view and each kernel use keeps the backing alive and charged
-  once, and that the release runs once, when the last obligation ends. It also checks that a
-  partial acceptance keeps the suffix with its writer, and that a repeated or unknown
-  acknowledgement changes no ownership. The
+- [`models/backing-release/`](../../models/backing-release/README.md) checks charged
+  backings across protocol acceptance, retransmission, peer acknowledgement, and kernel release.
+  One output can gather views of two backings, such as a frame header and its payload. It
+  checks that each retained view and each kernel use keeps its backing alive and charged once,
+  and that the release of each backing runs once, when its last obligation ends. It also checks
+  that a partial acceptance keeps the suffix of each backing with its writer, and that a
+  repeated or unknown acknowledgement changes no ownership. The
   [boundary assumptions](#backing-release-boundary-assumptions) below state what it takes from
   the runtime.
 
@@ -51,7 +52,7 @@ cargo xtask model --tlc-heap-mib=20480 --tlc-fp-mib=4096 \
 
 The first size sets the Java heap with `-Xmx`; the second sets separate fingerprint storage with
 `-XX:MaxDirectMemorySize`. The pair selects the pinned TLC `OffHeapDiskFPSet`, as defined by its
-[memory configuration](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/fp/FPSetConfiguration.java).
+[memory configuration](https://raw.githubusercontent.com/tlaplus/tlaplus/bc1b506bdcad/tlatools/org.lamport.tlatools/src/tlc2/tool/fp/FPSetConfiguration.java).
 Choose sizes that leave memory for the OS, file cache, and other native allocations. Each size
 must be a positive whole number of MiB, at most 4294967295. A missing member of the pair,
 duplicate option, or invalid value fails before a checker starts. The options apply to TLC;
@@ -63,7 +64,7 @@ Without the pair, the command keeps the default memory policy and adds no GC log
 change resources only; every selected profile still needs its complete check.
 
 Every TLC command also sets `-XX:+ExitOnOutOfMemoryError`. The pinned
-[liveness index](https://raw.githubusercontent.com/tlaplus/tlaplus/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/NodePtrTable.java)
+[liveness index](https://raw.githubusercontent.com/tlaplus/tlaplus/bc1b506bdcad/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/NodePtrTable.java)
 can retry with mismatched arrays after a heap allocation fails. The selected JDK exits with
 status 3 before that Java handler can recover. Such a run is incomplete, never a pass.
 
@@ -132,8 +133,8 @@ until its terminal event. The model takes the driver side from rsasync's termina
 contract, which the rsasync model `models/operation-ownership/` checks. It owns no driver. These
 facts are its boundary:
 
-- An accepted submission gives the driver a view of the backing until its terminal event. A
-  refused submission returns the view to the caller.
+- An accepted submission gives the driver a view of each backing of its regions until its
+  terminal event. A refused submission returns the views to the caller.
 - A zero-copy send has a send result and, when the kernel armed one, a later notice. Without a
   notice, the result is terminal. A copying send is that second case.
 - Notices, send results, and the peer's acknowledgements come in any order.
@@ -141,9 +142,12 @@ facts are its boundary:
   view until its own terminal event.
 - The model checks safety only. The rsasync model checks that each terminal event comes.
 
-The model checks one backing, two slices, and two datagram copies of each slice. The
-`Slices3` and `Copies3` profiles raise each of the two argued bounds by one. If a protocol or
-runtime change breaks one of these facts, change the model first, and run all of its profiles.
+The model checks one writer region of two slices, in each layout of those slices in one or two
+backings, and two datagram copies of each slice. One datagram can gather slices of two backings.
+The `Slices3` and `Copies3` profiles raise each of the two argued bounds by one. `Slices3` has
+25,161,615 distinct states and took 335 seconds on one 16-vCPU host, so run it on such a host.
+If a protocol or runtime change breaks one of these facts, change the model first, and run all
+of its profiles.
 
 ## When a profile fails
 
