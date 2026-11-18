@@ -157,9 +157,36 @@ impl Repo {
     /// root, with no compiler wrapper and no ambient compiler overrides. A
     /// missing toolchain or component fails; nothing is installed.
     fn cargo(&self, args: &[&str]) -> Command {
+        self.tool("cargo", args)
+    }
+
+    /// `rustfmt` with the root `rustfmt.toml` on the sources of `fuzz/`: the
+    /// harness and each target. `fuzz/` is a workspace of its own, so
+    /// `cargo fmt --all` does not reach it. `rustfmt` on the files resolves no
+    /// dependency of the fuzz workspace.
+    fn fuzz_fmt(&self, args: &[&str]) -> Result<Command, Failure> {
+        let targets = self.root.join("fuzz/fuzz_targets");
+        let unreadable =
+            |error: io::Error| Failure::new(format!("fmt fuzz: cannot read {}: {error}", targets.display()));
+        let mut files = vec![self.root.join("fuzz/src/lib.rs")];
+        for entry in fs::read_dir(&targets).map_err(unreadable)? {
+            let path = entry.map_err(unreadable)?.path();
+            if path.extension() == Some(OsStr::new("rs")) {
+                files.push(path);
+            }
+        }
+        files.sort();
+        let mut command = self.tool("rustfmt", &["--config-path", "rustfmt.toml"]);
+        command.args(args).args(files);
+        Ok(command)
+    }
+
+    /// A command of `tool` from the pinned toolchain, as [`cargo`](Self::cargo)
+    /// runs it.
+    fn tool(&self, tool: &str, args: &[&str]) -> Command {
         let mut command = Command::new("rustup");
         command
-            .args(["run", &self.channel, "cargo"])
+            .args(["run", &self.channel, tool])
             .args(args)
             .current_dir(&self.root);
         for (name, _) in env::vars_os() {
@@ -174,7 +201,8 @@ impl Repo {
         command
     }
 
-    /// Applies the machine-applicable Clippy fixes, then formats the code.
+    /// Applies the machine-applicable Clippy fixes, then formats the code and the
+    /// sources of `fuzz/`.
     /// `clippy --fix` reports each lint that it cannot fix as a warning and
     /// still succeeds. Thus a last pass that changes nothing fails on them.
     fn fix(&self, args: &[String]) -> Result<(), Failure> {
@@ -192,6 +220,7 @@ impl Repo {
             .args(&scope),
         )?;
         step("fmt", &mut self.cargo(&["fmt", "--all"]))?;
+        step("fmt fuzz", &mut self.fuzz_fmt(&[])?)?;
         step(
             "clippy",
             self.cargo(&["clippy", "--locked", "--all-targets", "--quiet"])
@@ -203,6 +232,7 @@ impl Repo {
     fn check(&self, args: &[String]) -> Result<(), Failure> {
         let scope = scope(args);
         step("fmt --check", &mut self.cargo(&["fmt", "--all", "--check"]))?;
+        step("fmt --check fuzz", &mut self.fuzz_fmt(&["--check"])?)?;
         step(
             "clippy",
             self.cargo(&["clippy", "--locked", "--all-targets", "--quiet"])

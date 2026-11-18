@@ -193,8 +193,14 @@ impl Model {
                     let bytes = i64::try_from(len).expect("a frame");
                     assert!(bytes <= self.connection, "DATA past the connection window");
                     let window = self.initial + stream.updates - i64::try_from(stream.sent).expect("a body");
-                    assert!(bytes <= window, "DATA of {len} bytes on {id} past its window of {window}");
-                    assert!(stream.sent + len <= stream.given, "DATA that the application did not give");
+                    assert!(
+                        bytes <= window,
+                        "DATA of {len} bytes on {id} past its window of {window}"
+                    );
+                    assert!(
+                        stream.sent + len <= stream.given,
+                        "DATA that the application did not give"
+                    );
                     for (offset, &got) in (stream.sent..).zip(payload) {
                         assert_eq!(got, byte(id, offset), "the body of {id} at {offset}");
                     }
@@ -295,7 +301,9 @@ fn run(role: Role, plan: Plan, input: &[u8], cut: usize) {
                 // The preface of the client is not a frame.
                 let preface = outbound.submit().expect("the client preface");
                 assert_eq!(preface.region.bytes(), PREFACE);
-                outbound.ack(preface.id, PREFACE.len()).expect("the output is outstanding");
+                outbound
+                    .ack(preface.id, PREFACE.len())
+                    .expect("the output is outstanding");
                 for expected in [1, 3] {
                     let region = Backing::from(Vec::with_capacity(64));
                     let post = line(b":method", b"POST");
@@ -312,7 +320,10 @@ fn run(role: Role, plan: Plan, input: &[u8], cut: usize) {
         loop {
             let (to, from, into, with) = (&mut connection, &mut inbound, &mut outbound, &mut lines);
             let ((event, turn), bytes) = allocated(move || to.drive(from, into, with, NOW));
-            assert!(bytes <= WORK, "a drive allocated {bytes} bytes, past the work limit {WORK}");
+            assert!(
+                bytes <= WORK,
+                "a drive allocated {bytes} bytes, past the work limit {WORK}"
+            );
             let act = match event {
                 Some(Event::Settings(settings)) => {
                     model.initial = i64::from(settings.initial_window_size);
@@ -327,7 +338,10 @@ fn run(role: Role, plan: Plan, input: &[u8], cut: usize) {
             };
             let progress = turn.progress;
             if progress == Progress::Blocked(Blocked::Output) {
-                assert!(outbound.free() < outbound.limit(), "the connection waits for an empty queue");
+                assert!(
+                    outbound.free() < outbound.limit(),
+                    "the connection waits for an empty queue"
+                );
             }
             let mut sent = Vec::new();
             while let Some(output) = outbound.submit() {
@@ -345,7 +359,13 @@ fn run(role: Role, plan: Plan, input: &[u8], cut: usize) {
                 Some(Act::Respond(stream)) => {
                     let region = Backing::from(Vec::with_capacity(64));
                     connection
-                        .headers(&mut outbound, stream, [line(b":status", b"200")].into_iter(), false, region)
+                        .headers(
+                            &mut outbound,
+                            stream,
+                            [line(b":status", b"200")].into_iter(),
+                            false,
+                            region,
+                        )
                         .expect("a drained queue has room for a response");
                     give(&mut connection, &mut outbound, &mut model, stream);
                 }
