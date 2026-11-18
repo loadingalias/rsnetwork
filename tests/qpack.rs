@@ -668,3 +668,30 @@ fn a_decoder_stream_with_no_room_refuses_and_changes_nothing() {
     peer.decoder.cancel(8, &mut peer.stream).expect("the region has room");
     assert_eq!(peer.written(), [0x01, 0x48]);
 }
+
+#[test]
+fn a_section_encodes_whole_instructions_only_and_needs_no_room_on_the_encoder_stream() {
+    let budget = budget();
+    let mut encoder = encoder(4096, 8, &budget);
+    let mut peer = Peer::new(limits(4096, 8), &budget);
+    let lines = [line(b"x-trace", b"7f3a")];
+    // The encoder stream has room for the 3 bytes of the capacity, and not for the insertion.
+    let (mut section, mut instructions) = (region(256), region(3));
+    let prefix = encoder
+        .encode(0, lines.iter().copied(), &mut section, &mut instructions)
+        .expect("the region holds the section");
+    assert_eq!(instructions.filled(), [0x3f, 0xe1, 0x1f]);
+    // The section names no entry, so it decodes with no insertion.
+    assert_eq!(prefix.bytes(), [0x00, 0x00]);
+    let bytes = [prefix.bytes(), section.filled()].concat();
+    peer.receive(instructions.filled());
+    assert_eq!(peer.decode(0, &bytes), Ok(owned(&[("x-trace", "7f3a")])));
+    // With room, the line goes into the table, and the section names it.
+    let (prefix, section, instructions) = encode(&mut encoder, 4, &lines);
+    assert_ne!(prefix, [0x00, 0x00]);
+    peer.receive(&instructions);
+    assert_eq!(
+        peer.decode(4, &[prefix, section].concat()),
+        Ok(owned(&[("x-trace", "7f3a")]))
+    );
+}
