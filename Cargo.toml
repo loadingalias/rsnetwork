@@ -6,6 +6,9 @@ repository = "https://github.com/loadingalias/rsnetwork"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+# The crate is at the workspace root: the package holds only its sources, its license, and its
+# README. The vendored test data, the models, and the docs stay in the repository.
+include = ["/src", "/LICENSE", "/README.md"]
 
 [dependencies]
 # The buffer types that the core shares with the runtime family. The core uses
