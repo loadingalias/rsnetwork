@@ -1,0 +1,4 @@
+# Test data from qifs, kept byte for byte as the source gives it: no whitespace check, and the
+# encoder outputs are binary.
+* -whitespace
+encoded/** binary

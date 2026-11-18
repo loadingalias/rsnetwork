@@ -34,37 +34,37 @@ pub struct Decoder {
 /// give them back while the connection is idle.
 pub struct Lines {
     /// The bytes of the lines, or the bytes of one line on its way to the table.
-    out: Vec<u8>,
+    pub(crate) out: Vec<u8>,
     /// The capacity of `out` that the charge pays for.
-    room: usize,
-    spans: Vec<Span>,
+    pub(crate) room: usize,
+    pub(crate) spans: Vec<Span>,
     /// The capacity of `spans` that the charge pays for.
-    count: usize,
+    pub(crate) count: usize,
     _charge: Permit,
 }
 
 /// The lines of the block that a decode writes, and the work of the block.
-struct Buffer<'l> {
-    out: &'l mut Vec<u8>,
-    room: usize,
-    lines: &'l mut Vec<Span>,
+pub(crate) struct Buffer<'l> {
+    pub(crate) out: &'l mut Vec<u8>,
+    pub(crate) room: usize,
+    pub(crate) lines: &'l mut Vec<Span>,
     /// The work of the block so far, and its limit.
-    work: usize,
-    limit: usize,
+    pub(crate) work: usize,
+    pub(crate) limit: usize,
 }
 
 /// Where one decoded line is in the buffer.
 #[derive(Clone, Copy)]
-struct Span {
-    start: usize,
-    name: usize,
-    value: usize,
-    never_indexed: bool,
+pub(crate) struct Span {
+    pub(crate) start: usize,
+    pub(crate) name: usize,
+    pub(crate) value: usize,
+    pub(crate) never_indexed: bool,
 }
 
 /// The source of the bytes of a name or a value.
 #[derive(Clone, Copy)]
-enum Part<'a> {
+pub(crate) enum Part<'a> {
     /// Bytes in the block, the static table, or the dynamic table.
     Plain(Bytes<'a>),
     /// A Huffman string in the block.
@@ -72,12 +72,12 @@ enum Part<'a> {
 }
 
 /// One line of a block, as its representation gives it (RFC 7541, section 6).
-struct Representation<'a> {
-    name: Part<'a>,
-    value: Part<'a>,
+pub(crate) struct Representation<'a> {
+    pub(crate) name: Part<'a>,
+    pub(crate) value: Part<'a>,
     /// The line goes into the dynamic table.
-    insert: bool,
-    never_indexed: bool,
+    pub(crate) insert: bool,
+    pub(crate) never_indexed: bool,
 }
 
 impl Decoder {
@@ -149,13 +149,7 @@ impl Decoder {
         // failed.
         self.update = false;
         match result {
-            Ok(()) => {
-                let lines: &'l Lines = lines;
-                Ok(Block {
-                    bytes: &lines.out,
-                    lines: &lines.spans,
-                })
-            }
+            Ok(()) => Ok(lines.block()),
             Err(DecodeError::TooLarge) => Err(DecodeError::TooLarge),
             Err(error) => {
                 self.failed = Some(error);
@@ -272,13 +266,13 @@ fn representation<'r, 'b: 'r>(table: &'r Table, rest: &mut &'b [u8]) -> Result<R
     let (index, used) = integer::decode(rest, prefix).ok_or(DecodeError::Malformed)?;
     *rest = &rest[used..];
     let name = if index == 0 {
-        string(rest)?
+        string(rest, 7).ok_or(DecodeError::Malformed)?
     } else {
         Part::Plain(entry(table, index)?.0)
     };
     Ok(Representation {
         name,
-        value: string(rest)?,
+        value: string(rest, 7).ok_or(DecodeError::Malformed)?,
         insert,
         never_indexed,
     })
@@ -298,18 +292,17 @@ fn entry(table: &Table, index: u64) -> Result<(Bytes<'_>, Bytes<'_>), DecodeErro
     }
 }
 
-/// Reads one string literal (RFC 7541, section 5.2) from the start of `rest`. A length past the
-/// end of the block is malformed, before any copy.
-fn string<'a>(rest: &mut &'a [u8]) -> Result<Part<'a>, DecodeError> {
-    let huffman = rest.first().is_some_and(|&byte| byte & 0x80 != 0);
-    let (len, used) = integer::decode(rest, 7).ok_or(DecodeError::Malformed)?;
-    let len = usize::try_from(len).map_err(|_| DecodeError::Malformed)?;
-    let bytes = rest
-        .get(used..)
-        .and_then(|after| after.get(..len))
-        .ok_or(DecodeError::Malformed)?;
+/// Reads one string literal (RFC 7541, section 5.2) from the start of `rest`: the Huffman bit,
+/// a length with a prefix of `prefix` bits, and the bytes. QPACK also starts strings in the
+/// middle of a byte (RFC 9204, section 4.1.2). Gives `None` for a length past the end of `rest`,
+/// before any copy.
+pub(crate) fn string<'a>(rest: &mut &'a [u8], prefix: u32) -> Option<Part<'a>> {
+    let huffman = rest.first().is_some_and(|&byte| byte & (1 << prefix) != 0);
+    let (len, used) = integer::decode(rest, prefix)?;
+    let len = usize::try_from(len).ok()?;
+    let bytes = rest.get(used..).and_then(|after| after.get(..len))?;
     *rest = &rest[used + len..];
-    Ok(if huffman {
+    Some(if huffman {
         Part::Huffman(bytes)
     } else {
         Part::Plain(Bytes(bytes, &[]))
@@ -322,8 +315,16 @@ impl Lines {
     /// to `budget` before it allocates, and refuses with [`Kind::Overload`], with no allocation,
     /// when the budget cannot pay.
     pub fn new(limits: Limits, budget: &Budget) -> Result<Self, Error> {
-        let room = limits.list_bytes.max(limits.table_bytes);
-        let count = limits.list_bytes / OVERHEAD;
+        Self::with_room(
+            limits.list_bytes.max(limits.table_bytes),
+            limits.list_bytes / OVERHEAD,
+            budget,
+        )
+    }
+
+    /// Makes lines with a buffer of `room` bytes and the positions of `count` lines, charged to
+    /// `budget`. QPACK sizes its lines with it.
+    pub(crate) fn with_room(room: usize, count: usize, budget: &Budget) -> Result<Self, Error> {
         let memory = count
             .checked_mul(size_of::<Span>())
             .and_then(|spans| spans.checked_add(room))
@@ -346,6 +347,16 @@ impl Lines {
     }
 }
 
+impl Lines {
+    /// The lines that the last decode wrote.
+    pub(crate) fn block(&self) -> Block<'_> {
+        Block {
+            bytes: &self.out,
+            lines: &self.spans,
+        }
+    }
+}
+
 impl fmt::Debug for Lines {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Lines")
@@ -358,7 +369,11 @@ impl fmt::Debug for Lines {
 impl Buffer<'_> {
     /// Copies the name and then the value of `line` to the end of `out`, in at most `room`
     /// bytes. Gives their lengths, and whether both fit. A part that does not fit leaves no byte.
-    fn stage(&mut self, line: &Representation<'_>, room: usize) -> Result<(usize, usize, bool), DecodeError> {
+    pub(crate) fn stage(
+        &mut self,
+        line: &Representation<'_>,
+        room: usize,
+    ) -> Result<(usize, usize, bool), DecodeError> {
         let end = self.out.len() + room;
         let (name, name_fits) = self.copy(line.name, end)?;
         let (value, value_fits) = self.copy(line.value, end)?;
@@ -398,7 +413,7 @@ impl Buffer<'_> {
     }
 
     /// Charges `bytes` of work, or refuses before the work.
-    fn charge(&mut self, bytes: usize) -> Result<(), DecodeError> {
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), DecodeError> {
         self.work = self
             .work
             .checked_add(bytes)

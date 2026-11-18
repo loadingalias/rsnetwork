@@ -14,7 +14,8 @@
 //!
 //! [`hpack`] is the header compression of HTTP/2: an encoder and a decoder, each the one owner of
 //! its dynamic table. [`h2`] is HTTP/2: the frame codec, and the engine of one connection with
-//! its streams and flow control.
+//! its streams and flow control. [`qpack`] is the field compression of HTTP/3, with its encoder
+//! and decoder streams.
 //!
 //! [`host`] is the caller-driven host: one connection that the application drives from its own
 //! event loop, with no runtime.
@@ -31,4 +32,5 @@ pub mod h1;
 pub mod h2;
 pub mod host;
 pub mod hpack;
+pub mod qpack;
 pub mod value;

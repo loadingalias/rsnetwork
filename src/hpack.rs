@@ -49,11 +49,11 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-mod decoder;
+pub(crate) mod decoder;
 mod encoder;
 pub(crate) mod huffman;
 pub(crate) mod integer;
-mod table;
+pub(crate) mod table;
 
 use core::fmt;
 
@@ -91,8 +91,8 @@ impl fmt::Debug for FieldLine<'_> {
 /// A credential is always sensitive. A short cookie has little entropy, so a peer that can add
 /// lines to the same connection can find it by the size of a block (RFC 7541, section 7.1.3).
 /// A long cookie is indexed. An HTTP/2 sender splits a `cookie` into its crumbs (RFC 9113,
-/// section 8.2.3), and the rule applies to each crumb.
-fn sensitive(name: &[u8], value: &[u8]) -> bool {
+/// section 8.2.3), and the rule applies to each crumb. The QPACK encoder uses the same rule.
+pub(crate) fn sensitive(name: &[u8], value: &[u8]) -> bool {
     let is = |sensitive: &[u8]| name.eq_ignore_ascii_case(sensitive);
     is(b"authorization") || is(b"proxy-authorization") || ((is(b"cookie") || is(b"set-cookie")) && value.len() < 20)
 }

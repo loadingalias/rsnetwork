@@ -62,6 +62,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "qpack"
+path = "fuzz_targets/qpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qpack_encoder"
+path = "fuzz_targets/qpack_encoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "h2"
 path = "fuzz_targets/h2.rs"
 test = false

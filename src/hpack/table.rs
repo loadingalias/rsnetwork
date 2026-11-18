@@ -148,6 +148,11 @@ impl Table {
         self.max
     }
 
+    /// The size of the table: the sum of the sizes of its entries.
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+
     /// The number of entries.
     pub(crate) fn len(&self) -> usize {
         self.entries.len()

@@ -15,6 +15,8 @@ writes. The module documentation of each target gives its input format and its c
 | `chunked` | `h1::ChunkDecoder` | Pieces give the result of the whole input. No step allocates. The data and the trailers stay in their limits. |
 | `values` | The constructors of `value`, `write_request`, `write_head`, `RequestParser`, and `ResponseParser` | No constructor allocates. A host name obeys its rules. Each accepted value passes through a writer and a parser with no change. |
 | `hpack` | `hpack::Decoder` and `hpack::Encoder` | No decode allocates or changes the charge. The lines of a block stay in the list limit. A decoder that fails gives the same error for each later block. The encoder sends each decoded block to a second decoder, which reads the same lines and marks. |
+| `qpack` | `qpack::Decoder`, with `qpack::Encoder` for the check | No call allocates or changes the charge. Each read of the encoder stream reads at least one byte, and after a refused instruction each later call refuses. A model of the blocked streams holds: a stream blocks only while fewer than `blocked_streams` other streams wait, and `unblocked` gives only streams that wait. A section that refuses for room on the decoder stream decodes in a new region of 64 bytes. The lines of a section stay in the list limit. The encoder sends each decoded section to a second decoder, which reads the same lines and marks, and the encoder accepts the decoder stream of the second decoder. |
+| `qpack_encoder` | `qpack::Encoder`, under a fuzzed decoder stream | No call allocates. A section that refuses for room writes no instruction. A decoder with the settings of the peer reads each section after its instructions with no wait, and gives the same lines and marks. A refused decoder instruction makes each later call refuse. |
 | `h2` | `h2::Connection`, with its stream layer, `hpack::Decoder`, and the frame codec | A cut input gives the events, the output, and the end of the whole input. No drive allocates past the work limit. Each charge returns when the connection drops. No frame follows a GOAWAY, and a connection error ends with one. A body goes up only on a stream after its header section and before its end, and no event follows a reset. No frame follows a reset of the endpoint, and no reset goes on an idle stream. The WINDOW_UPDATE frames of each stream and of the connection give back at most the DATA bytes of the input. The last stream of a GOAWAY never increases. A server has at most 4 handlers in flight: a stream that a reset ended keeps its slot until the target closes it, at the wait for a free slot. |
 | `h2_send` | The send scheduler of `h2::Connection`, under the frames of a hostile peer | Each DATA frame has 1 to 16,384 bytes, fits in its stream window and the connection window of a model that reads the frames of the peer, and comes before the end, the reset, or the GOAWAY of its stream. Its payload is the next bytes of the body that the application gave. `Sent` comes only after each byte of its chunk went out. When the connection waits for input, no stream has body bytes that both windows admit. No drive allocates past the work limit, and each charge returns when the connection drops. |
 | `differential` | `RequestParser` and `ChunkDecoder`, against `httparse` | Each head that rsnetwork accepts has the same method, target, version, field lines, and length for `httparse`. Each chunked body after it has the same data, trailer section, and length. |
@@ -71,6 +73,16 @@ conformance vector in `tests/conformance/mod.rs`, taken at `b43defd`.
 The seeds of `hpack` are the blocks of RFC 7541, Appendix C (`rfc7541-c2` to `rfc7541-c6`), and
 the first 12 blocks of `story_02.json` of four encoders of `tests/hpack-test-case`, each after the
 two control bytes of the target.
+
+The seeds of `qpack` are the exchange of RFC 9204, Appendix B, with the cancellation of stream 8,
+and the first 24 records of three outputs of `tests/qifs`: `quinn` `netbsd.out.256.100.0`,
+`ls-qpack` `netbsd.out.4096.100.1`, and `nghttp3` `fb-req.out.256.100.1`. Each output seed first
+sets the capacity of its file name, because the outputs follow draft 06 of QPACK (see
+`tests/qifs/README.md`). The seeds of `qpack_encoder` are the first 12 lists of `netbsd.qif` and
+`fb-resp.qif`, without lines whose name has more than 127 bytes or whose value has more than 255.
+`qpack/campaign-2026-11-18` is the input that stopped the first `qpack` campaign: a section that
+refused for room was decoded again in a region that the increments of the reads had filled. The
+codec was correct, and the harness now uses a new region.
 
 The seeds of `h2` are frame sequences that follow the figures of RFC 9113, section 6, with the
 blocks of RFC 7541, C.3.1 and C.4. Each name gives the RFC section that it exercises. The seeds of

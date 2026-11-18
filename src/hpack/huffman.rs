@@ -338,51 +338,78 @@ pub(crate) struct Invalid;
 ///
 /// It appends the decoded bytes to `out` only while `out` holds fewer than `limit` bytes, so the
 /// caller can check a string longer than its space and keep the bytes in a fixed capacity.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the window is the 32 bits after the read bits, and a code is at most 30 bits"
-)]
 pub(crate) fn decode(code: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<usize, Invalid> {
-    // The low `bits` bits of `acc` are the bits to decode, in order from the most significant.
-    let (mut acc, mut bits, mut decoded) = (0_u64, 0_u32, 0_usize);
-    let mut input = code.iter();
-    loop {
-        while bits <= 56 {
-            let Some(&byte) = input.next() else { break };
-            acc = (acc << 8) | u64::from(byte);
-            bits += 8;
-        }
-        if bits == 0 {
-            return Ok(decoded);
-        }
-        // The next 32 bits, with zero bits after the end of the string.
-        let window = if bits >= 32 {
-            (acc >> (bits - 32)) as u32
-        } else {
-            (acc << (32 - bits)) as u32
-        };
-        let mut len = TABLES.shortest;
-        while u64::from(window) >= TABLES.end[len] {
-            len += 1;
-        }
-        // The refill stops before 57 bits only at the end, so a longer code than the rest means
-        // that the rest is padding: at most 7 bits, all of them one.
-        if len as u32 > bits {
-            let ones = (1_u64 << bits) - 1;
-            return if bits < 8 && acc & ones == ones {
-                Ok(decoded)
+    let mut partial = Partial::default();
+    let decoded = partial.decode(code, out, limit)?;
+    partial.finish()?;
+    Ok(decoded)
+}
+
+/// A Huffman string that arrives in pieces: the bits of the last piece after its last complete
+/// code. QPACK reads the strings of the encoder stream in the pieces that the transport gives.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Partial {
+    /// The low `bits` bits are the bits to decode, in order from the most significant.
+    acc: u64,
+    bits: u32,
+}
+
+impl Partial {
+    /// Decodes each code that `code` completes after the bits of the earlier pieces, and gives
+    /// the number of decoded bytes. It keeps the bits after the last complete code for the next
+    /// piece.
+    ///
+    /// It appends the decoded bytes to `out` only while `out` holds fewer than `limit` bytes.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the window is the 32 bits after the read bits, and a code is at most 30 bits"
+    )]
+    pub(crate) fn decode(&mut self, code: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<usize, Invalid> {
+        let (mut acc, mut bits, mut decoded) = (self.acc, self.bits, 0_usize);
+        let mut input = code.iter();
+        loop {
+            while bits <= 56 {
+                let Some(&byte) = input.next() else { break };
+                acc = (acc << 8) | u64::from(byte);
+                bits += 8;
+            }
+            // The next 32 bits, with zero bits after the end of the piece. A code that the bits
+            // complete has the same first bits, so the zero bits do not change its length.
+            let window = if bits >= 32 {
+                (acc >> (bits - 32)) as u32
             } else {
-                Err(Invalid)
+                (acc << (32 - bits)) as u32
             };
+            let mut len = TABLES.shortest;
+            while u64::from(window) >= TABLES.end[len] {
+                len += 1;
+            }
+            // The refill stops before 57 bits only at the end of the piece, so a longer code than
+            // the rest continues in the next piece, or the rest is the padding.
+            if len as u32 > bits {
+                (self.acc, self.bits) = (acc, bits);
+                return Ok(decoded);
+            }
+            let index = TABLES.start[len] + ((window >> (32 - len)) - TABLES.first[len]) as usize;
+            // Each symbol is a byte, except EOS.
+            let byte = u8::try_from(TABLES.symbols[index]).map_err(|_| Invalid)?;
+            bits -= len as u32;
+            if out.len() < limit {
+                out.push(byte);
+            }
+            decoded += 1;
         }
-        let index = TABLES.start[len] + ((window >> (32 - len)) - TABLES.first[len]) as usize;
-        // Each symbol is a byte, except EOS.
-        let byte = u8::try_from(TABLES.symbols[index]).map_err(|_| Invalid)?;
-        bits -= len as u32;
-        if out.len() < limit {
-            out.push(byte);
+    }
+
+    /// Checks the end of the string: the bits after the last code are the padding, at most 7
+    /// bits, all of them one (RFC 7541, section 5.2).
+    pub(crate) fn finish(self) -> Result<(), Invalid> {
+        let ones = (1_u64 << self.bits) - 1;
+        if self.bits < 8 && self.acc & ones == ones {
+            Ok(())
+        } else {
+            Err(Invalid)
         }
-        decoded += 1;
     }
 }
 
