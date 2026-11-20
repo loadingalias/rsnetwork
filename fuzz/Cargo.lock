@@ -100,8 +100,7 @@ dependencies = [
 [[package]]
 name = "rstypes"
 version = "0.1.0-alpha.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84124ec6ddf6cab39532f2780de6af83d9136aa2f183cc5295b4364e61842cd8"
+source = "git+https://github.com/loadingalias/rsasync?branch=main#75ca1afe28bd39d0427b6ade62038745599b0255"
 
 [[package]]
 name = "shlex"

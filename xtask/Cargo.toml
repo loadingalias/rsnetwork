@@ -8,8 +8,8 @@ publish.workspace = true
 
 [dependencies]
 # The SHA-256 of the evidence digest. rscrypto is the family's only source of
-# hashes; the family policy pins it to an exact version.
-rscrypto = { version = "=0.12.0", default-features = false, features = ["sha2"] }
+# hashes. Like each owned crate, it comes from its Git `main`.
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["sha2"] }
 
 [lints]
 workspace = true

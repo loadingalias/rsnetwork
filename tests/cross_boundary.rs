@@ -209,7 +209,7 @@ mod uring {
 
     use rsasync::buffer::{Backing, Buffer as _, Lease, Pool, WriteLoan};
     use rsasync::capacity::Budget;
-    use rsasync::driver::{Config, Driver, TcpListener, TcpStream};
+    use rsasync::driver::{Config, Driver, TcpListener, TcpOptions, TcpStream};
 
     use super::{CONNECTIONS, EXCHANGES, LIMITS, RequestParser, allocations, clients, expected, respond};
 
@@ -228,6 +228,14 @@ mod uring {
         }
     }
 
+    /// A listener on a free port of the loopback address.
+    fn listen(driver: &mut Driver) -> TcpListener {
+        let bind = driver
+            .bind("127.0.0.1:0".parse().unwrap(), TcpOptions::default())
+            .unwrap();
+        drive(driver, bind).unwrap().unwrap()
+    }
+
     /// A pool of `slots` buffers of one head each, charged to a budget of its own.
     fn pool(slots: u32) -> Pool {
         let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
@@ -236,7 +244,7 @@ mod uring {
     }
 
     /// Sends all of `lease`. After a partial send, it sends a view of the rest, with no copy.
-    fn send_all(driver: &mut Driver, stream: &TcpStream, mut lease: Lease) {
+    fn send_all(driver: &mut Driver, stream: &mut TcpStream, mut lease: Lease) {
         while lease.initialized() > 0 {
             let send = driver.send(stream, lease).unwrap();
             let (sent, back) = drive(driver, send).unwrap();
@@ -247,7 +255,13 @@ mod uring {
     /// Sends the response head that the serializer wrote into `out`, then the body: the `body`
     /// range of `received`. The head goes out from the region that the serializer wrote, and the
     /// body is a view of the received region.
-    fn reply(driver: &mut Driver, stream: &TcpStream, out: WriteLoan<Backing>, received: Lease, body: Range<usize>) {
+    fn reply(
+        driver: &mut Driver,
+        stream: &mut TcpStream,
+        out: WriteLoan<Backing>,
+        received: Lease,
+        body: Range<usize>,
+    ) {
         let written = out.filled().as_ptr();
         let (head, count) = allocations(|| Lease::from(out.into_inner()));
         assert_eq!(
@@ -261,14 +275,14 @@ mod uring {
 
     /// Accepts one connection, receives its request into an owned buffer until the head is
     /// complete, and replies.
-    fn serve_owned(driver: &mut Driver, listener: &TcpListener, buffers: &mut Pool) {
+    fn serve_owned(driver: &mut Driver, listener: &mut TcpListener, buffers: &mut Pool) {
         let accept = driver.accept(listener).unwrap();
-        let (stream, _) = drive(driver, accept).unwrap().unwrap();
+        let (mut stream, _) = drive(driver, accept).unwrap().unwrap();
         let mut parser = RequestParser::new(LIMITS);
         let mut received = buffers.acquire().unwrap();
         let mut out = WriteLoan::new(buffers.acquire().unwrap());
         let body = loop {
-            let receive = driver.recv(&stream, received).unwrap();
+            let receive = driver.recv(&mut stream, received).unwrap();
             let (count, back) = drive(driver, receive).unwrap();
             received = back;
             assert_ne!(count.unwrap(), 0, "the client closed before the end of the head");
@@ -278,7 +292,7 @@ mod uring {
         };
         let (received, count) = allocations(|| Lease::from(received));
         assert_eq!(count, 0);
-        reply(driver, &stream, out, received, body);
+        reply(driver, &mut stream, out, received, body);
         driver.close(stream).unwrap();
     }
 
@@ -288,12 +302,12 @@ mod uring {
     #[test]
     fn the_io_uring_driver_serves_curl_and_each_request_with_no_copy_at_either_boundary() {
         let mut driver = Driver::new(Config::new()).unwrap();
-        let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut listener = listen(&mut driver);
         let address = listener.local_addr();
         let client = thread::spawn(move || clients(address));
         let mut buffers = pool(2);
         for _ in 0..CONNECTIONS {
-            serve_owned(&mut driver, &listener, &mut buffers);
+            serve_owned(&mut driver, &mut listener, &mut buffers);
         }
         assert_eq!(client.join().unwrap(), expected());
         driver.teardown().unwrap();
@@ -306,7 +320,7 @@ mod uring {
     fn a_kernel_selected_buffer_is_parsed_in_place_and_returns_to_its_ring_after_its_last_view_drops_elsewhere() {
         let mut driver = Driver::new(Config::new()).unwrap();
         driver.provide(pool(1)).unwrap();
-        let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut listener = listen(&mut driver);
         let address = listener.local_addr();
         let (next, wait) = mpsc::channel::<()>();
         let client = thread::spawn(move || {
@@ -327,9 +341,9 @@ mod uring {
             // The slot is in the ring before the request comes.
             driver.turn().unwrap();
             next.send(()).unwrap();
-            let accept = driver.accept(&listener).unwrap();
-            let (stream, _) = drive(&mut driver, accept).unwrap().unwrap();
-            let receive = driver.recv_selected(&stream).unwrap();
+            let accept = driver.accept(&mut listener).unwrap();
+            let (mut stream, _) = drive(&mut driver, accept).unwrap().unwrap();
+            let receive = driver.recv_selected(&mut stream).unwrap();
             let received = drive(&mut driver, receive).unwrap().unwrap();
             assert_eq!(
                 *slot.get_or_insert_with(|| received.as_ptr()),
@@ -338,8 +352,9 @@ mod uring {
             );
             let mut out = WriteLoan::new(buffers.acquire().unwrap());
             let body = respond(&mut RequestParser::new(LIMITS), received.bytes(), &mut out).expect("a whole head");
+            let received = Lease::from(received);
             let last = received.view(..).unwrap();
-            reply(&mut driver, &stream, out, received, body);
+            reply(&mut driver, &mut stream, out, received, body);
             driver.close(stream).unwrap();
             thread::spawn(move || drop(last)).join().unwrap();
         }

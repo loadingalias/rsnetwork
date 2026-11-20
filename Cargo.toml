@@ -13,7 +13,7 @@ include = ["/src", "/LICENSE", "/README.md"]
 [dependencies]
 # The buffer types that the core shares with the runtime family. The core uses
 # only `core`, so it does not select the `std` feature.
-rstypes = { version = "=0.1.0-alpha.2", default-features = false }
+rstypes = { git = "https://github.com/loadingalias/rsasync", branch = "main", default-features = false }
 
 # The cross-boundary proof (tests/cross_boundary.rs) runs the parser on Tokio:
 # a current-thread runtime and TCP, with no other feature.
@@ -22,10 +22,10 @@ tokio = { version = "1.54.1", features = ["rt", "net"] }
 # The independent head and chunk parser of the differential test (tests/h1_differential.rs).
 httparse = "1.10.1"
 
-# The proof runs the parser on the io_uring driver of rsasync, at the alpha of
-# its P0.3 path. The driver needs Linux on x86_64 or aarch64.
+# The proof runs the parser on the io_uring driver of rsasync, from its Git
+# `main`. The driver needs Linux on x86_64 or aarch64.
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dev-dependencies]
-rsasync = "=0.1.0-alpha.2"
+rsasync = { git = "https://github.com/loadingalias/rsasync", branch = "main" }
 
 # The caller-driven protocol loop. `test = true` makes `cargo xtask test` run its cases.
 [[example]]

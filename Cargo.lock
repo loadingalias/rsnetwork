@@ -34,8 +34,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "rsasync"
 version = "0.1.0-alpha.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f573585c32ef4431ea4aca506aea82a7fddedaa1946eef2f97215cd5461028c5"
+source = "git+https://github.com/loadingalias/rsasync?branch=main#75ca1afe28bd39d0427b6ade62038745599b0255"
 dependencies = [
  "rsnetwork-udp",
  "rstypes",
@@ -44,8 +43,7 @@ dependencies = [
 [[package]]
 name = "rscrypto"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e708a799aaf045099fc91c80bb60a63e8e3da710a6a17953d97afc5ecb192861"
+source = "git+https://github.com/loadingalias/rscrypto?branch=main#4b1899d17821da07a2866510036fe57e3a820e89"
 
 [[package]]
 name = "rsnetwork"
@@ -60,14 +58,12 @@ dependencies = [
 [[package]]
 name = "rsnetwork-udp"
 version = "0.1.0-alpha.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f959b04290266478c37f286083a0a9d8b403838dda53699a065b63188fabf8f3"
+source = "git+https://github.com/loadingalias/rsasync?branch=main#75ca1afe28bd39d0427b6ade62038745599b0255"
 
 [[package]]
 name = "rstypes"
 version = "0.1.0-alpha.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84124ec6ddf6cab39532f2780de6af83d9136aa2f183cc5295b4364e61842cd8"
+source = "git+https://github.com/loadingalias/rsasync?branch=main#75ca1afe28bd39d0427b6ade62038745599b0255"
 
 [[package]]
 name = "socket2"
