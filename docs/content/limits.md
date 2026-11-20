@@ -14,11 +14,14 @@ Each part of a connection reserves its memory from the budget before it allocate
 construction is `Kind::Overload`, and it allocates nothing. Thus a connection is admitted whole,
 before the engine parses its first byte.
 
+A pool of `rsnetwork::buffer` charges each of its allocations: each slot at its size, rounded up
+to its alignment, a 16-byte entry for each slot, and the shared state of the pool.
+
 | Part | Charge | When |
 | --- | --- | --- |
 | `Inbound` queue | `limit` entries of a received region | `Inbound::new(limit, &budget)` |
 | `Outbound` queue | `limit` entries of an output region | `Outbound::new(limit, &budget)` |
-| Chunk-size line pool of an engine | One 16-byte slot for each `Outbound` entry | `Server::new` and `Client::new` |
+| Chunk-size line pool of an engine | A pool of one 16-byte slot for each `Outbound` entry | `Server::new` and `Client::new` |
 | Join of a head or a trailer section that continues in the next received region | `head_bytes` or `trailer_bytes` | When the section continues in a later region, until the last view of it drops |
 | HPACK decoder | Its dynamic table: see [HPACK](hpack.md#limits) | `hpack::Decoder::new(limits, &budget)` |
 | HPACK lines | The space for the decoded lines of one block, which you lend to each decode | `hpack::Lines::new(limits, &budget)` |
@@ -28,14 +31,14 @@ before the engine parses its first byte.
 | QPACK encoder | Its dynamic table and its list of sections that wait for their acknowledgement | `qpack::Encoder::new(limits, &budget)` |
 | HTTP/2 connection | Its HPACK decoder of at least 4096 bytes, its HPACK encoder, a stream table of `max_concurrent_streams` entries, three lists of as many 4-byte identifiers (reset streams and the two rings of the send scheduler), and a frame pool of one 64-byte slot for each `Outbound` entry and one more | `h2::Connection::new` |
 | Join of an HTTP/2 header block that does not decode in place | Its bytes for a block in one frame, or `work` for a block that continues: see [HTTP/2](http2.md#header-blocks) | When the block arrives, until its decode |
-| TLS input region | `input_bytes` | When a receive needs a region, until the last view of its plaintext and the writable rest of the region drop |
+| TLS input region | A pool of one slot of `input_bytes` | When a receive needs a region, until the last view of its plaintext and the writable rest of the region drop |
 | TLS ciphertext output | Its capacity, as encryption and the handshake of rustls write it | When the connection writes, until the transport releases the last view |
 | Join of a TLS handshake message after the handshake that arrives in two or more records | Its bytes, at most `input_bytes` | When the message continues in a later record, until the message is complete |
 
 A join that the budget cannot pay for does not fail the connection: the turn is
 `Progress::Blocked(Blocked::Capacity(n))`, and the engine tries again in a later drive. The received
 regions and the head regions that you give are yours, so you charge them, for example with a pool of
-`rsnetwork::buffer` that charges its slots to the same budget.
+`rsnetwork::buffer` on the same budget.
 
 ## Turn limits
 

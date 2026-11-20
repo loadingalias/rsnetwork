@@ -100,8 +100,8 @@ assert_eq!(sent, b"HTTP/1.1 201 \r\nContent-Type: text/plain\r\ncontent-length: 
 ## Serve requests
 
 1. Make one `Server` for each connection with `Server::new(limits, body, turn, &outbound, &budget)`.
-   It makes its pool of chunk-size lines there: one 16-byte slot for each `Outbound` entry,
-   charged to the budget.
+   It makes its pool of chunk-size lines there, with one 16-byte slot for each `Outbound` entry.
+   The budget pays for the pool: see [admission](limits.md#admission).
 2. Call `server.drive(&mut inbound, &mut outbound, now)` until it gives no event. Drive again when more
    bytes arrive or after the application answers.
 3. For `ServerEvent::Request(head)`, answer with `respond(outbound, status, fields, framing,

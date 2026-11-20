@@ -57,7 +57,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "rsasync"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/loadingalias/rsasync?branch=main#45d1c43043a4702b7b48f1eadac4fc24de187647"
+source = "git+https://github.com/loadingalias/rsasync?branch=main#292b194dda085949756d43b598b18266714de0c9"
 dependencies = [
  "rscrypto",
  "rsnetwork-udp",
@@ -101,12 +101,12 @@ dependencies = [
 [[package]]
 name = "rsnetwork-udp"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/loadingalias/rsasync?branch=main#45d1c43043a4702b7b48f1eadac4fc24de187647"
+source = "git+https://github.com/loadingalias/rsasync?branch=main#292b194dda085949756d43b598b18266714de0c9"
 
 [[package]]
 name = "rstypes"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/loadingalias/rsasync?branch=main#45d1c43043a4702b7b48f1eadac4fc24de187647"
+source = "git+https://github.com/loadingalias/rsasync?branch=main#292b194dda085949756d43b598b18266714de0c9"
 
 [[package]]
 name = "rustls"

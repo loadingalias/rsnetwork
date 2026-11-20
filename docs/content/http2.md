@@ -421,9 +421,10 @@ no event: see [streams](#streams).
 `Connection::new` charges the HPACK decoder, the HPACK encoder, the stream table, and the frame
 pool to your budget. The stream table has `max_concurrent_streams` entries, and as many 4-byte
 identifiers in each of three lists: the held streams and the two rings of the send scheduler. The
-pool has one slot of 64 bytes for each entry of the output queue,
-and one more. `TurnLimits` bounds the work of each drive: `frames` counts each frame header, and
-`bytes` each received byte that the drive reads. See [limits](limits.md).
+pool has one slot of 64 bytes for each entry of the output queue, and one more. Each pool also
+charges an entry for each slot and its shared state: see [admission](limits.md#admission).
+`TurnLimits` bounds the work of each drive: `frames` counts each frame header, and `bytes` each
+received byte that the drive reads. See [limits](limits.md).
 
 ### Floods
 
