@@ -5,7 +5,8 @@ drives from its own event loop, with no runtime. Your loop owns the socket, or a
 source, and the clock. The connection spawns no task, starts no thread, and does not need `Send`.
 
 rsnetwork is in development and has no release. To connect the engines to a runtime instead, see
-[Write a binding](adapters.md).
+[Write a binding](adapters.md). To run the same connection over TLS 1.3, see
+[Run a connection over TLS 1.3](tls.md).
 
 ## The loop
 

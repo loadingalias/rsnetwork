@@ -17,6 +17,9 @@
 //! its streams and flow control. [`qpack`] is the field compression of HTTP/3, with its encoder
 //! and decoder streams.
 //!
+//! [`tls`] is TLS 1.3 (the default `tls` feature): the configuration of each end, and the engine
+//! that runs an HTTP engine over TLS records, with the cryptography of rscrypto.
+//!
 //! [`host`] is the caller-driven host: one connection that the application drives from its own
 //! event loop, with no runtime.
 //!
@@ -33,4 +36,6 @@ pub mod h2;
 pub mod host;
 pub mod hpack;
 pub mod qpack;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod value;

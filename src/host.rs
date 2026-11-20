@@ -76,8 +76,11 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use rstypes::buffer::{Backing, Lease};
+
 use crate::drive::{
-    AckError, ActionId, Blocked, Error, Inbound, Kind, Outbound, Output, Outstanding, Progress, Received, Turn,
+    AckError, ActionId, Blocked, Endpoint, Error, Inbound, Kind, Outbound, Output, Outstanding, Progress, Received,
+    Turn,
 };
 use crate::h1::{Client, ClientEvent, Server, ServerEvent};
 use crate::time::{ClockDomain, Deadline, Instant};
@@ -98,6 +101,37 @@ pub trait Engine: sealed::Sealed {
 
     /// Whether the engine has a timer, which needs the clock of the host.
     fn timed(&self) -> bool;
+
+    /// Lends the input region of the engine for one receive, or gives `None` when the engine has
+    /// none. The host receives into the capacity after the initialized bytes of the region, and
+    /// gives it back with [`received`](Self::received).
+    fn region(&mut self) -> Result<Option<Backing>, Error> {
+        Ok(None)
+    }
+
+    /// Takes a received region that the host owns: the region that [`region`](Self::region) lent,
+    /// with the bytes that the receive added, or a region of the host, for example one that the
+    /// kernel selected. The default freezes it and queues it in `inbound`, with no copy. Gives it
+    /// back when the engine cannot take it now: drive first.
+    fn received(
+        &mut self,
+        inbound: &mut Inbound,
+        region: Backing,
+        endpoint: Endpoint,
+        capacity: u64,
+    ) -> Result<(), Backing> {
+        if inbound.free() == 0 {
+            return Err(region);
+        }
+        let received = Received {
+            region: Lease::from(region),
+            endpoint,
+            capacity,
+        };
+        let pushed = inbound.push(received);
+        assert!(pushed.is_ok(), "a queue with a free place takes each region");
+        Ok(())
+    }
 }
 
 /// The engines of this crate are the only engines: a binding drives them, and does not replace
@@ -107,6 +141,8 @@ mod sealed {
 
     impl Sealed for crate::h1::Server {}
     impl Sealed for crate::h1::Client {}
+    #[cfg(feature = "tls")]
+    impl<E: super::Engine> Sealed for crate::tls::Tls<E> {}
 }
 
 impl Engine for Server {
@@ -205,6 +241,25 @@ impl<E: Engine> Connection<E> {
     )]
     pub fn receive(&mut self, received: Received) -> Result<(), Received> {
         self.inbound.push(received)
+    }
+
+    /// Lends the input region of the engine for one receive, or gives `None` when the engine has
+    /// none: then receive into a region of the host. Receive into the capacity after the
+    /// initialized bytes, and give the region back with [`received`](Self::received).
+    ///
+    /// A TLS engine lends the tail of its input region, so a record that continues after a
+    /// receive joins its first bytes in place. Refuses with [`Kind::Overload`] when the budget
+    /// cannot pay for a new region, and with [`Kind::Misuse`] while a lent region has not come
+    /// back.
+    pub fn region(&mut self) -> Result<Option<Backing>, Error> {
+        self.engine.region()
+    }
+
+    /// Gives the engine a received region that the host owns: the region that
+    /// [`region`](Self::region) lent, or a region of the host, for example one that the kernel
+    /// selected. Gives it back when the engine cannot take it now: drive first.
+    pub fn received(&mut self, region: Backing, endpoint: Endpoint, capacity: u64) -> Result<(), Backing> {
+        self.engine.received(&mut self.inbound, region, endpoint, capacity)
     }
 
     /// Records that the transport gives no more bytes: the peer closed its side.

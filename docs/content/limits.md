@@ -28,6 +28,10 @@ before the engine parses its first byte.
 | QPACK encoder | Its dynamic table and its list of sections that wait for their acknowledgement | `qpack::Encoder::new(limits, &budget)` |
 | HTTP/2 connection | Its HPACK decoder of at least 4096 bytes, its HPACK encoder, a stream table of `max_concurrent_streams` entries, three lists of as many 4-byte identifiers (reset streams and the two rings of the send scheduler), and a frame pool of one 64-byte slot for each `Outbound` entry and one more | `h2::Connection::new` |
 | Join of an HTTP/2 header block that does not decode in place | Its bytes for a block in one frame, or `work` for a block that continues: see [HTTP/2](http2.md#header-blocks) | When the block arrives, until its decode |
+| TLS plaintext list | One entry for each place of the `Inbound` queue of the engine inside `Tls` | `Tls::server` and `Tls::client` |
+| TLS input region | `input_bytes` | When a receive needs a region, until the last view of its plaintext drops |
+| TLS ciphertext output | Its capacity, as encryption and rustls write it | When the connection writes, until the transport releases the last view |
+| TLS plaintext copy: plaintext that rustls gave in its own buffer, or that joined its own region | Its bytes | When the copy is made, until its last view drops |
 
 A join that the budget cannot pay for does not fail the connection: the turn is
 `Progress::Blocked(Blocked::Capacity(n))`, and the engine tries again in a later drive. The received
@@ -75,5 +79,6 @@ deadline for it, and end the connection when it passes.
 | `hpack::Limits` | The dynamic table, the decoded lines, and the work of one HTTP/2 header block | [HPACK](hpack.md#limits) |
 | `qpack::Limits`, `qpack::EncoderLimits` | The dynamic tables, the blocked streams, the decoded lines of one HTTP/3 field section, the sections that wait for an acknowledgement, and the work of one read of the encoder stream | [QPACK](qpack.md#limits) |
 | `h2::Limits` | The settings that an HTTP/2 endpoint sends, the largest header block, the encoder table, and the connection receive window | [HTTP/2](http2.md#limits) |
+| `tls::Limits` | The capacity of each TLS input region, which also bounds the largest handshake message, and the work of one drive | [TLS](tls.md#limits) |
 | `drive::TurnLimits` | The work of one drive | This page |
 | `Inbound::new`, `Outbound::new` | The regions that each queue holds | [Drive a protocol engine](drive.md) |

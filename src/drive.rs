@@ -166,6 +166,11 @@ impl Inbound {
         self.ended
     }
 
+    /// The number of regions that the queue can take now.
+    pub fn free(&self) -> usize {
+        self.limit - self.regions.len()
+    }
+
     /// Adds a region after the others. Gives it back if the queue is full. An empty region has
     /// no byte to consume, so the queue drops it.
     #[expect(

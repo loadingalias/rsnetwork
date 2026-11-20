@@ -87,6 +87,24 @@ const DEADLOCK: &str = "(deadlock)";
 /// own package (`rsnetwork-tokio`, `rsnetwork-rsasync`), never in this closure.
 const PROTOCOL_CLOSURE: &[&str] = &["rsnetwork", "rstypes"];
 
+/// The crates that the default `tls` feature adds: rustls, the rscrypto provider, and their
+/// dependencies. None builds C, and only rscrypto does cryptography (N101). A new crate here needs
+/// the approval of the user.
+const TLS_CLOSURE: &[&str] = &[
+    "cfg-if",
+    "getrandom",
+    "libc",
+    "r-efi",
+    "rscrypto",
+    "rscrypto-rustls",
+    "rustls",
+    "rustls-pki-types",
+    "rustls-webpki",
+    "subtle",
+    "untrusted",
+    "zeroize",
+];
+
 /// Environment variables that change compilation without notice. Each command
 /// removes them, so only the checked-in configuration applies. Each variable
 /// that starts with `CARGO_BUILD_`, `CARGO_PROFILE_`, or `CARGO_TARGET_` is
@@ -245,14 +263,18 @@ impl Repo {
         self.closure()
     }
 
-    /// Fails when the dependencies of a protocol-only build hold a crate outside
-    /// [`PROTOCOL_CLOSURE`], for example an executor, a socket driver, or Tokio.
-    /// It reads the normal and build dependencies of `rsnetwork` on every target.
+    /// Fails when a build of `rsnetwork` holds a crate outside its list. The protocol-only build
+    /// (no default features) holds only [`PROTOCOL_CLOSURE`]: no executor, socket driver, or
+    /// Tokio. The default build adds only [`TLS_CLOSURE`]. It reads the normal and build
+    /// dependencies of `rsnetwork` on every target.
     fn closure(&self) -> Result<(), Failure> {
         eprintln!("── closure");
         let started = Instant::now();
-        let output = self
-            .cargo(&[
+        for (build, features, tls) in [
+            ("a protocol-only build", Some("--no-default-features"), &[][..]),
+            ("the default build", None, TLS_CLOSURE),
+        ] {
+            let mut args = vec![
                 "tree",
                 "--locked",
                 "--quiet",
@@ -266,29 +288,33 @@ impl Repo {
                 "none",
                 "--format",
                 "{p}",
-            ])
-            .output()
-            .map_err(|error| Failure::new(format!("closure: cannot start cargo tree: {error}")))?;
-        if !output.status.success() {
-            return Err(Failure::new(format!(
-                "closure: cargo tree failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        let tree = String::from_utf8_lossy(&output.stdout);
-        let mut outside: Vec<&str> = tree
-            .lines()
-            .filter_map(|line| line.split_whitespace().next())
-            .filter(|name| !PROTOCOL_CLOSURE.contains(name))
-            .collect();
-        outside.sort_unstable();
-        outside.dedup();
-        if !outside.is_empty() {
-            return Err(Failure::new(format!(
-                "closure: a protocol-only build of rsnetwork holds {}; a binding takes its runtime in its own package",
-                outside.join(", ")
-            )));
+            ];
+            args.extend(features);
+            let output = self
+                .cargo(&args)
+                .output()
+                .map_err(|error| Failure::new(format!("closure: cannot start cargo tree: {error}")))?;
+            if !output.status.success() {
+                return Err(Failure::new(format!(
+                    "closure: cargo tree failed ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            let tree = String::from_utf8_lossy(&output.stdout);
+            let mut outside: Vec<&str> = tree
+                .lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .filter(|name| !PROTOCOL_CLOSURE.contains(name) && !tls.contains(name))
+                .collect();
+            outside.sort_unstable();
+            outside.dedup();
+            if !outside.is_empty() {
+                return Err(Failure::new(format!(
+                    "closure: {build} of rsnetwork holds {}; a binding takes its runtime in its own package, and a new crate needs approval",
+                    outside.join(", ")
+                )));
+            }
         }
         eprintln!("   ok in {:.2}s", started.elapsed().as_secs_f64());
         Ok(())
