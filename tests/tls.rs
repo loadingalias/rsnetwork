@@ -1,12 +1,25 @@
 //! TLS 1.3 between an HTTP/1.1 client engine and an HTTP/1.1 server engine on the caller-driven
 //! host: the negotiated group, the copies of each receive form, trust failures, mTLS, rotation,
-//! resumption, and the end of input. The certificates come from `tls/generate.sh`.
+//! resumption, and the end of input. An unmodified rustls server is the independent peer of the
+//! record layer of the core: its suites, KeyUpdates, session tickets, and refused records. The
+//! certificates come from `tls/generate.sh`.
 
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::Arc;
+
+use rscrypto::aead::Nonce96;
+use rscrypto::aead::expert::AeadWithNonce as _;
+use rscrypto::{Aes128Gcm, Aes128GcmKey};
+use rscrypto_rustls::cipher_suite::{
+    TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
+};
+use rustls::crypto::cipher::OutboundPlain;
+use rustls::crypto::{CryptoProvider, Identity as Chain};
+use rustls::{ConnectionTrafficSecrets, ExtractedSecrets, ServerSide, Tcp, Tls13CipherSuite, VecInput};
 
 use rsnetwork::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use rsnetwork::capacity::Budget;
@@ -55,6 +68,7 @@ const TURN: TurnLimits = TurnLimits {
 
 const LIMITS: Limits = Limits {
     input_bytes: 32 * 1024,
+    key_records_max: u64::MAX,
     turn: TURN,
 };
 
@@ -163,14 +177,38 @@ struct Pair {
     ended: bool,
 }
 
+/// A client connection to the server `name`, with its own budget.
+fn client(config: &ClientConfig, name: &str, limits: Limits) -> Connection<Tls<Client>> {
+    let budget = budget();
+    let (inbound, outbound) = queues(&budget);
+    let engine = Client::new(HEAD, BODY_LIMITS, TURN, &outbound, &budget).unwrap();
+    let tls = Tls::client(config, name, engine, (inbound, outbound), limits, &budget).unwrap();
+    let (inbound, outbound) = queues(&budget);
+    Connection::new(tls, inbound, outbound, Some(clock())).unwrap()
+}
+
+/// Queues a GET request with `fields` on `client`.
+fn request(client: &mut Connection<Tls<Client>>, fields: &[Field<'_>]) {
+    let (tls, _) = client.parts();
+    let (client, outbound) = tls.parts();
+    client
+        .request(
+            outbound,
+            Method::GET,
+            Target::new(b"/").unwrap(),
+            Authority::new(b"server.test").unwrap(),
+            fields,
+            Framing::Length(0),
+            Backing::from(Vec::with_capacity(256)),
+        )
+        .unwrap();
+    client.finish(outbound).unwrap();
+}
+
 impl Pair {
-    fn new(client: &ClientConfig, name: &str, server: &ServerConfig) -> Self {
-        let (client_budget, server_budget) = (budget(), budget());
-        let (inbound, outbound) = queues(&client_budget);
-        let engine = Client::new(HEAD, BODY_LIMITS, TURN, &outbound, &client_budget).unwrap();
-        let tls = Tls::client(client, name, engine, (inbound, outbound), LIMITS, &client_budget).unwrap();
-        let (inbound, outbound) = queues(&client_budget);
-        let client = Connection::new(tls, inbound, outbound, Some(clock())).unwrap();
+    fn new(client_config: &ClientConfig, name: &str, server: &ServerConfig) -> Self {
+        let server_budget = budget();
+        let client = client(client_config, name, LIMITS);
         let (inbound, outbound) = queues(&server_budget);
         let engine = Server::new(HEAD, BODY_LIMITS, TURN, &outbound, &server_budget).unwrap();
         let tls = Tls::server(server, engine, (inbound, outbound), LIMITS, &server_budget).unwrap();
@@ -192,20 +230,7 @@ impl Pair {
 
     /// Queues a GET request with `fields` on the client.
     fn request(&mut self, fields: &[Field<'_>]) {
-        let (tls, _) = self.client.parts();
-        let (client, outbound) = tls.parts();
-        client
-            .request(
-                outbound,
-                Method::GET,
-                Target::new(b"/").unwrap(),
-                Authority::new(b"server.test").unwrap(),
-                fields,
-                Framing::Length(0),
-                Backing::from(Vec::with_capacity(256)),
-            )
-            .unwrap();
-        client.finish(outbound).unwrap();
+        request(&mut self.client, fields);
     }
 
     /// Drives both ends and moves their output, one received region in each direction in each
@@ -342,7 +367,7 @@ fn a_request_negotiates_x25519mlkem768_with_no_copy_but_encryption_and_leaves_no
 }
 
 #[test]
-fn a_record_split_across_two_regions_decrypts_and_copies_at_most_the_rest_of_one_record() {
+fn a_record_split_across_two_regions_opens_and_copies_at_most_the_rest_of_one_record() {
     let (client, server) = (
         client_config(CA, None, VALID, Resumption::Off),
         server_config(None, Resumption::Off),
@@ -361,10 +386,12 @@ fn a_record_split_across_two_regions_decrypts_and_copies_at_most_the_rest_of_one
         pair.run();
         assert_eq!(pair.client_error(), None, "{receive:?}");
         assert_eq!(pair.body, BODY, "{receive:?}");
-        let partial = copies(&mut pair).0.partial - before.partial;
+        let after = copies(&mut pair).0;
+        let partial = after.partial - before.partial;
         match receive {
-            // The second half arrives in the tail of the same region.
-            Receive::Lent => assert_eq!(partial, 0),
+            // The second half arrives in the tail of the same region, and the record opens there:
+            // only encryption copies.
+            Receive::Lent => assert_eq!(Copies { encrypted: 0, ..after }, Copies::default()),
             // The rest of the record moves from the second region: less than one record.
             _ => assert!(
                 partial > 0 && partial < rsnetwork::tls::RECORD_BYTES_MAX as u64,
@@ -582,4 +609,284 @@ fn a_seeded_run_replays_each_byte_of_its_handshake_and_request() {
     assert_eq!(first, run(1));
     // Another seed gives other bytes, so the seed and not a constant made them.
     assert_ne!(first, run(2));
+}
+
+/// The three suites of the provider.
+const SUITES: [&Tls13CipherSuite; 3] = [
+    TLS13_AES_128_GCM_SHA256,
+    TLS13_AES_256_GCM_SHA384,
+    TLS13_CHACHA20_POLY1305_SHA256,
+];
+
+const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 14\r\n\r\nhello over tls";
+
+/// The configuration of an unmodified rustls server with one suite of the provider, records of at
+/// most `fragment` bytes, and the extraction of its keys, so that a test can seal and open records
+/// as the peer.
+fn peer_config(suite: &'static Tls13CipherSuite, fragment: Option<usize>) -> Arc<rustls::ServerConfig> {
+    let provider = CryptoProvider {
+        tls13_cipher_suites: Cow::Owned(vec![suite]),
+        ..rscrypto_rustls::default_provider()
+    };
+    let chain = Arc::new(Chain::from_cert_chain(vec![certificate(SERVER.0)]).unwrap());
+    let key = PrivateKeyDer::try_from(SERVER.1.to_vec()).unwrap();
+    let mut config = rustls::ServerConfig::builder_with_details(Arc::new(provider), Arc::new(At(VALID)))
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+    config.max_fragment_size = fragment;
+    config.enable_secret_extraction = true;
+    Arc::new(config)
+}
+
+/// An unmodified rustls server: the independent peer of a client engine.
+struct Peer {
+    connection: rustls::Connection<ServerSide, Tcp>,
+    input: VecInput,
+    /// The application data that the peer received.
+    data: Vec<u8>,
+}
+
+impl Peer {
+    fn new(config: &Arc<rustls::ServerConfig>) -> Self {
+        Self {
+            connection: rustls::Connection::<ServerSide, Tcp>::new(Arc::clone(config)).unwrap(),
+            input: VecInput::default(),
+            data: Vec::new(),
+        }
+    }
+
+    /// Reads the bytes of the client, and gives the bytes of the answer.
+    fn receive(&mut self, mut bytes: &[u8]) -> Vec<u8> {
+        while !bytes.is_empty() {
+            self.input.read(&mut bytes).unwrap();
+        }
+        let mut answer = Vec::new();
+        let mut handler = self.connection.read_tls(&mut self.input, &mut answer);
+        while let Some(payload) = handler.next_payload() {
+            self.data.extend_from_slice(payload.unwrap().bytes());
+        }
+        drop(handler);
+        answer
+    }
+
+    fn send(&mut self, plaintext: &[u8]) -> Vec<u8> {
+        let mut records = Vec::new();
+        self.connection
+            .write(OutboundPlain::Single(plaintext), &mut records)
+            .unwrap();
+        records
+    }
+
+    /// A KeyUpdate of the peer that asks the client for one.
+    fn update(&mut self) -> Vec<u8> {
+        let mut records = Vec::new();
+        self.connection.refresh_traffic_keys(&mut records).unwrap();
+        records
+    }
+
+    /// The keys of the peer and their sequence numbers.
+    fn keys(self) -> ExtractedSecrets {
+        self.connection.dangerous_extract_secrets().unwrap()
+    }
+}
+
+/// Moves bytes between `client` and `peer` until the client sends nothing, and adds the
+/// response body that the client receives to `body`.
+fn exchange(client: &mut Connection<Tls<Client>>, peer: &mut Peer, body: &mut Vec<u8>) {
+    for _ in 0..1024 {
+        drive(client, |_, event| {
+            if let ClientEvent::Data(data) = event {
+                body.extend_from_slice(data.bytes());
+            }
+        });
+        let mut sent = VecDeque::new();
+        take(client, &mut sent, 1);
+        if sent.is_empty() {
+            return;
+        }
+        for part in sent {
+            let answer = peer.receive(&part);
+            if !answer.is_empty() {
+                give(client, &answer, Receive::Lent);
+            }
+        }
+    }
+    panic!("the client still sends after 1024 rounds");
+}
+
+/// One request of `client` and the response of `peer`.
+fn round(client: &mut Connection<Tls<Client>>, peer: &mut Peer, body: &mut Vec<u8>) {
+    request(client, &[]);
+    exchange(client, peer, body);
+    let response = peer.send(RESPONSE);
+    give(client, &response, Receive::Lent);
+    exchange(client, peer, body);
+}
+
+#[test]
+fn a_key_update_that_the_peer_asks_for_changes_both_keys_over_each_suite() {
+    let config = client_config(CA, None, VALID, Resumption::Off);
+    for suite in SUITES {
+        let mut peer = Peer::new(&peer_config(suite, None));
+        let mut client = client(&config, "server.test", LIMITS);
+        let mut body = Vec::new();
+        exchange(&mut client, &mut peer, &mut body);
+        round(&mut client, &mut peer, &mut body);
+        // The peer changes its key and asks for a KeyUpdate. The client answers with its own.
+        let update = peer.update();
+        give(&mut client, &update, Receive::Lent);
+        exchange(&mut client, &mut peer, &mut body);
+        // The next response opens with the new key of the peer.
+        round(&mut client, &mut peer, &mut body);
+        assert_eq!(
+            client.wait(),
+            Wait::Until {
+                blocked: rsnetwork::drive::Blocked::Input,
+                deadline: None
+            }
+        );
+        assert_eq!(body, [BODY, BODY].concat(), "{:?}", suite.common.suite);
+        assert_eq!(peer.data.windows(6).filter(|bytes| bytes == b"GET / ").count(), 2);
+        // The second request is the first record under the new key of the client.
+        assert_eq!(peer.keys().rx.0, 1, "{:?}", suite.common.suite);
+    }
+}
+
+#[test]
+fn a_key_at_its_record_limit_sends_a_key_update_and_the_connection_keeps_working() {
+    let mut peer = Peer::new(&peer_config(TLS13_AES_128_GCM_SHA256, None));
+    let limits = Limits {
+        key_records_max: 2,
+        ..LIMITS
+    };
+    let mut client = client(&client_config(CA, None, VALID, Resumption::Off), "server.test", limits);
+    let mut body = Vec::new();
+    exchange(&mut client, &mut peer, &mut body);
+    for _ in 0..3 {
+        round(&mut client, &mut peer, &mut body);
+    }
+    assert_eq!(body, [BODY, BODY, BODY].concat());
+    // Each key seals one request and then its KeyUpdate. So the third request is the first record
+    // under its key, where one key for each request would make it the third.
+    assert_eq!(peer.keys().rx.0, 1);
+}
+
+#[test]
+fn a_session_ticket_in_several_records_joins_and_resumes_the_next_connection() {
+    // Records of at most 64 bytes split each handshake message, also each session ticket.
+    let config = peer_config(TLS13_AES_128_GCM_SHA256, Some(64));
+    let client_config = client_config(CA, None, VALID, SESSIONS);
+    let mut kinds = Vec::new();
+    for _ in 0..2 {
+        let mut peer = Peer::new(&config);
+        let mut client = client(&client_config, "server.test", LIMITS);
+        let mut body = Vec::new();
+        exchange(&mut client, &mut peer, &mut body);
+        round(&mut client, &mut peer, &mut body);
+        assert_eq!(body, BODY);
+        let tls = client.parts().0;
+        kinds.push(tls.negotiated().unwrap().handshake);
+        assert!(tls.copies().handshake > 0);
+    }
+    assert_eq!(kinds, [Handshake::Full, Handshake::Resumed]);
+}
+
+/// The AES-128-GCM key of one direction of the peer, and the sequence number of its next record:
+/// an opener and sealer of the test, with no code of the crate.
+struct Keys {
+    cipher: Aes128Gcm,
+    iv: [u8; 12],
+    seq: u64,
+}
+
+impl Keys {
+    fn new((seq, secrets): &(u64, ConnectionTrafficSecrets)) -> Self {
+        let ConnectionTrafficSecrets::Aes128Gcm { key, iv } = secrets else {
+            panic!("the peer has one suite");
+        };
+        Self {
+            cipher: Aes128Gcm::new(&Aes128GcmKey::from_bytes(key.as_ref().try_into().unwrap())),
+            iv: iv.as_ref().try_into().unwrap(),
+            seq: *seq,
+        }
+    }
+
+    fn nonce(&mut self) -> Nonce96 {
+        let mut nonce = self.iv;
+        for (byte, seq) in nonce[4..].iter_mut().zip(self.seq.to_be_bytes()) {
+            *byte ^= seq;
+        }
+        self.seq += 1;
+        Nonce96::from_bytes(nonce)
+    }
+
+    /// A protected record of the inner content type `kind` (RFC 8446, section 5.2).
+    fn seal(&mut self, kind: u8, content: &[u8]) -> Vec<u8> {
+        let mut inner = [content, &[kind]].concat();
+        let [high, low] = u16::try_from(inner.len() + 16).unwrap().to_be_bytes();
+        let header = [23, 3, 3, high, low];
+        let nonce = self.nonce();
+        let tag = self.cipher.encrypt_in_place(&nonce, &header, &mut inner).unwrap();
+        [&header[..], &inner, tag.as_ref()].concat()
+    }
+
+    /// The inner plaintext of one protected record: its content and its type.
+    fn open(&mut self, record: &[u8]) -> Vec<u8> {
+        let (header, rest) = record.split_at(5);
+        let (text, tag) = rest.split_at(rest.len() - 16);
+        let mut text = text.to_vec();
+        let nonce = self.nonce();
+        let tag = Aes128Gcm::tag_from_slice(tag).unwrap();
+        self.cipher.decrypt_in_place(&nonce, header, &mut text, &tag).unwrap();
+        text
+    }
+}
+
+/// Makes a record that the protocol refuses, with the keys of the peer.
+type Bad = fn(&mut Keys) -> Vec<u8>;
+
+#[test]
+fn a_long_record_a_wrong_tag_or_an_unknown_content_type_ends_with_malformed_and_its_alert() {
+    let config = client_config(CA, None, VALID, Resumption::Off);
+    let cases: [(Bad, &str, u8); 3] = [
+        // 2^14 + 257 bytes after the header: one more than the protocol allows.
+        (
+            |_| vec![23, 3, 3, 0x41, 0x01],
+            "a TLS record is longer than the protocol allows",
+            22,
+        ),
+        (
+            |keys| {
+                let mut record = keys.seal(23, b"data");
+                *record.last_mut().unwrap() ^= 1;
+                record
+            },
+            "a TLS record failed its authentication",
+            20,
+        ),
+        (
+            |keys| keys.seal(0x63, b"data"),
+            "a TLS record has an unknown content type",
+            10,
+        ),
+    ];
+    for (record, reason, alert) in cases {
+        let mut peer = Peer::new(&peer_config(TLS13_AES_128_GCM_SHA256, None));
+        let mut client = client(&config, "server.test", LIMITS);
+        exchange(&mut client, &mut peer, &mut Vec::new());
+        let secrets = peer.keys();
+        let (mut tx, mut rx) = (Keys::new(&secrets.tx), Keys::new(&secrets.rx));
+        give(&mut client, &record(&mut tx), Receive::Lent);
+        drive(&mut client, |_, _| {});
+        let Wait::Ended(Err(error)) = client.wait() else {
+            panic!("the client did not end: {:?}", client.wait());
+        };
+        assert_eq!((error.kind(), error.reason()), (Kind::Malformed, reason));
+        let mut sent = VecDeque::new();
+        take(&mut client, &mut sent, 1);
+        let sent: Vec<u8> = sent.into_iter().flatten().collect();
+        // A fatal alert, and then the alert content type.
+        assert_eq!(rx.open(&sent), [2, alert, 21], "{reason}");
+    }
 }

@@ -1,11 +1,12 @@
 //! TLS 1.3 in the core: the configuration of each end, and [`Tls`], the engine that runs an inner
 //! engine, for example an HTTP/1.1 server, over TLS records.
 //!
-//! The host gives [`Tls`] ciphertext, and sends the ciphertext that it writes. rustls, with the
-//! cryptography of rscrypto, decrypts each record in place in the region that its bytes arrived
-//! in. The inner engine reads the plaintext as views of that region, with no copy. Encryption
-//! writes the plaintext of the inner engine into the ciphertext output. [`Copies`] counts each
-//! copy by its cause, also the encryption, which each sent byte needs.
+//! The host gives [`Tls`] ciphertext, and sends the ciphertext that it writes. rustls runs the
+//! handshake with the cryptography of rscrypto, and then gives the traffic keys to the record
+//! layer of the core. The record layer opens each record with rscrypto in place, in the region
+//! that its bytes arrived in, and the inner engine reads the plaintext as views of that region,
+//! with no copy. It seals the plaintext of the inner engine into the ciphertext output, so a sent
+//! byte costs only its encryption. [`Copies`] counts each copy by its cause, also the encryption.
 //!
 //! - **Configuration.** [`ClientConfig`] and [`ServerConfig`] take each choice explicitly: the
 //!   trust roots, the identity of each end, ALPN, resumption, and the wall clock that checks the
@@ -14,15 +15,18 @@
 //!   provider, so nothing installs a provider for the process.
 //! - **Receive.** A host receives into the region that
 //!   [`host::Connection::region`](crate::host::Connection::region) lends: the tail of the input
-//!   region, so a record that continues after a receive joins in place. A region that the host
+//!   region, so a record that continues after a receive completes in place. A region that the host
 //!   owns, for example one that the kernel selected, goes to
 //!   [`host::Connection::received`](crate::host::Connection::received): a record that continues
 //!   into it costs one copy of the rest of that record. A read-only region goes to
 //!   [`host::Connection::receive`](crate::host::Connection::receive), and costs one copy of its
 //!   bytes.
-//! - **Delivery.** The plaintext of a region reaches the inner engine when the region freezes.
-//!   When a partial record ends the region, the engine copies the smaller part: the partial
-//!   record to a new region, or the plaintext to its own region.
+//! - **Delivery.** The plaintext of each record reaches the inner engine in the turn that opens
+//!   it: the region freezes its bytes up to the end of the record, and the rest of the region
+//!   stays writable for the next receive.
+//! - **Keys.** rustls keeps the key schedule. This end sends a KeyUpdate before a key seals more
+//!   records than the confidentiality limit of its suite or [`Limits::key_records_max`], and it
+//!   takes each KeyUpdate of the peer. A client gives each session ticket to rustls.
 //! - **Randomness.** Each configuration takes its randomness explicitly: the system, or a seeded
 //!   generator whose child streams replay a run byte for byte ([`Entropy`]).
 //! - **Resumption.** Sessions resume only in the process that made them ([`Resumption`]).
@@ -32,29 +36,36 @@
 //!   [`Closure::Unnotified`]. Only a protocol with its own framing can then tell that no byte is
 //!   lost.
 
+mod record;
+
+use core::alloc::Layout;
 use core::fmt;
-use core::num::NonZeroUsize;
-use core::ops::Range;
+use core::num::{NonZeroU32, NonZeroUsize};
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::borrow::Cow;
 use std::sync::{Arc, PoisonError, RwLock};
 
+use record::{CONTENT_MAX, Content, HEADER, PROTECTED_MAX, Protection, TAG, Violation};
 use rscrypto_rustls::kx_group::{X25519Group, X25519MlKem768Group};
 use rscrypto_rustls::replay::{self, ScopedRandom, Stream};
-use rstypes::buffer::{Backing, Buffer as _, BufferMut as _, Lease, WriteLoan};
-use rstypes::capacity::{Budget, Credit, Permit};
+use rstypes::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, PoolRefused, WriteLoan};
+use rstypes::capacity::{Budget, Credit};
 use rustls::crypto::CryptoProvider;
-use rustls::crypto::cipher::OutboundPlain;
 use rustls::crypto::kx::SupportedKxGroup;
 use rustls::crypto::{Credentials, Identity as Chain, SelectedCredential, SingleCredential};
 use rustls::enums::ApplicationProtocol;
 use rustls::error::{AlertDescription, CertificateError, PeerMisbehaved};
+use rustls::kernel::KernelConnection;
 use rustls::pki_types::ServerName;
 use rustls::server::{
     ClientHello, NoServerSessionStorage, PreferServerOrder, ServerCredentialResolver, ServerSessionMemoryCache,
     Tls13Tickets, WebPkiClientVerifier,
 };
-use rustls::{ClientSide, HandshakeKind, RootCertStore, ServerSide, SideData, Tcp, TlsInputBuffer};
+use rustls::split::SplitConnection;
+use rustls::{
+    ClientSide, CommonState, ConnectionTrafficSecrets, ExtractedSecrets, HandshakeKind, MessageHandler, RootCertStore,
+    ServerSide, SideData, SupportedCipherSuite, Tcp, TlsInputBuffer,
+};
 
 pub use rscrypto::ChaCha20Rng;
 pub use rustls::pki_types::pem::PemObject;
@@ -67,14 +78,7 @@ use crate::time::Instant;
 
 /// The largest TLS 1.3 record that a peer can send: a 5-byte header, 2^14 bytes of plaintext,
 /// and 256 bytes of content type, padding, and tag (RFC 8446, section 5.2).
-pub const RECORD_BYTES_MAX: usize = 5 + (1 << 14) + 256;
-
-/// The most plaintext in one record.
-const RECORD_PLAINTEXT_MAX: usize = 1 << 14;
-
-/// The bytes that each record of this end adds to its plaintext: the header, the content type,
-/// and the 16-byte tag of each suite of the provider.
-const RECORD_OVERHEAD: usize = 5 + 1 + 16;
+pub const RECORD_BYTES_MAX: usize = HEADER + PROTECTED_MAX;
 
 /// The identity that one end shows: its certificate chain, with the end-entity certificate first,
 /// and the private key of that certificate.
@@ -256,6 +260,8 @@ impl ClientConfig {
         }
         .map_err(|error| configuration(&error))?;
         config.alpn_protocols = protocols(options.protocols)?;
+        // rustls gives the traffic keys to the record layer of the core when the handshake completes.
+        config.enable_secret_extraction = true;
         config.resumption = match options.resumption {
             Resumption::Off => rustls::client::Resumption::disabled(),
             Resumption::Process(sessions) => rustls::client::Resumption::in_memory_sessions(sessions.get()),
@@ -319,6 +325,7 @@ impl ServerConfig {
         // HelloRetryRequest when the client sent no key share for it.
         config.kx_selector = &PreferServerOrder;
         config.alpn_protocols = protocols(options.protocols)?;
+        config.enable_secret_extraction = true;
         config.session_storage = match options.resumption {
             Resumption::Off => Arc::new(NoServerSessionStorage {}),
             Resumption::Process(sessions) => ServerSessionMemoryCache::new(sessions.get()),
@@ -440,23 +447,25 @@ pub struct Limits {
     /// [`RECORD_BYTES_MAX`]. It also bounds the largest handshake message, for example a
     /// certificate chain, because rustls joins a message in the input region.
     pub input_bytes: usize,
-    /// The work of one drive: the bytes and the records that the connection decrypts and
-    /// encrypts.
+    /// The most records that this end seals under one key, at least 2. The last of them is a
+    /// KeyUpdate, and the next records use a new key. The connection uses the smaller of this
+    /// limit and the confidentiality limit of its suite (RFC 8446, section 5.5), so `u64::MAX`
+    /// gives the limit of the suite.
+    pub key_records_max: u64,
+    /// The work of one drive: the bytes and the records that the connection opens and seals.
     pub turn: TurnLimits,
 }
 
 /// The bytes that a connection copied, by cause.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Copies {
-    /// Received bytes from a read-only region, which decryption in place needs in a writable one.
+    /// Received bytes from a read-only region, which an open in place needs in a writable one.
     pub received: u64,
     /// Bytes of a partial record that moved to a new input region.
     pub partial: u64,
-    /// Plaintext that moved to its own region, because it was smaller than the partial record
-    /// after it.
-    pub joined: u64,
-    /// Plaintext that rustls gave in its own buffer, not in the input region.
-    pub rustls: u64,
+    /// Bytes of a handshake message after the handshake, for example a session ticket, whose
+    /// records hold it in two or more parts: the parts join in a buffer of their own.
+    pub handshake: u64,
     /// Plaintext that encryption wrote into the ciphertext output. Each sent byte needs it.
     pub encrypted: u64,
 }
@@ -505,65 +514,396 @@ pub enum Closure {
     Unnotified,
 }
 
-/// The rustls connection of one end.
+/// The rustls connection of one end during the handshake.
 enum Session {
     Client(rustls::Connection<ClientSide, Tcp>),
     Server(rustls::Connection<ServerSide, Tcp>),
 }
 
 impl Session {
-    fn common(&self) -> &rustls::CommonState {
+    fn common(&self) -> &CommonState {
         match self {
             Self::Client(connection) => connection,
             Self::Server(connection) => connection,
         }
     }
 
-    fn write(&mut self, plaintext: &[u8], output: &mut Vec<u8>) -> Result<(), rustls::Error> {
+    /// Reads the records that `input` shows, and writes the handshake output into `output`.
+    fn read(&mut self, input: &mut View<'_>, output: &mut Vec<u8>) -> Result<(), Error> {
         match self {
-            Self::Client(connection) => connection.write(OutboundPlain::Single(plaintext), output),
-            Self::Server(connection) => connection.write(OutboundPlain::Single(plaintext), output),
-        }
-    }
-
-    fn close(&mut self, output: &mut Vec<u8>) -> Result<(), rustls::Error> {
-        match self {
-            Self::Client(connection) => connection.send_close_notify(output),
-            Self::Server(connection) => connection.send_close_notify(output),
+            Self::Client(connection) => read(connection.read_tls(input, output)),
+            Self::Server(connection) => read(connection.read_tls(input, output)),
         }
     }
 }
 
-/// A writable input region: received ciphertext, which rustls decrypts in place.
+/// Runs the handler of the records of one read. The handshake gives no application data: 0-RTT
+/// is off, and the input ends at the record that completes the handshake.
+fn read<S: SideData>(mut handler: MessageHandler<'_, '_, S>) -> Result<(), Error> {
+    match handler.next_payload() {
+        None => Ok(()),
+        Some(Err(error)) => Err(refused(&error)),
+        Some(Ok(_)) => Err(Error::new(
+            Kind::Malformed,
+            "the peer sent application data before the TLS handshake completed",
+        )),
+    }
+}
+
+/// The rustls state of one end after the handshake: the key schedule, which gives the keys of each
+/// KeyUpdate, and the session store of a client.
+enum Kernel {
+    Client(KernelConnection<ClientSide>),
+    Server(KernelConnection<ServerSide>),
+}
+
+impl Kernel {
+    /// The connection after the handshake of `session`, and its traffic keys.
+    fn new(session: Session) -> Result<(Self, ExtractedSecrets), Error> {
+        match session {
+            Session::Client(connection) => keys(connection).map(|(secrets, kernel)| (Self::Client(kernel), secrets)),
+            Session::Server(connection) => keys(connection).map(|(secrets, kernel)| (Self::Server(kernel), secrets)),
+        }
+    }
+
+    fn suite(&self) -> SupportedCipherSuite {
+        match self {
+            Self::Client(kernel) => kernel.negotiated_cipher_suite(),
+            Self::Server(kernel) => kernel.negotiated_cipher_suite(),
+        }
+    }
+
+    /// The keys of the next records of the peer, after its KeyUpdate.
+    fn update_rx(&mut self) -> Result<Protection, Error> {
+        let update = match self {
+            Self::Client(kernel) => kernel.update_rx_secret(),
+            Self::Server(kernel) => kernel.update_rx_secret(),
+        };
+        protection(update.ok().as_ref())
+    }
+
+    /// The keys of the next records of this end, after its KeyUpdate.
+    fn update_tx(&mut self) -> Result<Protection, Error> {
+        let update = match self {
+            Self::Client(kernel) => kernel.update_tx_secret(),
+            Self::Server(kernel) => kernel.update_tx_secret(),
+        };
+        protection(update.ok().as_ref())
+    }
+}
+
+/// The traffic keys of the connection after `connection`'s handshake, and its kernel state.
+fn keys<S: SideData>(connection: rustls::Connection<S, Tcp>) -> Result<(ExtractedSecrets, KernelConnection<S>), Error> {
+    connection
+        .split()
+        .and_then(SplitConnection::dangerous_into_kernel_connection)
+        .map_err(|_| no_keys())
+}
+
+/// The protection of the keys of one direction and their sequence number.
+fn protection(keys: Option<&(u64, ConnectionTrafficSecrets)>) -> Result<Protection, Error> {
+    keys.and_then(|(seq, secrets)| Protection::new(secrets, *seq))
+        .ok_or_else(no_keys)
+}
+
+fn no_keys() -> Error {
+    Error::new(Kind::Unsupported, "rustls did not give the TLS traffic keys")
+}
+
+/// The handshake message types after the handshake (RFC 8446, section 4).
+const NEW_SESSION_TICKET: u8 = 4;
+const KEY_UPDATE: u8 = 24;
+/// A KeyUpdate that does not ask the peer for one (RFC 8446, section 4.6.3).
+const KEY_UPDATE_NOT_REQUESTED: [u8; 5] = [KEY_UPDATE, 0, 0, 1, 0];
+/// The bytes of a handshake message header: its type and its 3-byte length.
+const MESSAGE_HEADER: usize = 4;
+/// The alert levels (RFC 8446, section 6).
+const WARNING: u8 = 1;
+const FATAL: u8 = 2;
+
+/// The record layer of one end after the handshake.
+struct Records {
+    kernel: Kernel,
+    /// The protection of the records of the peer.
+    rx: Protection,
+    /// The protection of the records of this end.
+    tx: Protection,
+    /// The records that one key of this end seals: the last of them is a KeyUpdate.
+    tx_limit: u64,
+    /// The peer asked for a KeyUpdate, which this end sends before its next record.
+    update: bool,
+    /// A handshake message whose records have not all arrived.
+    joined: Option<Bytes>,
+}
+
+impl Records {
+    fn new(kernel: Kernel, secrets: &ExtractedSecrets, key_records_max: u64) -> Result<Self, Error> {
+        let SupportedCipherSuite::Tls13(suite) = kernel.suite() else {
+            return Err(no_keys());
+        };
+        Ok(Self {
+            rx: protection(Some(&secrets.rx))?,
+            tx: protection(Some(&secrets.tx))?,
+            tx_limit: key_records_max.min(suite.common.confidentiality_limit),
+            update: false,
+            joined: None,
+            kernel,
+        })
+    }
+
+    /// Seals one record of type `content` after the bytes of `written`. First, it sends a
+    /// KeyUpdate when the peer asked for one, or when the key reached its limit.
+    fn seal(&mut self, content: Content, plaintext: &[&[u8]], written: &mut Bytes) -> Result<(), Error> {
+        if self.update || self.tx.seq().saturating_add(1) >= self.tx_limit {
+            self.update_tx(written)?;
+        }
+        seal(&mut self.tx, content, plaintext, written)
+    }
+
+    /// Sends a KeyUpdate under the old key, and then seals with the new key. The KeyUpdate does
+    /// not ask the peer for one: only the key of this end changes.
+    fn update_tx(&mut self, written: &mut Bytes) -> Result<(), Error> {
+        seal(&mut self.tx, Content::Handshake, &[&KEY_UPDATE_NOT_REQUESTED], written)?;
+        self.tx = self.kernel.update_tx()?;
+        self.update = false;
+        Ok(())
+    }
+
+    /// Takes the handshake messages in the content of one record. A message that continues into
+    /// the next record joins in a buffer of at most `limit` bytes.
+    fn handshake(
+        &mut self,
+        mut content: &[u8],
+        limit: usize,
+        budget: &Budget,
+        copies: &mut Copies,
+    ) -> Result<(), Fault> {
+        if content.is_empty() {
+            return Err(Violation::new(AlertDescription::UnexpectedMessage, "a TLS handshake record is empty").into());
+        }
+        if let Some(mut joined) = self.joined.take() {
+            let taken = join(&mut joined, content, limit)?;
+            copies.handshake += taken as u64;
+            content = content.get(taken..).unwrap_or_default();
+            if joined.bytes.len() < message_end(&joined.bytes) {
+                self.joined = Some(joined);
+                return Ok(());
+            }
+            let (kind, body) = split_message(&joined.bytes).unwrap_or_default();
+            self.message(kind, body, content.is_empty())?;
+        }
+        while !content.is_empty() {
+            let end = message_end(content);
+            let Some((whole, rest)) = content.split_at_checked(end) else {
+                let mut joined = Bytes::new(budget);
+                copies.handshake += join(&mut joined, content, limit)? as u64;
+                self.joined = Some(joined);
+                return Ok(());
+            };
+            let (kind, body) = split_message(whole).unwrap_or_default();
+            self.message(kind, body, rest.is_empty())?;
+            content = rest;
+        }
+        Ok(())
+    }
+
+    /// Takes one handshake message of the peer after the handshake. `last` tells whether it ends
+    /// its record, as each message before a key change must (RFC 8446, section 5.1).
+    fn message(&mut self, kind: u8, body: &[u8], last: bool) -> Result<(), Fault> {
+        match (kind, &mut self.kernel) {
+            (NEW_SESSION_TICKET, Kernel::Client(kernel)) => kernel.handle_new_session_ticket(body).map_err(|_| {
+                Violation::new(
+                    AlertDescription::DecodeError,
+                    "rustls refused a session ticket of the server",
+                )
+            })?,
+            (KEY_UPDATE, _) => {
+                if !last {
+                    return Err(Violation::new(
+                        AlertDescription::UnexpectedMessage,
+                        "a KeyUpdate does not end its TLS record",
+                    )
+                    .into());
+                }
+                let requested = match body {
+                    [0] => false,
+                    [1] => true,
+                    [_] => {
+                        return Err(Violation::new(
+                            AlertDescription::IllegalParameter,
+                            "a KeyUpdate has an unknown request",
+                        )
+                        .into());
+                    }
+                    _ => {
+                        return Err(
+                            Violation::new(AlertDescription::DecodeError, "a KeyUpdate has the wrong length").into(),
+                        );
+                    }
+                };
+                self.rx = self.kernel.update_rx()?;
+                self.update |= requested;
+            }
+            _ => {
+                return Err(Violation::new(
+                    AlertDescription::UnexpectedMessage,
+                    "the peer sent a handshake message that TLS 1.3 forbids after the handshake",
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Seals one record with `tx` after the bytes of `written`, which it charges first.
+fn seal(tx: &mut Protection, content: Content, plaintext: &[&[u8]], written: &mut Bytes) -> Result<(), Error> {
+    let len: usize = plaintext.iter().map(|part| part.len()).sum();
+    written.reserve(HEADER + len + 1 + TAG, OUTPUT_REFUSED)?;
+    tx.seal(content, plaintext, &mut written.bytes)
+        .map_err(|_| Error::new(Kind::Unsupported, "the cipher refused to seal a TLS record"))?;
+    written.settle(OUTPUT_REFUSED)
+}
+
+/// The end of the handshake message that starts `bytes`: its header and its body. A partial
+/// header needs at least its 4 bytes.
+fn message_end(bytes: &[u8]) -> usize {
+    match bytes {
+        [_, high, middle, low, ..] => {
+            MESSAGE_HEADER + (usize::from(*high) << 16 | usize::from(*middle) << 8 | usize::from(*low))
+        }
+        _ => MESSAGE_HEADER,
+    }
+}
+
+/// The type and the body of one complete handshake message.
+fn split_message(bytes: &[u8]) -> Option<(u8, &[u8])> {
+    let (&[kind, ..], body) = bytes.split_first_chunk::<MESSAGE_HEADER>()?;
+    Some((kind, body))
+}
+
+/// Adds to `joined` the first bytes of `content` that its message needs, and gives how many it
+/// took. Refuses a message larger than `limit`.
+fn join(joined: &mut Bytes, content: &[u8], limit: usize) -> Result<usize, Error> {
+    let mut taken = 0;
+    loop {
+        let end = message_end(&joined.bytes);
+        if end > limit {
+            return Err(Error::new(
+                Kind::Overload,
+                "a TLS handshake message is larger than the input region",
+            ));
+        }
+        let take = (end - joined.bytes.len()).min(content.len() - taken);
+        if take == 0 {
+            return Ok(taken);
+        }
+        joined.reserve(end - joined.bytes.len(), MESSAGE_REFUSED)?;
+        joined
+            .bytes
+            .extend_from_slice(content.get(taken..taken + take).unwrap_or_default());
+        taken += take;
+    }
+}
+
+/// The phase of a connection.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a connection holds one phase in place, and a box would add an allocation for each connection"
+)]
+enum Phase {
+    /// rustls runs the handshake on the input region.
+    Handshake(Session),
+    /// The record layer of the core protects each record.
+    Records(Records),
+    /// rustls did not give the traffic keys, so the connection ended.
+    Failed,
+}
+
+/// The application protocol that ALPN selected: at most 255 bytes (RFC 7301, section 3.1).
+#[derive(Clone, Copy)]
+struct Protocol {
+    bytes: [u8; 255],
+    len: u8,
+}
+
+impl Protocol {
+    fn new(name: &[u8]) -> Option<Self> {
+        let mut bytes = [0; 255];
+        bytes.get_mut(..name.len())?.copy_from_slice(name);
+        Some(Self {
+            bytes,
+            len: u8::try_from(name.len()).ok()?,
+        })
+    }
+
+    fn name(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+/// What the handshake negotiated. The connection keeps it after rustls gives its keys.
+#[derive(Clone, Copy)]
+struct Facts {
+    group: Group,
+    protocol: Option<Protocol>,
+    handshake: Handshake,
+}
+
+impl Facts {
+    fn of(common: &CommonState) -> Option<Self> {
+        Some(Self {
+            group: Group(u16::from(common.negotiated_key_exchange_group()?.name())),
+            protocol: match common.alpn_protocol() {
+                Some(name) => Some(Protocol::new(name.as_ref())?),
+                None => None,
+            },
+            // A handshake that neither resumed nor retried is full.
+            handshake: match common.handshake_kind()? {
+                HandshakeKind::Resumed => Handshake::Resumed,
+                HandshakeKind::FullWithHelloRetryRequest => Handshake::Retried,
+                _ => Handshake::Full,
+            },
+        })
+    }
+}
+
+/// A writable input region: received ciphertext, which rustls reads during the handshake and the
+/// record layer opens in place after it.
 struct Region {
     backing: Backing,
-    /// The charge of the backing when this engine allocated it. A region of the host carries
-    /// its own.
-    charge: Option<Permit>,
-    /// The bytes before `start` are done: rustls discarded them.
+    /// The bytes before `start` are done.
     start: usize,
+    /// During the handshake, the end of the records that rustls can read. It reads one record at
+    /// a time, so it stops at the record that completes the handshake.
+    seen: usize,
 }
 
 impl Region {
     /// Allocates a region of `capacity` bytes that starts with `bytes`, charged to `budget`.
     fn new(budget: &Budget, bytes: &[u8], capacity: usize) -> Result<Self, Error> {
-        let charge = budget
-            .reserve(capacity as u64)
-            .map_err(|_| Error::new(Kind::Overload, "the budget refused a TLS input region"))?;
-        let mut region = Vec::new();
-        region
-            .try_reserve_exact(capacity)
-            .map_err(|_| Error::new(Kind::Overload, "the memory for a TLS input region is not available"))?;
-        region.extend_from_slice(bytes);
-        Ok(Self {
-            backing: Backing::from(region),
-            charge: Some(charge),
+        // A pool of one slot charges its region before it allocates it. The parts that
+        // `freeze_prefix` makes share the slot, so the charge ends after the last of them.
+        let refused = |refused: PoolRefused| match refused {
+            PoolRefused::Budget(_) => Error::new(Kind::Overload, "the budget refused a TLS input region"),
+            PoolRefused::Layout => Error::new(Kind::Misuse, "the TLS input region is too large"),
+            PoolRefused::Allocation => Error::new(Kind::Overload, "the memory for a TLS input region is not available"),
+        };
+        let slot = Layout::array::<u8>(capacity).map_err(|_| refused(PoolRefused::Layout))?;
+        let backing = Pool::new(budget, NonZeroU32::MIN, slot)
+            .map_err(refused)?
+            .acquire()
+            .map_err(|_| refused(PoolRefused::Allocation))?;
+        let mut region = Self {
+            backing,
             start: 0,
-        })
+            seen: 0,
+        };
+        region.append(bytes);
+        Ok(region)
     }
 
-    /// The bytes after the discarded ones: a partial record, or records that the engine has not
-    /// decrypted yet.
+    /// The bytes after the done ones: a partial record, or records that the engine has not read.
     fn pending(&self) -> &[u8] {
         self.backing.bytes().get(self.start..).unwrap_or_default()
     }
@@ -582,23 +922,30 @@ impl Region {
         added
     }
 
-    /// Freezes the region into a lease, which keeps its charge until its last view drops.
-    fn freeze(self) -> Lease {
-        let size = self.backing.allocation_size();
-        match self.charge {
-            Some(charge) => Lease::from_owner(
-                Charged {
-                    bytes: self.backing,
-                    _charge: charge,
-                },
-                size,
-            ),
-            None => Lease::from(self.backing),
+    /// Freezes the bytes before `end`, the end of the opened records, into a lease, with no copy.
+    /// The rest of the region stays writable.
+    fn freeze_prefix(&mut self, end: usize) -> Lease {
+        assert!(
+            end == self.start && end <= self.backing.initialized(),
+            "a region freezes at the end of its opened records"
+        );
+        let backing = core::mem::replace(&mut self.backing, Backing::from(Vec::new()));
+        match backing.freeze_prefix(end) {
+            Ok((lease, rest)) => {
+                self.backing = rest;
+                self.start = 0;
+                lease
+            }
+            Err(backing) => {
+                self.backing = backing;
+                Lease::from(Vec::new())
+            }
         }
     }
 }
 
-/// The view of an input region that rustls reads: the bytes after the ones that it discarded.
+/// The view of an input region that rustls reads: the bytes after the ones that it discarded, up
+/// to the end of the records that it can see.
 struct View<'a> {
     region: &'a mut Region,
     notified: &'a mut bool,
@@ -607,16 +954,12 @@ struct View<'a> {
 
 impl TlsInputBuffer for View<'_> {
     fn slice_mut(&mut self) -> &mut [u8] {
-        let start = self.region.start;
-        self.region.backing.bytes_mut().get_mut(start..).unwrap_or_default()
+        let Region { backing, start, seen } = &mut *self.region;
+        backing.bytes_mut().get_mut(*start..*seen).unwrap_or_default()
     }
 
     fn discard(&mut self, len: usize) {
-        self.region.start = self
-            .region
-            .start
-            .saturating_add(len)
-            .min(self.region.backing.initialized());
+        self.region.start = self.region.start.saturating_add(len).min(self.region.seen);
     }
 
     fn received_close_notify(&mut self) {
@@ -628,22 +971,18 @@ impl TlsInputBuffer for View<'_> {
     }
 }
 
-/// Plaintext that waits for its region to freeze.
-enum Plaintext {
-    /// Bytes that rustls decrypted in place, at this range of the region.
-    InPlace(Range<usize>),
-    /// Bytes that rustls gave in its own buffer, already copied to a region of their own.
-    Copied(Lease),
-}
-
-/// Ciphertext that this end writes before it goes to the output queue, with the charge of its
-/// capacity: the charge always equals the capacity.
-struct Written {
+/// Bytes that the engine writes, its ciphertext output or a joined handshake message, with the
+/// charge of their capacity: the charge always equals the capacity.
+struct Bytes {
     bytes: Vec<u8>,
     charge: Credit,
 }
 
-impl Written {
+/// The refusals of a charge of [`Bytes`].
+const OUTPUT_REFUSED: Error = Error::new(Kind::Overload, "the budget refused the TLS output");
+const MESSAGE_REFUSED: Error = Error::new(Kind::Overload, "the budget refused a TLS handshake message");
+
+impl Bytes {
     fn new(budget: &Budget) -> Self {
         Self {
             bytes: Vec::new(),
@@ -651,32 +990,28 @@ impl Written {
         }
     }
 
-    /// Makes room for `additional` bytes: it charges them, and then allocates them.
-    fn reserve(&mut self, additional: usize) -> Result<(), Error> {
+    /// Makes room for `additional` bytes: it charges them, and then allocates them. Refuses with
+    /// `refused`.
+    fn reserve(&mut self, additional: usize, refused: Error) -> Result<(), Error> {
         let target = self.bytes.len().saturating_add(additional);
         if let Some(more) = target.checked_sub(self.bytes.capacity()).filter(|&more| more > 0) {
-            self.charge.charge(more as u64).map_err(|_| overload())?;
+            self.charge.charge(more as u64).map_err(|_| refused)?;
             if self.bytes.try_reserve_exact(additional).is_err() {
-                self.charge.refund(more as u64).map_err(|_| overload())?;
-                return Err(overload());
+                self.charge.refund(more as u64).map_err(|_| refused)?;
+                return Err(refused);
             }
         }
-        self.settle()
+        self.settle(refused)
     }
 
-    /// Charges the capacity that the allocator or rustls added.
-    fn settle(&mut self) -> Result<(), Error> {
+    /// Charges the capacity that the allocator or rustls added. Refuses with `refused`.
+    fn settle(&mut self, refused: Error) -> Result<(), Error> {
         let capacity = self.bytes.capacity() as u64;
         if let Some(more) = capacity.checked_sub(self.charge.charged()).filter(|&more| more > 0) {
-            self.charge.charge(more).map_err(|_| overload())?;
+            self.charge.charge(more).map_err(|_| refused)?;
         }
         Ok(())
     }
-}
-
-/// The error of a refused charge of the output.
-fn overload() -> Error {
-    Error::new(Kind::Overload, "the budget refused the TLS output")
 }
 
 /// Bytes and the charge that pays for them, as the owner of a lease: the last view drops both.
@@ -698,11 +1033,32 @@ struct Next {
     start: usize,
 }
 
-/// The charge and the place of the input region that the host holds for a receive.
+/// The place of the input region that the host holds for a receive.
 struct Lent {
     address: usize,
-    charge: Option<Permit>,
     start: usize,
+    seen: usize,
+}
+
+/// The failure of a turn, and the alert that this end sends for it, if any.
+struct Fault {
+    error: Error,
+    alert: Option<AlertDescription>,
+}
+
+impl From<Error> for Fault {
+    fn from(error: Error) -> Self {
+        Self { error, alert: None }
+    }
+}
+
+impl From<Violation> for Fault {
+    fn from(violation: Violation) -> Self {
+        Self {
+            error: Error::new(Kind::Malformed, violation.reason),
+            alert: Some(violation.alert),
+        }
+    }
 }
 
 /// An inner engine that runs over TLS records: the TLS 1.3 connection of one end.
@@ -714,23 +1070,21 @@ pub struct Tls<E> {
     /// The plaintext queues of the inner engine.
     inbound: Inbound,
     outbound: Outbound,
-    session: Session,
+    phase: Phase,
+    /// What the handshake negotiated, after it completed.
+    facts: Option<Facts>,
     /// The stream of each draw of the connection, or `None` for the system.
     stream: Option<Stream>,
     budget: Budget,
     limits: Limits,
-    /// The region that rustls decrypts in, or `None` when no received byte is pending.
+    /// The region that the engine reads, or `None` when no received byte is pending.
     region: Option<Region>,
     lent: Option<Lent>,
     next: Option<Next>,
-    /// The plaintext of the region that the inner engine has not received yet. Its capacity is
-    /// the size of the inbound queue of the inner engine.
-    plaintext: Vec<Plaintext>,
-    _plaintext_charge: Permit,
     /// The facts of the last received region.
     endpoint: Option<Endpoint>,
     capacity: u64,
-    written: Written,
+    written: Bytes,
     copies: Copies,
     /// The peer sent `close_notify`.
     notified: bool,
@@ -756,13 +1110,13 @@ impl<E: Engine> Tls<E> {
         let name = ServerName::try_from(name)
             .map_err(|_| Error::new(Kind::Misuse, "the server name is not a DNS name or an IP address"))?
             .to_owned();
-        let mut written = Written::new(budget);
+        let mut written = Bytes::new(budget);
         let stream = config.entropy.stream(CONNECTION);
         let session = scoped(stream.as_ref(), || {
             config.config.connect(name).build(&mut written.bytes)
         })
         .map_err(|error| refused(&error))?;
-        written.settle()?;
+        written.settle(OUTPUT_REFUSED)?;
         Self::new(
             (Session::Client(session), stream),
             written,
@@ -791,7 +1145,7 @@ impl<E: Engine> Tls<E> {
         .map_err(|error| refused(&error))?;
         Self::new(
             (Session::Server(session), stream),
-            Written::new(budget),
+            Bytes::new(budget),
             engine,
             (inbound, outbound),
             limits,
@@ -801,7 +1155,7 @@ impl<E: Engine> Tls<E> {
 
     fn new(
         (session, stream): (Session, Option<Stream>),
-        written: Written,
+        written: Bytes,
         engine: E,
         (inbound, outbound): (Inbound, Outbound),
         limits: Limits,
@@ -813,28 +1167,24 @@ impl<E: Engine> Tls<E> {
                 "the TLS input region is smaller than a record",
             ));
         }
-        let slots = inbound.free();
-        let charge = slots
-            .checked_mul(size_of::<Plaintext>())
-            .and_then(|bytes| budget.reserve(bytes as u64).ok())
-            .ok_or_else(|| Error::new(Kind::Overload, "the budget refused the TLS plaintext list"))?;
-        let mut plaintext = Vec::new();
-        plaintext
-            .try_reserve_exact(slots)
-            .map_err(|_| Error::new(Kind::Overload, "the memory for the TLS plaintext list is not available"))?;
+        if limits.key_records_max < 2 {
+            return Err(Error::new(
+                Kind::Misuse,
+                "a TLS key seals fewer than 2 records, and its KeyUpdate is one of them",
+            ));
+        }
         Ok(Self {
             engine,
             inbound,
             outbound,
-            session,
+            phase: Phase::Handshake(session),
+            facts: None,
             stream,
             budget: budget.clone(),
             limits,
             region: None,
             lent: None,
             next: None,
-            plaintext,
-            _plaintext_charge: charge,
             endpoint: None,
             capacity: 0,
             written,
@@ -853,19 +1203,11 @@ impl<E: Engine> Tls<E> {
 
     /// What the handshake negotiated, or `None` before it completed.
     pub fn negotiated(&self) -> Option<Negotiated<'_>> {
-        let common = self.session.common();
-        if common.is_handshaking() {
-            return None;
-        }
+        let facts = self.facts.as_ref()?;
         Some(Negotiated {
-            group: Group(u16::from(common.negotiated_key_exchange_group()?.name())),
-            protocol: common.alpn_protocol().map(AsRef::as_ref),
-            // A handshake that neither resumed nor retried is full.
-            handshake: match common.handshake_kind()? {
-                HandshakeKind::Resumed => Handshake::Resumed,
-                HandshakeKind::FullWithHelloRetryRequest => Handshake::Retried,
-                _ => Handshake::Full,
-            },
+            group: facts.group,
+            protocol: facts.protocol.as_ref().map(Protocol::name),
+            handshake: facts.handshake,
         })
     }
 
@@ -885,13 +1227,17 @@ impl<E: Engine> Tls<E> {
         inbound: &mut Inbound,
         outbound: &mut Outbound,
         now: Option<Instant>,
-    ) -> Result<(Option<E::Event>, Turn), Error> {
+    ) -> Result<(Option<E::Event>, Turn), Fault> {
         let mut work = Work::default();
         self.take_queued(inbound)?;
         let stopped = loop {
             self.complete_from_next()?;
-            let stopped = self.decrypt(inbound.ended() && inbound.front().is_none(), &mut work)?;
-            self.deliver()?;
+            self.handshake(inbound.ended() && inbound.front().is_none(), &mut work)?;
+            let stopped = self.open(&mut work)?;
+            // A region with no pending byte is done: an idle connection keeps no input region.
+            if self.region.as_ref().is_some_and(|region| region.pending().is_empty()) {
+                self.region = None;
+            }
             // A region of the host continues the input once the record before it is complete.
             if self.region.is_some() || work.reached(&self.limits.turn) {
                 break stopped;
@@ -899,26 +1245,23 @@ impl<E: Engine> Tls<E> {
             let Some(next) = self.next.take() else { break stopped };
             self.region = Some(Region {
                 backing: next.backing,
-                charge: None,
                 start: next.start,
+                seen: next.start,
             });
         };
-        let handshaking = self.session.common().is_handshaking();
+        let handshaking = matches!(self.phase, Phase::Handshake(_));
         if self.notified && !self.inbound.ended() {
             self.closure = Some(Closure::Notified);
             self.inbound.end();
         }
         let input_ended = inbound.ended() && inbound.front().is_none() && self.next.is_none();
-        let partial = self.region.as_ref().is_some_and(|region| !region.pending().is_empty());
+        let partial = self.region.is_some();
         if input_ended && partial && !stopped {
-            return Err(Error::new(Kind::Partial, "the transport ended inside a TLS record"));
+            return Err(Error::new(Kind::Partial, "the transport ended inside a TLS record").into());
         }
         if input_ended && !partial && !self.inbound.ended() {
             if handshaking {
-                return Err(Error::new(
-                    Kind::Partial,
-                    "the transport ended before the TLS handshake completed",
-                ));
+                return Err(Error::new(Kind::Partial, "the transport ended before the TLS handshake completed").into());
             }
             self.closure = Some(Closure::Unnotified);
             self.inbound.end();
@@ -929,18 +1272,15 @@ impl<E: Engine> Tls<E> {
             let (event, turn) = self.engine.drive(&mut self.inbound, &mut self.outbound, now);
             (event, Some(turn))
         };
-        if !handshaking {
-            self.encrypt(outbound, &mut work)?;
-        }
+        self.encrypt(outbound, &mut work)?;
         if let Some(Turn {
             progress: Progress::Terminal(end),
             ..
         }) = inner
         {
-            self.written.reserve(RECORD_OVERHEAD + 2)?;
-            scoped(self.stream.as_ref(), || self.session.close(&mut self.written.bytes))
-                .map_err(|error| refused(&error))?;
-            self.written.settle()?;
+            if let Phase::Records(records) = &mut self.phase {
+                records.seal(Content::Alert, &[&[WARNING, 0]], &mut self.written)?;
+            }
             self.end = Some(end);
         }
         self.flush(outbound);
@@ -970,6 +1310,17 @@ impl<E: Engine> Tls<E> {
         } else {
             Progress::Blocked(Blocked::Output)
         }
+    }
+
+    /// The error of `fault`. When the fault names an alert and the record layer has its keys,
+    /// this end seals the alert first, so that it goes out before the end. During the handshake,
+    /// rustls wrote its own alert before it refused.
+    fn fail(&mut self, fault: Fault) -> Error {
+        if let (Some(alert), Phase::Records(records)) = (fault.alert, &mut self.phase) {
+            // The connection ends with the error also when its alert cannot go.
+            let _unsent = records.seal(Content::Alert, &[&[FATAL, alert.0]], &mut self.written);
+        }
+        fault.error
     }
 
     /// Copies the bytes of read-only received regions into the input region.
@@ -1014,7 +1365,8 @@ impl<E: Engine> Tls<E> {
                 "a TLS message is larger than the input region",
             ));
         }
-        let moved = Region::new(&self.budget, pending, self.limits.input_bytes)?;
+        let mut moved = Region::new(&self.budget, pending, self.limits.input_bytes)?;
+        moved.seen = region.seen.saturating_sub(region.start);
         self.copies.partial += pending.len() as u64;
         self.region = Some(moved);
         Ok(())
@@ -1052,136 +1404,160 @@ impl<E: Engine> Tls<E> {
         }
     }
 
-    /// Decrypts the complete records of the input region, until a limit of the turn stops it or
-    /// the inbound queue of the inner engine has no place for more plaintext. Gives whether such a
-    /// stop left records to decrypt.
-    fn decrypt(&mut self, ended: bool, work: &mut Work) -> Result<bool, Error> {
-        let Some(region) = &mut self.region else {
-            return Ok(false);
-        };
-        let base = region.backing.as_ptr().addr();
-        let room = self.inbound.free();
-        let mut sink = Sink {
-            base,
-            plaintext: &mut self.plaintext,
-            room,
-            budget: &self.budget,
-            copies: &mut self.copies,
-            limits: &self.limits.turn,
-            work,
-        };
-        let mut view = View {
-            region,
-            notified: &mut self.notified,
-            ended,
-        };
-        let read = scoped(self.stream.as_ref(), || match &mut self.session {
-            Session::Client(connection) => read(connection, &mut view, &mut self.written.bytes, &mut sink),
-            Session::Server(connection) => read(connection, &mut view, &mut self.written.bytes, &mut sink),
-        });
-        self.written.settle()?;
-        read
+    /// Runs the handshake on the complete records of the input region, one record at a time.
+    /// When the handshake completes, it gives the traffic keys to the record layer. rustls then
+    /// holds no part of a message, because the record that completes the handshake ends at a key
+    /// change (RFC 8446, section 5.1).
+    fn handshake(&mut self, ended: bool, work: &mut Work) -> Result<(), Error> {
+        loop {
+            let (Phase::Handshake(session), Some(region)) = (&mut self.phase, &mut self.region) else {
+                return Ok(());
+            };
+            region.seen = region.seen.max(region.start);
+            let unread = region.backing.bytes().get(region.seen..).unwrap_or_default();
+            let next = match unread {
+                // rustls refuses a header that is longer than a record, with its alert.
+                [_, _, _, high, low, ..] if usize::from(u16::from_be_bytes([*high, *low])) > PROTECTED_MAX => HEADER,
+                _ => record_end(unread),
+            };
+            if next > unread.len() || work.reached(&self.limits.turn) {
+                return Ok(());
+            }
+            region.seen += next;
+            work.add(next, 1);
+            let mut view = View {
+                region,
+                notified: &mut self.notified,
+                ended,
+            };
+            let read = scoped(self.stream.as_ref(), || {
+                session.read(&mut view, &mut self.written.bytes)
+            });
+            self.written.settle(OUTPUT_REFUSED)?;
+            read?;
+            if !session.common().is_handshaking() {
+                return self.hand_off();
+            }
+        }
     }
 
-    /// Gives the waiting plaintext to the inner engine: it freezes the region, or it copies the
-    /// plaintext when that is smaller than the pending bytes after it.
-    fn deliver(&mut self) -> Result<(), Error> {
-        let Some(region) = self.region.take() else {
+    /// Gives the traffic keys of the completed handshake to the record layer, at the sequence
+    /// numbers of rustls.
+    fn hand_off(&mut self) -> Result<(), Error> {
+        if self.region.as_ref().is_some_and(|region| region.start < region.seen) {
+            return Err(Error::new(
+                Kind::Unsupported,
+                "rustls kept a part of the handshake when it completed",
+            ));
+        }
+        let Phase::Handshake(session) = core::mem::replace(&mut self.phase, Phase::Failed) else {
             return Ok(());
         };
-        let Some(endpoint) = self.endpoint else {
-            assert!(self.plaintext.is_empty(), "each plaintext comes from a received region");
-            return Ok(());
-        };
-        let pending = region.pending().len();
-        if self.plaintext.is_empty() {
-            // A region with no pending byte is done: an idle connection keeps no input region.
-            if pending > 0 {
-                self.region = Some(region);
-            }
-            return Ok(());
-        }
-        let in_place: usize = self
-            .plaintext
-            .iter()
-            .map(|plaintext| match plaintext {
-                Plaintext::InPlace(range) => range.len(),
-                Plaintext::Copied(_) => 0,
-            })
-            .sum();
-        if pending <= in_place {
-            let rest = if pending > 0 {
-                let rest = Region::new(&self.budget, region.pending(), self.limits.input_bytes)?;
-                self.copies.partial += pending as u64;
-                Some(rest)
-            } else {
-                None
-            };
-            let lease = region.freeze();
-            for plaintext in self.plaintext.drain(..) {
-                let view = match plaintext {
-                    Plaintext::InPlace(range) => lease.view(range),
-                    Plaintext::Copied(lease) => Some(lease),
-                };
-                if let Some(region) = view {
-                    push(&mut self.inbound, region, endpoint, self.capacity);
-                }
-            }
-            self.region = rest;
-        } else {
-            let mut joined = Vec::new();
-            let total: usize = self
-                .plaintext
-                .iter()
-                .map(|plaintext| match plaintext {
-                    Plaintext::InPlace(range) => range.len(),
-                    Plaintext::Copied(lease) => lease.initialized(),
-                })
-                .sum();
-            let charge = charged(&self.budget, &mut joined, total)?;
-            for plaintext in self.plaintext.drain(..) {
-                match plaintext {
-                    Plaintext::InPlace(range) => {
-                        joined.extend_from_slice(region.backing.bytes().get(range).unwrap_or_default());
-                    }
-                    Plaintext::Copied(lease) => joined.extend_from_slice(lease.bytes()),
-                }
-            }
-            self.copies.joined += total as u64;
-            let size = joined.capacity();
-            let lease = Lease::from_owner(
-                Charged {
-                    bytes: joined,
-                    _charge: charge,
-                },
-                size,
-            );
-            push(&mut self.inbound, lease, endpoint, self.capacity);
-            self.region = Some(region);
-        }
+        self.facts = Facts::of(session.common());
+        let (kernel, secrets) = Kernel::new(session)?;
+        self.phase = Phase::Records(Records::new(kernel, &secrets, self.limits.key_records_max)?);
         Ok(())
     }
 
-    /// Encrypts the plaintext output of the inner engine, until a limit of the turn stops it or
-    /// the output queue has no place for more ciphertext.
+    /// Opens the complete records of the input region in place, until a limit of the turn stops
+    /// it or the inbound queue of the inner engine has no place. Gives whether such a stop left
+    /// records to open. The plaintext of each record reaches the inner engine at once, as a view
+    /// of the frozen part of the region.
+    fn open(&mut self, work: &mut Work) -> Result<bool, Fault> {
+        let (Phase::Records(records), Some(region), Some(endpoint)) =
+            (&mut self.phase, &mut self.region, self.endpoint)
+        else {
+            return Ok(false);
+        };
+        loop {
+            if self.notified {
+                // The peer closed: each later byte is ignored (RFC 8446, section 6.1).
+                region.start = region.backing.initialized();
+                return Ok(false);
+            }
+            let pending = region.pending();
+            let Some(len) = record::length(pending)? else {
+                return Ok(false);
+            };
+            if pending.len() < len {
+                return Ok(false);
+            }
+            if self.inbound.free() == 0 || work.reached(&self.limits.turn) {
+                return Ok(true);
+            }
+            let start = region.start;
+            let end = start + len;
+            let Some(record) = region.backing.bytes_mut().get_mut(start..end) else {
+                return Ok(false);
+            };
+            let opened = records.rx.open(record)?;
+            let content = record.get(opened.range.clone()).unwrap_or_default();
+            region.start = end;
+            work.add(len, 1);
+            if opened.content != Content::Handshake && records.joined.is_some() {
+                return Err(Violation::new(
+                    AlertDescription::UnexpectedMessage,
+                    "a TLS record came between the parts of a handshake message",
+                )
+                .into());
+            }
+            match opened.content {
+                Content::Data if content.is_empty() => {}
+                Content::Data => {
+                    let range = start + opened.range.start..start + opened.range.end;
+                    if let Some(plaintext) = region.freeze_prefix(end).view(range) {
+                        push(&mut self.inbound, plaintext, endpoint, self.capacity);
+                    }
+                }
+                Content::Handshake => {
+                    records.handshake(content, self.limits.input_bytes, &self.budget, &mut self.copies)?
+                }
+                Content::Alert => match *content {
+                    [_, description] => match AlertDescription(description) {
+                        AlertDescription::CloseNotify => self.notified = true,
+                        // A close_notify follows (RFC 8446, section 6.1).
+                        AlertDescription::UserCanceled => {}
+                        alert => return Err(refused(&rustls::Error::AlertReceived(alert)).into()),
+                    },
+                    [] => {
+                        return Err(
+                            Violation::new(AlertDescription::UnexpectedMessage, "a TLS alert record is empty").into(),
+                        );
+                    }
+                    _ => {
+                        return Err(Violation::new(
+                            AlertDescription::DecodeError,
+                            "a TLS alert record does not hold exactly one alert",
+                        )
+                        .into());
+                    }
+                },
+            }
+        }
+    }
+
+    /// Seals the plaintext output of the inner engine, until a limit of the turn stops it or the
+    /// output queue has no place for more ciphertext.
     fn encrypt(&mut self, outbound: &Outbound, work: &mut Work) -> Result<(), Error> {
+        let Phase::Records(records) = &mut self.phase else {
+            return Ok(());
+        };
+        // A KeyUpdate that the peer asked for goes out also when no plaintext waits.
+        if records.update {
+            records.update_tx(&mut self.written)?;
+        }
         while !work.reached(&self.limits.turn) {
             if outbound.free() == 0 && !self.written.bytes.is_empty() {
                 break;
             }
             let Some(output) = self.outbound.submit() else { break };
             let plaintext = output.region.bytes();
-            let records = plaintext.len().div_ceil(RECORD_PLAINTEXT_MAX);
-            self.written.reserve(plaintext.len() + records * RECORD_OVERHEAD)?;
-            // rustls can write an alert before it refuses: the charge covers it first.
-            let wrote = scoped(self.stream.as_ref(), || {
-                self.session.write(plaintext, &mut self.written.bytes)
-            });
-            self.written.settle()?;
-            wrote.map_err(|error| refused(&error))?;
+            for chunk in plaintext.chunks(CONTENT_MAX) {
+                records.seal(Content::Data, &[chunk], &mut self.written)?;
+            }
             self.outbound.ack(output.id, plaintext.len())?;
             self.copies.encrypted += plaintext.len() as u64;
-            work.add(plaintext.len(), records);
+            work.add(plaintext.len(), plaintext.len().div_ceil(CONTENT_MAX));
         }
         Ok(())
     }
@@ -1191,7 +1567,7 @@ impl<E: Engine> Tls<E> {
         if self.written.bytes.is_empty() || outbound.free() == 0 {
             return;
         }
-        let written = core::mem::replace(&mut self.written, Written::new(&self.budget));
+        let written = core::mem::replace(&mut self.written, Bytes::new(&self.budget));
         let size = written.bytes.capacity();
         let lease = Lease::from_owner(
             Charged {
@@ -1212,96 +1588,19 @@ fn push(inbound: &mut Inbound, region: Lease, endpoint: Endpoint, capacity: u64)
         endpoint,
         capacity,
     });
-    assert!(pushed.is_ok(), "the decryption keeps a place for each plaintext region");
-}
-
-/// Charges `capacity` bytes for `bytes`, and then allocates them.
-fn charged(budget: &Budget, bytes: &mut Vec<u8>, capacity: usize) -> Result<Permit, Error> {
-    let charge = budget
-        .reserve(capacity as u64)
-        .map_err(|_| Error::new(Kind::Overload, "the budget refused a TLS plaintext region"))?;
-    bytes
-        .try_reserve_exact(capacity)
-        .map_err(|_| Error::new(Kind::Overload, "the memory for a TLS plaintext region is not available"))?;
-    Ok(charge)
+    assert!(
+        pushed.is_ok(),
+        "the record layer opens a record only when the queue has a place"
+    );
 }
 
 /// The end of the record that starts `pending`: its header and its payload. A partial header
 /// needs at least its 5 bytes.
 fn record_end(pending: &[u8]) -> usize {
     match pending {
-        [_, _, _, high, low, ..] => 5 + usize::from(u16::from_be_bytes([*high, *low])),
-        _ => 5,
+        [_, _, _, high, low, ..] => HEADER + usize::from(u16::from_be_bytes([*high, *low])),
+        _ => HEADER,
     }
-}
-
-/// Where the decryption of one turn puts its plaintext, and its limits.
-struct Sink<'a> {
-    /// The address of the first byte of the input region.
-    base: usize,
-    plaintext: &'a mut Vec<Plaintext>,
-    /// The places of the inbound queue of the inner engine.
-    room: usize,
-    budget: &'a Budget,
-    copies: &'a mut Copies,
-    limits: &'a TurnLimits,
-    work: &'a mut Work,
-}
-
-impl Sink<'_> {
-    /// Whether the turn can decrypt no more.
-    fn full(&self) -> bool {
-        self.plaintext.len() >= self.room || self.work.reached(self.limits)
-    }
-
-    /// Records one payload: its range in the input region, or a copy when rustls gave it in its own
-    /// buffer.
-    fn take(&mut self, bytes: &[u8], len: usize) -> Result<(), Error> {
-        self.work.add(bytes.len(), 1);
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let start = bytes.as_ptr().addr().wrapping_sub(self.base);
-        let end = start.checked_add(bytes.len()).filter(|&end| end <= len);
-        let plaintext = if let Some(end) = end {
-            Plaintext::InPlace(start..end)
-        } else {
-            let mut copy = Vec::new();
-            let charge = charged(self.budget, &mut copy, bytes.len())?;
-            copy.extend_from_slice(bytes);
-            self.copies.rustls += bytes.len() as u64;
-            let size = copy.capacity();
-            Plaintext::Copied(Lease::from_owner(
-                Charged {
-                    bytes: copy,
-                    _charge: charge,
-                },
-                size,
-            ))
-        };
-        self.plaintext.push(plaintext);
-        Ok(())
-    }
-}
-
-/// Decrypts the complete records of `input` into `sink`, and writes any handshake output into
-/// `output`.
-fn read<S: SideData>(
-    connection: &mut rustls::Connection<S, Tcp>,
-    input: &mut View<'_>,
-    output: &mut Vec<u8>,
-    sink: &mut Sink<'_>,
-) -> Result<bool, Error> {
-    let len = input.region.backing.initialized();
-    let mut handler = connection.read_tls(input, output);
-    while !sink.full() {
-        let Some(payload) = handler.next_payload() else {
-            return Ok(false);
-        };
-        let payload = payload.map_err(|error| refused(&error))?;
-        sink.take(payload.bytes(), len)?;
-    }
-    Ok(true)
 }
 
 impl<E: Engine> Engine for Tls<E> {
@@ -1325,8 +1624,9 @@ impl<E: Engine> Engine for Tls<E> {
         }
         match self.turn(inbound, outbound, now) {
             Ok(result) => result,
-            Err(error) => {
-                // rustls wrote its alert before it refused: it goes out before the end.
+            Err(fault) => {
+                let error = self.fail(fault);
+                // The alert goes out before the end.
                 self.end = Some(Err(error));
                 self.flush(outbound);
                 (
@@ -1360,8 +1660,8 @@ impl<E: Engine> Engine for Tls<E> {
         };
         self.lent = Some(Lent {
             address: region.backing.as_ptr().addr(),
-            charge: region.charge,
             start: region.start,
+            seen: region.seen,
         });
         Ok(Some(region.backing))
     }
@@ -1371,8 +1671,8 @@ impl<E: Engine> Engine for Tls<E> {
             Some(lent) if lent.address == region.as_ptr().addr() => {
                 self.region = Some(Region {
                     backing: region,
-                    charge: lent.charge,
                     start: lent.start,
+                    seen: lent.seen,
                 });
             }
             Some(lent) => {
@@ -1389,8 +1689,8 @@ impl<E: Engine> Engine for Tls<E> {
             None => {
                 self.region = Some(Region {
                     backing: region,
-                    charge: None,
                     start: 0,
+                    seen: 0,
                 });
             }
         }
@@ -1404,7 +1704,7 @@ impl<E: fmt::Debug> fmt::Debug for Tls<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Tls")
             .field("engine", &self.engine)
-            .field("handshaking", &self.session.common().is_handshaking())
+            .field("handshaking", &matches!(self.phase, Phase::Handshake(_)))
             .field("copies", &self.copies)
             .field("closure", &self.closure)
             .finish_non_exhaustive()

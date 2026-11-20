@@ -1,9 +1,11 @@
 # Run a connection over TLS 1.3
 
 `rsnetwork::tls` runs a protocol engine, for example the HTTP/1.1 server, over TLS 1.3. The host
-moves only ciphertext. rustls decrypts each record in place, in the region that its bytes arrived
-in, and the engine reads its plaintext as views of that region. All cryptography comes from
-rscrypto, through the `rscrypto-rustls` provider.
+moves only ciphertext. rustls runs the handshake. When the handshake completes, rustls gives the
+traffic keys to the record layer of `rsnetwork`. The record layer decrypts each record in place, in
+the region that its bytes arrived in, and the engine reads its plaintext as views of that region.
+It encrypts the output of the engine straight into the ciphertext output. All cryptography comes
+from rscrypto: the handshake through the `rscrypto-rustls` provider, and each record directly.
 
 rsnetwork is in development and has no release. TLS uses rustls `0.24.0-dev.3`, a development
 release of rustls, until rustls 0.24.0 is released.
@@ -127,7 +129,7 @@ fn serve(
     };
     let (inbound, outbound) = (Inbound::new(queue, &budget)?, Outbound::new(queue, &budget)?);
     let server = Server::new(head, body, turn, &outbound, &budget)?;
-    let limits = Limits { input_bytes: 32 * 1024, turn };
+    let limits = Limits { input_bytes: 32 * 1024, key_records_max: u64::MAX, turn };
     let tls = Tls::server(&config, server, (inbound, outbound), limits, &budget)?;
     let (inbound, outbound) = (Inbound::new(queue, &budget)?, Outbound::new(queue, &budget)?);
     let clock = ClockDomain::new(1, Suspend::Pauses);
@@ -173,11 +175,15 @@ host uses decides the copies of received bytes:
 | A region of the host, for example one that the kernel selected | `Connection::received(region, ..)` with that region | When a record continues into it from the region before: the rest of that record, less than one record (`partial`) |
 | A read-only region | `Connection::receive(Received)` | Each byte, into a writable region (`received`) |
 
-The plaintext of a region reaches the engine when the region freezes. When a partial record ends
-the region, the connection copies the smaller part: the partial record to a new region
-(`partial`), or the plaintext to its own region (`joined`). A request and its response that end at
-record boundaries copy nothing. `rustls` counts plaintext that rustls gave in its own buffer.
-`encrypted` counts the plaintext that encryption wrote into ciphertext, which each sent byte needs.
+The plaintext of each record reaches the engine in the drive that decrypts it, with no copy. The
+connection freezes the region up to the end of the record, and the rest of the region stays
+writable for the next receive. A record that does not fit in the rest of its region moves to a new
+region (`partial`).
+
+`handshake` counts the bytes of a handshake message after the handshake, for example a session
+ticket, that arrives in two or more records. These parts join in a buffer of their own. `encrypted`
+counts the plaintext that encryption wrote into ciphertext, which each sent byte needs. One request
+and its response, received into the lent tail of the input region, copy no received byte.
 
 An idle connection keeps no input region and no ciphertext output: after its last view drops, the
 budget has each of their bytes back.
@@ -191,6 +197,19 @@ budget has each of their bytes back.
 | `group` | The key-exchange group, by its IANA code point: `Group::X25519_MLKEM768` or `Group::X25519` |
 | `protocol` | The ALPN name that the server selected, or `None` |
 | `handshake` | `Handshake::Full`, `Handshake::Retried` (after a HelloRetryRequest), or `Handshake::Resumed` |
+
+## Keys after the handshake
+
+rustls keeps the key schedule after the handshake. The record layer uses it for these messages:
+
+- **KeyUpdate of this end.** A key encrypts at most `key_records_max` records, and never more than
+  the confidentiality limit of its suite (RFC 8446, section 5.5). The last of these records is a
+  KeyUpdate, and the next records use a new key. The default limit of AES-GCM is 2^24 records.
+- **KeyUpdate of the peer.** The connection decrypts the next records of the peer with its new key.
+  When the peer asks for a KeyUpdate, this end sends one before its next record, also when it has
+  no data to send.
+- **Session ticket.** A client gives each session ticket of the server to rustls, for
+  [resumption](#resumption). A server refuses a session ticket.
 
 ## Resumption
 
@@ -231,7 +250,8 @@ identity.
 ## Errors
 
 A failed handshake or record ends the connection with an [error](errors.md). The connection first
-writes the alert of rustls, so send the rest of the output before the release.
+writes an alert: during the handshake the alert of rustls, and after it the alert of the record
+layer. Send the rest of the output before the release.
 
 | Cause | `Kind` | Reason |
 | --- | --- | --- |
@@ -244,7 +264,27 @@ writes the alert of rustls, so send the rest of the output before the release.
 | The transport ended before the handshake completed | `Partial` | `the transport ended before the TLS handshake completed` |
 | The transport ended inside a record | `Partial` | `the transport ended inside a TLS record` |
 | A handshake message, for example a certificate chain, is larger than `input_bytes` | `Overload` | `a TLS message is larger than the input region` |
-| The peer sent bytes that TLS forbids | `Malformed` | `the peer sent TLS bytes that the protocol forbids` |
+| The peer sent bytes that TLS forbids during the handshake | `Malformed` | `the peer sent TLS bytes that the protocol forbids` |
+| A handshake message after the handshake is larger than `input_bytes` | `Overload` | `a TLS handshake message is larger than the input region` |
+| The peer ended the connection with another error alert | `Malformed` | `the peer ended the TLS connection with an alert` |
+
+After the handshake, each record that RFC 8446 forbids ends the connection with `Kind::Malformed`
+and the alert of its rule:
+
+| Record | Alert | Reason |
+| --- | --- | --- |
+| The record is longer than 2^14 + 256 bytes after its header | `record_overflow` | `a TLS record is longer than the protocol allows` |
+| The record holds more than 2^14 bytes of content | `record_overflow` | `a TLS record has more content than the protocol allows` |
+| The tag of the record fails | `bad_record_mac` | `a TLS record failed its authentication` |
+| The record is not protected | `unexpected_message` | `a TLS record after the handshake is not protected` |
+| The record has no content type, or an unknown one | `unexpected_message` | `a TLS record has no content type`, or `a TLS record has an unknown content type` |
+| A handshake or alert record is empty | `unexpected_message` | `a TLS handshake record is empty`, or `a TLS alert record is empty` |
+| A record comes between the parts of a handshake message | `unexpected_message` | `a TLS record came between the parts of a handshake message` |
+| A handshake message that TLS 1.3 forbids after the handshake, for example a session ticket to a server | `unexpected_message` | `the peer sent a handshake message that TLS 1.3 forbids after the handshake` |
+| A KeyUpdate does not end its record | `unexpected_message` | `a KeyUpdate does not end its TLS record` |
+| A KeyUpdate has an unknown request | `illegal_parameter` | `a KeyUpdate has an unknown request` |
+| A KeyUpdate or an alert record has the wrong length | `decode_error` | `a KeyUpdate has the wrong length`, or `a TLS alert record does not hold exactly one alert` |
+| rustls refused a session ticket | `decode_error` | `rustls refused a session ticket of the server` |
 
 A trust failure never authorizes a weaker check. Do not retry it with another configuration.
 
@@ -263,8 +303,12 @@ When the engine ends, the connection sends `close_notify` before its terminal tu
 
 | `tls::Limits` field | Bounds |
 | --- | --- |
-| `input_bytes` | The capacity of each input region that the connection allocates, at least `RECORD_BYTES_MAX` (16 645 bytes). It also bounds the largest handshake message, because rustls joins a message in the input region |
+| `input_bytes` | The capacity of each input region that the connection allocates, at least `RECORD_BYTES_MAX` (16 645 bytes). It also bounds the largest handshake message: rustls joins a message of the handshake in the input region, and the record layer joins a message after the handshake in a buffer of at most this size |
+| `key_records_max` | The most records that one key of this end encrypts, at least 2: the last of them is a KeyUpdate. `u64::MAX` gives the confidentiality limit of the suite. A smaller value changes the key more often |
 | `turn` | The bytes and records that one drive decrypts and encrypts |
 
-Each input region, each ciphertext output, and each copied plaintext region is charged to the
+`Tls::client` and `Tls::server` refuse with `Kind::Misuse` when `input_bytes` is smaller than
+`RECORD_BYTES_MAX`, or `key_records_max` is smaller than 2.
+
+Each input region, each ciphertext output, and each joined handshake message is charged to the
 budget of the connection: see [limits](limits.md).
