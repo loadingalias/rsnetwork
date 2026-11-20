@@ -23,6 +23,8 @@
 //! - **Delivery.** The plaintext of a region reaches the inner engine when the region freezes.
 //!   When a partial record ends the region, the engine copies the smaller part: the partial
 //!   record to a new region, or the plaintext to its own region.
+//! - **Randomness.** Each configuration takes its randomness explicitly: the system, or a seeded
+//!   generator whose child streams replay a run byte for byte ([`Entropy`]).
 //! - **Resumption.** Sessions resume only in the process that made them ([`Resumption`]).
 //! - **0-RTT.** Off: neither end sends or accepts early data.
 //! - **End.** A `close_notify` of the peer ends the input of the inner engine. When the transport
@@ -33,11 +35,17 @@
 use core::fmt;
 use core::num::NonZeroUsize;
 use core::ops::Range;
+use core::sync::atomic::{AtomicU64, Ordering};
+use std::borrow::Cow;
 use std::sync::{Arc, PoisonError, RwLock};
 
+use rscrypto_rustls::kx_group::{X25519Group, X25519MlKem768Group};
+use rscrypto_rustls::replay::{self, ScopedRandom, Stream};
 use rstypes::buffer::{Backing, Buffer as _, BufferMut as _, Lease, WriteLoan};
 use rstypes::capacity::{Budget, Credit, Permit};
+use rustls::crypto::CryptoProvider;
 use rustls::crypto::cipher::OutboundPlain;
+use rustls::crypto::kx::SupportedKxGroup;
 use rustls::crypto::{Credentials, Identity as Chain, SelectedCredential, SingleCredential};
 use rustls::enums::ApplicationProtocol;
 use rustls::error::{AlertDescription, CertificateError, PeerMisbehaved};
@@ -48,6 +56,7 @@ use rustls::server::{
 };
 use rustls::{ClientSide, HandshakeKind, RootCertStore, ServerSide, SideData, Tcp, TlsInputBuffer};
 
+pub use rscrypto::ChaCha20Rng;
 pub use rustls::pki_types::pem::PemObject;
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 pub use rustls::time_provider::{DefaultTimeProvider, TimeProvider};
@@ -108,6 +117,8 @@ pub struct ClientOptions<'a> {
     /// The wall clock that checks the validity of each certificate. [`DefaultTimeProvider`] reads
     /// the clock of the system.
     pub clock: Arc<dyn TimeProvider>,
+    /// Where the randomness of each handshake and key comes from.
+    pub entropy: Entropy,
 }
 
 /// The choices of a TLS server.
@@ -125,7 +136,98 @@ pub struct ServerOptions<'a> {
     pub resumption: Resumption,
     /// The wall clock that checks the validity of each client certificate and session.
     pub clock: Arc<dyn TimeProvider>,
+    /// Where the randomness of each handshake and key comes from.
+    pub entropy: Entropy,
 }
+
+/// Where the randomness of a configuration comes from.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a configuration takes one value by move, one time, so a box would add an allocation and save nothing"
+)]
+pub enum Entropy {
+    /// The operating system, which the provider reads at each draw.
+    System,
+    /// A seeded generator. Each connection, and each key that the configuration loads, draws from
+    /// its own child of it, in the order of the calls that make them. So a run with the same seed,
+    /// the same configurations, and the same calls in the same order replays byte for byte. Give
+    /// each process its own seed: a draw in a copy of the process that seeded it refuses.
+    Seeded(ChaCha20Rng),
+}
+
+impl fmt::Debug for Entropy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::System => "System",
+            Self::Seeded(_) => "Seeded",
+        })
+    }
+}
+
+/// The draws of a seeded configuration go through the stream of the innermost scope.
+static SCOPED: ScopedRandom = ScopedRandom;
+/// The keys of a seeded configuration draw from the scope that loads or uses them.
+static SCOPED_KEYS: rscrypto_rustls::sign::Provider = rscrypto_rustls::sign::Provider::scoped();
+/// The key-exchange groups of a seeded configuration, in the order of the default provider:
+/// X25519MLKEM768, then X25519. Each draws its key shares from the scope.
+static SCOPED_HYBRID: X25519MlKem768Group = X25519MlKem768Group::new(&SCOPED);
+static SCOPED_X25519: X25519Group = X25519Group::new(&SCOPED);
+static SCOPED_GROUPS: [&dyn SupportedKxGroup; 2] = [&SCOPED_HYBRID, &SCOPED_X25519];
+
+/// The randomness of a configuration: the root generator of each stream, or `None` for the
+/// system, and the index of the next stream.
+struct Source {
+    root: Option<ChaCha20Rng>,
+    next: AtomicU64,
+}
+
+impl Source {
+    fn new(entropy: Entropy) -> Self {
+        Self {
+            root: match entropy {
+                Entropy::System => None,
+                Entropy::Seeded(root) => Some(root),
+            },
+            next: AtomicU64::new(0),
+        }
+    }
+
+    /// The provider whose draws come from this source.
+    fn provider(&self) -> CryptoProvider {
+        let provider = rscrypto_rustls::default_provider();
+        if self.root.is_none() {
+            return provider;
+        }
+        CryptoProvider {
+            kx_groups: Cow::Borrowed(&SCOPED_GROUPS),
+            secure_random: &SCOPED,
+            key_provider: &SCOPED_KEYS,
+            ..provider
+        }
+    }
+
+    /// The stream of the next owner that `label` names, or `None` for the system.
+    fn stream(&self, label: &[u8; 8]) -> Option<Stream> {
+        // Ordering: each call takes its own index; nothing else depends on the order.
+        let root = self.root.as_ref()?;
+        Some(Stream::new(
+            root.child(label, self.next.fetch_add(1, Ordering::Relaxed)),
+        ))
+    }
+}
+
+/// Runs `f` with the draws of rustls in `stream`, or from the system when it is `None`.
+fn scoped<R>(stream: Option<&Stream>, f: impl FnOnce() -> R) -> R {
+    match stream {
+        Some(stream) => replay::scope(stream, f),
+        None => f(),
+    }
+}
+
+/// The label of the stream of each connection.
+const CONNECTION: &[u8; 8] = b"tls-con\0";
+/// The label of the stream that loads a key.
+const KEY: &[u8; 8] = b"tls-key\0";
 
 /// The configuration of TLS clients. Each connection that [`Tls::client`] makes shares it, and
 /// its sessions for resumption.
@@ -133,18 +235,24 @@ pub struct ServerOptions<'a> {
 pub struct ClientConfig {
     config: Arc<rustls::ClientConfig>,
     resumption: Resumption,
+    entropy: Arc<Source>,
 }
 
 impl ClientConfig {
     /// Makes the configuration from `options`. Refuses with [`Kind::Misuse`] when it has no root,
     /// a root or the identity is not valid, or a protocol name is empty or longer than 255 bytes.
     pub fn new(options: ClientOptions<'_>) -> Result<Self, Error> {
-        let provider = Arc::new(rscrypto_rustls::default_provider());
-        let builder = rustls::ClientConfig::builder_with_details(provider, options.clock)
+        let entropy = Source::new(options.entropy);
+        let builder = rustls::ClientConfig::builder_with_details(Arc::new(entropy.provider()), options.clock)
             .with_root_certificates(roots(options.roots)?);
         let mut config = match options.identity {
             None => builder.with_no_client_auth(),
-            Some(identity) => builder.with_client_auth_cert(chain(identity.chain)?, identity.key),
+            Some(identity) => {
+                let chain = chain(identity.chain)?;
+                scoped(entropy.stream(KEY).as_ref(), || {
+                    builder.with_client_auth_cert(chain, identity.key)
+                })
+            }
         }
         .map_err(|error| configuration(&error))?;
         config.alpn_protocols = protocols(options.protocols)?;
@@ -155,6 +263,7 @@ impl ClientConfig {
         Ok(Self {
             config: Arc::new(config),
             resumption: options.resumption,
+            entropy: Arc::new(entropy),
         })
     }
 
@@ -179,6 +288,7 @@ pub struct ServerConfig {
     config: Arc<rustls::ServerConfig>,
     identity: Arc<Rotation>,
     resumption: Resumption,
+    entropy: Arc<Source>,
 }
 
 impl ServerConfig {
@@ -186,8 +296,13 @@ impl ServerConfig {
     /// not valid, its key does not match its certificate, a client root is not valid, or a
     /// protocol name is empty or longer than 255 bytes.
     pub fn new(options: ServerOptions<'_>) -> Result<Self, Error> {
-        let provider = Arc::new(rscrypto_rustls::default_provider());
-        let identity = Arc::new(Rotation(RwLock::new(credential(options.identity, &provider)?)));
+        let entropy = Source::new(options.entropy);
+        let provider = Arc::new(entropy.provider());
+        let identity = Arc::new(Rotation(RwLock::new(credential(
+            options.identity,
+            &provider,
+            &entropy,
+        )?)));
         let builder = rustls::ServerConfig::builder_with_details(Arc::clone(&provider), options.clock);
         let builder = match options.client_roots {
             None => builder.with_no_client_auth(),
@@ -215,6 +330,7 @@ impl ServerConfig {
             config: Arc::new(config),
             identity,
             resumption: options.resumption,
+            entropy: Arc::new(entropy),
         })
     }
 
@@ -222,7 +338,7 @@ impl ServerConfig {
     /// the identity that it showed. Refuses with [`Kind::Misuse`], and keeps the identity, when
     /// the new one is not valid.
     pub fn rotate(&self, identity: Identity) -> Result<(), Error> {
-        let credential = credential(identity, self.config.provider())?;
+        let credential = credential(identity, self.config.provider(), &self.entropy)?;
         *self.identity.0.write().unwrap_or_else(PoisonError::into_inner) = credential;
         Ok(())
     }
@@ -279,10 +395,13 @@ fn chain(chain: Vec<CertificateDer<'static>>) -> Result<Arc<Chain<'static>>, Err
 }
 
 /// The credential of a server identity, after a check that the key matches the certificate.
-fn credential(identity: Identity, provider: &rustls::crypto::CryptoProvider) -> Result<Arc<SingleCredential>, Error> {
-    Credentials::from_der(chain(identity.chain)?, identity.key, provider)
-        .map(|credentials| Arc::new(SingleCredential::from(credentials)))
-        .map_err(|error| configuration(&error))
+fn credential(identity: Identity, provider: &CryptoProvider, entropy: &Source) -> Result<Arc<SingleCredential>, Error> {
+    let chain = chain(identity.chain)?;
+    scoped(entropy.stream(KEY).as_ref(), || {
+        Credentials::from_der(chain, identity.key, provider)
+    })
+    .map(|credentials| Arc::new(SingleCredential::from(credentials)))
+    .map_err(|error| configuration(&error))
 }
 
 /// The ALPN names of `protocols`. Refuses a name that is empty or longer than 255 bytes, which
@@ -596,6 +715,8 @@ pub struct Tls<E> {
     inbound: Inbound,
     outbound: Outbound,
     session: Session,
+    /// The stream of each draw of the connection, or `None` for the system.
+    stream: Option<Stream>,
     budget: Budget,
     limits: Limits,
     /// The region that rustls decrypts in, or `None` when no received byte is pending.
@@ -636,14 +757,14 @@ impl<E: Engine> Tls<E> {
             .map_err(|_| Error::new(Kind::Misuse, "the server name is not a DNS name or an IP address"))?
             .to_owned();
         let mut written = Written::new(budget);
-        let session = config
-            .config
-            .connect(name)
-            .build(&mut written.bytes)
-            .map_err(|error| refused(&error))?;
+        let stream = config.entropy.stream(CONNECTION);
+        let session = scoped(stream.as_ref(), || {
+            config.config.connect(name).build(&mut written.bytes)
+        })
+        .map_err(|error| refused(&error))?;
         written.settle()?;
         Self::new(
-            Session::Client(session),
+            (Session::Client(session), stream),
             written,
             engine,
             (inbound, outbound),
@@ -663,10 +784,13 @@ impl<E: Engine> Tls<E> {
         limits: Limits,
         budget: &Budget,
     ) -> Result<Self, Error> {
-        let session =
-            rustls::Connection::<ServerSide, Tcp>::new(Arc::clone(&config.config)).map_err(|error| refused(&error))?;
+        let stream = config.entropy.stream(CONNECTION);
+        let session = scoped(stream.as_ref(), || {
+            rustls::Connection::<ServerSide, Tcp>::new(Arc::clone(&config.config))
+        })
+        .map_err(|error| refused(&error))?;
         Self::new(
-            Session::Server(session),
+            (Session::Server(session), stream),
             Written::new(budget),
             engine,
             (inbound, outbound),
@@ -676,7 +800,7 @@ impl<E: Engine> Tls<E> {
     }
 
     fn new(
-        session: Session,
+        (session, stream): (Session, Option<Stream>),
         written: Written,
         engine: E,
         (inbound, outbound): (Inbound, Outbound),
@@ -703,6 +827,7 @@ impl<E: Engine> Tls<E> {
             inbound,
             outbound,
             session,
+            stream,
             budget: budget.clone(),
             limits,
             region: None,
@@ -813,8 +938,7 @@ impl<E: Engine> Tls<E> {
         }) = inner
         {
             self.written.reserve(RECORD_OVERHEAD + 2)?;
-            self.session
-                .close(&mut self.written.bytes)
+            scoped(self.stream.as_ref(), || self.session.close(&mut self.written.bytes))
                 .map_err(|error| refused(&error))?;
             self.written.settle()?;
             self.end = Some(end);
@@ -951,10 +1075,10 @@ impl<E: Engine> Tls<E> {
             notified: &mut self.notified,
             ended,
         };
-        let read = match &mut self.session {
+        let read = scoped(self.stream.as_ref(), || match &mut self.session {
             Session::Client(connection) => read(connection, &mut view, &mut self.written.bytes, &mut sink),
             Session::Server(connection) => read(connection, &mut view, &mut self.written.bytes, &mut sink),
-        };
+        });
         self.written.settle()?;
         read
     }
@@ -1050,7 +1174,9 @@ impl<E: Engine> Tls<E> {
             let records = plaintext.len().div_ceil(RECORD_PLAINTEXT_MAX);
             self.written.reserve(plaintext.len() + records * RECORD_OVERHEAD)?;
             // rustls can write an alert before it refuses: the charge covers it first.
-            let wrote = self.session.write(plaintext, &mut self.written.bytes);
+            let wrote = scoped(self.stream.as_ref(), || {
+                self.session.write(plaintext, &mut self.written.bytes)
+            });
             self.written.settle()?;
             wrote.map_err(|error| refused(&error))?;
             self.outbound.ack(output.id, plaintext.len())?;

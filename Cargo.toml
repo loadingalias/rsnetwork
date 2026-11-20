@@ -16,14 +16,16 @@ include = ["/src", "/LICENSE", "/README.md"]
 rstypes = { git = "https://github.com/loadingalias/rsasync", branch = "main", default-features = false }
 # TLS 1.3 (the `tls` feature). The provider gives each cryptographic operation from rscrypto: the
 # TLS 1.3 suites, X25519MLKEM768 and X25519, and the signature checks of WebPKI chains.
-rscrypto-rustls = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["sha2", "hmac", "hkdf", "aes-gcm", "chacha20poly1305", "x25519", "ml-kem", "ecdsa-p256", "ecdsa-p384", "ed25519", "rsa", "getrandom"], optional = true }
+rscrypto-rustls = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["sha2", "hmac", "hkdf", "aes-gcm", "chacha20poly1305", "x25519", "ml-kem", "ecdsa-p256", "ecdsa-p384", "ed25519", "rsa", "getrandom", "chacha20-rng"], optional = true }
+# The seeded generator of a replayable run (`tls::Entropy::Seeded`).
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng"], optional = true }
 # The rustls that the provider builds against. Move it to 0.24.0 when the provider does.
 rustls = { version = "=0.24.0-dev.3", default-features = false, features = ["std", "webpki"], optional = true }
 
 [features]
 default = ["tls"]
 # TLS 1.3 in the core. A protocol-only build turns off the default features.
-tls = ["dep:rscrypto-rustls", "dep:rustls"]
+tls = ["dep:rscrypto", "dep:rscrypto-rustls", "dep:rustls"]
 
 # The cross-boundary proof (tests/cross_boundary.rs) runs the parser on Tokio:
 # a current-thread runtime and TCP, with no other feature.

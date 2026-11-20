@@ -47,6 +47,7 @@ and rustls 0.24 has no default provider of the process.
 | `protocols` | The ALPN names to offer, the most preferred first. Empty offers none |
 | `resumption` | `Resumption::Off`, or `Resumption::Process(n)` (see [Resumption](#resumption)) |
 | `clock` | The wall clock that checks the validity of each certificate |
+| `entropy` | `Entropy::System`, or `Entropy::Seeded(generator)` (see [Replay a run](#replay-a-run)) |
 
 | `ServerOptions` field | Meaning |
 | --- | --- |
@@ -55,6 +56,7 @@ and rustls 0.24 has no default provider of the process.
 | `protocols` | The ALPN names that the server accepts, the most preferred first |
 | `resumption` | `Resumption::Off`, or `Resumption::Process(n)` |
 | `clock` | The wall clock that checks each client certificate and session |
+| `entropy` | `Entropy::System`, or `Entropy::Seeded(generator)` |
 
 `ClientConfig::new` and `ServerConfig::new` refuse with `Kind::Misuse` when a configuration
 cannot work: no root, a certificate that does not parse, a key that does not match its
@@ -88,7 +90,8 @@ use rsnetwork::h1::{BodyLimits, Framing, Limits as HeadLimits, Server, ServerEve
 use rsnetwork::host::Connection;
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
-    CertificateDer, DefaultTimeProvider, Identity, Limits, PrivateKeyDer, Resumption, ServerConfig, ServerOptions, Tls,
+    CertificateDer, DefaultTimeProvider, Entropy, Identity, Limits, PrivateKeyDer, Resumption, ServerConfig, ServerOptions,
+    Tls,
 };
 use rsnetwork::value::Status;
 
@@ -106,6 +109,7 @@ fn serve(
         protocols: &[b"http/1.1"],
         resumption: Resumption::Process(NonZeroUsize::new(1024).expect("not zero")),
         clock: Arc::new(DefaultTimeProvider),
+        entropy: Entropy::System,
     })?;
 
     // One connection: the HTTP/1.1 engine with its plaintext queues, inside `Tls`, inside the
@@ -195,6 +199,27 @@ most `n` sessions. The ticket keys are local to the process, so another instance
 the same server after a restart, runs a full handshake. `ClientConfig::resumption()` and
 `ServerConfig::resumption()` report the scope. `Resumption::Off` runs a full handshake for each
 connection, and the server then sends no session ticket.
+
+## Replay a run
+
+`Entropy::System` reads the randomness of each handshake from the operating system.
+`Entropy::Seeded(generator)` takes it from a seeded `ChaCha20Rng` instead. Each connection, and each
+key that the configuration loads, draws from its own child of the generator, in the order of the
+calls that make them. A run with the same seed, the same configurations, and the same calls in
+the same order sends the same bytes, so a recorded run replays byte for byte.
+
+```rust
+use rsnetwork::tls::{ChaCha20Rng, Entropy};
+
+// One root seed for the run. Record it with the run, and give each process its own seed.
+let root = ChaCha20Rng::from_seed([0x5a; ChaCha20Rng::SEED_SIZE]);
+let client = Entropy::Seeded(root.child(b"client\0\0", 0));
+let server = Entropy::Seeded(root.child(b"server\0\0", 0));
+# let _ = (client, server);
+```
+
+A seed gives secret randomness only when it is secret. A draw in a copy of the process that
+seeded the generator refuses, and the handshake then fails with `Kind::Unsupported`.
 
 ## Rotate the server identity
 

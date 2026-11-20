@@ -90,6 +90,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "httparse",
  "rsasync",
+ "rscrypto",
  "rscrypto-rustls",
  "rstypes",
  "rustls",

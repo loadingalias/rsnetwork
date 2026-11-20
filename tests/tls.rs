@@ -15,8 +15,8 @@ use rsnetwork::h1::{BodyLimits, Client, ClientEvent, Framing, Limits as HeadLimi
 use rsnetwork::host::{Connection, Engine, Wait};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
-    CertificateDer, ClientConfig, ClientOptions, Closure, Copies, Group, Handshake, Identity, Limits, PrivateKeyDer,
-    Resumption, ServerConfig, ServerOptions, TimeProvider, Tls, UnixTime,
+    CertificateDer, ChaCha20Rng, ClientConfig, ClientOptions, Closure, Copies, Entropy, Group, Handshake, Identity,
+    Limits, PrivateKeyDer, Resumption, ServerConfig, ServerOptions, TimeProvider, Tls, UnixTime,
 };
 use rsnetwork::value::{Authority, Field, Method, Status, Target};
 
@@ -96,6 +96,7 @@ fn server_config(client_roots: Option<&[u8]>, resumption: Resumption) -> ServerC
         protocols: &[b"http/1.1"],
         resumption,
         clock: Arc::new(At(VALID)),
+        entropy: Entropy::System,
     })
     .unwrap()
 }
@@ -107,6 +108,7 @@ fn client_config(root: &[u8], identity: Option<Identity>, now: u64, resumption: 
         protocols: &[b"h2", b"http/1.1"],
         resumption,
         clock: Arc::new(At(now)),
+        entropy: Entropy::System,
     })
     .unwrap()
 }
@@ -154,6 +156,8 @@ struct Pair {
     /// The received regions that wait for their round, toward the client and toward the server.
     to_client: VecDeque<Vec<u8>>,
     to_server: VecDeque<Vec<u8>>,
+    /// Each received region, in the order of the transport.
+    transcript: Vec<u8>,
     /// The response body that the client received, and whether the response ended.
     body: Vec<u8>,
     ended: bool,
@@ -180,6 +184,7 @@ impl Pair {
             parts: 1,
             to_client: VecDeque::new(),
             to_server: VecDeque::new(),
+            transcript: Vec::new(),
             body: Vec::new(),
             ended: false,
         }
@@ -229,12 +234,14 @@ impl Pair {
             take(&mut self.server, &mut self.to_client, self.parts);
             take(&mut self.client, &mut self.to_server, self.parts);
             let moved = [
-                self.to_client
-                    .pop_front()
-                    .map(|part| give(&mut self.client, &part, self.receive)),
-                self.to_server
-                    .pop_front()
-                    .map(|part| give(&mut self.server, &part, self.receive)),
+                self.to_client.pop_front().map(|part| {
+                    self.transcript.extend_from_slice(&part);
+                    give(&mut self.client, &part, self.receive);
+                }),
+                self.to_server.pop_front().map(|part| {
+                    self.transcript.extend_from_slice(&part);
+                    give(&mut self.server, &part, self.receive);
+                }),
             ];
             if moved == [None, None] {
                 return;
@@ -528,6 +535,7 @@ fn a_certificate_chain_larger_than_one_record_completes_when_it_arrives_in_parts
         protocols: &[b"http/1.1"],
         resumption: Resumption::Off,
         clock: Arc::new(At(VALID)),
+        entropy: Entropy::System,
     })
     .unwrap();
     let client = client_config(CA, None, VALID, Resumption::Off);
@@ -539,4 +547,39 @@ fn a_certificate_chain_larger_than_one_record_completes_when_it_arrives_in_parts
     pair.run();
     assert_eq!((pair.client_error(), pair.server_error()), (None, None));
     assert_eq!(pair.body, BODY);
+}
+
+#[test]
+fn a_seeded_run_replays_each_byte_of_its_handshake_and_request() {
+    let run = |seed: u8| {
+        let root = ChaCha20Rng::from_seed([seed; ChaCha20Rng::SEED_SIZE]);
+        let client = ClientConfig::new(ClientOptions {
+            roots: &[certificate(CA)],
+            identity: None,
+            protocols: &[b"http/1.1"],
+            resumption: Resumption::Off,
+            clock: Arc::new(At(VALID)),
+            entropy: Entropy::Seeded(root.child(b"client\0\0", 0)),
+        })
+        .unwrap();
+        let server = ServerConfig::new(ServerOptions {
+            identity: identity(SERVER),
+            client_roots: None,
+            protocols: &[b"http/1.1"],
+            resumption: Resumption::Off,
+            clock: Arc::new(At(VALID)),
+            entropy: Entropy::Seeded(root.child(b"server\0\0", 0)),
+        })
+        .unwrap();
+        let mut pair = Pair::new(&client, "server.test", &server);
+        pair.request(&[]);
+        pair.run();
+        assert_eq!(pair.body, BODY);
+        pair.transcript
+    };
+    let first = run(1);
+    assert!(first.len() > 1000);
+    assert_eq!(first, run(1));
+    // Another seed gives other bytes, so the seed and not a constant made them.
+    assert_ne!(first, run(2));
 }
