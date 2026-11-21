@@ -153,7 +153,8 @@ response never carries a request.
 
 - The ClientHello is ready when you make the client. The handshake runs in the calls of the first
   exchange, under its deadline.
-- `negotiated()` gives the group, the ALPN name, and the kind of handshake after it completed.
+- `negotiated()` gives the group, the ALPN name, the kind of handshake, and the certificate and key
+  algorithm of the server, after the handshake completed: see [negotiated facts](tls.md#negotiated-facts).
 - A body that the close delimits is complete only after the `close_notify` of the server. When the
   transport ends without it, the body ends `Outcome::Truncated`, because its end is not proven.
 

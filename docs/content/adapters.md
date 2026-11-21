@@ -96,7 +96,8 @@ A completion host, for example io_uring, owns each buffer until its operation co
 
 `client::Http1` and `server::Http1` are one HTTP/1.1 connection over TCP or TLS each, and a binding
 moves their bytes with the same calls as a `Connection`. Their calls of the exchange are the
-handler interface: see [send requests](client.md) and [serve requests](server.md). A binding adds
+handler interface: see [send requests](client.md) and [serve requests](server.md). `tls::Stream` is
+a byte stream over TLS for other protocols: see [send a byte stream over TLS](tls-stream.md). A binding adds
 its own handler form over these calls, for example an async function, and owns the progress of the
 connection while the handler runs. The server tells when the transport accepted a response, so a
 binding reports the end of the handler and the delivery of its response as two results.

@@ -202,6 +202,15 @@ impl Owns {
     }
 }
 
+/// The bytes of the end-entity certificate of `identity`, which the connection keeps as the
+/// evidence of the peer.
+pub(super) fn end_entity_bytes(identity: Option<&VerifiedIdentity<'_>>) -> u64 {
+    match identity.map(|identity| identity.identity()) {
+        Some(Identity::X509(chain)) => chain.end_entity.len() as u64,
+        _ => 0,
+    }
+}
+
 /// The bytes that one copy of the chain of `identity` holds: each certificate, and the list of
 /// the intermediate certificates.
 pub(super) fn chain_bytes(identity: Option<&VerifiedIdentity<'_>>) -> u64 {
@@ -270,9 +279,10 @@ impl Held {
 
     /// After the last call of the handshake that sent `own`: rustls keeps two copies of the chain
     /// of `peer`, one for each later ticket and one for the facts of the connection, until the
-    /// hand-off.
-    pub(super) fn finished(&mut self, peer: u64, own: &Own) {
-        self.keep(self.state + self.transcript(own) + 2 * peer + self.sessions);
+    /// hand-off. The hand-off copies `evidence` bytes of the end-entity certificate before it
+    /// drops them.
+    pub(super) fn finished(&mut self, peer: u64, evidence: u64, own: &Own) {
+        self.keep(self.state + self.transcript(own) + 2 * peer + evidence + self.sessions);
     }
 
     /// The transcript for client authentication: a copy of what this end sends.

@@ -174,7 +174,8 @@ plaintext output in the next drive, so drive again after you answer an event.
 
 For HTTP/1.1 requests over TLS, `client::Http1::tls` makes these layers for you: see
 [send HTTP/1.1 requests with a deadline](client.md). For an HTTP/1.1 server, `server::Http1::tls`
-does: see [serve HTTP/1.1 requests](server.md).
+does: see [serve HTTP/1.1 requests](server.md). For a protocol other than HTTP, `tls::Stream` gives
+a byte stream over TLS: see [send a byte stream over TLS](tls-stream.md).
 
 The record layer seals at most one plaintext region for each entry of the plaintext output queue
 before the transport accepts its records. Then it waits, and the turn is `Blocked::Output`. Thus
@@ -214,6 +215,12 @@ budget has each of their bytes back.
 | `group` | The key-exchange group, by its IANA code point: `Group::X25519_MLKEM768` or `Group::X25519` |
 | `protocol` | The ALPN name that the server selected, or `None` |
 | `handshake` | `Handshake::Full`, `Handshake::Retried` (after a HelloRetryRequest), or `Handshake::Resumed` |
+| `peer` | `Some(Peer { certificate, authentication })`: the DER of the end-entity certificate of the peer that your roots verified, and its key algorithm, `Authentication::EcdsaP256`, `EcdsaP384`, `Ed25519`, or `Rsa`. `None` for a client with no certificate |
+
+Each `Authentication` is a classical signature. Post-quantum key exchange and post-quantum
+authentication are two guarantees, so a hybrid `group` does not make the authentication
+post-quantum. The connection keeps its copy of the certificate, charged to its budget, until it
+drops.
 
 ## Keys after the handshake
 

@@ -37,8 +37,10 @@
 //!   lost.
 
 mod memory;
+mod peer;
 mod record;
 mod sent;
+pub(crate) mod stream;
 
 use core::alloc::Layout;
 use core::fmt;
@@ -50,7 +52,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use memory::{ClientStore, Cost, Held, Own, Owns, ServerStore};
 use record::{CONTENT_MAX, Content, HEADER, PROTECTED_MAX, Protection, TAG, Violation};
 use rscrypto_rustls::kx_group::{X25519Group, X25519MlKem768Group};
-use rscrypto_rustls::replay::{self, ScopedRandom, Stream};
+use rscrypto_rustls::replay::{self, ScopedRandom};
 use rstypes::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, PoolRefused, WriteLoan};
 use rstypes::capacity::{Budget, Credit};
 use rustls::client::ClientSessionStore;
@@ -76,6 +78,7 @@ pub use rscrypto::ChaCha20Rng;
 pub use rustls::pki_types::pem::PemObject;
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 pub use rustls::time_provider::{DefaultTimeProvider, TimeProvider};
+pub use stream::{Stream, StreamLimits};
 
 use crate::drive::{
     Accepted, Blocked, Endpoint, Error, Inbound, Kind, Outbound, Progress, Received, Turn, TurnLimits, Work,
@@ -225,17 +228,17 @@ impl Source {
     }
 
     /// The stream of the next owner that `label` names, or `None` for the system.
-    fn stream(&self, label: &[u8; 8]) -> Option<Stream> {
+    fn stream(&self, label: &[u8; 8]) -> Option<replay::Stream> {
         // Ordering: each call takes its own index; nothing else depends on the order.
         let root = self.root.as_ref()?;
-        Some(Stream::new(
+        Some(replay::Stream::new(
             root.child(label, self.next.fetch_add(1, Ordering::Relaxed)),
         ))
     }
 }
 
 /// Runs `f` with the draws of rustls in `stream`, or from the system when it is `None`.
-fn scoped<R>(stream: Option<&Stream>, f: impl FnOnce() -> R) -> R {
+fn scoped<R>(stream: Option<&replay::Stream>, f: impl FnOnce() -> R) -> R {
     match stream {
         Some(stream) => replay::scope(stream, f),
         None => f(),
@@ -541,7 +544,10 @@ pub enum Handshake {
     Resumed,
 }
 
-/// What the handshake of a connection negotiated.
+/// What the handshake of a connection negotiated: the security evidence of the connection.
+///
+/// The key exchange and the authentication are two guarantees, and each has its own field: a
+/// post-quantum `group` does not make the authentication post-quantum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Negotiated<'a> {
     /// The key-exchange group.
@@ -550,6 +556,31 @@ pub struct Negotiated<'a> {
     pub protocol: Option<&'a [u8]>,
     /// How the handshake ran.
     pub handshake: Handshake,
+    /// How the peer authenticated, or `None` when it did not: a client with no certificate.
+    pub peer: Option<Peer<'a>>,
+}
+
+/// How the peer of a connection authenticated: the certificate that the trust roots verified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Peer<'a> {
+    /// The DER of the end-entity certificate of the peer.
+    pub certificate: &'a [u8],
+    /// The key algorithm of the certificate, which signed the handshake.
+    pub authentication: Authentication,
+}
+
+/// The key algorithm of the end-entity certificate of a peer, which signed its handshake. Each
+/// of them is a classical signature, so it gives no post-quantum authentication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Authentication {
+    /// ECDSA with the P-256 curve.
+    EcdsaP256,
+    /// ECDSA with the P-384 curve.
+    EcdsaP384,
+    /// Ed25519.
+    Ed25519,
+    /// RSA.
+    Rsa,
 }
 
 /// How the input of a connection ended.
@@ -916,28 +947,67 @@ impl Protocol {
 }
 
 /// What the handshake negotiated. The connection keeps it after rustls gives its keys.
-#[derive(Clone, Copy)]
 struct Facts {
     group: Group,
     protocol: Option<Protocol>,
     handshake: Handshake,
+    peer: Option<Evidence>,
+}
+
+/// The authentication of the peer, which the connection keeps: a copy of its end-entity
+/// certificate, charged with the kernel state.
+struct Evidence {
+    certificate: Vec<u8>,
+    authentication: Authentication,
 }
 
 impl Facts {
-    fn of(common: &CommonState) -> Option<Self> {
-        Some(Self {
-            group: Group(u16::from(common.negotiated_key_exchange_group()?.name())),
-            protocol: match common.alpn_protocol() {
-                Some(name) => Some(Protocol::new(name.as_ref())?),
-                None => None,
+    /// The facts of a completed handshake, or `None` when rustls lacks one of them. Refuses with
+    /// [`Kind::Overload`] when the memory for the certificate of the peer is not available.
+    fn of(common: &CommonState) -> Result<Option<Self>, Error> {
+        let peer = match common.peer_identity().map(|identity| identity.identity()) {
+            Some(Chain::X509(chain)) => {
+                let der = chain.end_entity.as_ref();
+                let authentication = peer::authentication(der).ok_or(Error::new(
+                    Kind::Unsupported,
+                    "the key algorithm of the peer is not one that the provider verifies",
+                ))?;
+                let mut certificate = Vec::new();
+                certificate.try_reserve_exact(der.len()).map_err(|_| {
+                    Error::new(
+                        Kind::Overload,
+                        "the memory for the certificate of the peer is not available",
+                    )
+                })?;
+                certificate.extend_from_slice(der);
+                Some(Evidence {
+                    certificate,
+                    authentication,
+                })
+            }
+            _ => None,
+        };
+        let (Some(group), Some(kind)) = (common.negotiated_key_exchange_group(), common.handshake_kind()) else {
+            return Ok(None);
+        };
+        let protocol = match common.alpn_protocol() {
+            Some(name) => match Protocol::new(name.as_ref()) {
+                Some(protocol) => Some(protocol),
+                None => return Ok(None),
             },
+            None => None,
+        };
+        Ok(Some(Self {
+            group: Group(u16::from(group.name())),
+            protocol,
             // A handshake that neither resumed nor retried is full.
-            handshake: match common.handshake_kind()? {
+            handshake: match kind {
                 HandshakeKind::Resumed => Handshake::Resumed,
                 HandshakeKind::FullWithHelloRetryRequest => Handshake::Retried,
                 _ => Handshake::Full,
             },
-        })
+            peer,
+        }))
     }
 }
 
@@ -1186,7 +1256,7 @@ pub struct Tls<E> {
     /// What the handshake negotiated, after it completed.
     facts: Option<Facts>,
     /// The stream of each draw of the connection, or `None` for the system.
-    stream: Option<Stream>,
+    stream: Option<replay::Stream>,
     /// The charge of the memory of rustls.
     held: Held,
     cost: Cost,
@@ -1299,7 +1369,7 @@ impl<E: Engine> Tls<E> {
     }
 
     fn new(
-        (session, stream): (Session, Option<Stream>),
+        (session, stream): (Session, Option<replay::Stream>),
         (held, cost, own, tickets): (Held, Cost, Arc<Owns>, Option<Arc<ClientStore>>),
         (written, sent): (Bytes, Sent),
         engine: E,
@@ -1348,6 +1418,10 @@ impl<E: Engine> Tls<E> {
             group: facts.group,
             protocol: facts.protocol.as_ref().map(Protocol::name),
             handshake: facts.handshake,
+            peer: facts.peer.as_ref().map(|evidence| Peer {
+                certificate: &evidence.certificate,
+                authentication: evidence.authentication,
+            }),
         })
     }
 
@@ -1607,17 +1681,19 @@ impl<E: Engine> Tls<E> {
             self.held.after(visible, &own);
             read?;
             if !session.common().is_handshaking() {
-                let peer = memory::chain_bytes(session.common().peer_identity());
-                self.held.finished(peer, &own);
-                return self.hand_off(peer);
+                let identity = session.common().peer_identity();
+                let (peer, evidence) = (memory::chain_bytes(identity), memory::end_entity_bytes(identity));
+                self.held.finished(peer, evidence, &own);
+                return self.hand_off(peer, evidence);
             }
         }
     }
 
     /// Gives the traffic keys of the completed handshake to the record layer, at the sequence
     /// numbers of rustls. A client keeps one copy of the `peer` bytes of the chain of the server
-    /// for its tickets.
-    fn hand_off(&mut self, peer: u64) -> Result<(), Error> {
+    /// for its tickets, and each end keeps the `evidence` bytes of the end-entity certificate of
+    /// its peer.
+    fn hand_off(&mut self, peer: u64, evidence: u64) -> Result<(), Error> {
         if self.region.as_ref().is_some_and(|region| region.start < region.seen) {
             return Err(Error::new(
                 Kind::Unsupported,
@@ -1627,13 +1703,13 @@ impl<E: Engine> Tls<E> {
         let Phase::Handshake(session) = core::mem::replace(&mut self.phase, Phase::Failed) else {
             return Ok(());
         };
-        self.facts = Facts::of(session.common());
+        self.facts = Facts::of(session.common())?;
         let (kernel, secrets) = Kernel::new(session)?;
         let kept = match kernel {
             Kernel::Client(_) => peer,
             Kernel::Server(_) => 0,
         };
-        self.held.hand_off(self.cost.kernel, kept);
+        self.held.hand_off(self.cost.kernel, kept + evidence);
         self.phase = Phase::Records(Records::new(
             kernel,
             &secrets,

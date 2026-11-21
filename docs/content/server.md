@@ -136,7 +136,7 @@ transport accepted each byte of the response before it.
 | `cancel()` | Ends the exchange in flight. The client sees an incomplete response, and the connection ends with `Kind::Cancelled` |
 | `delivery()` | How much of the last response the transport accepted: see [delivery](#delivery) |
 | `shutdown(deadline, now)` | Closes the connection: see [close](#close) |
-| `negotiated()` | Over TLS, the group, the ALPN name, and the kind of handshake, after it completed |
+| `negotiated()` | Over TLS, the group, the ALPN name, the kind of handshake, and the client certificate when the client showed one, after the handshake completed: see [negotiated facts](tls.md#negotiated-facts) |
 | `wait()` | When to call again: now, when the transport gives what the connection waits for, at a deadline, during the linger, or never after the end |
 | `reset()` | The transport failed: see [reset](#reset) |
 | `release()` | The end of the connection when it can drop, as `Closed`, and `None` before it |

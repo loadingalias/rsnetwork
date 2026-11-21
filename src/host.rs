@@ -143,6 +143,8 @@ mod sealed {
     impl Sealed for crate::h1::Client {}
     #[cfg(feature = "tls")]
     impl<E: super::Engine> Sealed for crate::tls::Tls<E> {}
+    #[cfg(feature = "tls")]
+    impl Sealed for crate::tls::stream::Raw {}
 }
 
 impl Engine for Server {

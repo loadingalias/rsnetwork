@@ -38,7 +38,7 @@ to its alignment, a 16-byte entry for each slot, and the shared state of the poo
 | Join of a TLS handshake message after the handshake that arrives in two or more records | Its bytes, at most `input_bytes` | When the message continues in a later record, until the message is complete |
 | TLS handshake | The state of rustls that the configuration fixes, and a bound of what rustls keeps of the messages of the peer: see [TLS handshakes](#tls-handshakes) | `Tls::client` and `Tls::server`, until the handshake completes |
 | Call of rustls during a TLS handshake | Its working memory: see [TLS handshakes](#tls-handshakes) | Before the call, until it returns |
-| TLS connection after the handshake | The key schedule of rustls, and on a client one copy of the chain of the server | When the handshake completes, until the connection drops |
+| TLS connection after the handshake | The key schedule of rustls, a copy of the end-entity certificate of the peer, and on a client one copy of the chain of the server | When the handshake completes, until the connection drops |
 | TLS session store | One place for each session of `Resumption::Process(n)`, charged to the `budget` of the configuration | `ClientConfig::new` and `ServerConfig::new` |
 | Stored TLS session | Its bytes, with the chain of the peer, to the `budget` of the configuration | When the store keeps it, until a handshake takes it or the store evicts it |
 | TLS session that a handshake takes | The session and its copies in the handshake, to the budget of the connection | When the handshake takes it, until the handshake completes |
