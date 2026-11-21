@@ -446,7 +446,8 @@ fn idle(now: Instant, waits: &[Wait]) {
             Wait::Until {
                 deadline: Some(deadline),
                 ..
-            } => {
+            }
+            | Wait::Linger { deadline } => {
                 let left = deadline.instant().as_nanos().saturating_sub(now.as_nanos());
                 sleep = sleep.min(Duration::from_nanos(left));
             }

@@ -6,13 +6,14 @@
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
+use std::assert_matches;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use rsnetwork::body::{Collect, Outcome, Read};
+use rsnetwork::body::{Collect, Outcome, Part, Read};
 use rsnetwork::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use rsnetwork::capacity::Budget;
-use rsnetwork::client::{Http1, Limits, Part, Request};
+use rsnetwork::client::{Http1, Limits, Request};
 use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{self, BodyLimits, Framing, Server, ServerEvent};
 use rsnetwork::host::{Connection, Engine, Wait};
@@ -161,6 +162,8 @@ struct Pair {
     to_server: VecDeque<Vec<u8>>,
     /// The transport ends before the last record of the server, its `close_notify`.
     cut: bool,
+    /// The end of the transport is a reset, not an end of input.
+    reset: bool,
 }
 
 /// An alert record over TLS 1.3: its header, the alert, its content type, and its tag.
@@ -235,6 +238,7 @@ impl Pair {
             to_client: VecDeque::new(),
             to_server: VecDeque::new(),
             cut: false,
+            reset: false,
         }
     }
 
@@ -263,7 +267,9 @@ impl Pair {
             }
             let to_client = self.to_client.pop_front().map(|bytes| {
                 // An empty part is the end of the transport.
-                if bytes.is_empty() {
+                if bytes.is_empty() && self.reset {
+                    self.client.reset();
+                } else if bytes.is_empty() {
                     self.client.end_input();
                 } else if let Err(rest) = give_client(&mut self.client, bytes) {
                     self.to_client.push_front(rest);
@@ -589,4 +595,78 @@ fn a_close_after_the_exchange_sends_close_notify_and_releases_the_client() {
         panic!("the pair runs over TLS")
     };
     assert_eq!(server.parts().0.closure(), Some(rsnetwork::tls::Closure::Notified));
+}
+
+#[test]
+fn a_reset_ends_a_body_that_the_close_delimits_as_reset_not_complete() {
+    let reply = || Reply {
+        framing: Framing::Close,
+        parts: vec![b"until the close".to_vec()],
+        finish: true,
+    };
+    let body = |pair: &mut Pair| {
+        let mut parts = Vec::new();
+        for _ in 0..16 {
+            match pair.client.next(at(1)).unwrap() {
+                Some(Part::Data(data)) => parts.extend_from_slice(data.bytes()),
+                Some(Part::End(outcome)) => return (parts, outcome),
+                None => pair.transport(),
+            }
+        }
+        panic!("the body did not end after 16 calls");
+    };
+    let deadline = Deadline::at(at(1_000));
+
+    // Over TCP, the transport fails after the bytes of the body.
+    let mut pair = Pair::new(Transport::Plain, vec![reply()]);
+    send(&mut pair, &get(), deadline, at(0)).unwrap();
+    head(&mut pair, at(1));
+    pair.client.reset();
+    let (parts, outcome) = body(&mut pair);
+    assert_eq!(parts, b"until the close");
+    assert_matches!(outcome, Outcome::Reset(None));
+
+    // Over TLS, the transport fails before the `close_notify` record.
+    let mut pair = Pair::new(Transport::Tls, vec![reply()]);
+    (pair.cut, pair.reset) = (true, true);
+    send(&mut pair, &get(), deadline, at(0)).unwrap();
+    head(&mut pair, at(1));
+    let (parts, outcome) = body(&mut pair);
+    assert_eq!(parts, b"until the close");
+    assert_matches!(outcome, Outcome::Reset(None));
+}
+
+#[test]
+fn a_response_before_the_end_of_the_request_body_leaves_the_client_working() {
+    for transport in [Transport::Plain, Transport::Tls] {
+        // The server answers at the request head, before the body, in three parts.
+        let reply = Reply {
+            framing: Framing::Length(9),
+            parts: vec![b"one".to_vec(), b"two".to_vec(), b"six".to_vec()],
+            finish: true,
+        };
+        let mut pair = Pair::new(transport, vec![reply]);
+        let post = Request {
+            method: Method::POST,
+            body: Framing::Length(9),
+            ..get()
+        };
+        send(&mut pair, &post, Deadline::at(at(1_000)), at(0)).unwrap();
+        for part in [b"abc", b"def", b"ghi"] {
+            pair.transport();
+            pair.client.write(&Lease::from(&part[..]), at(0)).unwrap();
+        }
+        pair.client.finish(at(0)).unwrap();
+        head(&mut pair, at(0));
+        let mut parts = Vec::new();
+        let outcome = loop {
+            match pair.client.next(at(0)).unwrap() {
+                Some(Part::Data(data)) => parts.extend_from_slice(data.bytes()),
+                Some(Part::End(outcome)) => break outcome,
+                None => pair.transport(),
+            }
+        };
+        assert_eq!(parts, b"onetwosix", "{transport:?}");
+        assert_matches!(outcome, Outcome::Complete(None), "{transport:?}");
+    }
 }

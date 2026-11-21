@@ -36,7 +36,9 @@ pub mod h1;
 pub mod h2;
 pub mod host;
 pub mod hpack;
+mod link;
 pub mod qpack;
+pub mod server;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub mod value;

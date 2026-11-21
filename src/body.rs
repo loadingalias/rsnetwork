@@ -47,6 +47,15 @@ pub enum Outcome {
     Malformed,
 }
 
+/// A part of a body that a read gives with no copy: bytes of a received region, or the end.
+#[derive(Clone, Debug)]
+pub enum Part {
+    /// Bytes of the body: a view of a received region, with no copy.
+    Data(Lease),
+    /// The end of the body, with its outcome. Only `Outcome::Complete` makes the body complete.
+    End(Outcome),
+}
+
 /// The trailer section of a body: a view of its field lines in the received region.
 #[derive(Clone)]
 pub struct Trailers {

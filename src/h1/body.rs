@@ -11,7 +11,7 @@ use super::head::{BodyLimits, Limits, ParseError};
 use super::join::{Join, Step, join};
 use super::write::{begin_chunk, last_chunk};
 use super::{ChunkDecoder, ChunkStep, Framing, WriteError};
-use crate::body::Trailers;
+use crate::body::{Outcome, Trailers};
 use crate::drive::{Error, Inbound, Kind, Outbound, Work};
 use crate::value::Field;
 
@@ -35,6 +35,16 @@ pub(super) enum Read {
     /// A trailer section continues in the next region, and the budget cannot pay for its join of
     /// this many bytes now.
     Capacity(u64),
+}
+
+/// The outcome of a body whose input ended before the end of the body. After a reset of the
+/// transport, the peer can have sent more.
+pub(super) fn cut(inbound: &Inbound) -> Outcome {
+    if inbound.is_reset() {
+        Outcome::Reset(None)
+    } else {
+        Outcome::Truncated
+    }
 }
 
 /// Reads one body from the received regions, with no copy.
@@ -122,7 +132,8 @@ impl BodyReader {
         }
         let Some(front) = inbound.front() else {
             return Ok(match self.state {
-                State::Close if inbound.ended() => {
+                // A reset is no proof that the peer ended the body.
+                State::Close if inbound.ended() && !inbound.is_reset() => {
                     self.state = State::Done;
                     Read::End(None)
                 }
@@ -275,11 +286,11 @@ impl BodyWriter {
                 if len as u64 > left {
                     return Err(misuse("the data passes the end of the body"));
                 }
-                outbound.push(data.clone()).map_err(|_| full())?;
+                outbound.push_payload(data.clone()).map_err(|_| full())?;
                 self.open = Some(Open::Length(left - len as u64));
                 Ok(())
             }
-            Some(Open::Close) => outbound.push(data.clone()).map_err(|_| full()),
+            Some(Open::Close) => outbound.push_payload(data.clone()).map_err(|_| full()),
             Some(Open::Chunked) => {
                 if outbound.free() < 3 {
                     return Err(full());
@@ -287,10 +298,9 @@ impl BodyWriter {
                 let size = NonZeroUsize::new(len).ok_or_else(|| misuse("an empty chunk"))?;
                 let mut line = WriteLoan::new(self.pool.acquire().map_err(|_| full())?);
                 begin_chunk(&mut line, size).map_err(|_| misuse("the chunk is too large for a size line"))?;
-                for region in [Lease::from(line.into_inner()), data.clone(), Lease::from(&b"\r\n"[..])] {
-                    outbound.push(region).map_err(|_| full())?;
-                }
-                Ok(())
+                outbound.push(Lease::from(line.into_inner())).map_err(|_| full())?;
+                outbound.push_payload(data.clone()).map_err(|_| full())?;
+                outbound.push(Lease::from(&b"\r\n"[..])).map_err(|_| full())
             }
         }
     }

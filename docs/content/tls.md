@@ -173,7 +173,13 @@ Send each output of the connection, and acknowledge it, as without TLS. The engi
 plaintext output in the next drive, so drive again after you answer an event.
 
 For HTTP/1.1 requests over TLS, `client::Http1::tls` makes these layers for you: see
-[send HTTP/1.1 requests with a deadline](client.md).
+[send HTTP/1.1 requests with a deadline](client.md). For an HTTP/1.1 server, `server::Http1::tls`
+does: see [serve HTTP/1.1 requests](server.md).
+
+The record layer seals at most one plaintext region for each entry of the plaintext output queue
+before the transport accepts its records. Then it waits, and the turn is `Blocked::Output`. Thus
+the bytes in flight stay bounded, and the server can tell which body bytes the transport
+accepted.
 
 ## Receive forms and their copies
 
@@ -313,6 +319,8 @@ A trust failure never authorizes a weaker check. Do not retry it with another co
 - `Closure::Unnotified`: the transport ended with no `close_notify`. The engine also sees the end.
   A protocol with its own framing, for example a body with a length, can tell that a message is
   incomplete. For data that ends only at the end of the connection, treat this end as partial.
+- `Closure::Reset`: the transport failed, after `Connection::reset`. The peer can have sent more.
+  The engine sees an end with no proof, so a body that did not end is `Outcome::Reset(None)`.
 
 When the engine ends, the connection sends `close_notify` before its terminal turn.
 

@@ -38,6 +38,7 @@
 
 mod memory;
 mod record;
+mod sent;
 
 use core::alloc::Layout;
 use core::fmt;
@@ -69,13 +70,16 @@ use rustls::{
     ClientSide, CommonState, ConnectionTrafficSecrets, ExtractedSecrets, HandshakeKind, MessageHandler, RootCertStore,
     ServerSide, SideData, SupportedCipherSuite, Tcp, TlsInputBuffer,
 };
+use sent::Sent;
 
 pub use rscrypto::ChaCha20Rng;
 pub use rustls::pki_types::pem::PemObject;
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 pub use rustls::time_provider::{DefaultTimeProvider, TimeProvider};
 
-use crate::drive::{Blocked, Endpoint, Error, Inbound, Kind, Outbound, Progress, Received, Turn, TurnLimits, Work};
+use crate::drive::{
+    Accepted, Blocked, Endpoint, Error, Inbound, Kind, Outbound, Progress, Received, Turn, TurnLimits, Work,
+};
 use crate::host::Engine;
 use crate::time::Instant;
 
@@ -557,6 +561,8 @@ pub enum Closure {
     /// whether a message is incomplete. For data that ends only at the end of the connection,
     /// treat the end as partial.
     Unnotified,
+    /// The transport failed, for example with a reset. The peer can have sent more data.
+    Reset,
 }
 
 /// The rustls connection of one end during the handshake.
@@ -1199,6 +1205,8 @@ pub struct Tls<E> {
     endpoint: Option<Endpoint>,
     capacity: u64,
     written: Bytes,
+    /// The plaintext regions that the record layer sealed, until the transport accepts them.
+    sent: Sent,
     copies: Copies,
     /// The peer sent `close_notify`.
     notified: bool,
@@ -1226,6 +1234,7 @@ impl<E: Engine> Tls<E> {
         check(&limits)?;
         // The charges come before rustls starts, so a refusal allocates nothing. The connection
         // keeps the name, and the ClientHello carries it.
+        let sent = Sent::new(NonZeroUsize::new(outbound.limit()).unwrap_or(NonZeroUsize::MIN), budget)?;
         let name_bytes = match &name {
             ServerName::DnsName(dns) => dns.as_ref().len(),
             _ => 0,
@@ -1246,7 +1255,7 @@ impl<E: Engine> Tls<E> {
         Ok(Self::new(
             (Session::Client(session), stream),
             (held, config.cost, Arc::clone(&config.own), config.store.clone()),
-            written,
+            (written, sent),
             engine,
             (inbound, outbound),
             limits,
@@ -1266,6 +1275,7 @@ impl<E: Engine> Tls<E> {
         budget: &Budget,
     ) -> Result<Self, Error> {
         check(&limits)?;
+        let sent = Sent::new(NonZeroUsize::new(outbound.limit()).unwrap_or(NonZeroUsize::MIN), budget)?;
         let own = config.own.get();
         let mut held = Held::new(budget, &config.cost, 0, &own)?;
         let stream = config.entropy.stream(CONNECTION);
@@ -1280,7 +1290,7 @@ impl<E: Engine> Tls<E> {
         Ok(Self::new(
             (Session::Server(session), stream),
             (held, config.cost, Arc::clone(&config.own), None),
-            written,
+            (written, sent),
             engine,
             (inbound, outbound),
             limits,
@@ -1291,7 +1301,7 @@ impl<E: Engine> Tls<E> {
     fn new(
         (session, stream): (Session, Option<Stream>),
         (held, cost, own, tickets): (Held, Cost, Arc<Owns>, Option<Arc<ClientStore>>),
-        written: Bytes,
+        (written, sent): (Bytes, Sent),
         engine: E,
         (inbound, outbound): (Inbound, Outbound),
         limits: Limits,
@@ -1317,6 +1327,7 @@ impl<E: Engine> Tls<E> {
             endpoint: None,
             capacity: 0,
             written,
+            sent,
             copies: Copies::default(),
             notified: false,
             closure: None,
@@ -1348,6 +1359,13 @@ impl<E: Engine> Tls<E> {
     /// How the input ended, or `None` before its end.
     pub fn closure(&self) -> Option<Closure> {
         self.closure
+    }
+
+    /// The plaintext whose records the transport accepted, when it accepted `accepted` bytes of
+    /// the ciphertext of this connection: each byte, and the body bytes of them. A record counts
+    /// when each of its bytes went.
+    pub(crate) fn sent(&self, accepted: u64) -> Accepted {
+        self.sent.sent(accepted)
     }
 
     /// One turn, up to the progress of the inner engine.
@@ -1393,8 +1411,13 @@ impl<E: Engine> Tls<E> {
             if handshaking {
                 return Err(Error::new(Kind::Partial, "the transport ended before the TLS handshake completed").into());
             }
-            self.closure = Some(Closure::Unnotified);
-            self.inbound.end();
+            if inbound.is_reset() {
+                self.closure = Some(Closure::Reset);
+                self.inbound.reset();
+            } else {
+                self.closure = Some(Closure::Unnotified);
+                self.inbound.end();
+            }
         }
         let (event, inner) = if handshaking {
             (None, None)
@@ -1707,15 +1730,21 @@ impl<E: Engine> Tls<E> {
         if records.update {
             records.update_tx(&mut self.written)?;
         }
-        while !work.reached(&self.limits.turn) {
+        self.sent.settle(outbound.accepted().bytes);
+        while !work.reached(&self.limits.turn) && !self.sent.full() {
             if outbound.free() == 0 && !self.written.bytes.is_empty() {
                 break;
             }
+            let payload = self.outbound.front_is_payload();
             let Some(output) = self.outbound.submit() else { break };
             let plaintext = output.region.bytes();
+            // The offset of the ciphertext after the output that the queue took.
+            let start = outbound.pushed().strict_add(self.written.bytes.len() as u64);
             for chunk in plaintext.chunks(CONTENT_MAX) {
                 records.seal(Content::Data, &[chunk], &mut self.written)?;
             }
+            let end = outbound.pushed().strict_add(self.written.bytes.len() as u64);
+            self.sent.push(start, end, plaintext.len(), payload);
             self.outbound.ack(output.id, plaintext.len())?;
             self.copies.encrypted += plaintext.len() as u64;
             work.add(plaintext.len(), plaintext.len().div_ceil(CONTENT_MAX));

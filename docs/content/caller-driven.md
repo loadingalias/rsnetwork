@@ -14,7 +14,8 @@ A `Connection` holds one engine, `h1::Server` or `h1::Client`, and its two queue
 your loop:
 
 1. Read the bytes that the socket received, and give each region to `connection.receive`. When the
-   socket reports that the peer closed its side, call `connection.end_input()`.
+   socket reports that the peer closed its side, call `connection.end_input()`. When the socket
+   reports a reset, or a write fails, call `connection.reset()`.
 2. Call `connection.drive(now)` until it gives no event, with the time of your host as `now`.
    Answer each event, for example a request, with the engine and the output queue that
    `connection.parts()` gives.
@@ -27,6 +28,7 @@ your loop:
 | --- | --- |
 | `Now` | Drive again now: the engine has an event or more work |
 | `Until { blocked, deadline }` | Drive when your host gives what `blocked` names, or at `deadline`, whichever comes first. `None` has no deadline |
+| `Linger { deadline }` | Only the [server](server.md#linger) gives it: half-close the socket once, give each received byte as before, and call again at `deadline` |
 | `Ended(result)` | Do not drive again. Send the rest of the output, then release the connection |
 
 | `blocked` | The engine waits for |
@@ -60,6 +62,9 @@ on that clock. A host with no clock gives `None` for both. The server engine has
 A connection must stay driven until its terminal release: the engine ended, and the socket
 accepted each output. `connection.release()` gives the result of the connection then, and `None`
 before it. Then drop the connection and close the socket.
+
+After `connection.reset()`, the output that waits can never go, so `release()` does not wait for
+it, and `outstanding()` reports it.
 
 To drop a connection before its release, for example at shutdown, call `connection.abandon()`. It
 reports the output that the socket has not accepted: its regions, its bytes, and the output that

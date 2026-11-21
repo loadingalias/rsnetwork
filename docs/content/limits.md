@@ -32,6 +32,8 @@ to its alignment, a 16-byte entry for each slot, and the shared state of the poo
 | HTTP/2 connection | Its HPACK decoder of at least 4096 bytes, its HPACK encoder, a stream table of `max_concurrent_streams` entries, three lists of as many 4-byte identifiers (reset streams and the two rings of the send scheduler), and a frame pool of one 64-byte slot for each `Outbound` entry and one more | `h2::Connection::new` |
 | Join of an HTTP/2 header block that does not decode in place | Its bytes for a block in one frame, or `work` for a block that continues: see [HTTP/2](http2.md#header-blocks) | When the block arrives, until its decode |
 | TLS input region | A pool of one slot of `input_bytes` | When a receive needs a region, until the last view of its plaintext and the writable rest of the region drop |
+| TLS sealed regions | One 32-byte mark for each entry of the plaintext output queue: the record layer seals no more regions before the transport accepts their records | `Tls::client` and `Tls::server` |
+| HTTP/1.1 server regions | A pool of two slots of `head_bytes`, for response heads and trailer sections | `server::Http1::plain` and `server::Http1::tls` |
 | TLS ciphertext output | Its capacity, and the one allocation of the lease that owns it. Before a call of rustls, also twice the bytes that the call can write | When the connection writes, until the transport releases the last view |
 | Join of a TLS handshake message after the handshake that arrives in two or more records | Its bytes, at most `input_bytes` | When the message continues in a later record, until the message is complete |
 | TLS handshake | The state of rustls that the configuration fixes, and a bound of what rustls keeps of the messages of the peer: see [TLS handshakes](#tls-handshakes) | `Tls::client` and `Tls::server`, until the handshake completes |
@@ -99,7 +101,9 @@ bounds it. Each turn makes at least one step, so a small limit slows an engine b
 | A QPACK encoder that floods the encoder stream | Its dynamic table, which `table_bytes` bounds | `work` bounds each read of the encoder stream: see [QPACK](qpack.md#limits) |
 
 The head timeout of the server bounds the time of a slow head: see
-[HTTP/1.1](http1.md#framing-and-connection-rules). Bound the time of a slow body with your own
+[HTTP/1.1](http1.md#framing-and-connection-rules). In `server::Http1` over TLS, it also bounds the
+TLS handshake. After the last output, the [linger](server.md#linger) of `server::Http1` discards the
+bytes of a peer that goes on sending, up to `linger.bytes` and `linger.time`. Bound the time of a slow body with your own
 deadline for it, and end the connection when it passes.
 
 ## Each limit
@@ -111,6 +115,7 @@ deadline for it, and end the connection when it passes.
 | `hpack::Limits` | The dynamic table, the decoded lines, and the work of one HTTP/2 header block | [HPACK](hpack.md#limits) |
 | `qpack::Limits`, `qpack::EncoderLimits` | The dynamic tables, the blocked streams, the decoded lines of one HTTP/3 field section, the sections that wait for an acknowledgement, and the work of one read of the encoder stream | [QPACK](qpack.md#limits) |
 | `h2::Limits` | The settings that an HTTP/2 endpoint sends, the largest header block, the encoder table, and the connection receive window | [HTTP/2](http2.md#limits) |
+| `server::Limits`, `server::Linger` | The limits of an HTTP/1.1 server connection, its head timeout, and its linger after the last output | [Serve requests](server.md) |
 | `tls::Limits` | The capacity of each TLS input region, which also bounds the largest handshake message, the records under one key, and the work of one drive | [TLS](tls.md#limits) |
 | `drive::TurnLimits` | The work of one drive | This page |
 | `Inbound::new`, `Outbound::new` | The regions that each queue holds | [Drive a protocol engine](drive.md) |

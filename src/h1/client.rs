@@ -6,7 +6,7 @@ use core::ops::Range;
 use rstypes::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use rstypes::capacity::Budget;
 
-use super::body::{BodyReader, BodyWriter, Read, full, misuse, write_error};
+use super::body::{BodyReader, BodyWriter, Read, cut, full, misuse, write_error};
 use super::head::{BodyLimits, Limits, ParseError};
 use super::join::{Join, Step, join};
 use super::write::write_request_head;
@@ -58,6 +58,8 @@ pub struct Client {
     /// The application cancelled the response body: the next drive gives its
     /// `End(Outcome::Cancelled)`.
     cancelled: bool,
+    /// The application holds the response body: a drive gives none of it.
+    hold: bool,
     /// The end of the connection.
     end: Option<Result<(), Error>>,
 }
@@ -153,6 +155,7 @@ impl Client {
             close: false,
             upgrade: false,
             cancelled: false,
+            hold: false,
             end: None,
         })
     }
@@ -292,6 +295,14 @@ impl Client {
         self.end.get_or_insert(Ok(()));
     }
 
+    /// Holds the response body when `hold` is true: a drive then gives no event of the body, and
+    /// its bytes wait in the queue. Hold the body while the application cannot take a part of it,
+    /// so that a drive for output gives no part that nothing can take. The drain of a cancelled
+    /// body goes on.
+    pub fn hold_body(&mut self, hold: bool) {
+        self.hold = hold;
+    }
+
     /// Cancels the read of the response. Inside the body, the next drive gives
     /// [`End(Outcome::Cancelled)`](ClientEvent::End), once, and no more of the body. The engine then
     /// reads and discards the rest of the body, up to [`BodyLimits::drain_bytes`], to reuse the
@@ -383,6 +394,7 @@ impl Client {
                     return Ok(Some(ClientEvent::Handoff));
                 }
                 ReadState::Switch => return Ok(None),
+                ReadState::Body(reader) if self.hold && !reader.draining() => return Ok(None),
                 ReadState::Body(reader) => reader,
             };
             let draining = reader.draining();
@@ -418,7 +430,7 @@ impl Client {
                 Read::Truncated => {
                     self.end = Some(Err(Error::new(Kind::Partial, "the response body ended before its end")));
                     if !draining {
-                        return Ok(Some(ClientEvent::End(Outcome::Truncated)));
+                        return Ok(Some(ClientEvent::End(cut(inbound))));
                     }
                 }
                 Read::Capacity(units) => {

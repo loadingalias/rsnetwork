@@ -37,11 +37,13 @@ outside the closure of the `tls` feature.
 
 | Effect | Interface | Contract |
 | --- | --- | --- |
-| Received bytes | `Connection::receive(Received)`, `Connection::end_input()` | Any region: a buffer of the binding, a pool slot through `Lease::from_owner`, or a buffer that the kernel selected. The engine reads it in place, with no copy |
+| Received bytes | `Connection::receive(Received)`, `Connection::end_input()`, `Connection::reset()` | Any region: a buffer of the binding, a pool slot through `Lease::from_owner`, or a buffer that the kernel selected. The engine reads it in place, with no copy |
 | Received bytes into a region of the engine | `Connection::region()`, then `Connection::received(region, endpoint, capacity)` | `region()` lends the input region of the engine, or gives `None` when the engine has none. Receive into its capacity after its initialized bytes, and give it back. `received` also takes a writable region of the host. A TLS engine decrypts in place only in a writable region: see [receive forms](tls.md#receive-forms-and-their-copies) |
 | Output | `Connection::output()`, `Connection::ack(id, accepted)` | One output at a time. Give its region to the transport, and acknowledge the exact bytes that the transport accepted |
 | Time | The `ClockDomain` of `Connection::new`, and an `Instant` at each drive | A monotonic clock. A host with no clock gives `None` |
-| Wait and wake | `Connection::wait()` | `Now`, `Until { blocked, deadline }`, or `Ended(result)`, from the last turn |
+| Transport failure | `Connection::reset()` | A reset or a failed write: no byte comes or goes after it. A body that did not end ends `Outcome::Reset(None)`, and `release()` does not wait for the output |
+| Wait and wake | `Connection::wait()` | `Now`, `Until { blocked, deadline }`, `Linger { deadline }`, or `Ended(result)`, from the last turn |
+| Half-close | `Wait::Linger { deadline }` | Only the [server](server.md#linger) gives it, after its last output: shut down the write side of the transport once, give each received byte, and call again at `deadline` |
 | Cleanup | `Connection::release()`, `Connection::abandon()` | Drive until the release. An abandon reports the output that the transport has not accepted |
 
 A connection refuses at construction when the host does not have a capability that the engine
@@ -51,7 +53,8 @@ needs. An engine with a timer on a host with no clock gives `Kind::Unsupported`.
 
 Each turn of a binding:
 
-1. Give the received regions to `receive`, and call `end_input` at the end of the input.
+1. Give the received regions to `receive`. Call `end_input` at the end of the input, and `reset`
+   when the transport fails.
 2. Call `drive(now)` until it gives no event, and answer each event.
 3. Give each output to the transport, and acknowledge it.
 4. Wait as `wait()` tells, and go to step 1.
@@ -89,6 +92,15 @@ A completion host, for example io_uring, owns each buffer until its operation co
 - Submit a send of the region of an output. The transport keeps its own view of the region. At the
   completion, acknowledge the count that the send gives.
 
+## Clients and servers
+
+`client::Http1` and `server::Http1` are one HTTP/1.1 connection over TCP or TLS each, and a binding
+moves their bytes with the same calls as a `Connection`. Their calls of the exchange are the
+handler interface: see [send requests](client.md) and [serve requests](server.md). A binding adds
+its own handler form over these calls, for example an async function, and owns the progress of the
+connection while the handler runs. The server tells when the transport accepted a response, so a
+binding reports the end of the handler and the delivery of its response as two results.
+
 ## Threads
 
 A connection stays on the thread of its host, and it does not need `Send`. A binding that moves
@@ -105,6 +117,5 @@ until the transport completes it.
 
 - A wake when capacity is free again. It needs a release listener in the shared capacity types. Until
   then, drive again after your code releases capacity, for example after it consumes a body.
-- Work that a connection owns outside a drive, for example the handler of a request.
 - Name resolution and other blocking jobs, with a bound.
 - A send of several output regions in one call.

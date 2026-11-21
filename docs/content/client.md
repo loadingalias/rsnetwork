@@ -118,13 +118,13 @@ its trailers. Each other outcome leaves a part, for example `Outcome::Truncated`
 | `write(&data, now)`, `finish(now)` | The request body, with no copy, and its end, for `Framing::Length(n)` or `Framing::Chunked`. A full output queue refuses with `Kind::Overload`: send the output first |
 | `response(now)` | The response head, or `None` before it. An informational (1xx) response does not count |
 | `read_into(now, &mut region)` | Copies the next body bytes into the free capacity of the region, or gives `Read::Done(outcome)` after the last byte |
-| `next(now)` | `Part::Data(view)`: the next body bytes as a view of the received region, with no copy. `Part::End(outcome)` at the end |
+| `next(now)` | `body::Part::Data(view)`: the next body bytes as a view of the received region, with no copy. `Part::End(outcome)` at the end |
 | `collect(now, &mut region)` | Collects the whole body into one region, whose free capacity bounds it: `Collect::Complete(trailers)`, `Collect::TooLarge`, or `Collect::More` while bytes are still to come |
 | `delivered()` | The body bytes that the client gave so far |
 | `cancel()` | Leaves the rest of the body unread (see [reuse](#reuse-a-connection)) |
 | `close(now)` | Ends the connection. Over TLS it sends `close_notify`. Send the rest of the output, and then `release()` |
 | `wait()` | When to call again: now, when the transport gives what the connection waits for, at the deadline of the exchange, or never after the end |
-| `received`, `receive`, `region`, `output`, `ack`, `end_input`, `release` | The transport calls, as on a [host connection](caller-driven.md) |
+| `received`, `receive`, `region`, `output`, `ack`, `end_input`, `reset`, `release` | The transport calls, as on a [host connection](caller-driven.md). Call `reset` when the transport fails: a body that did not end then ends `Outcome::Reset(None)` |
 
 ## The deadline
 

@@ -17,13 +17,14 @@ that ends any other way is a part, never a complete value.
 | --- | --- |
 | `Complete(trailers)` | The body ended as its framing says: at its length, after its last chunk and its trailers, or at the end of input when the end of input delimits it |
 | `Truncated` | The input ended inside a body with a length or with chunks (EOF) |
-| `Reset(code)` | The peer reset the stream or the connection, with the code of a protocol that has one. Your host gives it when the transport reports a reset |
+| `Reset(code)` | The peer reset the stream or the connection, with the code of a protocol that has one. Over TCP, your host calls `reset` when the transport reports a reset, and the code is `None` |
 | `Cancelled` | The application cancelled the body |
 | `Malformed` | The framing of the body broke the rules of its protocol |
 
 The end of input does not always cut a body. A response with no length, for example from an
 HTTP/1.0 server, ends at the close of the connection, so that end is `Complete(None)`. A body with a
-Content-Length or with chunks that ends early is `Truncated`.
+Content-Length or with chunks that ends early is `Truncated`. A reset never completes a body: after
+a reset, each body that did not end is `Reset(None)`, also a body that the close delimits.
 
 `Trailers::fields()` gives the trailer fields of a complete body, in their received order.
 
@@ -54,7 +55,8 @@ has not ended. `consumer.take()` gives the waiting bytes as a view, with no copy
 `consumer.outcome()` gives the outcome after the last waiting byte. `consumer.delivered()` gives
 the number of body bytes that the consumer copied or gave, also after an interrupted body.
 
-The [client](client.md) runs a consumer for each response body.
+The [client](client.md) runs a consumer for each response body, and the [server](server.md) for
+each request body.
 
 ## Collect a body
 

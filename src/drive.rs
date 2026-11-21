@@ -137,6 +137,8 @@ pub struct Inbound {
     limit: usize,
     /// The transport gives no more bytes.
     ended: bool,
+    /// The transport failed, so its end is not the end of the peer's data.
+    reset: bool,
     /// The charge of the queue memory.
     _charge: Permit,
 }
@@ -151,6 +153,7 @@ impl Inbound {
             regions,
             limit: limit.get(),
             ended: false,
+            reset: false,
             _charge: charge,
         })
     }
@@ -161,9 +164,23 @@ impl Inbound {
         self.ended = true;
     }
 
+    /// Records that the transport failed after the queued regions, for example with a reset: no
+    /// more bytes come, and the peer's data can continue after them. An engine reads the queued
+    /// regions first, and then sees an end with no proof: a body ends
+    /// [`Outcome::Reset`](crate::body::Outcome::Reset), never complete.
+    pub fn reset(&mut self) {
+        self.ended = true;
+        self.reset = true;
+    }
+
     /// Whether the transport gives no more bytes after the queued regions.
     pub fn ended(&self) -> bool {
         self.ended
+    }
+
+    /// Whether the transport failed: its end is not the end of the peer's data.
+    pub fn is_reset(&self) -> bool {
+        self.reset
     }
 
     /// The number of regions that the queue can take now.
@@ -224,6 +241,7 @@ impl fmt::Debug for Inbound {
             .field("regions", &self.regions.len())
             .field("limit", &self.limit)
             .field("ended", &self.ended)
+            .field("reset", &self.reset)
             .finish_non_exhaustive()
     }
 }
@@ -262,7 +280,7 @@ impl fmt::Debug for Output {
 /// The queue holds at most the number of regions that [`new`](Self::new) sets, and it reserves
 /// their space there, charged to the caller's budget. Thus a push never allocates.
 pub struct Outbound {
-    regions: VecDeque<Lease>,
+    regions: VecDeque<Queued>,
     limit: usize,
     /// The charge of the queue memory.
     _charge: Permit,
@@ -270,6 +288,38 @@ pub struct Outbound {
     next: u64,
     /// The output that has no acknowledgement yet, and the length of its region.
     outstanding: Option<(ActionId, usize)>,
+    /// The bytes that the queue took, since it was made.
+    pushed: u64,
+    /// The bytes that the transport accepted, since the queue was made.
+    accepted: Accepted,
+}
+
+/// A region in an [`Outbound`] queue.
+struct Queued {
+    region: Lease,
+    /// The region holds body bytes, not framing.
+    payload: bool,
+}
+
+/// The bytes that a transport accepted, since their queue was made: each byte, and the body bytes
+/// of them. Each count only grows, so a count at one time and a count later give the bytes
+/// between them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Accepted {
+    /// Each byte: framing, such as a head or a chunk-size line, and body bytes.
+    pub(crate) bytes: u64,
+    /// The body bytes.
+    pub(crate) payload: u64,
+}
+
+impl Accepted {
+    /// Adds `len` bytes, which are body bytes when `payload` is true.
+    pub(crate) fn add(&mut self, len: u64, payload: bool) {
+        self.bytes = self.bytes.strict_add(len);
+        if payload {
+            self.payload = self.payload.strict_add(len);
+        }
+    }
 }
 
 impl Outbound {
@@ -284,6 +334,8 @@ impl Outbound {
             _charge: charge,
             next: 0,
             outstanding: None,
+            pushed: 0,
+            accepted: Accepted::default(),
         })
     }
 
@@ -302,7 +354,11 @@ impl Outbound {
     pub fn outstanding(&self) -> Outstanding {
         Outstanding {
             regions: self.regions.len(),
-            bytes: self.regions.iter().map(|region| region.initialized() as u64).sum(),
+            bytes: self
+                .regions
+                .iter()
+                .map(|queued| queued.region.initialized() as u64)
+                .sum(),
             submitted: self.outstanding.map(|(id, _)| id),
         }
     }
@@ -310,14 +366,42 @@ impl Outbound {
     /// Adds a region after the others. Gives it back if the queue is full. An empty region has
     /// nothing to send, so the queue drops it.
     pub fn push(&mut self, region: Lease) -> Result<(), Lease> {
-        if region.initialized() == 0 {
+        self.queue(region, false)
+    }
+
+    /// Adds a region of body bytes after the others, as [`push`](Self::push) does. The queue
+    /// counts the body bytes that the transport accepts apart from framing.
+    pub(crate) fn push_payload(&mut self, region: Lease) -> Result<(), Lease> {
+        self.queue(region, true)
+    }
+
+    fn queue(&mut self, region: Lease, payload: bool) -> Result<(), Lease> {
+        let len = region.initialized();
+        if len == 0 {
             return Ok(());
         }
         if self.regions.len() >= self.limit {
             return Err(region);
         }
-        self.regions.push_back(region);
+        self.regions.push_back(Queued { region, payload });
+        self.pushed = self.pushed.strict_add(len as u64);
         Ok(())
+    }
+
+    /// The bytes that the queue took, since it was made.
+    pub(crate) fn pushed(&self) -> u64 {
+        self.pushed
+    }
+
+    /// The bytes that the transport accepted, since the queue was made.
+    pub(crate) fn accepted(&self) -> Accepted {
+        self.accepted
+    }
+
+    /// Whether the front region holds body bytes.
+    #[cfg(feature = "tls")]
+    pub(crate) fn front_is_payload(&self) -> bool {
+        self.regions.front().is_some_and(|queued| queued.payload)
     }
 
     /// Gives the next output: the bytes of the front region that the transport has not accepted.
@@ -327,7 +411,7 @@ impl Outbound {
         if self.outstanding.is_some() {
             return None;
         }
-        let region = self.regions.front()?.clone();
+        let region = self.regions.front()?.region.clone();
         let id = ActionId(self.next);
         self.next = self.next.checked_add(1)?;
         self.outstanding = Some((id, region.initialized()));
@@ -347,8 +431,9 @@ impl Outbound {
                 }
                 self.outstanding = None;
                 if let Some(front) = self.regions.front_mut() {
-                    match front.view(accepted..) {
-                        Some(rest) if rest.initialized() > 0 => *front = rest,
+                    self.accepted.add(accepted as u64, front.payload);
+                    match front.region.view(accepted..) {
+                        Some(rest) if rest.initialized() > 0 => front.region = rest,
                         _ => {
                             self.regions.pop_front();
                         }
@@ -392,7 +477,7 @@ impl Outstanding {
 
 /// Makes an empty queue with space for `limit` items. It charges that memory to `budget` before
 /// it allocates, and the permit pays for the queue until it drops.
-fn reserve<T>(limit: NonZeroUsize, budget: &Budget) -> Result<(VecDeque<T>, Permit), Error> {
+pub(crate) fn reserve<T>(limit: NonZeroUsize, budget: &Budget) -> Result<(VecDeque<T>, Permit), Error> {
     let bytes = limit
         .get()
         .checked_mul(size_of::<T>())

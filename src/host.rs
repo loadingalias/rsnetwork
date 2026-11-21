@@ -195,6 +195,15 @@ pub enum Wait {
         /// The next deadline of the engine, or `None` when it has none.
         deadline: Option<Deadline>,
     },
+    /// After the output: half-close the transport once, for example with a TCP `shutdown` of
+    /// its write side, and then give each received byte as before, until the end of input or
+    /// `deadline`. The server reads and discards those bytes, so a reset of the peer does not
+    /// discard a response that it has not read yet. Then the end follows. Only
+    /// [`server::Http1`](crate::server::Http1) waits so.
+    Linger {
+        /// The end of the linger.
+        deadline: Deadline,
+    },
     /// Never: the engine ended with this result. Send the rest of the output, and then release
     /// the connection.
     Ended(Result<(), Error>),
@@ -209,6 +218,8 @@ pub struct Connection<E> {
     /// The clock of the host, if it has one.
     clock: Option<ClockDomain>,
     wait: Wait,
+    /// The transport failed, so no output can go.
+    reset: bool,
 }
 
 impl<E: Engine> Connection<E> {
@@ -230,6 +241,7 @@ impl<E: Engine> Connection<E> {
             outbound,
             clock,
             wait: Wait::Now,
+            reset: false,
         })
     }
 
@@ -265,6 +277,17 @@ impl<E: Engine> Connection<E> {
     /// Records that the transport gives no more bytes: the peer closed its side.
     pub fn end_input(&mut self) {
         self.inbound.end();
+    }
+
+    /// Records that the transport failed, for example with a reset or a refused write: no byte
+    /// comes or goes after this. The engine reads the received bytes, and then an end with no
+    /// proof: a body ends [`Outcome::Reset`](crate::body::Outcome::Reset). Output that waits can
+    /// never go, so [`release`](Self::release) does not wait for it, and
+    /// [`outstanding`](Self::outstanding) reports it. An engine that waits for the application,
+    /// for example a server with a request in flight, ends when the application cancels.
+    pub fn reset(&mut self) {
+        self.inbound.reset();
+        self.reset = true;
     }
 
     /// Drives the engine for one turn at `now`, and gives its event, if it has one. Then
@@ -305,6 +328,17 @@ impl<E: Engine> Connection<E> {
         (&mut self.engine, &mut self.outbound)
     }
 
+    /// The engine, for a look at its state.
+    #[cfg(feature = "tls")]
+    pub(crate) fn engine(&self) -> &E {
+        &self.engine
+    }
+
+    /// The output queue, for a look at its state.
+    pub(crate) fn queue(&self) -> &Outbound {
+        &self.outbound
+    }
+
     /// The next output to give to the transport. Acknowledge it with [`ack`](Self::ack).
     pub fn output(&mut self) -> Option<Output> {
         self.outbound.submit()
@@ -321,10 +355,11 @@ impl<E: Engine> Connection<E> {
     }
 
     /// Gives the end of the connection when it can drop: after the terminal turn, when the
-    /// transport accepted each output. Gives `None` before that: drive on, and send the output.
+    /// transport accepted each output, or after a [`reset`](Self::reset). Gives `None` before
+    /// that: drive on, and send the output.
     pub fn release(&self) -> Option<Result<(), Error>> {
         match self.wait {
-            Wait::Ended(end) if self.outbound.outstanding().is_empty() => Some(end),
+            Wait::Ended(end) if self.reset || self.outbound.outstanding().is_empty() => Some(end),
             _ => None,
         }
     }

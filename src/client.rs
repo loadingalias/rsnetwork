@@ -34,12 +34,11 @@ use rstypes::buffer::{Backing, BufferMut, Lease, Pool, PoolRefused, WriteLoan};
 use rstypes::capacity::Budget;
 use rstypes::time::{ClockDomain, Deadline, Instant};
 
-use crate::body::{Collect, Consumer, Outcome, Read};
-use crate::drive::{
-    AckError, ActionId, Endpoint, Error, Inbound, Kind, Outbound, Output, Outstanding, Received, TurnLimits,
-};
+use crate::body::{Collect, Consumer, Outcome, Part, Read};
+use crate::drive::{AckError, ActionId, Endpoint, Error, Kind, Output, Outstanding, Received, TurnLimits};
 use crate::h1::{self, BodyLimits, ClientEvent, Framing, RetainedResponse};
 use crate::host::{Connection, Wait};
+use crate::link::{Link, earliest, queues};
 #[cfg(feature = "tls")]
 use crate::tls::{self, ClientConfig, Closure, Negotiated, Tls};
 use crate::value::{Authority, Field, Method, Target};
@@ -72,51 +71,6 @@ pub struct Request<'a> {
     pub body: Framing,
 }
 
-/// A part of a response body that [`Http1::next`] gives.
-#[derive(Clone, Debug)]
-pub enum Part {
-    /// Bytes of the body: a view of a received region, with no copy.
-    Data(Lease),
-    /// The end of the body, with its outcome. Only `Outcome::Complete` makes the body complete.
-    End(Outcome),
-}
-
-/// The transport of a client connection.
-#[derive(Debug)]
-#[cfg_attr(
-    feature = "tls",
-    expect(
-        clippy::large_enum_variant,
-        reason = "a client holds its one transport in place, and a box would add an allocation to each TLS client"
-    )
-)]
-enum Link {
-    Plain(Connection<h1::Client>),
-    #[cfg(feature = "tls")]
-    Tls(Connection<Tls<h1::Client>>),
-}
-
-/// Runs `$body` with `$connection` bound to the connection of each transport.
-macro_rules! each {
-    ($link:expr, $connection:ident => $body:expr) => {
-        match $link {
-            Link::Plain($connection) => $body,
-            #[cfg(feature = "tls")]
-            Link::Tls($connection) => $body,
-        }
-    };
-}
-
-impl Link {
-    fn engine(&mut self) -> (&mut h1::Client, &mut Outbound) {
-        match self {
-            Self::Plain(connection) => connection.parts(),
-            #[cfg(feature = "tls")]
-            Self::Tls(connection) => connection.parts().0.parts(),
-        }
-    }
-}
-
 /// The place of the client in the current exchange.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -138,7 +92,7 @@ enum State {
 /// [module](self) for the calls and their rules.
 #[derive(Debug)]
 pub struct Http1 {
-    link: Link,
+    link: Link<h1::Client>,
     /// The region of each request head: one slot, which comes back when the transport takes the
     /// head.
     heads: Pool,
@@ -188,7 +142,7 @@ impl Http1 {
         Ok(Self::new(Link::Tls(connection), heads, clock))
     }
 
-    fn new(link: Link, heads: Pool, clock: ClockDomain) -> Self {
+    fn new(link: Link<h1::Client>, heads: Pool, clock: ClockDomain) -> Self {
         Self {
             link,
             heads,
@@ -231,7 +185,7 @@ impl Http1 {
         }
         let (engine, _) = self.link.engine();
         if !engine.ready() {
-            if let Wait::Ended(_) = each!(&self.link, connection => connection.wait()) {
+            if let Wait::Ended(_) = self.link.wait() {
                 return Err(misuse("the connection ended: make a new client"));
             }
             return Ok(false);
@@ -373,10 +327,7 @@ impl Http1 {
     /// What the TLS handshake negotiated, or `None` before it completed and over TCP.
     #[cfg(feature = "tls")]
     pub fn negotiated(&mut self) -> Option<Negotiated<'_>> {
-        match &mut self.link {
-            Link::Plain(_) => None,
-            Link::Tls(connection) => connection.parts().0.negotiated(),
-        }
+        self.link.negotiated()
     }
 
     /// When to call again: now, when the transport gives what the connection waits for, at the
@@ -385,7 +336,7 @@ impl Http1 {
         if let Some(error) = self.end {
             return Wait::Ended(Err(error));
         }
-        match each!(&self.link, connection => connection.wait()) {
+        match self.link.wait() {
             Wait::Until { blocked, deadline } => Wait::Until {
                 blocked,
                 deadline: earliest(deadline, self.deadline),
@@ -400,37 +351,43 @@ impl Http1 {
         reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
     )]
     pub fn receive(&mut self, received: Received) -> Result<(), Received> {
-        each!(&mut self.link, connection => connection.receive(received))
+        self.link.receive(received)
     }
 
     /// Lends the input region of the connection for one receive, as [`Connection::region`] does.
     pub fn region(&mut self) -> Result<Option<Backing>, Error> {
-        each!(&mut self.link, connection => connection.region())
+        self.link.region()
     }
 
     /// Gives the connection a received region, as [`Connection::received`] does.
     pub fn received(&mut self, region: Backing, endpoint: Endpoint, capacity: u64) -> Result<(), Backing> {
-        each!(&mut self.link, connection => connection.received(region, endpoint, capacity))
+        self.link.received(region, endpoint, capacity)
     }
 
     /// Records that the transport gives no more bytes.
     pub fn end_input(&mut self) {
-        each!(&mut self.link, connection => connection.end_input());
+        self.link.end_input();
+    }
+
+    /// Records that the transport failed, as [`Connection::reset`] does: a body in flight ends
+    /// [`Outcome::Reset`], and the client ends.
+    pub fn reset(&mut self) {
+        self.link.reset();
     }
 
     /// The next output to give to the transport. Acknowledge it with [`ack`](Self::ack).
     pub fn output(&mut self) -> Option<Output> {
-        each!(&mut self.link, connection => connection.output())
+        self.link.output()
     }
 
     /// Acknowledges that the transport accepted the first `accepted` bytes of output `id`.
     pub fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
-        each!(&mut self.link, connection => connection.ack(id, accepted))
+        self.link.ack(id, accepted)
     }
 
     /// The output that the transport has not accepted.
     pub fn outstanding(&self) -> Outstanding {
-        each!(&self.link, connection => connection.outstanding())
+        self.link.outstanding()
     }
 
     /// Gives the end of the client when it can drop: after its end, when the transport accepted
@@ -439,7 +396,7 @@ impl Http1 {
         match self.end {
             Some(error) if self.outstanding().is_empty() => Some(Err(error)),
             Some(_) => None,
-            None => each!(&self.link, connection => connection.release()),
+            None => self.link.release(),
         }
     }
 
@@ -504,8 +461,11 @@ impl Http1 {
         Ok(())
     }
 
-    /// Drives the connection one time, and takes its event. Gives whether it took one.
+    /// Drives the connection one time, and takes its event. Gives whether it took one. The
+    /// engine holds the body while a part waits for a read, so each part that comes has a place.
     fn pump(&mut self, now: Instant) -> Result<bool, Error> {
+        let hold = !self.body.wants_data();
+        self.link.engine().0.hold_body(hold);
         let Some(event) = self.link_drive(now)? else {
             return Ok(false);
         };
@@ -540,16 +500,8 @@ impl Http1 {
     /// Drives the connection one time. Over TLS, a server that selected a protocol other than
     /// HTTP/1.1 ends the client.
     fn link_drive(&mut self, now: Instant) -> Result<Option<ClientEvent>, Error> {
-        let event = each!(&mut self.link, connection => connection.drive(Some(now)))?;
-        #[cfg(feature = "tls")]
-        if let Link::Tls(connection) = &mut self.link
-            && let Some(Negotiated {
-                protocol: Some(protocol),
-                ..
-            }) = connection.parts().0.negotiated()
-            && protocol != b"http/1.1"
-        {
-            let error = Error::new(Kind::Unsupported, "the server selected a protocol other than HTTP/1.1");
+        let event = self.link.drive(now)?;
+        if let Some(error) = self.link.refused("the server selected a protocol other than HTTP/1.1") {
             self.end = Some(error);
             return Err(error);
         }
@@ -560,8 +512,8 @@ impl Http1 {
     /// `close_notify`, its end is not proven, so the body is truncated.
     fn unnotified(&mut self, outcome: Outcome) -> Outcome {
         #[cfg(feature = "tls")]
-        if let (Outcome::Complete(_), Framing::Close, Link::Tls(connection)) = (&outcome, self.framing, &mut self.link)
-            && connection.parts().0.closure() == Some(Closure::Unnotified)
+        if let (Outcome::Complete(_), Framing::Close) = (&outcome, self.framing)
+            && self.link.closure() == Some(Closure::Unnotified)
         {
             return Outcome::Truncated;
         }
@@ -571,7 +523,7 @@ impl Http1 {
     /// No event came: the call waits, or the error of a connection that ended before the
     /// exchange did.
     fn waiting(&self) -> Result<(), Error> {
-        match each!(&self.link, connection => connection.wait()) {
+        match self.link.wait() {
             Wait::Ended(Err(error)) => Err(error),
             Wait::Ended(Ok(())) => Err(Error::new(Kind::Partial, "the connection ended before the response")),
             _ => Ok(()),
@@ -591,21 +543,6 @@ fn heads(limits: &Limits, budget: &Budget) -> Result<Pool, Error> {
             "the memory for the region of a request head is not available",
         ),
     })
-}
-
-fn queues(limit: NonZeroUsize, budget: &Budget) -> Result<(Inbound, Outbound), Error> {
-    Ok((Inbound::new(limit, budget)?, Outbound::new(limit, budget)?))
-}
-
-/// The earlier of two deadlines.
-fn earliest(a: Option<Deadline>, b: Option<Deadline>) -> Option<Deadline> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(match a.instant().compare(b.instant()) {
-            Ok(core::cmp::Ordering::Greater) => b,
-            _ => a,
-        }),
-        (a, b) => a.or(b),
-    }
 }
 
 fn misuse(reason: &'static str) -> Error {

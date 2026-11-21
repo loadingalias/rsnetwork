@@ -23,6 +23,8 @@ Body bytes are views of the received regions, with no copy. The engines allocate
 construction, except for a head or a trailer section that continues in the next received region:
 you give the region of each head that you send, and the size line of each chunk comes from a pool
 of the engine. When the transport reports that the peer closed its side, call `Inbound::end`.
+When the transport fails, for example with a reset, call `Inbound::reset`: a body that did not end
+then ends `Outcome::Reset(None)`, never complete.
 
 ## Example
 
@@ -99,6 +101,10 @@ assert_eq!(sent, b"HTTP/1.1 201 \r\nContent-Type: text/plain\r\ncontent-length: 
 
 ## Serve requests
 
+For a server over TCP or TLS that tracks the delivery of each response and closes without losing
+one, use the [server](server.md). It runs this engine. Use the engine directly when you drive its
+queues yourself:
+
 1. Make one `Server` for each connection with `Server::new(limits, body, turn, &outbound, &budget)`.
    It makes its pool of chunk-size lines there, with one 16-byte slot for each `Outbound` entry.
    The budget pays for the pool: see [admission](limits.md#admission).
@@ -119,6 +125,8 @@ assert_eq!(sent, b"HTTP/1.1 201 \r\nContent-Type: text/plain\r\ncontent-length: 
 | `accept_body` | Sends `100 Continue` to a request that waits for it, and starts the read of its body |
 | `inform` | Sends an informational response with a status from 102 to 199, for example 103 |
 | `cancel` | Stops the response with no end of its body. A request body that did not end gets `End(Outcome::Cancelled)`. The connection then ends |
+| `shutdown` | Takes no new request. The connection ends after the exchange in flight, whose response gets `connection: close` when its head is not out yet. With no exchange in flight, it ends at once. A pipelined request stays unread |
+| `hold_body(hold)` | While `hold` is true, a drive gives no event of the request body, and its bytes wait in the queue. Hold the body while your code cannot take a part of it. A drain goes on |
 
 `send` and `finish` refuse with `Kind::Overload` when the `Outbound` queue or the pool is full,
 and change nothing. Acknowledge output, then call again. A call in the wrong state, for example
@@ -147,6 +155,7 @@ For a request with a deadline over TCP or TLS, and body reads that drive the con
 | `cancel_response` | Ends the response body with `End(Outcome::Cancelled)`, and gives no more of it. The engine reads and discards the rest, up to `drain_bytes`, to reuse the connection. Above it, the connection closes at once |
 | `ready` | Whether the engine takes a request now: no exchange is in flight, a drain is complete, and the connection has not ended |
 | `close` | Ends the connection: no more requests, and an exchange in flight ends with it. The next turn is terminal, so a TLS connection sends `close_notify` |
+| `hold_body(hold)` | While `hold` is true, a drive gives no event of the response body, and its bytes wait in the queue. A drain goes on |
 
 ## Limits
 

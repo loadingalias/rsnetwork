@@ -7,7 +7,7 @@ use rstypes::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use rstypes::capacity::Budget;
 use rstypes::time::{Deadline, Instant};
 
-use super::body::{BodyReader, BodyWriter, Read, full, misuse, write_error};
+use super::body::{BodyReader, BodyWriter, Read, cut, full, misuse, write_error};
 use super::head::{BodyLimits, Limits, ParseError, Version};
 use super::join::{Join, Step, join};
 use super::write::write_response;
@@ -76,6 +76,8 @@ pub struct Server {
     /// The application cancelled the response inside the request body: the next drive gives that
     /// body its `End(Outcome::Cancelled)`.
     cancelled: bool,
+    /// The application holds the request body: a drive gives none of it.
+    hold: bool,
     /// The end of the connection.
     end: Option<Result<(), Error>>,
 }
@@ -182,6 +184,7 @@ impl Server {
             request: Request::default(),
             close: false,
             cancelled: false,
+            hold: false,
             end: None,
         })
     }
@@ -321,6 +324,7 @@ impl Server {
                 ReadState::Done => return Ok(None),
                 // The body waits until the application accepts it.
                 ReadState::Body(_) if self.request.expect => return Ok(None),
+                ReadState::Body(reader) if self.hold && !reader.draining() => return Ok(None),
                 ReadState::Body(reader) => reader,
             };
             let draining = reader.draining();
@@ -353,7 +357,7 @@ impl Server {
                 Read::Truncated => {
                     self.end = Some(Err(Error::new(Kind::Partial, "the request body ended before its end")));
                     if !draining {
-                        return Ok(Some(ServerEvent::End(Outcome::Truncated)));
+                        return Ok(Some(ServerEvent::End(cut(inbound))));
                     }
                 }
                 Read::Capacity(units) => {
@@ -662,6 +666,26 @@ impl Server {
         self.writer.finish_with_trailers(outbound, trailers, region)?;
         self.after_write();
         Ok(())
+    }
+
+    /// Holds the request body when `hold` is true: a drive then gives no event of the body, and
+    /// its bytes wait in the queue. Hold the body while the application cannot take a part of it,
+    /// so that a drive for output gives no part that nothing can take. The drain of an unread
+    /// body goes on.
+    pub fn hold_body(&mut self, hold: bool) {
+        self.hold = hold;
+    }
+
+    /// Takes no new request: the connection ends after the exchange in flight, and its response
+    /// gets `connection: close` when its head is not out yet. With no exchange in flight, the
+    /// connection ends at once, also when a part of a request head arrived: the engine did not
+    /// accept that request, so the client can send it again (RFC 9112, section 9.6). The bytes of
+    /// a pipelined request stay unread.
+    pub fn shutdown(&mut self) {
+        self.close = true;
+        if self.waits_for_head() {
+            self.end = Some(Ok(()));
+        }
     }
 
     /// Cancels the current response. The connection closes after the bytes that `outbound`
