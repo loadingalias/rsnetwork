@@ -7,22 +7,24 @@ use core::num::NonZeroUsize;
 
 use rstypes::capacity::{Budget, Permit};
 
-use super::record::{CONTENT_MAX, HEADER, TAG};
+use super::record::{HEADER, TAG};
 use crate::drive::{Accepted, Error, reserve};
 
 /// The ciphertext bytes that one data record adds to its content: its header, its content type,
 /// and its tag. The record layer adds no padding.
 const OVERHEAD: u64 = (HEADER + 1 + TAG) as u64;
 
-/// One plaintext region that the record layer sealed: its records are the ciphertext from `start`
-/// to `end`, in the order of the output.
+/// A run of the records of one plaintext region in one output: its records are the ciphertext
+/// from `start` to `end`, in the order of the output.
 #[derive(Clone, Copy, Debug)]
 struct Mark {
     start: u64,
     end: u64,
-    /// The plaintext bytes of the region.
+    /// The plaintext bytes of the run.
     len: u64,
-    /// The region holds body bytes.
+    /// The plaintext bytes of each record of the run but the last.
+    record: u64,
+    /// The run holds body bytes.
     payload: bool,
 }
 
@@ -51,19 +53,24 @@ impl Sent {
         })
     }
 
-    /// Whether the record layer must wait for the transport before it seals another region.
-    pub(super) fn full(&self) -> bool {
-        self.marks.len() >= self.max
+    /// The marks that are free. With none, the record layer waits for the transport before it
+    /// seals another region.
+    pub(super) fn free(&self) -> usize {
+        self.max - self.marks.len()
     }
 
-    /// Marks a region of `len` plaintext bytes, whose records are the ciphertext from `start` to
-    /// `end`. The caller checked that the marks are not full.
-    pub(super) fn push(&mut self, start: u64, end: u64, len: usize, payload: bool) {
-        assert!(!self.full(), "the record layer seals a region only when a mark is free");
+    /// Marks a run of `len` plaintext bytes in records of `record` bytes, but the last, whose
+    /// ciphertext goes from `start` to `end`. The caller checked that a mark is free.
+    pub(super) fn push(&mut self, start: u64, end: u64, len: usize, record: usize, payload: bool) {
+        assert!(
+            self.free() > 0,
+            "the record layer seals a region only when a mark is free"
+        );
         self.marks.push_back(Mark {
             start,
             end,
             len: len as u64,
+            record: record as u64,
             payload,
         });
     }
@@ -89,12 +96,12 @@ impl Sent {
                 sent.add(mark.len, mark.payload);
                 continue;
             }
-            let records = mark.len.div_ceil(CONTENT_MAX as u64);
-            // Each record but the last holds `CONTENT_MAX` bytes. A KeyUpdate inside the region
-            // makes it longer, and then no part of it counts.
+            let records = mark.len.div_ceil(mark.record.max(1));
+            // Each record but the last holds `record` bytes. A KeyUpdate inside the run makes it
+            // longer, and then no part of it counts.
             if accepted > mark.start && mark.end - mark.start == mark.len + records * OVERHEAD {
-                let whole = (accepted - mark.start) / (CONTENT_MAX as u64 + OVERHEAD);
-                sent.add(whole * CONTENT_MAX as u64, mark.payload);
+                let whole = (accepted - mark.start) / (mark.record + OVERHEAD);
+                sent.add(whole * mark.record, mark.payload);
             }
             break;
         }

@@ -229,3 +229,60 @@ fn an_accepted_stream_ends_at_its_handshake_timeout() {
     assert_matches!(server.next(at(5_000)), Err(error) if error.kind() == Kind::Deadline);
     assert_matches!(server.release(), Some(Err(error)) if error.kind() == Kind::Deadline);
 }
+
+#[test]
+fn a_write_that_crosses_the_end_of_a_region_of_the_host_goes_on_in_order_and_counts_whole_records() {
+    let (mut client, mut server) = pair(false);
+    run(&mut client, &mut server);
+    // A region of 20,000 bytes takes one full record of 16,384 bytes and one record that fills
+    // its rest: 20,000 - 16,406 - 22 = 3,572 bytes. The rest of the write goes into the output of
+    // the engine.
+    let region = rsnetwork::buffer::Backing::from(Vec::with_capacity(20_000));
+    let address = region.as_ptr().addr();
+    client.output_region(region).unwrap();
+    let data: Vec<u8> = (0..40_000_u32).map(|index| (index % 251) as u8).collect();
+    client.write(&Lease::from(data.clone()), at(0)).unwrap();
+    let first = client.output().unwrap();
+    assert_eq!(first.region.bytes().as_ptr().addr(), address);
+    assert_eq!(first.region.initialized(), 20_000);
+    let received = Received {
+        region: Lease::from(first.region.bytes().to_vec()),
+        endpoint: ENDPOINT,
+        capacity: 1 << 20,
+    };
+    server.receive(received).unwrap();
+    client.ack(first.id, first.region.initialized()).unwrap();
+    assert_eq!(client.sent(), RECORD as u64 + 3_572);
+    let (mut bytes, outcome) = run(&mut client, &mut server);
+    assert!(outcome.is_none());
+    assert_eq!(client.sent(), 40_000);
+    read(&mut server, &mut bytes);
+    assert_eq!(bytes, data, "the bytes arrive in their order");
+}
+
+#[test]
+fn a_received_region_larger_than_the_input_region_opens_in_turns() {
+    let (mut client, mut server) = pair(false);
+    run(&mut client, &mut server);
+    let data: Vec<u8> = (0..40_000_u32).map(|index| (index % 251) as u8).collect();
+    client.write(&Lease::from(data.clone()), at(0)).unwrap();
+    // The transport gives the server all 40,000 bytes of records in one read-only region, more
+    // than its input region of 32 KiB.
+    let mut records = Vec::new();
+    while let Some(output) = client.output() {
+        records.extend_from_slice(output.region.bytes());
+        client.ack(output.id, output.region.initialized()).unwrap();
+    }
+    assert!(records.len() > LIMITS.tls.input_bytes);
+    let received = Received {
+        region: Lease::from(records),
+        endpoint: ENDPOINT,
+        capacity: 1 << 20,
+    };
+    server.receive(received).unwrap();
+    let mut bytes = Vec::new();
+    for _ in 0..8 {
+        read(&mut server, &mut bytes);
+    }
+    assert_eq!(bytes, data);
+}

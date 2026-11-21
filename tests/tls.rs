@@ -4,8 +4,9 @@
 //! record layer of the core: its suites, KeyUpdates, session tickets, and refused records. The
 //! certificates come from `tls/generate.sh`.
 
+use core::alloc::Layout;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
-use core::num::{NonZeroU64, NonZeroUsize};
+use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -21,7 +22,7 @@ use rustls::crypto::cipher::OutboundPlain;
 use rustls::crypto::{CryptoProvider, Identity as Chain};
 use rustls::{ConnectionTrafficSecrets, ExtractedSecrets, ServerSide, Tcp, Tls13CipherSuite, VecInput};
 
-use rsnetwork::buffer::{Backing, Buffer as _, Lease, WriteLoan};
+use rsnetwork::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, WriteLoan};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Endpoint, Error, Inbound, Kind, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Client, ClientEvent, Framing, Limits as HeadLimits, Server, ServerEvent};
@@ -239,19 +240,7 @@ impl Pair {
     /// round, until no byte moves.
     fn run(&mut self) {
         for _ in 0..1024 {
-            drive(&mut self.server, |server, event| {
-                if let ServerEvent::Request(_) = event {
-                    let (tls, _) = server.parts();
-                    let (server, outbound) = tls.parts();
-                    let head = Backing::from(Vec::with_capacity(256));
-                    let length = Framing::Length(BODY.len() as u64);
-                    server
-                        .respond(outbound, Status::new(200).unwrap(), &[], length, head)
-                        .unwrap();
-                    server.send(outbound, &Lease::from(BODY.to_vec())).unwrap();
-                    server.finish(outbound).unwrap();
-                }
-            });
+            drive(&mut self.server, answer);
             let (body, ended) = (&mut self.body, &mut self.ended);
             drive(&mut self.client, |_, event| match event {
                 ClientEvent::Data(data) => body.extend_from_slice(data.bytes()),
@@ -289,6 +278,21 @@ impl Pair {
             Wait::Ended(Err(error)) => Some(error),
             _ => None,
         }
+    }
+}
+
+/// Answers each request with `BODY`.
+fn answer(server: &mut Connection<Tls<Server>>, event: ServerEvent) {
+    if let ServerEvent::Request(_) = event {
+        let (tls, _) = server.parts();
+        let (server, outbound) = tls.parts();
+        let head = Backing::from(Vec::with_capacity(256));
+        let length = Framing::Length(BODY.len() as u64);
+        server
+            .respond(outbound, Status::new(200).unwrap(), &[], length, head)
+            .unwrap();
+        server.send(outbound, &Lease::from(BODY.to_vec())).unwrap();
+        server.finish(outbound).unwrap();
     }
 }
 
@@ -369,6 +373,80 @@ fn a_request_negotiates_x25519mlkem768_with_no_copy_but_encryption_and_leaves_no
     // The idle server holds no input region and no output: its budget is back where it was
     // before the request.
     assert_eq!(pair.server_budget.available(), server_idle);
+}
+
+#[test]
+fn a_response_sealed_into_a_pool_slot_of_the_host_is_at_its_address_with_no_copy_but_encryption() {
+    let (client, server) = (
+        client_config(CA, None, VALID, Resumption::Off),
+        server_config(None, Resumption::Off),
+    );
+    let mut pair = Pair::new(&client, "server.test", &server);
+    pair.run();
+    // A pool of the host on the budget of the server, with one slot of 4 KiB.
+    let mut pool = Pool::new(&pair.server_budget, NonZeroU32::MIN, Layout::array::<u8>(4096).unwrap()).unwrap();
+    let slot = pool.acquire().unwrap();
+    let address = slot.as_ptr().addr();
+    pair.server.output_region(slot).unwrap();
+    pair.request(&[]);
+    drive(&mut pair.client, |_, _| {});
+    take(&mut pair.client, &mut pair.to_server, 1);
+    while let Some(part) = pair.to_server.pop_front() {
+        give(&mut pair.server, &part, Receive::Lent);
+    }
+    drive(&mut pair.server, answer);
+    let output = pair.server.output().unwrap();
+    assert_eq!(
+        output.region.bytes().as_ptr().addr(),
+        address,
+        "the records are in the slot"
+    );
+    assert!(pair.server.output().is_none(), "the slot holds the whole response");
+    pair.to_client.push_back(output.region.bytes().to_vec());
+    pair.server.ack(output.id, output.region.initialized()).unwrap();
+    drop(output);
+    pair.run();
+    assert_eq!((pair.client_error(), pair.server_error()), (None, None));
+    assert_eq!(pair.body, BODY);
+    let (_, copies) = copies(&mut pair);
+    assert_eq!(Copies { encrypted: 0, ..copies }, Copies::default());
+    assert!(copies.encrypted > 0);
+
+    // With no region of the host, the engine seals into its own output.
+    pair.body.clear();
+    pair.request(&[]);
+    drive(&mut pair.client, |_, _| {});
+    take(&mut pair.client, &mut pair.to_server, 1);
+    while let Some(part) = pair.to_server.pop_front() {
+        give(&mut pair.server, &part, Receive::Lent);
+    }
+    drive(&mut pair.server, answer);
+    let output = pair.server.output().unwrap();
+    assert_ne!(output.region.bytes().as_ptr().addr(), address);
+}
+
+#[test]
+fn a_region_of_the_host_too_small_for_a_record_of_one_byte_refuses_and_comes_back() {
+    let (client, server) = (
+        client_config(CA, None, VALID, Resumption::Off),
+        server_config(None, Resumption::Off),
+    );
+    let mut pair = Pair::new(&client, "server.test", &server);
+    // A record of one byte of data takes its 5-byte header, the byte, its content type, and a
+    // 16-byte tag: 23 bytes.
+    let (error, region) = pair
+        .server
+        .output_region(Backing::from(Vec::with_capacity(22)))
+        .unwrap_err();
+    assert_eq!(error.kind(), Kind::Misuse);
+    assert_eq!(region.capacity(), 22);
+    pair.server
+        .output_region(Backing::from(Vec::with_capacity(23)))
+        .unwrap();
+    assert_eq!(
+        pair.server.take_output_region().map(|region| region.capacity()),
+        Some(23)
+    );
 }
 
 #[test]

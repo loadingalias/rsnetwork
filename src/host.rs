@@ -132,6 +132,25 @@ pub trait Engine: sealed::Sealed {
         assert!(pushed.is_ok(), "a queue with a free place takes each region");
         Ok(())
     }
+
+    /// Takes a writable region of the host, for example a pool slot or a registered buffer, for
+    /// the next records of the engine. The default refuses with [`Kind::Unsupported`]: only a TLS
+    /// engine seals records. Gives the region back with the refusal.
+    fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
+        Err((
+            Error::new(
+                Kind::Unsupported,
+                "the engine seals no records into a region of the host",
+            ),
+            region,
+        ))
+    }
+
+    /// Gives back the region of the host that [`output_region`](Self::output_region) took, when
+    /// no record went into it.
+    fn take_output_region(&mut self) -> Option<Backing> {
+        None
+    }
 }
 
 /// The engines of this crate are the only engines: a binding drives them, and does not replace
@@ -290,6 +309,23 @@ impl<E: Engine> Connection<E> {
     pub fn reset(&mut self) {
         self.inbound.reset();
         self.reset = true;
+    }
+
+    /// Gives the engine a writable region of the host, for example a pool slot or a registered
+    /// buffer, for its next records, as [`Engine::output_region`] says. A TLS engine seals its
+    /// next records into it, and gives it to the output queue at the end of the turn that sealed
+    /// into it. When the region cannot take the next record, the records after it go into the
+    /// own output of the engine. Refuses, and gives the region back, when the engine seals no
+    /// records, holds a region already, or the region has bytes or less room than a record of
+    /// one byte.
+    pub fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
+        self.engine.output_region(region)
+    }
+
+    /// Gives back the region of the host that the engine holds with no record in it, for example
+    /// when the connection is idle.
+    pub fn take_output_region(&mut self) -> Option<Backing> {
+        self.engine.take_output_region()
     }
 
     /// Drives the engine for one turn at `now`, and gives its event, if it has one. Then

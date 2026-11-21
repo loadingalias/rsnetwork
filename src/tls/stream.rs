@@ -254,6 +254,18 @@ impl Stream {
         self.connection.reset();
     }
 
+    /// Gives the stream a writable region of the host for its next records, as
+    /// [`Connection::output_region`] does.
+    pub fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
+        self.connection.output_region(region)
+    }
+
+    /// Gives back the region of the host that the stream holds with no record in it, as
+    /// [`Connection::take_output_region`] does.
+    pub fn take_output_region(&mut self) -> Option<Backing> {
+        self.connection.take_output_region()
+    }
+
     /// The next output to give to the transport. Acknowledge it with [`ack`](Self::ack).
     pub fn output(&mut self) -> Option<Output> {
         self.connection.output()

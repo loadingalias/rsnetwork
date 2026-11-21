@@ -34,6 +34,7 @@ to its alignment, a 16-byte entry for each slot, and the shared state of the poo
 | TLS input region | A pool of one slot of `input_bytes` | When a receive needs a region, until the last view of its plaintext and the writable rest of the region drop |
 | TLS sealed regions | One 32-byte mark for each entry of the plaintext output queue: the record layer seals no more regions before the transport accepts their records | `Tls::client` and `Tls::server` |
 | HTTP/1.1 server regions | A pool of two slots of `head_bytes`, for response heads and trailer sections | `server::Http1::plain` and `server::Http1::tls` |
+| Output region of the host | Nothing: your host charges the region, for example through its pool | `Connection::output_region` |
 | TLS ciphertext output | Its capacity, and the one allocation of the lease that owns it. Before a call of rustls, also twice the bytes that the call can write | When the connection writes, until the transport releases the last view |
 | Join of a TLS handshake message after the handshake that arrives in two or more records | Its bytes, at most `input_bytes` | When the message continues in a later record, until the message is complete |
 | TLS handshake | The state of rustls that the configuration fixes, and a bound of what rustls keeps of the messages of the peer: see [TLS handshakes](#tls-handshakes) | `Tls::client` and `Tls::server`, until the handshake completes |

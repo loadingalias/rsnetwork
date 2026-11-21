@@ -12,6 +12,7 @@ use rscrypto::aead::expert::AeadWithNonce as _;
 use rscrypto::{
     Aead, AeadGather, Aes128Gcm, Aes128GcmKey, Aes256Gcm, Aes256GcmKey, ChaCha20Poly1305, ChaCha20Poly1305Key,
 };
+use rstypes::buffer::{Backing, WriteLoan};
 use rustls::ConnectionTrafficSecrets;
 use rustls::error::AlertDescription;
 
@@ -230,6 +231,82 @@ impl Protection {
         self.seq = self.seq.checked_add(1).ok_or(SealRefused)?;
         Ok(())
     }
+
+    /// Seals one record of type `content` into the spare capacity of `out`, a region of the host,
+    /// as [`seal`](Self::seal) does into a `Vec`. Refuses when the spare capacity is too small for
+    /// the record. The caller checked that room, and a cipher refuses only a length above the
+    /// limits of a record, so a refusal leaves at most a part of the record in `out`, and the
+    /// connection ends.
+    pub(super) fn seal_into(
+        &mut self,
+        content: Content,
+        plaintext: &[&[u8]],
+        out: &mut WriteLoan<Backing>,
+    ) -> Result<(), SealRefused> {
+        let len: usize = plaintext.iter().map(|part| part.len()).sum();
+        assert!(
+            len <= CONTENT_MAX,
+            "a sealed record holds at most one record of content"
+        );
+        let inner = len + 1;
+        let [high, low] = u16::try_from(inner + TAG).map_err(|_| SealRefused)?.to_be_bytes();
+        let header = [OUTER[0], OUTER[1], OUTER[2], high, low];
+        if out.capacity() - out.filled().len() < HEADER + inner + TAG {
+            return Err(SealRefused);
+        }
+        let kind = [content as u8];
+        let parts = plaintext.iter().copied().chain(iter::once(&kind[..]));
+        let nonce = self.nonce();
+        put(out, &header)?;
+        let tag = match &self.cipher {
+            Cipher::Aes128(cipher) => seal_spare(cipher, &nonce, &header, parts, inner, out),
+            Cipher::Aes256(cipher) => seal_spare(cipher, &nonce, &header, parts, inner, out),
+            Cipher::ChaCha(cipher) => seal_spare(cipher, &nonce, &header, parts, inner, out),
+        }?;
+        put(out, &tag)?;
+        self.seq = self.seq.checked_add(1).ok_or(SealRefused)?;
+        Ok(())
+    }
+}
+
+/// Writes `bytes` at the start of the spare capacity of `out`.
+fn put(out: &mut WriteLoan<Backing>, bytes: &[u8]) -> Result<(), SealRefused> {
+    let written = out.fill_with(|spare| match spare.get_mut(..bytes.len()) {
+        Some(spare) => spare.write_copy_of_slice(bytes),
+        None => &mut [],
+    });
+    if written == bytes.len() {
+        Ok(())
+    } else {
+        Err(SealRefused)
+    }
+}
+
+/// Encrypts the parts of `plaintext`, `len` bytes, into the start of the spare capacity of `out`,
+/// and gives the tag.
+fn seal_spare<'a, A: AeadGather<Nonce = Nonce96>>(
+    cipher: &A,
+    nonce: &Nonce96,
+    aad: &[u8],
+    plaintext: impl IntoIterator<Item = &'a [u8]>,
+    len: usize,
+    out: &mut WriteLoan<Backing>,
+) -> Result<[u8; TAG], SealRefused> {
+    let mut tag = None;
+    let written = out.fill_with(|spare| {
+        let Some(spare) = spare.get_mut(..len) else {
+            return &mut [];
+        };
+        match cipher.encrypt_gather_uninit(nonce, aad, plaintext, spare) {
+            Ok((sealed, ciphertext)) => {
+                tag = Some(sealed);
+                ciphertext
+            }
+            Err(_) => &mut [],
+        }
+    });
+    let tag = tag.filter(|_| written == len).ok_or(SealRefused)?;
+    tag.as_ref().try_into().map_err(|_| SealRefused)
 }
 
 /// The cipher refused to seal a record.

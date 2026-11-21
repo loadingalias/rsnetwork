@@ -744,19 +744,19 @@ impl Records {
         })
     }
 
-    /// Seals one record of type `content` after the bytes of `written`. First, it sends a
-    /// KeyUpdate when the peer asked for one, or when the key reached its limit.
-    fn seal(&mut self, content: Content, plaintext: &[&[u8]], written: &mut Bytes) -> Result<(), Error> {
+    /// Seals one record of type `content` into `out`. First, it sends a KeyUpdate when the peer
+    /// asked for one, or when the key reached its limit.
+    fn seal(&mut self, content: Content, plaintext: &[&[u8]], out: &mut Out<'_>) -> Result<(), Error> {
         if self.update || self.tx.seq().saturating_add(1) >= self.tx_limit {
-            self.update_tx(written)?;
+            self.update_tx(out)?;
         }
-        seal(&mut self.tx, content, plaintext, written)
+        seal(&mut self.tx, content, plaintext, out)
     }
 
     /// Sends a KeyUpdate under the old key, and then seals with the new key. The KeyUpdate does
     /// not ask the peer for one: only the key of this end changes.
-    fn update_tx(&mut self, written: &mut Bytes) -> Result<(), Error> {
-        seal(&mut self.tx, Content::Handshake, &[&KEY_UPDATE_NOT_REQUESTED], written)?;
+    fn update_tx(&mut self, out: &mut Out<'_>) -> Result<(), Error> {
+        seal(&mut self.tx, Content::Handshake, &[&KEY_UPDATE_NOT_REQUESTED], out)?;
         self.tx = self.kernel.update_tx()?;
         self.update = false;
         Ok(())
@@ -860,13 +860,64 @@ impl Records {
     }
 }
 
-/// Seals one record with `tx` after the bytes of `written`, which it charges first.
-fn seal(tx: &mut Protection, content: Content, plaintext: &[&[u8]], written: &mut Bytes) -> Result<(), Error> {
+/// Seals one record with `tx` into `out`: into the region of the host when it takes the record,
+/// and else after the own bytes, which it charges first.
+fn seal(tx: &mut Protection, content: Content, plaintext: &[&[u8]], out: &mut Out<'_>) -> Result<(), Error> {
+    const REFUSED: Error = Error::new(Kind::Unsupported, "the cipher refused to seal a TLS record");
     let len: usize = plaintext.iter().map(|part| part.len()).sum();
-    written.reserve(HEADER + len + 1 + TAG, OUTPUT_REFUSED)?;
-    tx.seal(content, plaintext, &mut written.bytes)
-        .map_err(|_| Error::new(Kind::Unsupported, "the cipher refused to seal a TLS record"))?;
-    written.settle(OUTPUT_REFUSED)
+    let size = HEADER + len + 1 + TAG;
+    if let Some(room) = out.host_room()
+        && let Some(host) = out.host.as_mut()
+    {
+        if room >= size {
+            return tx.seal_into(content, plaintext, &mut host.loan).map_err(|_| REFUSED);
+        }
+        // The record does not fit: the region ends, and the next records go after the own bytes.
+        host.full = true;
+    }
+    out.own.reserve(size, OUTPUT_REFUSED)?;
+    tx.seal(content, plaintext, &mut out.own.bytes).map_err(|_| REFUSED)?;
+    out.own.settle(OUTPUT_REFUSED)
+}
+
+/// The output of one seal: the region of the host, when the engine holds one and its own bytes
+/// are empty, and else its own bytes. The records of the region go out before the own bytes.
+struct Out<'a> {
+    own: &'a mut Bytes,
+    host: &'a mut Option<Host>,
+}
+
+impl Out<'_> {
+    /// The spare capacity of the region of the host, when the next record goes there.
+    fn host_room(&self) -> Option<usize> {
+        self.host
+            .as_ref()
+            .filter(|host| !host.full && self.own.bytes.is_empty())
+            .map(Host::room)
+    }
+}
+
+/// A region of the host, which the engine seals its next records into.
+struct Host {
+    loan: WriteLoan<Backing>,
+    /// The region takes no more records: the next one did not fit.
+    full: bool,
+}
+
+impl Host {
+    /// The spare capacity of the region.
+    fn room(&self) -> usize {
+        self.loan.capacity() - self.loan.filled().len()
+    }
+}
+
+/// The smallest region of the host: a record of one byte of data.
+const HOST_MIN: usize = HEADER + 1 + 1 + TAG;
+
+/// The outputs that wait for a place in the output queue: the region of the host with records,
+/// and the own bytes.
+fn waiting(host: &Option<Host>, own: &Bytes) -> usize {
+    usize::from(host.as_ref().is_some_and(|host| !host.loan.filled().is_empty())) + usize::from(!own.bytes.is_empty())
 }
 
 /// The end of the handshake message that starts `bytes`: its header and its body. A partial
@@ -1275,6 +1326,8 @@ pub struct Tls<E> {
     endpoint: Option<Endpoint>,
     capacity: u64,
     written: Bytes,
+    /// The region of the host for the next records.
+    host: Option<Host>,
     /// The plaintext regions that the record layer sealed, until the transport accepts them.
     sent: Sent,
     copies: Copies,
@@ -1397,6 +1450,7 @@ impl<E: Engine> Tls<E> {
             endpoint: None,
             capacity: 0,
             written,
+            host: None,
             sent,
             copies: Copies::default(),
             notified: false,
@@ -1506,7 +1560,11 @@ impl<E: Engine> Tls<E> {
         }) = inner
         {
             if let Phase::Records(records) = &mut self.phase {
-                records.seal(Content::Alert, &[&[WARNING, 0]], &mut self.written)?;
+                let mut out = Out {
+                    own: &mut self.written,
+                    host: &mut self.host,
+                };
+                records.seal(Content::Alert, &[&[WARNING, 0]], &mut out)?;
             }
             self.end = Some(end);
         }
@@ -1518,7 +1576,7 @@ impl<E: Engine> Tls<E> {
             Progress::Blocked(Blocked::Capacity(units))
         } else if work.reached(&self.limits.turn) || (stopped && self.inbound.free() > 0) {
             Progress::Pending
-        } else if !self.written.bytes.is_empty() {
+        } else if waiting(&self.host, &self.written) > 0 {
             Progress::Blocked(Blocked::Output)
         } else {
             match inner.map(|turn| turn.progress) {
@@ -1534,7 +1592,7 @@ impl<E: Engine> Tls<E> {
 
     /// The progress of an engine that ended: it waits until its last bytes are in the queue.
     fn ending(&self, end: Result<(), Error>) -> Progress {
-        if self.written.bytes.is_empty() {
+        if waiting(&self.host, &self.written) == 0 {
             Progress::Terminal(end)
         } else {
             Progress::Blocked(Blocked::Output)
@@ -1547,7 +1605,11 @@ impl<E: Engine> Tls<E> {
     fn fail(&mut self, fault: Fault) -> Error {
         if let (Some(alert), Phase::Records(records)) = (fault.alert, &mut self.phase) {
             // The connection ends with the error also when its alert cannot go.
-            let _unsent = records.seal(Content::Alert, &[&[FATAL, alert.0]], &mut self.written);
+            let mut out = Out {
+                own: &mut self.written,
+                host: &mut self.host,
+            };
+            let _unsent = records.seal(Content::Alert, &[&[FATAL, alert.0]], &mut out);
         }
         fault.error
     }
@@ -1560,6 +1622,9 @@ impl<E: Engine> Tls<E> {
             }
             let region = match &mut self.region {
                 Some(region) if region.room() > 0 => region,
+                // The complete records of a full region open first, and then only the rest of a
+                // partial record moves.
+                Some(region) if region.pending().len() >= record_end(region.pending()) => break,
                 Some(_) => {
                     self.relocate()?;
                     let Some(region) = &mut self.region else { break };
@@ -1802,25 +1867,58 @@ impl<E: Engine> Tls<E> {
         let Phase::Records(records) = &mut self.phase else {
             return Ok(());
         };
+        let mut out = Out {
+            own: &mut self.written,
+            host: &mut self.host,
+        };
         // A KeyUpdate that the peer asked for goes out also when no plaintext waits.
         if records.update {
-            records.update_tx(&mut self.written)?;
+            records.update_tx(&mut out)?;
         }
+        // The offset of the ciphertext after the output that the queue took.
+        let offset = |out: &Out<'_>| {
+            let host = out.host.as_ref().map_or(0, |host| host.loan.filled().len());
+            outbound.pushed().strict_add((host + out.own.bytes.len()) as u64)
+        };
         self.sent.settle(outbound.accepted().bytes);
-        while !work.reached(&self.limits.turn) && !self.sent.full() {
-            if outbound.free() == 0 && !self.written.bytes.is_empty() {
+        // A region of the host can end inside a plaintext region, which then has two marks.
+        while !work.reached(&self.limits.turn) && self.sent.free() >= 2 {
+            if outbound.free() < waiting(out.host, out.own) {
                 break;
             }
             let payload = self.outbound.front_is_payload();
             let Some(output) = self.outbound.submit() else { break };
             let plaintext = output.region.bytes();
-            // The offset of the ciphertext after the output that the queue took.
-            let start = outbound.pushed().strict_add(self.written.bytes.len() as u64);
-            for chunk in plaintext.chunks(CONTENT_MAX) {
-                records.seal(Content::Data, &[chunk], &mut self.written)?;
+            let mut rest = plaintext;
+            let (mut start, mut len, mut record) = (offset(&out), 0, 0);
+            let mut into_host = out.host_room().is_some();
+            while !rest.is_empty() {
+                let chunk = match out.host_room() {
+                    Some(room) if room >= HOST_MIN => rest.len().min(CONTENT_MAX).min(room - HEADER - 1 - TAG),
+                    // A region that cannot take one more byte of data ends.
+                    Some(_) => {
+                        if let Some(host) = out.host.as_mut() {
+                            host.full = true;
+                        }
+                        rest.len().min(CONTENT_MAX)
+                    }
+                    None => rest.len().min(CONTENT_MAX),
+                };
+                // The records of a mark are in one output, each of `record` bytes but the last.
+                if into_host != out.host_room().is_some() && len > 0 {
+                    self.sent.push(start, offset(&out), len, record, payload);
+                    (start, len) = (offset(&out), 0);
+                }
+                into_host = out.host_room().is_some();
+                if len == 0 {
+                    record = chunk;
+                }
+                let (part, after) = rest.split_at(chunk);
+                records.seal(Content::Data, &[part], &mut out)?;
+                len += chunk;
+                rest = after;
             }
-            let end = outbound.pushed().strict_add(self.written.bytes.len() as u64);
-            self.sent.push(start, end, plaintext.len(), payload);
+            self.sent.push(start, offset(&out), len, record, payload);
             self.outbound.ack(output.id, plaintext.len())?;
             self.copies.encrypted += plaintext.len() as u64;
             work.add(plaintext.len(), plaintext.len().div_ceil(CONTENT_MAX));
@@ -1828,8 +1926,15 @@ impl<E: Engine> Tls<E> {
         Ok(())
     }
 
-    /// Gives the written ciphertext to the output queue, when it has a place.
+    /// Gives the written ciphertext to the output queue, when it has a place: the region of the
+    /// host first, and then the own bytes.
     fn flush(&mut self, outbound: &mut Outbound) {
+        if outbound.free() > 0
+            && let Some(host) = self.host.take_if(|host| !host.loan.filled().is_empty())
+        {
+            let pushed = outbound.push(Lease::from(host.loan.into_inner()));
+            assert!(pushed.is_ok(), "a queue with a free place takes each region");
+        }
         if self.written.bytes.is_empty() || outbound.free() == 0 {
             return;
         }
@@ -1947,6 +2052,36 @@ impl<E: Engine> Engine for Tls<E> {
             seen: region.seen,
         });
         Ok(Some(region.backing))
+    }
+
+    fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
+        let refusal = if self.host.is_some() {
+            Some("the TLS engine holds an output region of the host")
+        } else if region.initialized() > 0 {
+            Some("the TLS output region of the host holds bytes")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            return Err((Error::new(Kind::Misuse, reason), region));
+        }
+        let loan = WriteLoan::new(region);
+        if loan.capacity() < HOST_MIN {
+            return Err((
+                Error::new(
+                    Kind::Misuse,
+                    "the TLS output region is smaller than a record of one byte",
+                ),
+                loan.into_inner(),
+            ));
+        }
+        self.host = Some(Host { loan, full: false });
+        Ok(())
+    }
+
+    fn take_output_region(&mut self) -> Option<Backing> {
+        let host = self.host.take_if(|host| host.loan.filled().is_empty())?;
+        Some(host.loan.into_inner())
     }
 
     fn received(&mut self, _: &mut Inbound, region: Backing, endpoint: Endpoint, capacity: u64) -> Result<(), Backing> {

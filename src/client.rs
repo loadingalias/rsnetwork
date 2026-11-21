@@ -375,6 +375,18 @@ impl Http1 {
         self.link.reset();
     }
 
+    /// Gives the connection a writable region of the host for its next TLS records, as
+    /// [`Connection::output_region`] does.
+    pub fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
+        self.link.output_region(region)
+    }
+
+    /// Gives back the region of the host that the connection holds with no record in it, as
+    /// [`Connection::take_output_region`] does.
+    pub fn take_output_region(&mut self) -> Option<Backing> {
+        self.link.take_output_region()
+    }
+
     /// The next output to give to the transport. Acknowledge it with [`ack`](Self::ack).
     pub fn output(&mut self) -> Option<Output> {
         self.link.output()

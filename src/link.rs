@@ -106,6 +106,14 @@ impl<E: Engine> Link<E> {
         each!(self, connection => connection.reset());
     }
 
+    pub(crate) fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
+        each!(self, connection => connection.output_region(region))
+    }
+
+    pub(crate) fn take_output_region(&mut self) -> Option<Backing> {
+        each!(self, connection => connection.take_output_region())
+    }
+
     pub(crate) fn output(&mut self) -> Option<Output> {
         each!(self, connection => connection.output())
     }

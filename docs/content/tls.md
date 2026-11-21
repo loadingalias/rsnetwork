@@ -191,12 +191,34 @@ host uses decides the copies of received bytes:
 | --- | --- | --- |
 | The tail of the input region | `Connection::region()`, then `Connection::received(region, ..)` with the same region | None. A record that continues after a receive joins its first bytes in place |
 | A region of the host, for example one that the kernel selected | `Connection::received(region, ..)` with that region | When a record continues into it from the region before: the rest of that record, less than one record (`partial`) |
-| A read-only region | `Connection::receive(Received)` | Each byte, into a writable region (`received`) |
+| A read-only region | `Connection::receive(Received)` | Each byte, into a writable region (`received`). A region larger than `input_bytes` copies in parts: the records of each part open before the next part |
 
 The plaintext of each record reaches the engine in the drive that decrypts it, with no copy. The
 connection freezes the region up to the end of the record, and the rest of the region stays
 writable for the next receive. A record that does not fit in the rest of its region moves to a new
 region (`partial`).
+
+## Output regions of the host
+
+By default, the connection seals its records into its own output, charged to its budget. To send
+from memory that your host selects, for example a slot of a pool or a registered buffer of
+io_uring, give the connection a writable region before you drive it:
+
+1. Call `Connection::output_region(region)` with an empty `Backing`. The connection seals its next
+   records into it, so a sent byte costs only its encryption also there.
+2. Drive the connection. At the end of the turn that sealed into the region, the region comes back
+   as an `Output`, at its address, and its view returns to your pool when the transport releases
+   it.
+3. Call `Connection::take_output_region()` to get back a region with no record in it, for example
+   when the connection is idle.
+
+The connection holds one region at a time. When the next record does not fit in the rest of the
+region, the region ends, and the records after it go into the own output of the connection, in
+their order. A record of data can end early to fill the region. `output_region` refuses with
+`Kind::Misuse`, and gives the region back, when the connection holds a region already, when the
+region holds bytes, or when it is smaller than a record of one byte: 23 bytes. A connection with no
+TLS refuses with `Kind::Unsupported`. `client::Http1`, `server::Http1`, and `tls::Stream` have the
+same two calls.
 
 `handshake` counts the bytes of a handshake message after the handshake, for example a session
 ticket, that arrives in two or more records. These parts join in a buffer of their own. `encrypted`

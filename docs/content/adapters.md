@@ -40,6 +40,7 @@ outside the closure of the `tls` feature.
 | Received bytes | `Connection::receive(Received)`, `Connection::end_input()`, `Connection::reset()` | Any region: a buffer of the binding, a pool slot through `Lease::from_owner`, or a buffer that the kernel selected. The engine reads it in place, with no copy |
 | Received bytes into a region of the engine | `Connection::region()`, then `Connection::received(region, endpoint, capacity)` | `region()` lends the input region of the engine, or gives `None` when the engine has none. Receive into its capacity after its initialized bytes, and give it back. `received` also takes a writable region of the host. A TLS engine decrypts in place only in a writable region: see [receive forms](tls.md#receive-forms-and-their-copies) |
 | Output | `Connection::output()`, `Connection::ack(id, accepted)` | One output at a time. Give its region to the transport, and acknowledge the exact bytes that the transport accepted |
+| Output into a region of the host | `Connection::output_region(region)`, `Connection::take_output_region()` | A TLS connection seals its next records into a writable region that the host selects, for example a registered buffer, and gives it back as an output. A region with no record comes back with `take_output_region`. See [output regions of the host](tls.md#output-regions-of-the-host) |
 | Time | The `ClockDomain` of `Connection::new`, and an `Instant` at each drive | A monotonic clock. A host with no clock gives `None` |
 | Transport failure | `Connection::reset()` | A reset or a failed write: no byte comes or goes after it. A body that did not end ends `Outcome::Reset(None)`, and `release()` does not wait for the output |
 | Wait and wake | `Connection::wait()` | `Now`, `Until { blocked, deadline }`, `Linger { deadline }`, or `Ended(result)`, from the last turn |
@@ -90,7 +91,8 @@ A completion host, for example io_uring, owns each buffer until its operation co
   `Backing`, to `received`. A TLS engine decrypts it in place. Give a read-only buffer, as a
   `Lease`, to `receive`.
 - Submit a send of the region of an output. The transport keeps its own view of the region. At the
-  completion, acknowledge the count that the send gives.
+  completion, acknowledge the count that the send gives. To send from registered buffers, give a
+  TLS connection one with `output_region` before the drive: its records are then in that buffer.
 
 ## Clients and servers
 
