@@ -4,14 +4,16 @@ The `rsnetwork::host` module is the caller-driven host: one connection that your
 drives from its own event loop, with no runtime. Your loop owns the socket, or any other byte
 source, and the clock. The connection spawns no task, starts no thread, and does not need `Send`.
 
-rsnetwork is in development and has no release. To connect the engines to a runtime instead, see
+rsnetwork is in development and has no release. To move the bytes of a std TCP socket, use
+[`host::Tcp`](#bind-a-tcp-socket). To connect the engines to a runtime instead, see
 [Write a binding](adapters.md). To run the same connection over TLS 1.3, see
 [Run a connection over TLS 1.3](tls.md).
 
 ## The loop
 
-A `Connection` holds one engine, `h1::Server` or `h1::Client`, and its two queues. In each turn of
-your loop:
+A `Connection` holds one engine, `h1::Server` or `h1::Client`, and its two queues. The calls that
+move its bytes, for example `receive`, `output`, `ack`, `wait`, and `release`, are the calls of the
+trait `host::Io`: import it with `use rsnetwork::host::Io as _;`. In each turn of your loop:
 
 1. Read the bytes that the socket received, and give each region to `connection.receive`. When the
    socket reports that the peer closed its side, call `connection.end_input()`. When the socket
@@ -87,7 +89,7 @@ use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
-use rsnetwork::host::{Connection, Wait};
+use rsnetwork::host::{Connection, Io as _, Wait};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::value::Status;
 
@@ -142,15 +144,197 @@ assert_eq!(sent, b"HTTP/1.1 200 \r\nconnection: close\r\ncontent-length: 5\r\n\r
 assert_eq!(connection.release(), Some(Ok(())));
 ```
 
-## A nonblocking socket
+## Bind a TCP socket
 
-For a `std::net::TcpStream` in nonblocking mode, one turn of the loop is:
+With the `tcp` feature, `host::Tcp` moves the bytes between one nonblocking `std::net::TcpStream`
+and one connection: a `Connection`, a `client::Http1`, a `server::Http1`, or a `tls::Stream`. Your
+loop keeps the poller and the clock. The socket spawns no task and starts no thread.
 
-1. Read into a new region. `Ok(0)` is the end of input. `Ok(n)` gives a region of `n` bytes for
-   `receive`. `WouldBlock` means that no byte waits.
-2. Drive, as above.
-3. For each output, write its bytes. `Ok(n)` is an acknowledgement of `n` bytes. `WouldBlock` is
-   an acknowledgement of `0`, and the next output waits until the socket can take more.
+Prerequisites:
 
-The test `tests/host.rs` of rsnetwork runs a client and a server connection this way over loopback
-sockets.
+- The `tcp` feature. It is off by default, and it adds no dependency. Until `Read::read_buf` and
+  `TcpStream::set_linger` are stable in std, it needs the nightly toolchain that rsnetwork pins.
+- A connected `TcpStream`, for example from `TcpStream::connect` or `TcpListener::accept`.
+- A `Pool` of receive regions, charged to the budget of the connection: see [receive regions](#receive-regions).
+
+To run a connection over the socket:
+
+1. Make the socket with `Tcp::new(stream, pool)`. It sets the stream to nonblocking mode and sets
+   `TCP_NODELAY`, because each output region is its own write. It refuses with the `io::Error` of
+   the stream.
+2. In each turn, call the connection, for example `client.response(now)` or `server.request(now)`.
+   Only these calls drive it.
+3. Call `tcp.pump(&mut connection)`, and do what its `Next` says.
+4. At `Next::Released`, read the end of the connection with `connection.release()`. Then call
+   `tcp.close(&connection)`.
+
+| `Next` | Next action |
+| --- | --- |
+| `Now` | Call the connection again, and pump again: bytes moved, or the connection has more work |
+| `Wait { read, write, deadline }` | Wait in your poller until the socket can read (`read`) or write (`write`), or until `deadline`. With neither, no event of the socket can help: the connection waits for capacity, for example for your code to drop the views of received bytes. Call it again after that |
+| `Released` | The connection can drop: close the socket |
+
+Register `tcp.socket()` with your poller. Do not read or write it yourself.
+
+### What a pump does
+
+A pump reads one time when the connection waits for input or lingers, and then writes each output
+until the socket takes only part of one. It gives each result of the socket to the connection:
+
+| The socket gives | The pump |
+| --- | --- |
+| Bytes | Gives them to the connection, with no copy |
+| The end of the stream | Calls `end_input`: a body with a length that did not end ends `Outcome::Truncated` |
+| An error, for example a reset or a refused write | Calls `reset`: a body that did not end ends `Outcome::Reset(None)` |
+| `WouldBlock` on a read | Gives `Wait` with `read` |
+| Part of an output, or `WouldBlock` on a write | Acknowledges the exact bytes, and gives `Wait` with `write` |
+| `Interrupted` | Gives `Now` |
+
+At `Wait::Linger` of a [server](server.md#linger), after the last output, the pump shuts down the
+write side of the socket one time. At the release of the connection, it does the same, so the
+peer reads each byte and then the end of the stream.
+
+`pump` refuses with `Kind::Overload` when the connection cannot pay for its input region. It
+writes the output first. Release capacity, and pump again.
+
+### Receive regions
+
+A connection over TCP lends no input region, so the pump reads into a slot of the pool. The reads
+fill each slot one after the other, so a short read keeps no slot for itself. A slot comes back
+when the last view of its bytes drops. When each slot is in use, the pump gives `Wait` with
+neither `read` nor `write`.
+
+A TLS connection lends its own input region, and the pump reads into it: see
+[TLS over the socket](#tls-over-the-socket). Its pool serves only the linger of a server, which
+discards the bytes, so one slot of a few KiB is enough.
+
+### Close
+
+`tcp.close(&connection)` closes the socket and gives the output that the socket did not accept,
+as an `Outstanding`:
+
+- After `Next::Released`, with no output left, the peer read each byte and then the end of the
+  stream. `close` gives an empty `Outstanding`.
+- Before the release, or with output left, for example at a shutdown of your process, `close`
+  resets the connection. Thus the peer cannot read the close as the end of the data, for example
+  of a body that the close delimits. The `Outstanding` tells what did not go.
+
+### Example
+
+A client and a server exchange one request over loopback sockets. The code runs in a function that
+returns `Result<(), Box<dyn std::error::Error>>`. The documentation of `rsnetwork::host::Tcp` runs
+the same example as a test. This loop does not wait: a real loop waits in its poller as each
+`Next::Wait` says.
+
+```rust
+use core::alloc::Layout;
+use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use core::time::Duration;
+use std::net::{TcpListener, TcpStream};
+
+use rsnetwork::body::Part;
+use rsnetwork::buffer::{Buffer as _, Lease, Pool};
+use rsnetwork::capacity::Budget;
+use rsnetwork::client::{self, Request};
+use rsnetwork::drive::TurnLimits;
+use rsnetwork::h1::{self, BodyLimits, Framing};
+use rsnetwork::host::{Io as _, Next, Tcp};
+use rsnetwork::server::{self, Linger, Response};
+use rsnetwork::time::{ClockDomain, Deadline, Instant, Suspend};
+use rsnetwork::value::{Authority, Method, Status, Target};
+
+let head = h1::Limits { head_bytes: 8 * 1024, fields: 64, name_bytes: 64, value_bytes: 4 * 1024 };
+let body = BodyLimits {
+    body_bytes: 1 << 20,
+    drain_bytes: 64 * 1024,
+    extension_bytes: 256,
+    trailer_bytes: 4 * 1024,
+    trailer_fields: 16,
+};
+let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
+let queue = NonZeroUsize::new(16).expect("not zero");
+let linger = Linger { time: Duration::from_secs(5), bytes: 64 * 1024 };
+let budget = Budget::new(NonZeroU64::new(1 << 22).expect("not zero"));
+
+// The monotonic clock of the host.
+let clock = ClockDomain::new(1, Suspend::Pauses);
+let start = std::time::Instant::now();
+let now = || Instant::new(clock, u64::try_from(start.elapsed().as_nanos()).expect("in range"));
+
+// Each socket has 4 receive regions of 16 KiB, charged to the budget.
+let slot = Layout::array::<u8>(16 * 1024)?;
+let pool = || Pool::new(&budget, NonZeroU32::new(4).expect("not zero"), slot);
+let listener = TcpListener::bind("127.0.0.1:0")?;
+let mut near = Tcp::new(TcpStream::connect(listener.local_addr()?)?, pool()?)?;
+let mut far = Tcp::new(listener.accept()?.0, pool()?)?;
+
+let mut client = client::Http1::plain(client::Limits { head, body, turn, queue }, clock, &budget)?;
+let limits = server::Limits { head, body, turn, queue, head_timeout: Some(Duration::from_secs(30)), linger };
+let mut server = server::Http1::plain(limits, clock, &budget)?;
+
+let request = Request {
+    method: Method::GET,
+    target: Target::new(b"/hello")?,
+    authority: Authority::new(b"127.0.0.1")?,
+    fields: &[],
+    body: Framing::Length(0),
+};
+let deadline = Deadline::at(Instant::new(clock, 30_000_000_000));
+client.send(&request, deadline, now())?;
+let (mut answered, mut response, mut received, mut closed) = (false, None, Vec::new(), false);
+loop {
+    // Call each connection: only its calls drive it.
+    if server.request(now())?.is_some() {
+        let hello = Response { status: Status::new(200)?, fields: &[], body: Framing::Length(5) };
+        answered = server.respond(&hello, now())?;
+        server.write(&Lease::from(b"hello".to_vec()), now())?;
+        server.finish(now())?;
+    }
+    if response.is_none() {
+        response = client.response(now())?;
+    }
+    while response.is_some() && !closed && let Some(part) = client.next(now())? {
+        match part {
+            Part::Data(data) => received.extend_from_slice(data.bytes()),
+            Part::End(_) => {
+                client.close(now())?;
+                closed = true;
+            }
+        }
+    }
+    // Then pump each socket.
+    if (near.pump(&mut client)?, far.pump(&mut server)?) == (Next::Released, Next::Released) {
+        break;
+    }
+}
+assert!(answered);
+assert_eq!(received, b"hello");
+assert_eq!(client.release(), Some(Ok(())));
+assert_eq!(server.release().map(|closed| closed.result), Some(Ok(())));
+assert!(near.close(&client).is_empty() && far.close(&server).is_empty());
+```
+
+## TLS over the socket
+
+A TLS connection runs over `host::Tcp` with the same loop. Make it with `client::Http1::tls`,
+`server::Http1::tls`, `tls::Stream::connect`, or `tls::Stream::accept`, and give its socket a pool
+of one small slot. In the example, the client over TLS is:
+
+```rust
+// `config` is a `tls::ClientConfig`, and `tls` is the `tls::Limits` of the connection.
+let slot = Layout::array::<u8>(4096)?;
+let mut near = Tcp::new(TcpStream::connect(address)?, Pool::new(&budget, NonZeroU32::MIN, slot)?)?;
+let limits = client::Limits { head, body, turn, queue };
+let mut client = client::Http1::tls(&config, "example.com", (limits, tls), clock, &budget)?;
+```
+
+- The pump reads into the tail of the input region that the connection lends, and TLS decrypts
+  each record there. No received byte is copied: `Copies::received` stays 0.
+- The connection runs the handshake, sends `close_notify`, and tells a `close_notify` of the peer
+  from an end of the stream with no `close_notify`. The pump moves only ciphertext.
+- A write of the application that meets a full plaintext queue drives the connection one time,
+  because only a drive seals plaintext into records. When the queue is still full, the write
+  refuses with `Kind::Overload`: pump, and write again.
+
+[Run a connection over TLS 1.3](tls.md) gives the configuration of each end, and
+[Send a byte stream over TLS](tls-stream.md) gives the stream.

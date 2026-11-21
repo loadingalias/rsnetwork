@@ -69,12 +69,14 @@ The calls of the exchange are the handler interface. Each call takes the time `n
 has nothing to give yet, it gives `false`, `None`, `Read::Wait`, or `Collect::More`. Then wait as
 `server.wait()` says, move the bytes, and call again. This function answers each request with the
 bytes of its body, until the connection ends. `host` is your loop: it waits, moves the bytes of
-the socket with `received` and `output`, and gives the time.
+the socket, for example with [`host::Tcp`](caller-driven.md#bind-a-tcp-socket), and gives the
+time.
 
 ```rust
 use rsnetwork::body::Collect;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use rsnetwork::h1::Framing;
+use rsnetwork::host::Io as _;
 use rsnetwork::server::{Closed, Http1, Response};
 use rsnetwork::time::Instant;
 use rsnetwork::value::Status;
@@ -131,7 +133,7 @@ transport accepted each byte of the response before it.
 | `next(now)` | `body::Part::Data(view)`: the next body bytes as a view of the received region, with no copy. `Part::End(outcome)` at the end |
 | `collect(now, &mut region)` | Collects the whole body into one region, whose free capacity bounds it: `Collect::Complete(trailers)`, `Collect::TooLarge`, `Collect::Interrupted(outcome)`, or `Collect::More` while bytes are still to come |
 | `respond(&response, now)` | `true`: the response head went out. `false`: the transport still holds the regions of the heads before |
-| `write(&data, now)`, `finish(now)` | The response body, with no copy, and its end. A full output queue refuses with `Kind::Overload`: send the output first |
+| `write(&data, now)`, `finish(now)` | The response body, with no copy, and its end. A full output queue makes the call drive the connection one time: over TLS, only a drive seals the plaintext that waits. When the queue is still full, the call refuses with `Kind::Overload`: send the output, and call again |
 | `finish_with_trailers(&fields, now)` | Ends a chunked body with trailers. `false` as for `respond` |
 | `cancel()` | Ends the exchange in flight. The client sees an incomplete response, and the connection ends with `Kind::Cancelled` |
 | `delivery()` | How much of the last response the transport accepted: see [delivery](#delivery) |

@@ -10,7 +10,8 @@ loop, moves the ciphertext of the socket: see [drive a connection from your own 
 
 ## Prerequisites
 
-- A host that moves bytes between the socket and the stream, and reads a monotonic clock.
+- A host that moves bytes between the socket and the stream, for example
+  [`host::Tcp`](caller-driven.md#tls-over-the-socket), and reads a monotonic clock.
 - A `tls::ClientConfig` or a `tls::ServerConfig`, as on the [TLS page](tls.md#configure-each-end).
   The ALPN name of your protocol goes in its `protocols`.
 - `tls::StreamLimits`: the `tls::Limits` of the connection, the size of each queue, and the
@@ -32,6 +33,7 @@ use rsnetwork::body::{Outcome, Part};
 use rsnetwork::buffer::{Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::TurnLimits;
+use rsnetwork::host::Io as _;
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{ClientConfig, Limits, Stream, StreamLimits};
 
@@ -86,7 +88,7 @@ a `Truncated` end.
 | `Stream::accept(&config, limits, clock, &budget)` | The server end of a stream |
 | `read_into(now, &mut region)` | Copies the next received bytes into the free capacity of the region, or gives `Read::Done(outcome)` after the last byte |
 | `next(now)` | `body::Part::Data(view)`: the next received bytes as a view of their received region, with no copy. `Part::End(outcome)` at the end |
-| `write(&data, now)` | Queues a view of your region, with no copy. Before the handshake completes, the bytes wait for it. A full queue refuses with `Kind::Overload`, and takes nothing: send the output, and write again |
+| `write(&data, now)` | Queues a view of your region, with no copy. Before the handshake completes, the bytes wait for it. A full queue makes the write drive the stream one time, which seals the bytes that wait. When the queue is still full, the write refuses with `Kind::Overload`, and takes nothing: send the output, and write again |
 | `written()`, `sent()` | The bytes that `write` took, and the bytes whose records the transport accepted: see [write progress](#write-progress) |
 | `close(now)` | Ends the stream: it sends `close_notify` after the bytes that it took, and reads no more. A read after it ends `Outcome::Cancelled`, unless the peer closed first |
 | `drive(now)` | Drives the stream: the handshake, the encryption of the bytes that wait, and the close. Call it each time that `wait()` says. Each read and write also drives the stream |

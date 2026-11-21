@@ -1,21 +1,20 @@
 //! The contracts of the caller-driven host: client and server connections against each other in
-//! memory with injected time and over loopback std sockets, the deadline on its own turn, the head
-//! timeout, the clock refusals, and the report of a connection that drops before its release.
+//! memory with injected time, the deadline on its own turn, the head timeout, the clock refusals,
+//! and the report of a connection that drops before its release. `tests/tcp.rs` runs the host
+//! over loopback sockets through `host::Tcp`.
 //! Each expected byte, deadline, and outcome comes from the test's own input and clock.
 
 use core::assert_matches;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
-use std::io::{ErrorKind, Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
 
 use rsnetwork::body::Outcome;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Client, ClientEvent, Framing, Limits, Server, ServerEvent};
-use rsnetwork::host::{Connection, Engine, Wait};
+use rsnetwork::host::{Connection, Engine, Io as _, Wait};
 use rsnetwork::time::{ClockDomain, Deadline, Instant, Suspend};
 use rsnetwork::value::{Authority, Method, Status, Target};
 
@@ -307,90 +306,4 @@ fn a_connection_that_drops_before_its_release_reports_the_outstanding_output() {
         outstanding.bytes,
         (head.len() + b"5\r\nhello\r\n0\r\n\r\n".len()) as u64
     );
-}
-
-/// A client and a server connection exchange a request and a response over loopback std sockets
-/// in nonblocking mode, with the time of a std clock. The test moves the bytes between the sockets
-/// and the connections, as an event loop does.
-#[test]
-fn a_client_and_a_server_exchange_over_loopback_std_sockets() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut near = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (mut far, _) = listener.accept().unwrap();
-    near.set_nonblocking(true).unwrap();
-    far.set_nonblocking(true).unwrap();
-    let start = std::time::Instant::now();
-    let clock = |start: std::time::Instant| {
-        let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap();
-        Instant::new(CLOCK, nanos)
-    };
-
-    let (mut client, mut server) = (open_client(), open_server(Some(Duration::from_secs(5))));
-    let (engine, outbound) = client.parts();
-    let head = Backing::from(Vec::with_capacity(256));
-    let target = Target::new(b"/hello").unwrap();
-    let authority = Authority::new(b"127.0.0.1").unwrap();
-    engine
-        .request(outbound, Method::GET, target, authority, &[], Framing::Length(0), head)
-        .unwrap();
-    engine.finish(outbound).unwrap();
-
-    let mut answered = false;
-    let mut body = Vec::new();
-    for _ in 0..100_000 {
-        pump(&mut near, &mut client);
-        pump(&mut far, &mut server);
-        while let Some(event) = server.drive(Some(clock(start))).unwrap() {
-            if let ServerEvent::End(_) = event
-                && !answered
-            {
-                let (engine, outbound) = server.parts();
-                let head = Backing::from(Vec::with_capacity(256));
-                engine
-                    .respond(outbound, Status::new(200).unwrap(), &[], Framing::Chunked, head)
-                    .unwrap();
-                engine.send(outbound, &Lease::from(b"over loopback".to_vec())).unwrap();
-                engine.finish(outbound).unwrap();
-                answered = true;
-            }
-        }
-        while let Some(event) = client.drive(Some(clock(start))).unwrap() {
-            match event {
-                ClientEvent::Data(data) => body.extend_from_slice(data.bytes()),
-                ClientEvent::End(outcome) => {
-                    assert_matches!(outcome, Outcome::Complete(None));
-                    assert_eq!(body, b"over loopback");
-                    return;
-                }
-                ClientEvent::Response(_) | ClientEvent::Informational(_) | ClientEvent::Handoff => {}
-            }
-        }
-    }
-    panic!("no response after 100000 loop turns");
-}
-
-/// Moves bytes between a nonblocking socket and a connection: what the socket received into the
-/// connection, and the output of the connection into the socket, with an acknowledgement of the
-/// bytes that the socket accepted.
-fn pump<E: Engine>(socket: &mut TcpStream, connection: &mut Connection<E>) {
-    let mut region = vec![0; 4096];
-    match socket.read(&mut region) {
-        Ok(0) => connection.end_input(),
-        Ok(len) => {
-            region.truncate(len);
-            connection.receive(received(&region)).unwrap();
-        }
-        Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-        Err(error) => panic!("{error}"),
-    }
-    while let Some(output) = connection.output() {
-        match socket.write(output.region.bytes()) {
-            Ok(accepted) => connection.ack(output.id, accepted).unwrap(),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                connection.ack(output.id, 0).unwrap();
-                break;
-            }
-            Err(error) => panic!("{error}"),
-        }
-    }
 }

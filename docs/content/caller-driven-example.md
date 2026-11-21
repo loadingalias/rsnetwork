@@ -4,7 +4,9 @@ The example `examples/caller_driven.rs` drives an HTTP/1.1 client and server fro
 Each side is one `rsnetwork::host::Connection` over a loopback TCP socket in nonblocking mode, and
 the program uses only the public API of `rsnetwork` and the standard library. It has no runtime
 and starts no thread. [Drive a connection from your own event loop](caller-driven.md) gives each
-call that it uses.
+call that it uses. The example moves the bytes of each socket with its own loop, so it shows each
+call of `host::Io`. With the `tcp` feature, [`host::Tcp`](caller-driven.md#bind-a-tcp-socket) is
+that loop.
 
 rsnetwork is in development and has no release.
 

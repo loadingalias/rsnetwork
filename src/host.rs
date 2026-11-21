@@ -3,14 +3,19 @@
 //! The application owns the byte source, for example a nonblocking socket, and its clock. A
 //! [`Connection`] owns one engine and its two queues. The application gives it the received bytes
 //! and the time, drives it, writes its output to the transport, and acknowledges the bytes that
-//! the transport accepted. After each drive, [`Connection::wait`] tells when to drive again: now,
-//! when the host gives what the engine waits for, or at the next deadline. The connection spawns no
-//! task and needs no runtime, and it does not need `Send`.
+//! the transport accepted. After each drive, [`Io::wait`] tells when to drive again: now, when the
+//! host gives what the engine waits for, or at the next deadline. The connection spawns no task
+//! and needs no runtime, and it does not need `Send`.
 //!
 //! The application keeps driving the connection until its terminal release: the engine ended,
-//! and the transport accepted each output. [`Connection::release`] tells when that is. A
-//! connection that drops before it, through [`Connection::abandon`], reports the output that the
-//! transport has not accepted.
+//! and the transport accepted each output. [`Io::release`] tells when that is. A connection that
+//! drops before it, through [`Connection::abandon`], reports the output that the transport has
+//! not accepted.
+//!
+//! [`Io`] holds the calls that move the bytes of a connection: of a [`Connection`], and of each
+//! connection of the application API. A binding makes them for each connection, so it moves the
+//! bytes of each with one loop. With the `tcp` feature, [`Tcp`] is that loop over a nonblocking
+//! std TCP socket.
 //!
 //! ```
 //! use core::net::{Ipv4Addr, SocketAddr};
@@ -20,7 +25,7 @@
 //! use rsnetwork::capacity::Budget;
 //! use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, Received, TurnLimits};
 //! use rsnetwork::h1::{BodyLimits, Framing, Limits, Server, ServerEvent};
-//! use rsnetwork::host::{Connection, Wait};
+//! use rsnetwork::host::{Connection, Io as _, Wait};
 //! use rsnetwork::time::{ClockDomain, Instant, Suspend};
 //! use rsnetwork::value::Status;
 //!
@@ -84,6 +89,12 @@ use crate::drive::{
 };
 use crate::h1::{Client, ClientEvent, Server, ServerEvent};
 use crate::time::{ClockDomain, Deadline, Instant};
+
+#[cfg(feature = "tcp")]
+mod tcp;
+
+#[cfg(feature = "tcp")]
+pub use tcp::{Next, Tcp};
 
 /// A protocol engine that a [`Connection`] drives. The engines of this crate implement it.
 pub trait Engine: sealed::Sealed {
@@ -153,8 +164,8 @@ pub trait Engine: sealed::Sealed {
     }
 }
 
-/// The engines of this crate are the only engines: a binding drives them, and does not replace
-/// them.
+/// The engines and the connections of this crate are the only ones: a binding drives them, and
+/// does not replace them.
 mod sealed {
     pub trait Sealed {}
 
@@ -164,6 +175,12 @@ mod sealed {
     impl<E: super::Engine> Sealed for crate::tls::Tls<E> {}
     #[cfg(feature = "tls")]
     impl Sealed for crate::tls::stream::Raw {}
+
+    impl<E> Sealed for super::Connection<E> {}
+    impl Sealed for crate::client::Http1 {}
+    impl Sealed for crate::server::Http1 {}
+    #[cfg(feature = "tls")]
+    impl Sealed for crate::tls::Stream {}
 }
 
 impl Engine for Server {
@@ -230,6 +247,69 @@ pub enum Wait {
     Ended(Result<(), Error>),
 }
 
+/// The calls that move the bytes of one connection between its transport and its engine.
+///
+/// A binding, or the application in its own event loop, makes them for each connection: a
+/// [`Connection`], a [`client::Http1`](crate::client::Http1), a
+/// [`server::Http1`](crate::server::Http1), and a `tls::Stream`. So one binding moves the bytes
+/// of each. Each implementation tells what it adds to these rules.
+pub trait Io: sealed::Sealed {
+    /// The end of the connection that [`release`](Self::release) gives.
+    type End;
+
+    /// When to call the connection again, from its last turn.
+    fn wait(&self) -> Wait;
+
+    /// Queues bytes that the transport received. Gives them back when the queue is full: drive
+    /// first.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
+    )]
+    fn receive(&mut self, received: Received) -> Result<(), Received>;
+
+    /// Lends the input region of the connection for one receive, or gives `None` when it has
+    /// none: then receive into a region of the host. Receive into the capacity after the
+    /// initialized bytes, and give the region back with [`received`](Self::received).
+    fn region(&mut self) -> Result<Option<Backing>, Error>;
+
+    /// Gives the connection a received region that the host owns: the region that
+    /// [`region`](Self::region) lent, or a region of the host, for example one that the kernel
+    /// selected. Gives it back when the connection cannot take it now: drive first.
+    fn received(&mut self, region: Backing, endpoint: Endpoint, capacity: u64) -> Result<(), Backing>;
+
+    /// Records that the transport gives no more bytes: the peer closed its side.
+    fn end_input(&mut self);
+
+    /// Records that the transport failed, for example with a reset or a refused write: no byte
+    /// comes or goes after this.
+    fn reset(&mut self);
+
+    /// Gives the connection a writable region of the host, for example a pool slot or a
+    /// registered buffer, for its next TLS records. When the region cannot take the next record,
+    /// the records after it go into the own output of the connection. Refuses, and gives the
+    /// region back, when the connection seals no records, holds a region already, or the region
+    /// has bytes or less room than a record of one byte.
+    fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)>;
+
+    /// Gives back the region of the host that the connection holds with no record in it, for
+    /// example when the connection is idle.
+    fn take_output_region(&mut self) -> Option<Backing>;
+
+    /// The next output to give to the transport. Acknowledge it with [`ack`](Self::ack).
+    fn output(&mut self) -> Option<Output>;
+
+    /// Acknowledges that the transport accepted the first `accepted` bytes of output `id`.
+    fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError>;
+
+    /// The output that the transport has not accepted.
+    fn outstanding(&self) -> Outstanding;
+
+    /// Gives the end of the connection when it can drop, and `None` before that: drive on, and
+    /// send the output.
+    fn release(&self) -> Option<Self::End>;
+}
+
 /// One connection that the application drives: an engine and its two queues.
 #[derive(Debug)]
 pub struct Connection<E> {
@@ -266,70 +346,8 @@ impl<E: Engine> Connection<E> {
         })
     }
 
-    /// Queues bytes that the transport received. Gives them back when the queue is full: drive
-    /// first.
-    #[expect(
-        clippy::result_large_err,
-        reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
-    )]
-    pub fn receive(&mut self, received: Received) -> Result<(), Received> {
-        self.inbound.push(received)
-    }
-
-    /// Lends the input region of the engine for one receive, or gives `None` when the engine has
-    /// none: then receive into a region of the host. Receive into the capacity after the
-    /// initialized bytes, and give the region back with [`received`](Self::received).
-    ///
-    /// A TLS engine lends the tail of its input region, so a record that continues after a
-    /// receive joins its first bytes in place. Refuses with [`Kind::Overload`] when the budget
-    /// cannot pay for a new region, and with [`Kind::Misuse`] while a lent region has not come
-    /// back.
-    pub fn region(&mut self) -> Result<Option<Backing>, Error> {
-        self.engine.region()
-    }
-
-    /// Gives the engine a received region that the host owns: the region that
-    /// [`region`](Self::region) lent, or a region of the host, for example one that the kernel
-    /// selected. Gives it back when the engine cannot take it now: drive first.
-    pub fn received(&mut self, region: Backing, endpoint: Endpoint, capacity: u64) -> Result<(), Backing> {
-        self.engine.received(&mut self.inbound, region, endpoint, capacity)
-    }
-
-    /// Records that the transport gives no more bytes: the peer closed its side.
-    pub fn end_input(&mut self) {
-        self.inbound.end();
-    }
-
-    /// Records that the transport failed, for example with a reset or a refused write: no byte
-    /// comes or goes after this. The engine reads the received bytes, and then an end with no
-    /// proof: a body ends [`Outcome::Reset`](crate::body::Outcome::Reset). Output that waits can
-    /// never go, so [`release`](Self::release) does not wait for it, and
-    /// [`outstanding`](Self::outstanding) reports it. An engine that waits for the application,
-    /// for example a server with a request in flight, ends when the application cancels.
-    pub fn reset(&mut self) {
-        self.inbound.reset();
-        self.reset = true;
-    }
-
-    /// Gives the engine a writable region of the host, for example a pool slot or a registered
-    /// buffer, for its next records, as [`Engine::output_region`] says. A TLS engine seals its
-    /// next records into it, and gives it to the output queue at the end of the turn that sealed
-    /// into it. When the region cannot take the next record, the records after it go into the
-    /// own output of the engine. Refuses, and gives the region back, when the engine seals no
-    /// records, holds a region already, or the region has bytes or less room than a record of
-    /// one byte.
-    pub fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
-        self.engine.output_region(region)
-    }
-
-    /// Gives back the region of the host that the engine holds with no record in it, for example
-    /// when the connection is idle.
-    pub fn take_output_region(&mut self) -> Option<Backing> {
-        self.engine.take_output_region()
-    }
-
     /// Drives the engine for one turn at `now`, and gives its event, if it has one. Then
-    /// [`wait`](Self::wait) tells when to drive again, with the deadline of this turn.
+    /// [`wait`](Io::wait) tells when to drive again, with the deadline of this turn.
     ///
     /// Give the time of the host as `now`, on the clock that [`new`](Self::new) took, or `None`
     /// when the host has no clock. Refuses with [`Kind::Misuse`] when `now` does not match the
@@ -356,11 +374,6 @@ impl<E: Engine> Connection<E> {
         Ok(event)
     }
 
-    /// When to drive again, from the last turn.
-    pub fn wait(&self) -> Wait {
-        self.wait
-    }
-
     /// The engine and the output queue, for the calls of the application, such as a response.
     pub fn parts(&mut self) -> (&mut E, &mut Outbound) {
         (&mut self.engine, &mut self.outbound)
@@ -377,35 +390,79 @@ impl<E: Engine> Connection<E> {
         &self.outbound
     }
 
-    /// The next output to give to the transport. Acknowledge it with [`ack`](Self::ack).
-    pub fn output(&mut self) -> Option<Output> {
-        self.outbound.submit()
-    }
-
-    /// Acknowledges that the transport accepted the first `accepted` bytes of output `id`.
-    pub fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
-        self.outbound.ack(id, accepted)
-    }
-
-    /// The output that the transport has not accepted.
-    pub fn outstanding(&self) -> Outstanding {
-        self.outbound.outstanding()
-    }
-
-    /// Gives the end of the connection when it can drop: after the terminal turn, when the
-    /// transport accepted each output, or after a [`reset`](Self::reset). Gives `None` before
-    /// that: drive on, and send the output.
-    pub fn release(&self) -> Option<Result<(), Error>> {
-        match self.wait {
-            Wait::Ended(end) if self.reset || self.outbound.outstanding().is_empty() => Some(end),
-            _ => None,
-        }
-    }
-
     /// Drops the connection before its terminal release, and reports the output that the
     /// transport has not accepted. The transport keeps its own view of the submitted output until
     /// its terminal event.
     pub fn abandon(self) -> Outstanding {
         self.outbound.outstanding()
+    }
+}
+
+impl<E: Engine> Io for Connection<E> {
+    type End = Result<(), Error>;
+
+    fn wait(&self) -> Wait {
+        self.wait
+    }
+
+    fn receive(&mut self, received: Received) -> Result<(), Received> {
+        self.inbound.push(received)
+    }
+
+    /// A TLS engine lends the tail of its input region, so a record that continues after a
+    /// receive joins its first bytes in place. Refuses with [`Kind::Overload`] when the budget
+    /// cannot pay for a new region, and with [`Kind::Misuse`] while a lent region has not come
+    /// back.
+    fn region(&mut self) -> Result<Option<Backing>, Error> {
+        self.engine.region()
+    }
+
+    fn received(&mut self, region: Backing, endpoint: Endpoint, capacity: u64) -> Result<(), Backing> {
+        self.engine.received(&mut self.inbound, region, endpoint, capacity)
+    }
+
+    fn end_input(&mut self) {
+        self.inbound.end();
+    }
+
+    /// The engine reads the received bytes, and then an end with no proof: a body ends
+    /// [`Outcome::Reset`](crate::body::Outcome::Reset). Output that waits can never go, so
+    /// [`release`](Io::release) does not wait for it, and [`outstanding`](Io::outstanding)
+    /// reports it. An engine that waits for the application, for example a server with a request
+    /// in flight, ends when the application cancels.
+    fn reset(&mut self) {
+        self.inbound.reset();
+        self.reset = true;
+    }
+
+    /// A TLS engine seals its next records into the region, as [`Engine::output_region`] says,
+    /// and gives it to the output queue at the end of the turn that sealed into it.
+    fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
+        self.engine.output_region(region)
+    }
+
+    fn take_output_region(&mut self) -> Option<Backing> {
+        self.engine.take_output_region()
+    }
+
+    fn output(&mut self) -> Option<Output> {
+        self.outbound.submit()
+    }
+
+    fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
+        self.outbound.ack(id, accepted)
+    }
+
+    fn outstanding(&self) -> Outstanding {
+        self.outbound.outstanding()
+    }
+
+    /// Gives the end after the terminal turn, when the transport accepted each output, or after a
+    /// [`reset`](Io::reset).
+    fn release(&self) -> Option<Result<(), Error>> {
+        match self.wait {
+            Wait::Ended(end) if self.reset || self.outbound.outstanding().is_empty() => Some(end),
+            _ => None,
+        }
     }
 }

@@ -15,7 +15,7 @@ use crate::drive::{
     AckError, ActionId, Blocked, Endpoint, Error, Inbound, Kind, Outbound, Output, Outstanding, Progress, Received,
     Turn,
 };
-use crate::host::{Connection, Engine, Wait};
+use crate::host::{Connection, Engine, Io, Wait};
 use crate::link::{earliest, queues};
 
 /// The limits of a TLS stream, which the caller sets.
@@ -155,12 +155,17 @@ impl Stream {
 
     /// Queues `data` as the next bytes of the stream, with no copy: the stream takes a view of
     /// its own. Before the handshake completes, the bytes wait for it. Refuses with
-    /// [`Kind::Overload`], and takes nothing, when the queue is full: send the output, and write
-    /// again. Refuses with [`Kind::Misuse`] after [`close`](Self::close).
+    /// [`Kind::Overload`], and takes nothing, when the queue is full also after a drive: send the
+    /// output, and write again. Refuses with [`Kind::Misuse`] after [`close`](Self::close).
     pub fn write(&mut self, data: &Lease, now: Instant) -> Result<(), Error> {
         self.live(now)?;
         if self.closed {
             return Err(misuse("the stream is closed"));
+        }
+        // Only a drive seals the plaintext into records and frees its queue: drive one time when
+        // the queue is full.
+        if self.connection.parts().0.parts().1.free() == 0 {
+            self.pump(now)?;
         }
         let plaintext = self.connection.parts().0.parts().1;
         plaintext
@@ -206,89 +211,6 @@ impl Stream {
     /// How the input of the peer ended, or `None` before its end.
     pub fn closure(&self) -> Option<Closure> {
         self.connection.engine().closure()
-    }
-
-    /// When to call again: now, when the transport gives what the stream waits for, at the
-    /// deadline of the handshake, or never after the end.
-    pub fn wait(&self) -> Wait {
-        if let Some(error) = self.end {
-            return Wait::Ended(Err(error));
-        }
-        match self.connection.wait() {
-            Wait::Until { blocked, deadline } => Wait::Until {
-                blocked,
-                deadline: earliest(deadline, self.handshake),
-            },
-            wait => wait,
-        }
-    }
-
-    /// Queues ciphertext that the transport received, as [`Connection::receive`] does.
-    #[expect(
-        clippy::result_large_err,
-        reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
-    )]
-    pub fn receive(&mut self, received: Received) -> Result<(), Received> {
-        self.connection.receive(received)
-    }
-
-    /// Lends the input region of the stream for one receive, as [`Connection::region`] does.
-    pub fn region(&mut self) -> Result<Option<Backing>, Error> {
-        self.connection.region()
-    }
-
-    /// Gives the stream a received region, as [`Connection::received`] does.
-    pub fn received(&mut self, region: Backing, endpoint: Endpoint, capacity: u64) -> Result<(), Backing> {
-        self.connection.received(region, endpoint, capacity)
-    }
-
-    /// Records that the transport gives no more bytes. With no `close_notify` before it, the
-    /// stream ends `Outcome::Truncated`.
-    pub fn end_input(&mut self) {
-        self.connection.end_input();
-    }
-
-    /// Records that the transport failed, as [`Connection::reset`] does: the stream ends
-    /// `Outcome::Reset`, and [`sent`](Self::sent) keeps the bytes that went.
-    pub fn reset(&mut self) {
-        self.connection.reset();
-    }
-
-    /// Gives the stream a writable region of the host for its next records, as
-    /// [`Connection::output_region`] does.
-    pub fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
-        self.connection.output_region(region)
-    }
-
-    /// Gives back the region of the host that the stream holds with no record in it, as
-    /// [`Connection::take_output_region`] does.
-    pub fn take_output_region(&mut self) -> Option<Backing> {
-        self.connection.take_output_region()
-    }
-
-    /// The next output to give to the transport. Acknowledge it with [`ack`](Self::ack).
-    pub fn output(&mut self) -> Option<Output> {
-        self.connection.output()
-    }
-
-    /// Acknowledges that the transport accepted the first `accepted` bytes of output `id`.
-    pub fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
-        self.connection.ack(id, accepted)
-    }
-
-    /// The output that the transport has not accepted.
-    pub fn outstanding(&self) -> Outstanding {
-        self.connection.outstanding()
-    }
-
-    /// Gives the end of the stream when it can drop: after its end, when the transport accepted
-    /// each output. At the deadline of the handshake, it does not wait for the output. Gives
-    /// `None` before that.
-    pub fn release(&self) -> Option<Result<(), Error>> {
-        match self.end {
-            Some(error) => Some(Err(error)),
-            None => self.connection.release(),
-        }
     }
 
     /// Refuses a call after the end of the stream, and a time on another clock.
@@ -357,6 +279,78 @@ impl Stream {
             }
         }
         Ok(true)
+    }
+}
+
+impl Io for Stream {
+    type End = Result<(), Error>;
+
+    /// When to call again: now, when the transport gives what the stream waits for, at the
+    /// deadline of the handshake, or never after the end.
+    fn wait(&self) -> Wait {
+        if let Some(error) = self.end {
+            return Wait::Ended(Err(error));
+        }
+        match self.connection.wait() {
+            Wait::Until { blocked, deadline } => Wait::Until {
+                blocked,
+                deadline: earliest(deadline, self.handshake),
+            },
+            wait => wait,
+        }
+    }
+
+    fn receive(&mut self, received: Received) -> Result<(), Received> {
+        self.connection.receive(received)
+    }
+
+    fn region(&mut self) -> Result<Option<Backing>, Error> {
+        self.connection.region()
+    }
+
+    fn received(&mut self, region: Backing, endpoint: Endpoint, capacity: u64) -> Result<(), Backing> {
+        self.connection.received(region, endpoint, capacity)
+    }
+
+    /// Records that the transport gives no more bytes. With no `close_notify` before it, the
+    /// stream ends `Outcome::Truncated`.
+    fn end_input(&mut self) {
+        self.connection.end_input();
+    }
+
+    /// The stream ends `Outcome::Reset`, and [`sent`](Self::sent) keeps the bytes that went.
+    fn reset(&mut self) {
+        self.connection.reset();
+    }
+
+    fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
+        self.connection.output_region(region)
+    }
+
+    fn take_output_region(&mut self) -> Option<Backing> {
+        self.connection.take_output_region()
+    }
+
+    fn output(&mut self) -> Option<Output> {
+        self.connection.output()
+    }
+
+    fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
+        self.connection.ack(id, accepted)
+    }
+
+    fn outstanding(&self) -> Outstanding {
+        self.connection.outstanding()
+    }
+
+    /// Gives the end of the stream when it can drop: after its end, when the transport accepted
+    /// each output. At the deadline of the handshake, it does not wait for the output. Gives
+    /// `None` before that.
+    fn release(&self) -> Option<Result<(), Error>> {
+        match self.end {
+            Some(error) => Some(Err(error)),
+            None => self.connection.release(),
+        }
     }
 }
 

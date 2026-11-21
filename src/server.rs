@@ -50,7 +50,7 @@ use crate::drive::{
     AckError, ActionId, Blocked, Endpoint, Error, Kind, Outbound, Output, Outstanding, Received, TurnLimits,
 };
 use crate::h1::{self, BodyLimits, Framing, RetainedRequest, ServerEvent};
-use crate::host::{Connection, Wait};
+use crate::host::{Connection, Io, Wait};
 use crate::link::{Link, earliest, queues};
 #[cfg(feature = "tls")]
 use crate::tls::{self, Negotiated, ServerConfig, Tls};
@@ -381,12 +381,14 @@ impl Http1 {
     }
 
     /// Queues `data` as the next bytes of the response body, with no copy. Refuses as
-    /// [`h1::Server::send`] does: with [`Kind::Overload`] when the output queue is full, so send
-    /// the output first.
+    /// [`h1::Server::send`] does: with [`Kind::Overload`] when the output queue is full also after
+    /// a drive, so send the output first.
     pub fn write(&mut self, data: &Lease, now: Instant) -> Result<(), Error> {
         self.responding(now)?;
-        let (engine, outbound) = self.link.engine();
-        engine.send(outbound, data)?;
+        self.queue(now, |server| {
+            let (engine, outbound) = server.link.engine();
+            engine.send(outbound, data)
+        })?;
         self.pump(now).map(drop)
     }
 
@@ -394,8 +396,10 @@ impl Http1 {
     /// the rest. Refuses as [`h1::Server::finish`] does.
     pub fn finish(&mut self, now: Instant) -> Result<(), Error> {
         self.responding(now)?;
-        let (engine, outbound) = self.link.engine();
-        engine.finish(outbound)?;
+        self.queue(now, |server| {
+            let (engine, outbound) = server.link.engine();
+            engine.finish(outbound)
+        })?;
         self.finished();
         self.pump(now).map(drop)
     }
@@ -405,11 +409,16 @@ impl Http1 {
     /// again. Refuses with [`Kind::Misuse`] when the body is not chunked.
     pub fn finish_with_trailers(&mut self, trailers: &[Field<'_>], now: Instant) -> Result<bool, Error> {
         self.responding(now)?;
-        let Ok(region) = self.heads.acquire() else {
+        let queued = self.queue(now, |server| {
+            let Ok(region) = server.heads.acquire() else {
+                return Ok(false);
+            };
+            let (engine, outbound) = server.link.engine();
+            engine.finish_with_trailers(outbound, trailers, region).map(|()| true)
+        })?;
+        if !queued {
             return Ok(false);
-        };
-        let (engine, outbound) = self.link.engine();
-        engine.finish_with_trailers(outbound, trailers, region)?;
+        }
         self.finished();
         self.pump(now)?;
         Ok(true)
@@ -474,138 +483,6 @@ impl Http1 {
         self.link.negotiated()
     }
 
-    /// When to call again: now, when the transport gives what the connection waits for, at a
-    /// deadline, during the linger, or never after the end.
-    pub fn wait(&self) -> Wait {
-        if self.closed {
-            return Wait::Ended(self.result());
-        }
-        if let Some(lingering) = self.lingering {
-            return Wait::Linger {
-                deadline: lingering.deadline,
-            };
-        }
-        if self.next.is_some() && self.delivered() {
-            return Wait::Now;
-        }
-        let deadline = earliest(self.shutdown, self.handshake);
-        match self.link.wait() {
-            // The linger starts at the next call, after the last output.
-            Wait::Ended(_) if self.link.outstanding().is_empty() => Wait::Now,
-            Wait::Ended(_) => Wait::Until {
-                blocked: Blocked::Output,
-                deadline,
-            },
-            Wait::Until { blocked, deadline: own } => Wait::Until {
-                blocked,
-                deadline: earliest(own, deadline),
-            },
-            wait => wait,
-        }
-    }
-
-    /// Queues bytes that the transport received, as [`Connection::receive`] does. During the
-    /// linger, it discards them.
-    #[expect(
-        clippy::result_large_err,
-        reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
-    )]
-    pub fn receive(&mut self, received: Received) -> Result<(), Received> {
-        if self.discard(received.region.initialized()) {
-            return Ok(());
-        }
-        self.link.receive(received)
-    }
-
-    /// Lends the input region of the connection for one receive, as [`Connection::region`] does.
-    /// During the linger and after the end, it lends none.
-    pub fn region(&mut self) -> Result<Option<Backing>, Error> {
-        if self.lingering.is_some() || self.closed {
-            return Ok(None);
-        }
-        self.link.region()
-    }
-
-    /// Gives the connection a received region, as [`Connection::received`] does. During the
-    /// linger, it discards it.
-    pub fn received(&mut self, region: Backing, endpoint: Endpoint, capacity: u64) -> Result<(), Backing> {
-        if self.discard(region.initialized()) {
-            return Ok(());
-        }
-        self.link.received(region, endpoint, capacity)
-    }
-
-    /// Records that the transport gives no more bytes. It ends the linger.
-    pub fn end_input(&mut self) {
-        self.input_ended = true;
-        if self.lingering.take().is_some() {
-            self.closed = true;
-        } else {
-            self.link.end_input();
-        }
-    }
-
-    /// Records that the transport failed, as [`Connection::reset`] does: no byte comes or goes
-    /// after this. A response that the transport has not accepted becomes
-    /// [`Delivery::Partial`], and the connection can drop at once: [`outstanding`](Self::outstanding)
-    /// reports the output that did not go. The application can still read the request bytes that
-    /// arrived, and then the outcome of the body.
-    pub fn reset(&mut self) {
-        // A reset during the linger or after the end is no failure.
-        let quiet = self.lingering.take().is_some() || self.closed;
-        let unsent = matches!(self.link.wait(), Wait::Ended(_)) && !self.link.outstanding().is_empty();
-        self.input_ended = true;
-        self.reset = true;
-        self.link.reset();
-        if !quiet {
-            let error = Error::new(Kind::Partial, "the transport failed before the connection closed");
-            if self.state == State::Exchange || !self.delivered() {
-                self.fail(error);
-            } else if unsent {
-                // The output of a connection that ended did not go.
-                self.cleanup.get_or_insert(error);
-            }
-        }
-        self.closed = true;
-    }
-
-    /// Gives the connection a writable region of the host for its next TLS records, as
-    /// [`Connection::output_region`] does.
-    pub fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
-        self.link.output_region(region)
-    }
-
-    /// Gives back the region of the host that the connection holds with no record in it, as
-    /// [`Connection::take_output_region`] does.
-    pub fn take_output_region(&mut self) -> Option<Backing> {
-        self.link.take_output_region()
-    }
-
-    /// The next output to give to the transport. Acknowledge it with [`ack`](Self::ack).
-    pub fn output(&mut self) -> Option<Output> {
-        self.link.output()
-    }
-
-    /// Acknowledges that the transport accepted the first `accepted` bytes of output `id`.
-    pub fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
-        self.link.ack(id, accepted)
-    }
-
-    /// The output that the transport has not accepted.
-    pub fn outstanding(&self) -> Outstanding {
-        self.link.outstanding()
-    }
-
-    /// Gives the end of the connection when it can drop: after the protocol closed, the transport
-    /// accepted each output, and the linger ended. After a reset or at the deadline of a
-    /// shutdown, it does not wait for the output. Gives `None` before that.
-    pub fn release(&self) -> Option<Closed> {
-        self.closed.then(|| Closed {
-            result: self.result(),
-            cleanup: self.cleanup,
-        })
-    }
-
     /// Gives `head` to the application as the request in flight.
     fn start(&mut self, head: RetainedRequest) -> RetainedRequest {
         self.state = State::Exchange;
@@ -657,6 +534,19 @@ impl Http1 {
             return Err(misuse("respond first"));
         }
         Ok(())
+    }
+
+    /// Runs `queue`, which queues plaintext output and changes nothing when it refuses. Over TLS,
+    /// only a drive seals the plaintext into records and frees its queue. So when `queue` refuses
+    /// with [`Kind::Overload`], the connection drives one time, and `queue` runs again.
+    fn queue<T>(&mut self, now: Instant, mut queue: impl FnMut(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        match queue(self) {
+            Err(error) if error.kind() == Kind::Overload => {
+                self.pump(now)?;
+                queue(self)
+            }
+            result => result,
+        }
     }
 
     /// Records the end of the response in the output: the handler is complete.
@@ -834,6 +724,127 @@ impl Http1 {
 
     fn result(&self) -> Result<(), Error> {
         self.failure.map_or(Ok(()), Err)
+    }
+}
+
+impl Io for Http1 {
+    type End = Closed;
+
+    /// When to call again: now, when the transport gives what the connection waits for, at a
+    /// deadline, during the linger, or never after the end.
+    fn wait(&self) -> Wait {
+        if self.closed {
+            return Wait::Ended(self.result());
+        }
+        if let Some(lingering) = self.lingering {
+            return Wait::Linger {
+                deadline: lingering.deadline,
+            };
+        }
+        if self.next.is_some() && self.delivered() {
+            return Wait::Now;
+        }
+        let deadline = earliest(self.shutdown, self.handshake);
+        match self.link.wait() {
+            // The linger starts at the next call, after the last output.
+            Wait::Ended(_) if self.link.outstanding().is_empty() => Wait::Now,
+            Wait::Ended(_) => Wait::Until {
+                blocked: Blocked::Output,
+                deadline,
+            },
+            Wait::Until { blocked, deadline: own } => Wait::Until {
+                blocked,
+                deadline: earliest(own, deadline),
+            },
+            wait => wait,
+        }
+    }
+
+    /// During the linger, it discards the bytes.
+    fn receive(&mut self, received: Received) -> Result<(), Received> {
+        if self.discard(received.region.initialized()) {
+            return Ok(());
+        }
+        self.link.receive(received)
+    }
+
+    /// During the linger and after the end, it lends none.
+    fn region(&mut self) -> Result<Option<Backing>, Error> {
+        if self.lingering.is_some() || self.closed {
+            return Ok(None);
+        }
+        self.link.region()
+    }
+
+    /// During the linger, it discards the region.
+    fn received(&mut self, region: Backing, endpoint: Endpoint, capacity: u64) -> Result<(), Backing> {
+        if self.discard(region.initialized()) {
+            return Ok(());
+        }
+        self.link.received(region, endpoint, capacity)
+    }
+
+    /// Records that the transport gives no more bytes. It ends the linger.
+    fn end_input(&mut self) {
+        self.input_ended = true;
+        if self.lingering.take().is_some() {
+            self.closed = true;
+        } else {
+            self.link.end_input();
+        }
+    }
+
+    /// A response that the transport has not accepted becomes [`Delivery::Partial`], and the
+    /// connection can drop at once: [`outstanding`](Self::outstanding) reports the output that
+    /// did not go. The application can still read the request bytes that arrived, and then the
+    /// outcome of the body.
+    fn reset(&mut self) {
+        // A reset during the linger or after the end is no failure.
+        let quiet = self.lingering.take().is_some() || self.closed;
+        let unsent = matches!(self.link.wait(), Wait::Ended(_)) && !self.link.outstanding().is_empty();
+        self.input_ended = true;
+        self.reset = true;
+        self.link.reset();
+        if !quiet {
+            let error = Error::new(Kind::Partial, "the transport failed before the connection closed");
+            if self.state == State::Exchange || !self.delivered() {
+                self.fail(error);
+            } else if unsent {
+                // The output of a connection that ended did not go.
+                self.cleanup.get_or_insert(error);
+            }
+        }
+        self.closed = true;
+    }
+
+    fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
+        self.link.output_region(region)
+    }
+
+    fn take_output_region(&mut self) -> Option<Backing> {
+        self.link.take_output_region()
+    }
+
+    fn output(&mut self) -> Option<Output> {
+        self.link.output()
+    }
+
+    fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
+        self.link.ack(id, accepted)
+    }
+
+    fn outstanding(&self) -> Outstanding {
+        self.link.outstanding()
+    }
+
+    /// Gives the end of the connection when it can drop: after the protocol closed, the transport
+    /// accepted each output, and the linger ended. After a reset or at the deadline of a
+    /// shutdown, it does not wait for the output. Gives `None` before that.
+    fn release(&self) -> Option<Closed> {
+        self.closed.then(|| Closed {
+            result: self.result(),
+            cleanup: self.cleanup,
+        })
     }
 }
 

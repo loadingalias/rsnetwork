@@ -16,7 +16,7 @@ use rsnetwork::capacity::Budget;
 use rsnetwork::client::{Http1, Limits, Request};
 use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{self, BodyLimits, Framing, Server, ServerEvent};
-use rsnetwork::host::{Connection, Engine, Wait};
+use rsnetwork::host::{Connection, Engine, Io as _, Wait};
 use rsnetwork::time::{ClockDomain, Deadline, Instant, Suspend};
 use rsnetwork::tls::{
     CertificateDer, ClientConfig, ClientOptions, Entropy, Identity, Limits as TlsLimits, PrivateKeyDer, Resumption,

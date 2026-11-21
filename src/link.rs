@@ -11,7 +11,7 @@ use rstypes::time::{Deadline, Instant};
 #[cfg(feature = "tls")]
 use crate::drive::Kind;
 use crate::drive::{Accepted, AckError, ActionId, Endpoint, Error, Inbound, Outbound, Output, Outstanding, Received};
-use crate::host::{Connection, Engine, Wait};
+use crate::host::{Connection, Engine, Io, Wait};
 #[cfg(feature = "tls")]
 use crate::tls::{Closure, Negotiated, Tls};
 

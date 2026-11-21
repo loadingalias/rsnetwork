@@ -62,7 +62,8 @@ fn client(config: &ClientConfig) -> Result<Http1, Box<dyn std::error::Error>> {
 Each call of the exchange takes the time `now`. When a call has nothing to give yet, it gives
 `false`, `None`, or `Read::Wait`. Then wait as `client.wait()` says, move the bytes, and call
 again. This function sends one GET and copies the body into `region`. `host` is your loop: it
-waits, moves the bytes of the socket with `received` and `output`, and gives the time.
+waits, moves the bytes of the socket, for example with [`host::Tcp`](caller-driven.md#bind-a-tcp-socket),
+and gives the time.
 
 ```rust
 use rsnetwork::body::{Outcome, Read};
@@ -115,7 +116,7 @@ its trailers. Each other outcome leaves a part, for example `Outcome::Truncated`
 | Call | Result |
 | --- | --- |
 | `send(&request, deadline, now)` | `true`: the request went out. `false`: the connection cannot take it yet, for example while it drains a body before it. A request with `Framing::Length(0)` is complete at once |
-| `write(&data, now)`, `finish(now)` | The request body, with no copy, and its end, for `Framing::Length(n)` or `Framing::Chunked`. A full output queue refuses with `Kind::Overload`: send the output first |
+| `write(&data, now)`, `finish(now)` | The request body, with no copy, and its end, for `Framing::Length(n)` or `Framing::Chunked`. A full output queue makes the call drive the connection one time: over TLS, only a drive seals the plaintext that waits. When the queue is still full, the call refuses with `Kind::Overload`: send the output, and call again |
 | `response(now)` | The response head, or `None` before it. An informational (1xx) response does not count |
 | `read_into(now, &mut region)` | Copies the next body bytes into the free capacity of the region, or gives `Read::Done(outcome)` after the last byte |
 | `next(now)` | `body::Part::Data(view)`: the next body bytes as a view of the received region, with no copy. `Part::End(outcome)` at the end |

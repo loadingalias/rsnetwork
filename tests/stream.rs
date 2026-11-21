@@ -12,6 +12,7 @@ use rsnetwork::body::{Outcome, Part};
 use rsnetwork::buffer::{Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Endpoint, Kind, Received, TurnLimits};
+use rsnetwork::host::Io as _;
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
     Authentication, CertificateDer, ClientConfig, ClientOptions, Entropy, Group, Identity, Limits, Peer, PrivateKeyDer,

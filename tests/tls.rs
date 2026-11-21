@@ -26,7 +26,7 @@ use rsnetwork::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Write
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Endpoint, Error, Inbound, Kind, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Client, ClientEvent, Framing, Limits as HeadLimits, Server, ServerEvent};
-use rsnetwork::host::{Connection, Engine, Wait};
+use rsnetwork::host::{Connection, Engine, Io as _, Wait};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
     CertificateDer, ChaCha20Rng, ClientConfig, ClientOptions, Closure, Copies, Entropy, Group, Handshake, Identity,

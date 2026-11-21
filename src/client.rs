@@ -37,7 +37,7 @@ use rstypes::time::{ClockDomain, Deadline, Instant};
 use crate::body::{Collect, Consumer, Outcome, Part, Read};
 use crate::drive::{AckError, ActionId, Endpoint, Error, Kind, Output, Outstanding, Received, TurnLimits};
 use crate::h1::{self, BodyLimits, ClientEvent, Framing, RetainedResponse};
-use crate::host::{Connection, Wait};
+use crate::host::{Connection, Io, Wait};
 use crate::link::{Link, earliest, queues};
 #[cfg(feature = "tls")]
 use crate::tls::{self, ClientConfig, Closure, Negotiated, Tls};
@@ -215,13 +215,15 @@ impl Http1 {
     }
 
     /// Queues `data` as the next bytes of the request body, with no copy. Refuses as
-    /// [`h1::Client::send`] does: with [`Kind::Overload`] when the output queue is full, so send
-    /// the output first.
+    /// [`h1::Client::send`] does: with [`Kind::Overload`] when the output queue is full also after
+    /// a drive, so send the output first.
     pub fn write(&mut self, data: &Lease, now: Instant) -> Result<(), Error> {
         self.live(now)?;
         self.expire(now)?;
-        let (engine, outbound) = self.link.engine();
-        engine.send(outbound, data)?;
+        self.queue(now, |client| {
+            let (engine, outbound) = client.link.engine();
+            engine.send(outbound, data)
+        })?;
         self.pump(now).map(drop)
     }
 
@@ -229,9 +231,24 @@ impl Http1 {
     pub fn finish(&mut self, now: Instant) -> Result<(), Error> {
         self.live(now)?;
         self.expire(now)?;
-        let (engine, outbound) = self.link.engine();
-        engine.finish(outbound)?;
+        self.queue(now, |client| {
+            let (engine, outbound) = client.link.engine();
+            engine.finish(outbound)
+        })?;
         self.pump(now).map(drop)
+    }
+
+    /// Runs `queue`, which queues plaintext output and changes nothing when it refuses. Over TLS,
+    /// only a drive seals the plaintext into records and frees its queue. So when `queue` refuses
+    /// with [`Kind::Overload`], the connection drives one time, and `queue` runs again.
+    fn queue(&mut self, now: Instant, mut queue: impl FnMut(&mut Self) -> Result<(), Error>) -> Result<(), Error> {
+        match queue(self) {
+            Err(error) if error.kind() == Kind::Overload => {
+                self.pump(now)?;
+                queue(self)
+            }
+            result => result,
+        }
     }
 
     /// Gives the response head of the request in flight, or `None` when it has not arrived:
@@ -328,88 +345,6 @@ impl Http1 {
     #[cfg(feature = "tls")]
     pub fn negotiated(&mut self) -> Option<Negotiated<'_>> {
         self.link.negotiated()
-    }
-
-    /// When to call again: now, when the transport gives what the connection waits for, at the
-    /// deadline of the exchange, or never after the end.
-    pub fn wait(&self) -> Wait {
-        if let Some(error) = self.end {
-            return Wait::Ended(Err(error));
-        }
-        match self.link.wait() {
-            Wait::Until { blocked, deadline } => Wait::Until {
-                blocked,
-                deadline: earliest(deadline, self.deadline),
-            },
-            wait => wait,
-        }
-    }
-
-    /// Queues bytes that the transport received, as [`Connection::receive`] does.
-    #[expect(
-        clippy::result_large_err,
-        reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
-    )]
-    pub fn receive(&mut self, received: Received) -> Result<(), Received> {
-        self.link.receive(received)
-    }
-
-    /// Lends the input region of the connection for one receive, as [`Connection::region`] does.
-    pub fn region(&mut self) -> Result<Option<Backing>, Error> {
-        self.link.region()
-    }
-
-    /// Gives the connection a received region, as [`Connection::received`] does.
-    pub fn received(&mut self, region: Backing, endpoint: Endpoint, capacity: u64) -> Result<(), Backing> {
-        self.link.received(region, endpoint, capacity)
-    }
-
-    /// Records that the transport gives no more bytes.
-    pub fn end_input(&mut self) {
-        self.link.end_input();
-    }
-
-    /// Records that the transport failed, as [`Connection::reset`] does: a body in flight ends
-    /// [`Outcome::Reset`], and the client ends.
-    pub fn reset(&mut self) {
-        self.link.reset();
-    }
-
-    /// Gives the connection a writable region of the host for its next TLS records, as
-    /// [`Connection::output_region`] does.
-    pub fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
-        self.link.output_region(region)
-    }
-
-    /// Gives back the region of the host that the connection holds with no record in it, as
-    /// [`Connection::take_output_region`] does.
-    pub fn take_output_region(&mut self) -> Option<Backing> {
-        self.link.take_output_region()
-    }
-
-    /// The next output to give to the transport. Acknowledge it with [`ack`](Self::ack).
-    pub fn output(&mut self) -> Option<Output> {
-        self.link.output()
-    }
-
-    /// Acknowledges that the transport accepted the first `accepted` bytes of output `id`.
-    pub fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
-        self.link.ack(id, accepted)
-    }
-
-    /// The output that the transport has not accepted.
-    pub fn outstanding(&self) -> Outstanding {
-        self.link.outstanding()
-    }
-
-    /// Gives the end of the client when it can drop: after its end, when the transport accepted
-    /// each output. Gives `None` before that.
-    pub fn release(&self) -> Option<Result<(), Error>> {
-        match self.end {
-            Some(error) if self.outstanding().is_empty() => Some(Err(error)),
-            Some(_) => None,
-            None => self.link.release(),
-        }
     }
 
     /// Refuses a call after the end of the client, and a time on another clock.
@@ -539,6 +474,76 @@ impl Http1 {
             Wait::Ended(Err(error)) => Err(error),
             Wait::Ended(Ok(())) => Err(Error::new(Kind::Partial, "the connection ended before the response")),
             _ => Ok(()),
+        }
+    }
+}
+
+impl Io for Http1 {
+    type End = Result<(), Error>;
+
+    /// When to call again: now, when the transport gives what the connection waits for, at the
+    /// deadline of the exchange, or never after the end.
+    fn wait(&self) -> Wait {
+        if let Some(error) = self.end {
+            return Wait::Ended(Err(error));
+        }
+        match self.link.wait() {
+            Wait::Until { blocked, deadline } => Wait::Until {
+                blocked,
+                deadline: earliest(deadline, self.deadline),
+            },
+            wait => wait,
+        }
+    }
+
+    fn receive(&mut self, received: Received) -> Result<(), Received> {
+        self.link.receive(received)
+    }
+
+    fn region(&mut self) -> Result<Option<Backing>, Error> {
+        self.link.region()
+    }
+
+    fn received(&mut self, region: Backing, endpoint: Endpoint, capacity: u64) -> Result<(), Backing> {
+        self.link.received(region, endpoint, capacity)
+    }
+
+    fn end_input(&mut self) {
+        self.link.end_input();
+    }
+
+    /// A body in flight ends [`Outcome::Reset`], and the client ends.
+    fn reset(&mut self) {
+        self.link.reset();
+    }
+
+    fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
+        self.link.output_region(region)
+    }
+
+    fn take_output_region(&mut self) -> Option<Backing> {
+        self.link.take_output_region()
+    }
+
+    fn output(&mut self) -> Option<Output> {
+        self.link.output()
+    }
+
+    fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
+        self.link.ack(id, accepted)
+    }
+
+    fn outstanding(&self) -> Outstanding {
+        self.link.outstanding()
+    }
+
+    /// Gives the end of the client when it can drop: after its end, when the transport accepted
+    /// each output. Gives `None` before that.
+    fn release(&self) -> Option<Result<(), Error>> {
+        match self.end {
+            Some(error) if self.outstanding().is_empty() => Some(Err(error)),
+            Some(_) => None,
+            None => self.link.release(),
         }
     }
 }

@@ -26,6 +26,12 @@
 //! [`buffer`], [`capacity`], and [`time`] are the buffer, capacity, and time modules of the
 //! runtime family, which the public API uses. They are the same modules that `rsasync` gives, so
 //! a value from either path is the same type.
+//!
+//! The `tcp` feature adds [`host::Tcp`], which binds a connection to a nonblocking std TCP socket.
+
+// The TCP binding reads into uninitialized memory with no zeroing, and aborts a connection with a
+// reset. Each feature leaves when std makes it stable.
+#![cfg_attr(feature = "tcp", feature(read_buf, core_io_borrowed_buf, tcp_linger))]
 
 pub use rstypes::{buffer, capacity, time};
 

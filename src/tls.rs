@@ -14,12 +14,12 @@
 //!   a server selects X25519MLKEM768 whenever a client offers it. Each configuration has its own
 //!   provider, so nothing installs a provider for the process.
 //! - **Receive.** A host receives into the region that
-//!   [`host::Connection::region`](crate::host::Connection::region) lends: the tail of the input
+//!   [`host::Io::region`](crate::host::Io::region) lends: the tail of the input
 //!   region, so a record that continues after a receive completes in place. A region that the host
 //!   owns, for example one that the kernel selected, goes to
-//!   [`host::Connection::received`](crate::host::Connection::received): a record that continues
+//!   [`host::Io::received`](crate::host::Io::received): a record that continues
 //!   into it costs one copy of the rest of that record. A read-only region goes to
-//!   [`host::Connection::receive`](crate::host::Connection::receive), and costs one copy of its
+//!   [`host::Io::receive`](crate::host::Io::receive), and costs one copy of its
 //!   bytes.
 //! - **Delivery.** The plaintext of each record reaches the inner engine in the turn that opens
 //!   it: the region freezes its bytes up to the end of the record, and the rest of the region

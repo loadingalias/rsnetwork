@@ -14,8 +14,10 @@ cargo xtask test -E 'binary(h1_conformance)'
 ```
 
 The suite runs the server and client engines on the caller-driven host, in memory, with no
-socket and no runtime. A failure names the vector, its RFC sections, and the schedule or the seed.
-It shows the result of the run, and for a schedule also the result of the whole input.
+socket and no runtime. With the `tcp` feature, which `cargo xtask test` turns on, it also runs each
+vector over a loopback TCP socket through `host::Tcp`. A failure names the vector, its RFC
+sections, and the schedule or the seed. It shows the result of the run, and for a schedule also
+the result of the whole input.
 
 The [fuzz targets](../../fuzz/README.md) drive the same engines with coverage-guided input, and
 they check the same rule: each cut of the input gives the result of the whole input.
@@ -82,6 +84,11 @@ entries, so pipelined requests meet output backpressure.
    to 50 ms before each round. Two runs with the same seed must give the same steps: each region,
    each drive with its time and its wait, and each written byte. Each seeded run must give the
    outcome of the whole input. The suite runs 64 seeds.
+5. Over a loopback socket, `host::Tcp` receives the input in regions of 64 KiB, and then in
+   regions of one byte, which cut the input at each byte. The time is the clock of the host. Each
+   run must give an outcome that the vector permits, and the outcome and the output bytes of the
+   whole input in memory. A real socket cannot cut a write at a chosen byte or replay its time, so
+   the short writes and the seeds run only in memory.
 
 ## Reuse the suite in a binding
 
@@ -91,7 +98,10 @@ The suite has two parts:
   record of the steps. It does no I/O.
 - `tests/h1_conformance.rs` is the runner of the caller-driven host. Each round, the transport
   receives one region or the end of input, the host drives until the connection waits, and the
-  transport makes one write.
+  transport makes one write. Its module `tcp` is the runner of `host::Tcp` over a loopback socket.
+  The peer writes each part of the input in one write, and the runner waits until the part
+  arrived. Only a pump that then finds no byte in the socket proves that the client received each
+  byte that the server sent before its next request.
 
 A binding adds a runner of its own, as a test file of this package that includes the module with
 `mod conformance;`. A test of another package includes the same file with a `#[path]` attribute

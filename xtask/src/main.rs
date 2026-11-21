@@ -265,7 +265,8 @@ impl Repo {
 
     /// Fails when a build of `rsnetwork` holds a crate outside its list. The protocol-only build
     /// (no default features) holds only [`PROTOCOL_CLOSURE`]: no executor, socket driver, or
-    /// Tokio. The default build adds only [`TLS_CLOSURE`]. It reads the normal and build
+    /// Tokio. The default build, and a build with all features, add only [`TLS_CLOSURE`]: the
+    /// `tcp` feature adds no crate. It reads the normal and build
     /// dependencies of `rsnetwork` on every target.
     fn closure(&self) -> Result<(), Failure> {
         eprintln!("── closure");
@@ -273,6 +274,7 @@ impl Repo {
         for (build, features, tls) in [
             ("a protocol-only build", Some("--no-default-features"), &[][..]),
             ("the default build", None, TLS_CLOSURE),
+            ("a build with all features", Some("--all-features"), TLS_CLOSURE),
         ] {
             let mut args = vec![
                 "tree",
@@ -330,7 +332,7 @@ impl Repo {
         }
         step(
             "doctest",
-            &mut self.cargo(&["test", "--locked", "--doc", "--workspace", "--quiet"]),
+            &mut self.cargo(&["test", "--locked", "--doc", "--workspace", "--all-features", "--quiet"]),
         )
     }
 
@@ -1019,16 +1021,24 @@ fn scrubbed(name: &OsStr) -> bool {
 }
 
 /// The Cargo or Nextest arguments of the caller, after `--workspace` unless
-/// they select packages. With no selection, Cargo takes only the root package.
-/// With `--workspace`, Cargo ignores `-p`, and a second `--workspace` is an
-/// error.
+/// they select packages, and after `--all-features` unless they select
+/// features. With no selection, Cargo takes only the root package, and only
+/// its default features: the `tcp` feature adds code that no other build
+/// checks. With `--workspace`, Cargo ignores `-p`, and a second `--workspace`
+/// is an error.
 fn scope(args: &[String]) -> Vec<&str> {
-    let selects = args
+    let packages = args
         .iter()
         .any(|arg| arg == "--workspace" || arg.starts_with("--package") || arg.starts_with("-p"));
-    (!selects)
+    let features = args.iter().any(|arg| {
+        ["--all-features", "--no-default-features"].contains(&arg.as_str())
+            || arg.starts_with("--features")
+            || arg.starts_with("-F")
+    });
+    (!packages)
         .then_some("--workspace")
         .into_iter()
+        .chain((!features).then_some("--all-features"))
         .chain(args.iter().map(String::as_str))
         .collect()
 }
@@ -1272,21 +1282,24 @@ mod tests {
         assert!(matches!(result, Err(failure) if failure.message.contains("m/Missing.cfg")));
     }
 
-    /// A feature, target, or filter argument keeps the whole workspace:
-    /// without `--workspace`, `cargo xtask check --all-features`, the musl
-    /// step of CI, and a named test cover only the root package. Each package
-    /// flag keeps its own selection.
+    /// A target or filter argument keeps the whole workspace and each feature:
+    /// without them, the musl step of CI and a named test cover only the root
+    /// package and its default features. Each package flag keeps its own
+    /// package selection, and each feature flag its own feature selection, so
+    /// `cargo xtask check --no-default-features` checks the protocol-only build.
     #[test]
-    fn only_package_flags_narrow_the_scope() {
+    fn only_package_and_feature_flags_narrow_the_scope() {
         let joined = |args: &[&str]| scope(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()).join(" ");
         for args in [
             &[][..],
-            &["--all-features"],
             &["--target", "x86_64-unknown-linux-musl"],
             &["-E", "test(tlc_complete_search_holds)"],
             &["--exclude", "xtask"],
         ] {
-            assert_eq!(joined(args), [&["--workspace"][..], args].concat().join(" "));
+            assert_eq!(
+                joined(args),
+                [&["--workspace", "--all-features"][..], args].concat().join(" ")
+            );
         }
         for args in [
             &["-p", "rsnetwork"][..],
@@ -1295,7 +1308,16 @@ mod tests {
             &["--package=rsnetwork"],
             &["--workspace"],
         ] {
-            assert_eq!(joined(args), args.join(" "));
+            assert_eq!(joined(args), [&["--all-features"][..], args].concat().join(" "));
+        }
+        for args in [
+            &["--all-features"][..],
+            &["--no-default-features"],
+            &["--features", "tcp"],
+            &["--features=tcp"],
+            &["-Ftcp"],
+        ] {
+            assert_eq!(joined(args), [&["--workspace"][..], args].concat().join(" "));
         }
     }
 }

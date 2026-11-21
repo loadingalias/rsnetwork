@@ -94,7 +94,7 @@ use rsnetwork::buffer::{Backing, Lease, WriteLoan};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Endpoint, Inbound, Outbound, TurnLimits};
 use rsnetwork::h1::{BodyLimits, Framing, Limits as HeadLimits, Server, ServerEvent};
-use rsnetwork::host::Connection;
+use rsnetwork::host::{Connection, Io as _};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
     CertificateDer, DefaultTimeProvider, Entropy, Identity, Limits, PrivateKeyDer, Resumption, ServerConfig, ServerOptions,
