@@ -36,6 +36,7 @@
 //!   [`Closure::Unnotified`]. Only a protocol with its own framing can then tell that no byte is
 //!   lost.
 
+mod memory;
 mod record;
 
 use core::alloc::Layout;
@@ -45,11 +46,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::borrow::Cow;
 use std::sync::{Arc, PoisonError, RwLock};
 
+use memory::{ClientStore, Cost, Held, Own, Owns, ServerStore};
 use record::{CONTENT_MAX, Content, HEADER, PROTECTED_MAX, Protection, TAG, Violation};
 use rscrypto_rustls::kx_group::{X25519Group, X25519MlKem768Group};
 use rscrypto_rustls::replay::{self, ScopedRandom, Stream};
 use rstypes::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, PoolRefused, WriteLoan};
 use rstypes::capacity::{Budget, Credit};
+use rustls::client::ClientSessionStore;
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::kx::SupportedKxGroup;
 use rustls::crypto::{Credentials, Identity as Chain, SelectedCredential, SingleCredential};
@@ -58,7 +61,7 @@ use rustls::error::{AlertDescription, CertificateError, PeerMisbehaved};
 use rustls::kernel::KernelConnection;
 use rustls::pki_types::ServerName;
 use rustls::server::{
-    ClientHello, NoServerSessionStorage, PreferServerOrder, ServerCredentialResolver, ServerSessionMemoryCache,
+    ClientHello, NoServerSessionStorage, PreferServerOrder, ServerCredentialResolver, StoresServerSessions,
     Tls13Tickets, WebPkiClientVerifier,
 };
 use rustls::split::SplitConnection;
@@ -102,8 +105,9 @@ impl fmt::Debug for Identity {
 pub enum Resumption {
     /// Nowhere: each connection runs a full handshake.
     Off,
-    /// Only in this process, which keeps at most this many sessions. The ticket keys are local to
-    /// the process, so another instance, or this one after a restart, runs a full handshake.
+    /// Only in this process, which keeps at most this many sessions, each charged to the budget of
+    /// the configuration. The ticket keys are local to the process, so another instance, or this
+    /// one after a restart, runs a full handshake.
     Process(NonZeroUsize),
 }
 
@@ -118,6 +122,9 @@ pub struct ClientOptions<'a> {
     pub protocols: &'a [&'a [u8]],
     /// Where sessions can resume.
     pub resumption: Resumption,
+    /// The budget that each stored session is charged to. A ticket that it cannot pay for is not
+    /// kept.
+    pub budget: &'a Budget,
     /// The wall clock that checks the validity of each certificate. [`DefaultTimeProvider`] reads
     /// the clock of the system.
     pub clock: Arc<dyn TimeProvider>,
@@ -138,6 +145,9 @@ pub struct ServerOptions<'a> {
     pub protocols: &'a [&'a [u8]],
     /// Where sessions can resume.
     pub resumption: Resumption,
+    /// The budget that each stored session is charged to. A session that it cannot pay for is not
+    /// kept, and the client then gets no ticket for it.
+    pub budget: &'a Budget,
     /// The wall clock that checks the validity of each client certificate and session.
     pub clock: Arc<dyn TimeProvider>,
     /// Where the randomness of each handshake and key comes from.
@@ -240,13 +250,30 @@ pub struct ClientConfig {
     config: Arc<rustls::ClientConfig>,
     resumption: Resumption,
     entropy: Arc<Source>,
+    /// What each connection charges for rustls.
+    cost: Cost,
+    own: Arc<Owns>,
+    /// The store of the sessions, or `None` when they do not resume.
+    store: Option<Arc<ClientStore>>,
 }
 
 impl ClientConfig {
     /// Makes the configuration from `options`. Refuses with [`Kind::Misuse`] when it has no root,
-    /// a root or the identity is not valid, or a protocol name is empty or longer than 255 bytes.
+    /// a root or the identity is not valid, or a protocol name is empty or longer than 255 bytes,
+    /// and with [`Kind::Overload`] when `budget` cannot pay for the places of the session store.
     pub fn new(options: ClientOptions<'_>) -> Result<Self, Error> {
         let entropy = Source::new(options.entropy);
+        let identity = options.identity.is_some();
+        // The ClientHello carries each ALPN name with its length.
+        let own = options
+            .identity
+            .as_ref()
+            .map_or_else(Own::default, |identity| Own::new(&identity.chain))
+            .plus_bytes(options.protocols.iter().map(|name| 1 + name.len()).sum());
+        let store = match options.resumption {
+            Resumption::Off => None,
+            Resumption::Process(sessions) => Some(Arc::new(ClientStore::new(options.budget, sessions.get())?)),
+        };
         let builder = rustls::ClientConfig::builder_with_details(Arc::new(entropy.provider()), options.clock)
             .with_root_certificates(roots(options.roots)?);
         let mut config = match options.identity {
@@ -262,14 +289,17 @@ impl ClientConfig {
         config.alpn_protocols = protocols(options.protocols)?;
         // rustls gives the traffic keys to the record layer of the core when the handshake completes.
         config.enable_secret_extraction = true;
-        config.resumption = match options.resumption {
-            Resumption::Off => rustls::client::Resumption::disabled(),
-            Resumption::Process(sessions) => rustls::client::Resumption::in_memory_sessions(sessions.get()),
+        config.resumption = match &store {
+            None => rustls::client::Resumption::disabled(),
+            Some(store) => rustls::client::Resumption::store(Arc::clone(store) as Arc<dyn ClientSessionStore>),
         };
         Ok(Self {
             config: Arc::new(config),
             resumption: options.resumption,
             entropy: Arc::new(entropy),
+            cost: Cost::client(options.protocols, identity),
+            own: Arc::new(Owns::new(own)),
+            store,
         })
     }
 
@@ -295,14 +325,26 @@ pub struct ServerConfig {
     identity: Arc<Rotation>,
     resumption: Resumption,
     entropy: Arc<Source>,
+    /// What each connection charges for rustls.
+    cost: Cost,
+    own: Arc<Owns>,
+    /// The part of the trust roots that the CertificateRequest names.
+    hints: Own,
 }
 
 impl ServerConfig {
     /// Makes the configuration from `options`. Refuses with [`Kind::Misuse`] when the identity is
     /// not valid, its key does not match its certificate, a client root is not valid, or a
-    /// protocol name is empty or longer than 255 bytes.
+    /// protocol name is empty or longer than 255 bytes, and with [`Kind::Overload`] when `budget`
+    /// cannot pay for the places of the session store.
     pub fn new(options: ServerOptions<'_>) -> Result<Self, Error> {
         let entropy = Source::new(options.entropy);
+        let hints = Own::new(options.client_roots.unwrap_or_default());
+        let own = Own::new(&options.identity.chain).plus(hints);
+        let session_storage: Arc<dyn StoresServerSessions> = match options.resumption {
+            Resumption::Off => Arc::new(NoServerSessionStorage {}),
+            Resumption::Process(sessions) => Arc::new(ServerStore::new(options.budget, sessions.get())?),
+        };
         let provider = Arc::new(entropy.provider());
         let identity = Arc::new(Rotation(RwLock::new(credential(
             options.identity,
@@ -326,10 +368,7 @@ impl ServerConfig {
         config.kx_selector = &PreferServerOrder;
         config.alpn_protocols = protocols(options.protocols)?;
         config.enable_secret_extraction = true;
-        config.session_storage = match options.resumption {
-            Resumption::Off => Arc::new(NoServerSessionStorage {}),
-            Resumption::Process(sessions) => ServerSessionMemoryCache::new(sessions.get()),
-        };
+        config.session_storage = session_storage;
         if options.resumption == Resumption::Off {
             config.send_tls13_tickets = Tls13Tickets { default: 0, max: 0 };
         }
@@ -338,6 +377,9 @@ impl ServerConfig {
             identity,
             resumption: options.resumption,
             entropy: Arc::new(entropy),
+            cost: Cost::server(options.client_roots),
+            own: Arc::new(Owns::new(own)),
+            hints,
         })
     }
 
@@ -345,7 +387,10 @@ impl ServerConfig {
     /// the identity that it showed. Refuses with [`Kind::Misuse`], and keeps the identity, when
     /// the new one is not valid.
     pub fn rotate(&self, identity: Identity) -> Result<(), Error> {
+        let own = Own::new(&identity.chain).plus(self.hints);
         let credential = credential(identity, self.config.provider(), &self.entropy)?;
+        // The charge covers the new chain before a handshake can show it.
+        self.own.raise(own);
         *self.identity.0.write().unwrap_or_else(PoisonError::into_inner) = credential;
         Ok(())
     }
@@ -634,10 +679,19 @@ struct Records {
     update: bool,
     /// A handshake message whose records have not all arrived.
     joined: Option<Bytes>,
+    /// The bytes of one copy of the chain of the peer, which each session ticket copies.
+    chain: u64,
+    /// The store of the session tickets of a client, or `None` when they do not resume.
+    tickets: Option<Arc<ClientStore>>,
 }
 
 impl Records {
-    fn new(kernel: Kernel, secrets: &ExtractedSecrets, key_records_max: u64) -> Result<Self, Error> {
+    fn new(
+        kernel: Kernel,
+        secrets: &ExtractedSecrets,
+        key_records_max: u64,
+        (chain, tickets): (u64, Option<Arc<ClientStore>>),
+    ) -> Result<Self, Error> {
         let SupportedCipherSuite::Tls13(suite) = kernel.suite() else {
             return Err(no_keys());
         };
@@ -647,6 +701,8 @@ impl Records {
             tx_limit: key_records_max.min(suite.common.confidentiality_limit),
             update: false,
             joined: None,
+            chain,
+            tickets,
             kernel,
         })
     }
@@ -690,7 +746,7 @@ impl Records {
                 return Ok(());
             }
             let (kind, body) = split_message(&joined.bytes).unwrap_or_default();
-            self.message(kind, body, content.is_empty())?;
+            self.message(kind, body, content.is_empty(), budget)?;
         }
         while !content.is_empty() {
             let end = message_end(content);
@@ -701,7 +757,7 @@ impl Records {
                 return Ok(());
             };
             let (kind, body) = split_message(whole).unwrap_or_default();
-            self.message(kind, body, rest.is_empty())?;
+            self.message(kind, body, rest.is_empty(), budget)?;
             content = rest;
         }
         Ok(())
@@ -709,14 +765,25 @@ impl Records {
 
     /// Takes one handshake message of the peer after the handshake. `last` tells whether it ends
     /// its record, as each message before a key change must (RFC 8446, section 5.1).
-    fn message(&mut self, kind: u8, body: &[u8], last: bool) -> Result<(), Fault> {
+    fn message(&mut self, kind: u8, body: &[u8], last: bool, budget: &Budget) -> Result<(), Fault> {
         match (kind, &mut self.kernel) {
-            (NEW_SESSION_TICKET, Kernel::Client(kernel)) => kernel.handle_new_session_ticket(body).map_err(|_| {
-                Violation::new(
-                    AlertDescription::DecodeError,
-                    "rustls refused a session ticket of the server",
-                )
-            })?,
+            (NEW_SESSION_TICKET, Kernel::Client(kernel)) => {
+                // rustls copies the chain into each ticket. The charge goes to the budget of the
+                // store that keeps the ticket, or to the connection for this call. A ticket that
+                // the budget cannot pay for does not go to rustls.
+                let ticket = match &self.tickets {
+                    Some(store) => store.charge(body.len(), self.chain),
+                    None => memory::Ticket::new(budget, body.len(), self.chain),
+                };
+                if let Some(ticket) = ticket {
+                    memory::ticket(ticket, || kernel.handle_new_session_ticket(body)).map_err(|_| {
+                        Violation::new(
+                            AlertDescription::DecodeError,
+                            "rustls refused a session ticket of the server",
+                        )
+                    })?;
+                }
+            }
             (KEY_UPDATE, _) => {
                 if !last {
                     return Err(Violation::new(
@@ -1004,11 +1071,29 @@ impl Bytes {
         self.settle(refused)
     }
 
-    /// Charges the capacity that the allocator or rustls added. Refuses with `refused`.
+    /// Charges the growth of the bytes when a call writes at most `flight` more, or gives the
+    /// units that it needs. A vector grows to at most twice its length, so its capacity stays
+    /// within twice the length after the call, or its capacity before it.
+    fn room(&mut self, flight: usize) -> Result<(), u64> {
+        let bound = self
+            .bytes
+            .len()
+            .saturating_add(flight)
+            .saturating_mul(2)
+            .max(self.bytes.capacity());
+        let more = (bound as u64).saturating_sub(self.charge.charged());
+        self.charge.charge(more).map_err(|_| more)
+    }
+
+    /// Makes the charge equal the capacity: it charges what the allocator or rustls added, or
+    /// gives back what a growth bound did not use. Refuses with `refused`.
     fn settle(&mut self, refused: Error) -> Result<(), Error> {
         let capacity = self.bytes.capacity() as u64;
-        if let Some(more) = capacity.checked_sub(self.charge.charged()).filter(|&more| more > 0) {
+        let charged = self.charge.charged();
+        if let Some(more) = capacity.checked_sub(charged).filter(|&more| more > 0) {
             self.charge.charge(more).map_err(|_| refused)?;
+        } else if let Some(rest) = charged.checked_sub(capacity).filter(|&rest| rest > 0) {
+            self.charge.refund(rest).map_err(|_| refused)?;
         }
         Ok(())
     }
@@ -1075,6 +1160,14 @@ pub struct Tls<E> {
     facts: Option<Facts>,
     /// The stream of each draw of the connection, or `None` for the system.
     stream: Option<Stream>,
+    /// The charge of the memory of rustls.
+    held: Held,
+    cost: Cost,
+    own: Arc<Owns>,
+    /// The store of the session tickets of a client, until the hand-off.
+    tickets: Option<Arc<ClientStore>>,
+    /// The capacity that the next rustls call waits for.
+    wait: Option<u64>,
     budget: Budget,
     limits: Limits,
     /// The region that the engine reads, or `None` when no received byte is pending.
@@ -1108,23 +1201,36 @@ impl<E: Engine> Tls<E> {
         budget: &Budget,
     ) -> Result<Self, Error> {
         let name = ServerName::try_from(name)
-            .map_err(|_| Error::new(Kind::Misuse, "the server name is not a DNS name or an IP address"))?
-            .to_owned();
+            .map_err(|_| Error::new(Kind::Misuse, "the server name is not a DNS name or an IP address"))?;
+        check(&limits)?;
+        // The charges come before rustls starts, so a refusal allocates nothing. The connection
+        // keeps the name, and the ClientHello carries it.
+        let name_bytes = match &name {
+            ServerName::DnsName(dns) => dns.as_ref().len(),
+            _ => 0,
+        };
+        let own = config.own.get();
+        let mut held = Held::new(budget, &config.cost, 2 * name_bytes as u64, &own)?;
         let mut written = Bytes::new(budget);
+        written.room(own.flight() + name_bytes).map_err(|_| OUTPUT_REFUSED)?;
+        let name = name.to_owned();
         let stream = config.entropy.stream(CONNECTION);
-        let session = scoped(stream.as_ref(), || {
-            config.config.connect(name).build(&mut written.bytes)
-        })
-        .map_err(|error| refused(&error))?;
+        let Bytes { bytes, charge } = &mut written;
+        let session = memory::handshake(&mut held, charge, || {
+            scoped(stream.as_ref(), || config.config.connect(name).build(bytes))
+        });
         written.settle(OUTPUT_REFUSED)?;
-        Self::new(
+        held.after(0, &own);
+        let session = session.map_err(|error| refused(&error))?;
+        Ok(Self::new(
             (Session::Client(session), stream),
+            (held, config.cost, Arc::clone(&config.own), config.store.clone()),
             written,
             engine,
             (inbound, outbound),
             limits,
             budget,
-        )
+        ))
     }
 
     /// Makes the server end of a connection, over which `engine` runs with its plaintext queues.
@@ -1138,48 +1244,50 @@ impl<E: Engine> Tls<E> {
         limits: Limits,
         budget: &Budget,
     ) -> Result<Self, Error> {
+        check(&limits)?;
+        let own = config.own.get();
+        let mut held = Held::new(budget, &config.cost, 0, &own)?;
         let stream = config.entropy.stream(CONNECTION);
-        let session = scoped(stream.as_ref(), || {
-            rustls::Connection::<ServerSide, Tcp>::new(Arc::clone(&config.config))
-        })
-        .map_err(|error| refused(&error))?;
-        Self::new(
+        let mut written = Bytes::new(budget);
+        let session = memory::handshake(&mut held, &mut written.charge, || {
+            scoped(stream.as_ref(), || {
+                rustls::Connection::<ServerSide, Tcp>::new(Arc::clone(&config.config))
+            })
+        });
+        held.after(0, &own);
+        let session = session.map_err(|error| refused(&error))?;
+        Ok(Self::new(
             (Session::Server(session), stream),
-            Bytes::new(budget),
+            (held, config.cost, Arc::clone(&config.own), None),
+            written,
             engine,
             (inbound, outbound),
             limits,
             budget,
-        )
+        ))
     }
 
     fn new(
         (session, stream): (Session, Option<Stream>),
+        (held, cost, own, tickets): (Held, Cost, Arc<Owns>, Option<Arc<ClientStore>>),
         written: Bytes,
         engine: E,
         (inbound, outbound): (Inbound, Outbound),
         limits: Limits,
         budget: &Budget,
-    ) -> Result<Self, Error> {
-        if limits.input_bytes < RECORD_BYTES_MAX {
-            return Err(Error::new(
-                Kind::Misuse,
-                "the TLS input region is smaller than a record",
-            ));
-        }
-        if limits.key_records_max < 2 {
-            return Err(Error::new(
-                Kind::Misuse,
-                "a TLS key seals fewer than 2 records, and its KeyUpdate is one of them",
-            ));
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             engine,
             inbound,
             outbound,
             phase: Phase::Handshake(session),
             facts: None,
             stream,
+            held,
+            cost,
+            own,
+            tickets,
+            wait: None,
             budget: budget.clone(),
             limits,
             region: None,
@@ -1192,7 +1300,7 @@ impl<E: Engine> Tls<E> {
             notified: false,
             closure: None,
             end: None,
-        })
+        }
     }
 
     /// The inner engine and its plaintext output queue, for the calls of the application, such as
@@ -1229,6 +1337,7 @@ impl<E: Engine> Tls<E> {
         now: Option<Instant>,
     ) -> Result<(Option<E::Event>, Turn), Fault> {
         let mut work = Work::default();
+        self.wait = None;
         self.take_queued(inbound)?;
         let stopped = loop {
             self.complete_from_next()?;
@@ -1256,7 +1365,7 @@ impl<E: Engine> Tls<E> {
         }
         let input_ended = inbound.ended() && inbound.front().is_none() && self.next.is_none();
         let partial = self.region.is_some();
-        if input_ended && partial && !stopped {
+        if input_ended && partial && !stopped && self.wait.is_none() {
             return Err(Error::new(Kind::Partial, "the transport ended inside a TLS record").into());
         }
         if input_ended && !partial && !self.inbound.ended() {
@@ -1287,6 +1396,8 @@ impl<E: Engine> Tls<E> {
         let deadline = inner.and_then(|turn| turn.deadline);
         let progress = if let Some(end) = self.end {
             self.ending(end)
+        } else if let Some(units) = self.wait {
+            Progress::Blocked(Blocked::Capacity(units))
         } else if work.reached(&self.limits.turn) || (stopped && self.inbound.free() > 0) {
             Progress::Pending
         } else if !self.written.bytes.is_empty() {
@@ -1423,6 +1534,19 @@ impl<E: Engine> Tls<E> {
             if next > unread.len() || work.reached(&self.limits.turn) {
                 return Ok(());
             }
+            // rustls can read each byte that it did not discard, up to the end of this record. A
+            // call that the budget cannot pay for waits.
+            let visible = region.seen + next - region.start;
+            let own = self.own.get();
+            if let Err(units) = self.held.charge(own.work(self.cost.read, visible)) {
+                self.wait = Some(units);
+                return Ok(());
+            }
+            if let Err(units) = self.written.room(own.flight()) {
+                self.held.after(0, &own);
+                self.wait = Some(units);
+                return Ok(());
+            }
             region.seen += next;
             work.add(next, 1);
             let mut view = View {
@@ -1430,20 +1554,26 @@ impl<E: Engine> Tls<E> {
                 notified: &mut self.notified,
                 ended,
             };
-            let read = scoped(self.stream.as_ref(), || {
-                session.read(&mut view, &mut self.written.bytes)
+            let stream = self.stream.as_ref();
+            let Bytes { bytes, charge } = &mut self.written;
+            let read = memory::handshake(&mut self.held, charge, || {
+                scoped(stream, || session.read(&mut view, bytes))
             });
             self.written.settle(OUTPUT_REFUSED)?;
+            self.held.after(visible, &own);
             read?;
             if !session.common().is_handshaking() {
-                return self.hand_off();
+                let peer = memory::chain_bytes(session.common().peer_identity());
+                self.held.finished(peer, &own);
+                return self.hand_off(peer);
             }
         }
     }
 
     /// Gives the traffic keys of the completed handshake to the record layer, at the sequence
-    /// numbers of rustls.
-    fn hand_off(&mut self) -> Result<(), Error> {
+    /// numbers of rustls. A client keeps one copy of the `peer` bytes of the chain of the server
+    /// for its tickets.
+    fn hand_off(&mut self, peer: u64) -> Result<(), Error> {
         if self.region.as_ref().is_some_and(|region| region.start < region.seen) {
             return Err(Error::new(
                 Kind::Unsupported,
@@ -1455,7 +1585,17 @@ impl<E: Engine> Tls<E> {
         };
         self.facts = Facts::of(session.common());
         let (kernel, secrets) = Kernel::new(session)?;
-        self.phase = Phase::Records(Records::new(kernel, &secrets, self.limits.key_records_max)?);
+        let kept = match kernel {
+            Kernel::Client(_) => peer,
+            Kernel::Server(_) => 0,
+        };
+        self.held.hand_off(self.cost.kernel, kept);
+        self.phase = Phase::Records(Records::new(
+            kernel,
+            &secrets,
+            self.limits.key_records_max,
+            (peer, self.tickets.take()),
+        )?);
         Ok(())
     }
 
@@ -1579,6 +1719,23 @@ impl<E: Engine> Tls<E> {
         let pushed = outbound.push(lease);
         assert!(pushed.is_ok(), "a queue with a free place takes each region");
     }
+}
+
+/// Refuses `limits` that cannot work.
+fn check(limits: &Limits) -> Result<(), Error> {
+    if limits.input_bytes < RECORD_BYTES_MAX {
+        return Err(Error::new(
+            Kind::Misuse,
+            "the TLS input region is smaller than a record",
+        ));
+    }
+    if limits.key_records_max < 2 {
+        return Err(Error::new(
+            Kind::Misuse,
+            "a TLS key seals fewer than 2 records, and its KeyUpdate is one of them",
+        ));
+    }
+    Ok(())
 }
 
 /// Queues plaintext for the inner engine. The caller checked that the queue has a place.

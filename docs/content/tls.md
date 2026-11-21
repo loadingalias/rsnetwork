@@ -48,6 +48,7 @@ and rustls 0.24 has no default provider of the process.
 | `identity` | The certificate chain and key of the client, for a server that asks for one (mTLS), or `None` |
 | `protocols` | The ALPN names to offer, the most preferred first. Empty offers none |
 | `resumption` | `Resumption::Off`, or `Resumption::Process(n)` (see [Resumption](#resumption)) |
+| `budget` | The budget that the stored sessions are charged to |
 | `clock` | The wall clock that checks the validity of each certificate |
 | `entropy` | `Entropy::System`, or `Entropy::Seeded(generator)` (see [Replay a run](#replay-a-run)) |
 
@@ -57,15 +58,19 @@ and rustls 0.24 has no default provider of the process.
 | `client_roots` | `None`: the server asks for no client certificate. `Some(roots)`: each client must show a chain to one of these roots (mTLS) |
 | `protocols` | The ALPN names that the server accepts, the most preferred first |
 | `resumption` | `Resumption::Off`, or `Resumption::Process(n)` |
+| `budget` | The budget that the stored sessions are charged to |
 | `clock` | The wall clock that checks each client certificate and session |
 | `entropy` | `Entropy::System`, or `Entropy::Seeded(generator)` |
 
 `ClientConfig::new` and `ServerConfig::new` refuse with `Kind::Misuse` when a configuration
 cannot work: no root, a certificate that does not parse, a key that does not match its
-certificate, or an ALPN name that is empty or longer than 255 bytes.
+certificate, or an ALPN name that is empty or longer than 255 bytes. With
+`Resumption::Process(n)`, they charge the `n` places of the session store to `budget` first, and
+refuse with `Kind::Overload` when it cannot pay.
 
 The key exchange is the default hybrid profile. A client offers X25519MLKEM768 first and X25519
-second, with a key share for each. A server selects X25519MLKEM768 whenever the client offers it.
+second, with a key share for each, in each ClientHello: it keeps no hint of the group that a server
+chose before. A server selects X25519MLKEM768 whenever the client offers it.
 It sends a HelloRetryRequest for it when the client sent no key share for it. The suites are the
 TLS 1.3 suites AES-256-GCM, AES-128-GCM, and ChaCha20-Poly1305. TLS 1.2 is off. 0-RTT is off: no
 end sends or accepts early data.
@@ -104,19 +109,22 @@ fn serve(
     local: SocketAddr,
     received: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // One budget pays for the stored sessions and for each part of each connection.
+    let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
+
     // One configuration for each connection of the server.
     let config = ServerConfig::new(ServerOptions {
         identity: Identity { chain, key },
         client_roots: None,
         protocols: &[b"http/1.1"],
         resumption: Resumption::Process(NonZeroUsize::new(1024).expect("not zero")),
+        budget: &budget,
         clock: Arc::new(DefaultTimeProvider),
         entropy: Entropy::System,
     })?;
 
     // One connection: the HTTP/1.1 engine with its plaintext queues, inside `Tls`, inside the
-    // host connection with its ciphertext queues. One budget pays for each part.
-    let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
+    // host connection with its ciphertext queues.
     let queue = NonZeroUsize::new(16).expect("not zero");
     let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
     let head = HeadLimits { head_bytes: 8 * 1024, fields: 64, name_bytes: 64, value_bytes: 4 * 1024 };
@@ -219,6 +227,12 @@ the same server after a restart, runs a full handshake. `ClientConfig::resumptio
 `ServerConfig::resumption()` report the scope. `Resumption::Off` runs a full handshake for each
 connection, and the server then sends no session ticket.
 
+Each stored session is charged to the `budget` of its configuration. When the store is full, the
+oldest session goes. A session that the budget cannot pay for is not kept: a server then sends no
+ticket for it, and a client drops the ticket. Each connection works as before, and the next one
+runs a full handshake. When a handshake takes a session, its charge moves to the budget of the
+connection. When that budget cannot pay for it, the handshake is full.
+
 ## Replay a run
 
 `Entropy::System` reads the randomness of each handshake from the operating system.
@@ -310,5 +324,17 @@ When the engine ends, the connection sends `close_notify` before its terminal tu
 `Tls::client` and `Tls::server` refuse with `Kind::Misuse` when `input_bytes` is smaller than
 `RECORD_BYTES_MAX`, or `key_records_max` is smaller than 2.
 
+## Memory
+
 Each input region, each ciphertext output, and each joined handshake message is charged to the
-budget of the connection: see [limits](limits.md).
+budget of the connection. The memory of rustls is charged too, before rustls can allocate it:
+
+- `Tls::client` and `Tls::server` charge the state of the handshake before rustls starts. When the
+  budget cannot pay, they refuse with `Kind::Overload` (`the budget refused the state of a TLS
+  handshake`, or `the budget refused the TLS output`), and they allocate nothing.
+- Each rustls call of the handshake charges its working memory while it runs. When the budget
+  cannot pay, the turn is `Progress::Blocked(Blocked::Capacity(n))`, and the handshake goes on in a
+  later drive. The working memory of a call is large for its input, so size the budget for it: see
+  [limits](limits.md#tls-handshakes).
+- After the handshake, the connection keeps the charge of the key schedule of rustls, and on a
+  client one copy of the chain of the server.

@@ -32,13 +32,40 @@ to its alignment, a 16-byte entry for each slot, and the shared state of the poo
 | HTTP/2 connection | Its HPACK decoder of at least 4096 bytes, its HPACK encoder, a stream table of `max_concurrent_streams` entries, three lists of as many 4-byte identifiers (reset streams and the two rings of the send scheduler), and a frame pool of one 64-byte slot for each `Outbound` entry and one more | `h2::Connection::new` |
 | Join of an HTTP/2 header block that does not decode in place | Its bytes for a block in one frame, or `work` for a block that continues: see [HTTP/2](http2.md#header-blocks) | When the block arrives, until its decode |
 | TLS input region | A pool of one slot of `input_bytes` | When a receive needs a region, until the last view of its plaintext and the writable rest of the region drop |
-| TLS ciphertext output | Its capacity, as encryption and the handshake of rustls write it | When the connection writes, until the transport releases the last view |
+| TLS ciphertext output | Its capacity. Before a call of rustls, also twice the bytes that the call can write | When the connection writes, until the transport releases the last view |
 | Join of a TLS handshake message after the handshake that arrives in two or more records | Its bytes, at most `input_bytes` | When the message continues in a later record, until the message is complete |
+| TLS handshake | The state of rustls that the configuration fixes, and a bound of what rustls keeps of the messages of the peer: see [TLS handshakes](#tls-handshakes) | `Tls::client` and `Tls::server`, until the handshake completes |
+| Call of rustls during a TLS handshake | Its working memory: see [TLS handshakes](#tls-handshakes) | Before the call, until it returns |
+| TLS connection after the handshake | The key schedule of rustls, and on a client one copy of the chain of the server | When the handshake completes, until the connection drops |
+| TLS session store | One place for each session of `Resumption::Process(n)`, charged to the `budget` of the configuration | `ClientConfig::new` and `ServerConfig::new` |
+| Stored TLS session | Its bytes, with the chain of the peer, to the `budget` of the configuration | When the store keeps it, until a handshake takes it or the store evicts it |
+| TLS session that a handshake takes | The session and its copies in the handshake, to the budget of the connection | When the handshake takes it, until the handshake completes |
 
-A join that the budget cannot pay for does not fail the connection: the turn is
+A join or a call of rustls that the budget cannot pay for does not fail the connection: the turn is
 `Progress::Blocked(Blocked::Capacity(n))`, and the engine tries again in a later drive. The received
 regions and the head regions that you give are yours, so you charge them, for example with a pool of
 `rsnetwork::buffer` on the same budget.
+
+## TLS handshakes
+
+rustls allocates its own memory, and it takes no budget. So a TLS connection charges a bound of
+that memory before rustls can allocate it. The bounds come from the decoders of the rustls
+release that rsnetwork pins, and a test checks them at each allocation:
+
+| Charge | Bound |
+| --- | --- |
+| State of a handshake | About 20 KiB for a client, with more for each ALPN name, and 4 KiB for a server. A server that asks for a client certificate adds 8 KiB and twice the bytes of its roots |
+| Working memory of one call | 16 KiB, a part for the own chain, and a factor times the bytes that rustls can read in the call: 56 for a client and 24 for a server |
+| Messages of the peer that rustls keeps between calls | 17 times the most bytes that one call read, on a client and on a server that asks for a client certificate |
+| Transcript for client authentication | Twice the bytes that this end sends, on a client with an identity and on a server that asks for one |
+
+Only a connection in a call holds the working memory of the call, so it counts once for each
+thread that runs a call, not once for each connection. rustls can read a whole handshake message in
+one call, up to `input_bytes`. Thus one call of a client can charge 56 times `input_bytes` while it
+runs, about 1.8 MiB for 32 KiB. Give the budget room for it, or a handshake waits for capacity.
+
+A client factor of 56 comes from a list that rustls decodes in EncryptedExtensions also when the
+client did not ask for it. The other lists of a client have a factor of 24 or less.
 
 ## Turn limits
 

@@ -109,6 +109,7 @@ fn server_config(client_roots: Option<&[u8]>, resumption: Resumption) -> ServerC
         client_roots: client_roots.as_ref().map(|roots| &roots[..]),
         protocols: &[b"http/1.1"],
         resumption,
+        budget: &budget(),
         clock: Arc::new(At(VALID)),
         entropy: Entropy::System,
     })
@@ -121,6 +122,7 @@ fn client_config(root: &[u8], identity: Option<Identity>, now: u64, resumption: 
         identity,
         protocols: &[b"h2", b"http/1.1"],
         resumption,
+        budget: &budget(),
         clock: Arc::new(At(now)),
         entropy: Entropy::System,
     })
@@ -344,6 +346,8 @@ fn a_request_negotiates_x25519mlkem768_with_no_copy_but_encryption_and_leaves_no
         server_config(None, Resumption::Off),
     );
     let mut pair = Pair::new(&client, "server.test", &server);
+    // After the handshake, the server is idle: it keeps the state of its kernel connection.
+    pair.run();
     let server_idle = pair.server_budget.available();
     pair.request(&[]);
     pair.run();
@@ -362,7 +366,8 @@ fn a_request_negotiates_x25519mlkem768_with_no_copy_but_encryption_and_leaves_no
         assert_eq!(Copies { encrypted: 0, ..copies }, Copies::default());
         assert!(copies.encrypted > 0);
     }
-    // The idle server holds no input region and no output: its budget is back where it started.
+    // The idle server holds no input region and no output: its budget is back where it was
+    // before the request.
     assert_eq!(pair.server_budget.available(), server_idle);
 }
 
@@ -561,6 +566,7 @@ fn a_certificate_chain_larger_than_one_record_completes_when_it_arrives_in_parts
         client_roots: None,
         protocols: &[b"http/1.1"],
         resumption: Resumption::Off,
+        budget: &budget(),
         clock: Arc::new(At(VALID)),
         entropy: Entropy::System,
     })
@@ -585,6 +591,7 @@ fn a_seeded_run_replays_each_byte_of_its_handshake_and_request() {
             identity: None,
             protocols: &[b"http/1.1"],
             resumption: Resumption::Off,
+            budget: &budget(),
             clock: Arc::new(At(VALID)),
             entropy: Entropy::Seeded(root.child(b"client\0\0", 0)),
         })
@@ -594,6 +601,7 @@ fn a_seeded_run_replays_each_byte_of_its_handshake_and_request() {
             client_roots: None,
             protocols: &[b"http/1.1"],
             resumption: Resumption::Off,
+            budget: &budget(),
             clock: Arc::new(At(VALID)),
             entropy: Entropy::Seeded(root.child(b"server\0\0", 0)),
         })
