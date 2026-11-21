@@ -49,8 +49,12 @@ byte.
 | `Read::Wait` | No byte waits: give the next part |
 | `Read::Done(outcome)` | The body ended with `outcome` after its last byte |
 
-`consumer.delivered()` gives the number of body bytes that the consumer copied, also after an
-interrupted body.
+`consumer.wants_data()` tells when the consumer takes the next part: no byte waits, and the body
+has not ended. `consumer.take()` gives the waiting bytes as a view, with no copy, and
+`consumer.outcome()` gives the outcome after the last waiting byte. `consumer.delivered()` gives
+the number of body bytes that the consumer copied or gave, also after an interrupted body.
+
+The [client](client.md) runs a consumer for each response body.
 
 ## Collect a body
 

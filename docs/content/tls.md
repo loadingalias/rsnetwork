@@ -172,6 +172,9 @@ fn serve(
 Send each output of the connection, and acknowledge it, as without TLS. The engine encrypts its
 plaintext output in the next drive, so drive again after you answer an event.
 
+For HTTP/1.1 requests over TLS, `client::Http1::tls` makes these layers for you: see
+[send HTTP/1.1 requests with a deadline](client.md).
+
 ## Receive forms and their copies
 
 `Tls::copies()` reports each byte that the connection copied, by cause. The receive form that the

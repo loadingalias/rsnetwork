@@ -278,6 +278,20 @@ impl Client {
         }
     }
 
+    /// Whether the engine takes a request now: no exchange is in flight, and the connection has
+    /// not ended. After a response whose body the application cancelled, it is ready when the
+    /// drain of the rest of the body is complete.
+    pub fn ready(&self) -> bool {
+        self.end.is_none() && self.write == Write::Idle && matches!(self.read, ReadState::Idle)
+    }
+
+    /// Ends the connection: the engine takes no more requests, and an exchange in flight ends
+    /// with it, so its response stays incomplete. The next turn is terminal, and a TLS connection
+    /// then sends `close_notify`.
+    pub fn close(&mut self) {
+        self.end.get_or_insert(Ok(()));
+    }
+
     /// Cancels the read of the response. Inside the body, the next drive gives
     /// [`End(Outcome::Cancelled)`](ClientEvent::End), once, and no more of the body. The engine then
     /// reads and discards the rest of the body, up to [`BodyLimits::drain_bytes`], to reuse the

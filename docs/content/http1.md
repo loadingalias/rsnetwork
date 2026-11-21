@@ -126,6 +126,9 @@ and change nothing. Acknowledge output, then call again. A call in the wrong sta
 
 ## Send requests
 
+For a request with a deadline over TCP or TLS, and body reads that drive the connection, use the
+[client](client.md). It runs this engine. Use the engine directly when you drive its queues yourself:
+
 1. Make one `Client` for each connection with `Client::new(limits, body, turn, &outbound, &budget)`.
 2. Call `client.request(outbound, method, target, authority, fields, framing, region)`. The engine
    writes `authority` as the Host field, the first field line. Do not give a Host field yourself.
@@ -142,6 +145,8 @@ and change nothing. Acknowledge output, then call again. A call in the wrong sta
 | --- | --- |
 | `cancel_upload` | Sends no more request body bytes and no end of the body. The response can still arrive, and then the connection closes |
 | `cancel_response` | Ends the response body with `End(Outcome::Cancelled)`, and gives no more of it. The engine reads and discards the rest, up to `drain_bytes`, to reuse the connection. Above it, the connection closes at once |
+| `ready` | Whether the engine takes a request now: no exchange is in flight, a drain is complete, and the connection has not ended |
+| `close` | Ends the connection: no more requests, and an exchange in flight ends with it. The next turn is terminal, so a TLS connection sends `close_notify` |
 
 ## Limits
 

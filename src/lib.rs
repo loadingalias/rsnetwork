@@ -30,6 +30,7 @@
 pub use rstypes::{buffer, capacity, time};
 
 pub mod body;
+pub mod client;
 pub mod drive;
 pub mod h1;
 pub mod h2;

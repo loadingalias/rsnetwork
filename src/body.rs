@@ -80,7 +80,7 @@ pub struct Consumer {
     /// The part whose bytes wait for a read.
     waiting: Option<Lease>,
     outcome: Option<Outcome>,
-    /// The body bytes that the consumer copied so far.
+    /// The body bytes that the consumer copied or gave so far.
     delivered: u64,
 }
 
@@ -181,7 +181,26 @@ impl Consumer {
         }
     }
 
-    /// The body bytes that the consumer copied so far.
+    /// Whether the consumer takes the next part of the body: no byte waits, and the body has not
+    /// ended. Then [`read_into`](Self::read_into) gives [`Read::Wait`].
+    pub fn wants_data(&self) -> bool {
+        self.waiting.is_none() && self.outcome.is_none()
+    }
+
+    /// Takes the waiting bytes as a view of their received region, with no copy, or gives `None`
+    /// when no byte waits.
+    pub fn take(&mut self) -> Option<Lease> {
+        let waiting = self.waiting.take()?;
+        self.delivered += waiting.initialized() as u64;
+        Some(waiting)
+    }
+
+    /// The terminal outcome of the body, after its last waiting byte, or `None` before it.
+    pub fn outcome(&self) -> Option<&Outcome> {
+        self.waiting.is_none().then_some(self.outcome.as_ref()).flatten()
+    }
+
+    /// The body bytes that the consumer copied or gave so far.
     pub fn delivered(&self) -> u64 {
         self.delivered
     }
