@@ -77,13 +77,18 @@ fn a_slow_peer_retains_one_charged_head_and_is_refused_at_its_limit() {
     let mut server = Server::new(LIMITS, BODY, turn, &outbound, &budget).unwrap();
     let admitted = budget.available();
     let head = [b"GET /".as_slice(), &[b'a'; 2048]].concat();
+    // One join holds the head: its charge, the head limit and the lease of the join, stays the
+    // same at each byte.
+    let mut join = None;
     for (at, byte) in head.iter().enumerate() {
         inbound.push(received(&[*byte])).unwrap();
         let (event, turn) = server.drive(&mut inbound, &mut outbound, NOW);
         assert!(event.is_none(), "byte {at}");
         if at + 1 < LIMITS.head_bytes {
             assert_eq!(turn.progress, Progress::Blocked(Blocked::Input), "byte {at}");
-            assert_eq!(budget.available(), admitted - LIMITS.head_bytes as u64, "byte {at}");
+            let charged = admitted - budget.available();
+            assert!(charged > LIMITS.head_bytes as u64, "byte {at}: {charged}");
+            assert_eq!(*join.get_or_insert(charged), charged, "byte {at}");
             assert!(inbound.front().is_none(), "byte {at}");
         } else {
             assert_matches!(turn.progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Overload, "byte {at}: {:?}",

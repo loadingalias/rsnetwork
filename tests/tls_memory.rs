@@ -608,3 +608,23 @@ fn the_charge_of_a_client_ticket_returns_when_rustls_takes_or_evicts_it() {
     assert!(charges[0] > 0);
     assert_eq!(charges, [charges[0]; 3]);
 }
+
+#[test]
+fn the_charge_of_each_output_is_the_memory_that_it_frees() {
+    let (client, server, ..) = configs(&Profile::new("outputs"));
+    let budgets = (budget(CLIENT_END, 1 << 30), budget(SERVER_END, 1 << 30));
+    let mut pair = Pair::new((&client, &server), (&budgets.0, &budgets.1), LIMITS, 1);
+    // The ClientHello is the first output of the client, after its first drive. When the
+    // transport accepts it, its bytes and the lease that owns them drop, and the budget gets back
+    // exactly that memory.
+    owned(CLIENT_END, || pair.client.drive(now())).unwrap();
+    let output = owned(CLIENT_END, || pair.client.output()).unwrap();
+    let (id, len) = (output.id, output.region.initialized());
+    drop(output);
+    let (free, live) = (budgets.0.available(), counting::LIVE.get()[CLIENT_END]);
+    owned(CLIENT_END, || pair.client.ack(id, len)).unwrap();
+    let freed = live - counting::LIVE.get()[CLIENT_END];
+    assert!(freed > len as u64, "the output and its lease free {freed} bytes");
+    assert_eq!(budgets.0.available() - free, freed);
+    pair.close();
+}

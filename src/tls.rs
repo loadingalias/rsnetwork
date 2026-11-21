@@ -751,7 +751,7 @@ impl Records {
         while !content.is_empty() {
             let end = message_end(content);
             let Some((whole, rest)) = content.split_at_checked(end) else {
-                let mut joined = Bytes::new(budget);
+                let mut joined = Bytes::joined(budget);
                 copies.handshake += join(&mut joined, content, limit)? as u64;
                 self.joined = Some(joined);
                 return Ok(());
@@ -1038,33 +1038,54 @@ impl TlsInputBuffer for View<'_> {
     }
 }
 
-/// Bytes that the engine writes, its ciphertext output or a joined handshake message, with the
-/// charge of their capacity: the charge always equals the capacity.
+/// Bytes that the engine writes, its ciphertext output or a joined handshake message, with their
+/// charge: their capacity, and for an output the one allocation of the lease that it becomes.
 struct Bytes {
     bytes: Vec<u8>,
     charge: Credit,
+    /// The allocation of the lease of the bytes, or 0 for bytes that the engine keeps.
+    lease: u64,
 }
+
+/// The one allocation of the lease of each ciphertext output.
+const OUTPUT_LEASE: u64 = Lease::owner_layout::<Charged<Vec<u8>, Credit>>().size() as u64;
 
 /// The refusals of a charge of [`Bytes`].
 const OUTPUT_REFUSED: Error = Error::new(Kind::Overload, "the budget refused the TLS output");
 const MESSAGE_REFUSED: Error = Error::new(Kind::Overload, "the budget refused a TLS handshake message");
 
 impl Bytes {
-    fn new(budget: &Budget) -> Self {
+    /// A ciphertext output, which goes out as a lease.
+    fn output(budget: &Budget) -> Self {
         Self {
             bytes: Vec::new(),
             charge: budget.credit(0),
+            lease: OUTPUT_LEASE,
         }
+    }
+
+    /// A joined handshake message, which the engine keeps.
+    fn joined(budget: &Budget) -> Self {
+        Self {
+            lease: 0,
+            ..Self::output(budget)
+        }
+    }
+
+    /// The charge of `capacity` bytes, with the allocation of their lease.
+    fn target(&self, capacity: usize) -> u64 {
+        if capacity == 0 { 0 } else { capacity as u64 + self.lease }
     }
 
     /// Makes room for `additional` bytes: it charges them, and then allocates them. Refuses with
     /// `refused`.
     fn reserve(&mut self, additional: usize, refused: Error) -> Result<(), Error> {
         let target = self.bytes.len().saturating_add(additional);
-        if let Some(more) = target.checked_sub(self.bytes.capacity()).filter(|&more| more > 0) {
-            self.charge.charge(more as u64).map_err(|_| refused)?;
+        if target > self.bytes.capacity() {
+            let more = self.target(target).saturating_sub(self.charge.charged());
+            self.charge.charge(more).map_err(|_| refused)?;
             if self.bytes.try_reserve_exact(additional).is_err() {
-                self.charge.refund(more as u64).map_err(|_| refused)?;
+                self.charge.refund(more).map_err(|_| refused)?;
                 return Err(refused);
             }
         }
@@ -1081,18 +1102,18 @@ impl Bytes {
             .saturating_add(flight)
             .saturating_mul(2)
             .max(self.bytes.capacity());
-        let more = (bound as u64).saturating_sub(self.charge.charged());
+        let more = self.target(bound).saturating_sub(self.charge.charged());
         self.charge.charge(more).map_err(|_| more)
     }
 
-    /// Makes the charge equal the capacity: it charges what the allocator or rustls added, or
-    /// gives back what a growth bound did not use. Refuses with `refused`.
+    /// Makes the charge equal the charge of the capacity: it charges what the allocator or rustls
+    /// added, or gives back what a growth bound did not use. Refuses with `refused`.
     fn settle(&mut self, refused: Error) -> Result<(), Error> {
-        let capacity = self.bytes.capacity() as u64;
+        let target = self.target(self.bytes.capacity());
         let charged = self.charge.charged();
-        if let Some(more) = capacity.checked_sub(charged).filter(|&more| more > 0) {
+        if let Some(more) = target.checked_sub(charged).filter(|&more| more > 0) {
             self.charge.charge(more).map_err(|_| refused)?;
-        } else if let Some(rest) = charged.checked_sub(capacity).filter(|&rest| rest > 0) {
+        } else if let Some(rest) = charged.checked_sub(target).filter(|&rest| rest > 0) {
             self.charge.refund(rest).map_err(|_| refused)?;
         }
         Ok(())
@@ -1211,11 +1232,11 @@ impl<E: Engine> Tls<E> {
         };
         let own = config.own.get();
         let mut held = Held::new(budget, &config.cost, 2 * name_bytes as u64, &own)?;
-        let mut written = Bytes::new(budget);
+        let mut written = Bytes::output(budget);
         written.room(own.flight() + name_bytes).map_err(|_| OUTPUT_REFUSED)?;
         let name = name.to_owned();
         let stream = config.entropy.stream(CONNECTION);
-        let Bytes { bytes, charge } = &mut written;
+        let Bytes { bytes, charge, .. } = &mut written;
         let session = memory::handshake(&mut held, charge, || {
             scoped(stream.as_ref(), || config.config.connect(name).build(bytes))
         });
@@ -1248,7 +1269,7 @@ impl<E: Engine> Tls<E> {
         let own = config.own.get();
         let mut held = Held::new(budget, &config.cost, 0, &own)?;
         let stream = config.entropy.stream(CONNECTION);
-        let mut written = Bytes::new(budget);
+        let mut written = Bytes::output(budget);
         let session = memory::handshake(&mut held, &mut written.charge, || {
             scoped(stream.as_ref(), || {
                 rustls::Connection::<ServerSide, Tcp>::new(Arc::clone(&config.config))
@@ -1555,7 +1576,7 @@ impl<E: Engine> Tls<E> {
                 ended,
             };
             let stream = self.stream.as_ref();
-            let Bytes { bytes, charge } = &mut self.written;
+            let Bytes { bytes, charge, .. } = &mut self.written;
             let read = memory::handshake(&mut self.held, charge, || {
                 scoped(stream, || session.read(&mut view, bytes))
             });
@@ -1707,7 +1728,7 @@ impl<E: Engine> Tls<E> {
         if self.written.bytes.is_empty() || outbound.free() == 0 {
             return;
         }
-        let written = core::mem::replace(&mut self.written, Bytes::new(&self.budget));
+        let written = core::mem::replace(&mut self.written, Bytes::output(&self.budget));
         let size = written.bytes.capacity();
         let lease = Lease::from_owner(
             Charged {

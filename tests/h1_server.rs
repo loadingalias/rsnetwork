@@ -610,8 +610,15 @@ fn a_head_across_regions_joins_with_a_charge_and_no_copy_of_its_body() {
                 capacity: 1 << 16,
             })
             .unwrap();
+        // Owner 1 owns each allocation of the engine: the join, with the lease that owns it.
+        let live = || counting::LIVE.get()[1];
+        let before = live();
         let mut events = Vec::new();
-        while let (Some(event), _) = host.server.drive(&mut host.inbound, &mut host.outbound, NOW) {
+        loop {
+            counting::OWNER.set(1);
+            let (event, _) = host.server.drive(&mut host.inbound, &mut host.outbound, NOW);
+            counting::OWNER.set(0);
+            let Some(event) = event else { break };
             events.push(event);
         }
         let [
@@ -624,13 +631,17 @@ fn a_head_across_regions_joins_with_a_charge_and_no_copy_of_its_body() {
         };
         assert_eq!(request.head().target().as_bytes(), b"/notes", "cut at {cut}");
         assert_eq!((data.as_ptr(), data.bytes()), (body, &b"hello"[..]), "cut at {cut}");
-        assert_eq!(budget.available(), idle - LIMITS.head_bytes as u64, "cut at {cut}");
+        // The charge is the memory that the join holds, and at least the head limit.
+        let held = live() - before;
+        assert_eq!(idle - budget.available(), held, "cut at {cut}");
+        assert!(held > LIMITS.head_bytes as u64, "cut at {cut}");
         drop(events);
-        assert_eq!(budget.available(), idle, "cut at {cut}");
+        assert_eq!((budget.available(), live()), (idle, before), "cut at {cut}");
     }
 
     // One byte in each region: one join buffer that never grows again, with the lease that owns
-    // it, and one charge of the head limit, which returns when the last view of the head drops.
+    // it, and one charge of the memory that they hold, which returns when the last view of the
+    // head drops.
     let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
     let mut host = Host::with(BODY, &budget);
     let idle = budget.available();
@@ -643,10 +654,16 @@ fn a_head_across_regions_joins_with_a_charge_and_no_copy_of_its_body() {
         })
         .collect();
     let mut events = Vec::with_capacity(4);
+    let live = || counting::LIVE.get()[1];
+    let before = live();
     let ((), count) = allocations(|| {
         for received in regions {
             host.inbound.push(received).unwrap();
-            while let (Some(event), _) = host.server.drive(&mut host.inbound, &mut host.outbound, NOW) {
+            loop {
+                counting::OWNER.set(1);
+                let (event, _) = host.server.drive(&mut host.inbound, &mut host.outbound, NOW);
+                counting::OWNER.set(0);
+                let Some(event) = event else { break };
                 events.push(event);
             }
         }
@@ -656,15 +673,25 @@ fn a_head_across_regions_joins_with_a_charge_and_no_copy_of_its_body() {
         panic!("{events:?}");
     };
     assert_eq!(request.head().target().as_bytes(), b"/notes");
-    assert_eq!(budget.available(), idle - LIMITS.head_bytes as u64);
+    let held = live() - before;
+    assert_eq!(idle - budget.available(), held);
+    assert!(held > LIMITS.head_bytes as u64);
     drop(events);
-    assert_eq!(budget.available(), idle);
+    assert_eq!((budget.available(), live()), (idle, before));
 
-    // The pool takes 8 slots of 16 bytes, and the join of a 1024-byte head does not fit after it.
+    // The pool takes 8 slots of 16 bytes, and the join of a 1024-byte head does not fit after it:
+    // the turn waits for the head limit and the lease of the join.
     let budget = Budget::new(NonZeroU64::new(8 * 16 + 512).unwrap());
     let mut host = Host::with(BODY, &budget);
     host.receive(&REQUEST[..10]);
-    assert_eq!(host.drive(), (Vec::new(), Progress::Blocked(Blocked::Capacity(1024))));
+    let (events, Progress::Blocked(Blocked::Capacity(units))) = host.drive() else {
+        panic!("the join does not wait for capacity");
+    };
+    assert!(events.is_empty());
+    assert!(
+        units > LIMITS.head_bytes as u64 && units > budget.available(),
+        "{units}"
+    );
 }
 
 /// A trailer section that continues across received regions, cut at each position, gives the

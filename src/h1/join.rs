@@ -47,7 +47,8 @@ pub(super) enum Step {
 /// section when they hold all of it. It can rewrite the bytes of a complete section in place,
 /// with no change of their length, as the client does to unfold a response head. The join consumes from `inbound` only the bytes of the
 /// section, so the bytes after it keep their owner. It starts in `slot` when it has no join yet:
-/// it reserves `limit` units of `budget` before it allocates.
+/// it reserves `limit` units of `budget`, and the allocation of the lease of the section, before it
+/// allocates.
 pub(super) fn join(
     slot: &mut Option<Join>,
     budget: &Budget,
@@ -62,7 +63,8 @@ pub(super) fn join(
         let join = match slot {
             Some(join) => join,
             None => {
-                let units = limit as u64;
+                // The section, and the one allocation of the lease that it becomes.
+                let units = limit as u64 + Lease::owner_layout::<Joined>().size() as u64;
                 let Ok(permit) = budget.reserve(units) else {
                     return Ok(Step::Capacity(units));
                 };
