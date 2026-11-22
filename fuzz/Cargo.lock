@@ -100,7 +100,7 @@ dependencies = [
 [[package]]
 name = "rstypes"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/loadingalias/rsasync?branch=main#75ca1afe28bd39d0427b6ade62038745599b0255"
+source = "git+https://github.com/loadingalias/rsasync?branch=main#3e6334bc07f86ca8d39c7f0f0ed5585a93f4cfaf"
 
 [[package]]
 name = "shlex"
