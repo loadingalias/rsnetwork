@@ -1,5 +1,6 @@
-//! The HTTP/1.1 server over TCP and over TLS. The test is the binding: it moves the bytes of the
-//! transport, and it makes the calls of the exchange as the handler. The rules: a finished
+//! The server on HTTP/1.1, over TCP and over TLS. The test is the binding: it moves the bytes of
+//! the transport, and it makes the calls of the exchange as the handler. `tests/http2.rs` runs
+//! these rules on HTTP/2. The rules: a finished
 //! response is not a delivered one, a shutdown drains the exchange in flight and refuses new work,
 //! the report keeps the first failure, and the linger after the last output is bounded.
 
@@ -15,8 +16,10 @@ use rsnetwork::capacity::Budget;
 use rsnetwork::client;
 use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{self, BodyLimits, Framing};
+use rsnetwork::h2;
 use rsnetwork::host::{Connection, Io as _, Wait};
-use rsnetwork::server::{Closed, Delivery, Http1, Limits, Linger, Response};
+use rsnetwork::message::{RequestHead, Stream};
+use rsnetwork::server::{Cleartext, Closed, Delivery, Http, Limits, Linger, Response};
 use rsnetwork::time::{ClockDomain, Deadline, Instant, Suspend};
 use rsnetwork::tls::{
     CertificateDer, ClientConfig, ClientOptions, Closure, Entropy, Identity, Limits as TlsLimits, PrivateKeyDer,
@@ -57,13 +60,27 @@ const LINGER: Linger = Linger {
     bytes: 1000,
 };
 
+/// The HTTP/2 connection, which a TLS client can select.
+const H2: h2::Limits = h2::Limits {
+    settings: h2::Settings {
+        max_concurrent_streams: 8,
+        max_header_list_size: 4096,
+        ..h2::Settings::INITIAL
+    },
+    work: 64 * 1024,
+    encoder_table_bytes: 4096,
+    connection_window: 1 << 20,
+};
+
 const LIMITS: Limits = Limits {
     head: HEAD,
+    h2: H2,
     body: BODY,
     turn: TURN,
     queue: NonZeroUsize::new(16).unwrap(),
     head_timeout: Some(Duration::from_secs(5)),
     linger: LINGER,
+    cleartext: Cleartext::Http1,
 };
 
 const TLS: TlsLimits = TlsLimits {
@@ -138,18 +155,19 @@ fn client_config(protocols: &[&[u8]]) -> ClientConfig {
     .unwrap()
 }
 
-fn plain() -> Http1 {
-    Http1::plain(LIMITS, clock(), &budget()).unwrap()
+fn plain() -> Http {
+    Http::plain(LIMITS, clock(), &budget()).unwrap()
 }
 
-fn tls(protocols: &[&[u8]]) -> Http1 {
-    Http1::tls(&server_config(protocols), (LIMITS, TLS), clock(), &budget()).unwrap()
+fn tls(protocols: &[&[u8]]) -> Http {
+    Http::tls(&server_config(protocols), (LIMITS, TLS), clock(), &budget()).unwrap()
 }
 
 /// The TLS client of the core, which offers `protocols`.
 fn tls_client(protocols: &[&[u8]]) -> client::Http1 {
     let limits = client::Limits {
         head: HEAD,
+        h2: H2,
         body: BODY,
         turn: TURN,
         queue: NonZeroUsize::new(16).unwrap(),
@@ -170,20 +188,20 @@ fn get() -> client::Request<'static> {
         target: Target::new(b"/").unwrap(),
         authority: Authority::new(b"server.test").unwrap(),
         fields: &[],
-        body: Framing::Length(0),
+        length: Some(0),
     }
 }
 
-fn ok(body: Framing) -> Response<'static> {
+fn ok(length: Option<u64>) -> Response<'static> {
     Response {
         status: Status::new(200).unwrap(),
         fields: &[],
-        body,
+        length,
     }
 }
 
 /// Gives `bytes` to the server as one read-only received region.
-fn give(server: &mut Http1, bytes: &[u8]) {
+fn give(server: &mut Http, bytes: &[u8]) {
     let received = Received {
         region: Lease::from(bytes.to_vec()),
         endpoint: ENDPOINT,
@@ -193,7 +211,7 @@ fn give(server: &mut Http1, bytes: &[u8]) {
 }
 
 /// The transport accepts each output of the server: gives its bytes.
-fn take(server: &mut Http1) -> Vec<u8> {
+fn take(server: &mut Http) -> Vec<u8> {
     let mut bytes = Vec::new();
     while let Some(output) = server.output() {
         bytes.extend_from_slice(output.region.bytes());
@@ -214,7 +232,7 @@ fn give_client(client: &mut client::Http1, bytes: &[u8]) {
 }
 
 /// Moves the bytes between a TLS client and the server until the server gives a request head.
-fn handshake(client: &mut client::Http1, server: &mut Http1) -> h1::RetainedRequest {
+fn handshake(client: &mut client::Http1, server: &mut Http) -> (Stream, RequestHead) {
     assert!(client.send(&get(), Deadline::at(at(60_000)), at(0)).unwrap());
     for _ in 0..16 {
         while let Some(output) = client.output() {
@@ -253,14 +271,14 @@ fn a_reset_after_the_handler_finished_gives_a_partial_delivery_apart_from_the_fi
     // Over TCP the count is exact: the transport accepts the head and 20,000 bytes of the body.
     let mut server = plain();
     give(&mut server, b"GET / HTTP/1.1\r\nhost: a\r\n\r\n");
-    server.request(at(0)).unwrap().expect("a request");
-    assert!(server.respond(&ok(Framing::Length(4 * RECORD as u64)), at(0)).unwrap());
+    let (stream, _) = server.request(at(0)).unwrap().expect("a request");
+    assert!(server.respond(stream, &ok(Some(4 * RECORD as u64)), at(0)).unwrap());
     for _ in 0..4 {
-        server.write(&Lease::from(vec![b'x'; RECORD]), at(0)).unwrap();
+        server.write(stream, &Lease::from(vec![b'x'; RECORD]), at(0)).unwrap();
     }
-    server.finish(at(0)).unwrap();
+    server.finish(stream, at(0)).unwrap();
     assert_eq!(
-        server.delivery(),
+        server.delivery(stream),
         Some(Delivery::Sending {
             finished: true,
             accepted: 0
@@ -274,7 +292,7 @@ fn a_reset_after_the_handler_finished_gives_a_partial_delivery_apart_from_the_fi
     let second = server.output().unwrap();
     server.ack(second.id, 20_000 - RECORD).unwrap();
     assert_eq!(
-        server.delivery(),
+        server.delivery(stream),
         Some(Delivery::Sending {
             finished: true,
             accepted: 20_000
@@ -282,7 +300,7 @@ fn a_reset_after_the_handler_finished_gives_a_partial_delivery_apart_from_the_fi
     );
     server.reset();
     assert_matches!(
-        server.delivery(),
+        server.delivery(stream),
         Some(Delivery::Partial { finished: true, accepted: 20_000, error }) if error.kind() == Kind::Partial
     );
     assert_matches!(server.release(), Some(Closed { result: Err(error), .. }) if error.kind() == Kind::Partial);
@@ -291,12 +309,12 @@ fn a_reset_after_the_handler_finished_gives_a_partial_delivery_apart_from_the_fi
     // third give two records of the body.
     let mut client = tls_client(&[b"http/1.1"]);
     let mut server = tls(&[b"http/1.1"]);
-    handshake(&mut client, &mut server);
-    assert!(server.respond(&ok(Framing::Length(4 * RECORD as u64)), at(0)).unwrap());
+    let (stream, _) = handshake(&mut client, &mut server);
+    assert!(server.respond(stream, &ok(Some(4 * RECORD as u64)), at(0)).unwrap());
     for _ in 0..4 {
-        server.write(&Lease::from(vec![b'x'; RECORD]), at(0)).unwrap();
+        server.write(stream, &Lease::from(vec![b'x'; RECORD]), at(0)).unwrap();
     }
-    server.finish(at(0)).unwrap();
+    server.finish(stream, at(0)).unwrap();
     let mut whole = 0;
     'send: while let Some(output) = server.output() {
         let mut accepted = 0;
@@ -313,7 +331,7 @@ fn a_reset_after_the_handler_finished_gives_a_partial_delivery_apart_from_the_fi
     assert_eq!(whole, 2, "the transport accepted two full records of the body");
     let accepted = 2 * RECORD as u64;
     assert_eq!(
-        server.delivery(),
+        server.delivery(stream),
         Some(Delivery::Sending {
             finished: true,
             accepted
@@ -321,7 +339,7 @@ fn a_reset_after_the_handler_finished_gives_a_partial_delivery_apart_from_the_fi
     );
     server.reset();
     assert_matches!(
-        server.delivery(),
+        server.delivery(stream),
         Some(Delivery::Partial { finished: true, accepted: two, error })
             if two == accepted && error.kind() == Kind::Partial
     );
@@ -331,14 +349,14 @@ fn a_reset_after_the_handler_finished_gives_a_partial_delivery_apart_from_the_fi
 fn a_complete_delivery_needs_each_byte_of_the_response() {
     let mut server = plain();
     give(&mut server, b"GET / HTTP/1.1\r\nhost: a\r\n\r\n");
-    server.request(at(0)).unwrap().expect("a request");
-    assert!(server.respond(&ok(Framing::Chunked), at(0)).unwrap());
-    server.write(&Lease::from(&b"hello"[..]), at(0)).unwrap();
-    server.finish(at(0)).unwrap();
+    let (stream, _) = server.request(at(0)).unwrap().expect("a request");
+    assert!(server.respond(stream, &ok(None), at(0)).unwrap());
+    server.write(stream, &Lease::from(&b"hello"[..]), at(0)).unwrap();
+    server.finish(stream, at(0)).unwrap();
     let bytes = take(&mut server);
     assert!(bytes.ends_with(b"5\r\nhello\r\n0\r\n\r\n"));
     // The chunk framing does not count as body bytes.
-    assert_eq!(server.delivery(), Some(Delivery::Complete { accepted: 5 }));
+    assert_eq!(server.delivery(stream), Some(Delivery::Complete { accepted: 5 }));
 }
 
 #[test]
@@ -348,11 +366,11 @@ fn a_shutdown_drains_the_request_in_flight_and_refuses_the_one_that_the_applicat
         &mut server,
         b"GET /a HTTP/1.1\r\nhost: a\r\n\r\nGET /b HTTP/1.1\r\nhost: a\r\n\r\n",
     );
-    let a = server.request(at(0)).unwrap().expect("the first request");
-    assert_eq!(a.head().target().as_bytes(), b"/a");
-    assert!(server.respond(&ok(Framing::Length(2)), at(0)).unwrap());
-    server.write(&Lease::from(&b"ok"[..]), at(0)).unwrap();
-    server.finish(at(0)).unwrap();
+    let (stream, a) = server.request(at(0)).unwrap().expect("the first request");
+    assert_eq!(a.target().as_bytes(), b"/a");
+    assert!(server.respond(stream, &ok(Some(2)), at(0)).unwrap());
+    server.write(stream, &Lease::from(&b"ok"[..]), at(0)).unwrap();
+    server.finish(stream, at(0)).unwrap();
     // The second request waits for the delivery of the first response.
     assert!(server.request(at(0)).unwrap().is_none());
     server.shutdown(Deadline::at(at(1_000)), at(0)).unwrap();
@@ -361,7 +379,7 @@ fn a_shutdown_drains_the_request_in_flight_and_refuses_the_one_that_the_applicat
     assert!(first.starts_with(b"HTTP/1.1 200 "));
     assert!(refusal.starts_with(b"HTTP/1.1 503 "));
     assert!(refusal.windows(17).any(|line| line == b"connection: close"));
-    assert_eq!(server.delivery(), Some(Delivery::Complete { accepted: 2 }));
+    assert_eq!(server.delivery(stream), Some(Delivery::Complete { accepted: 2 }));
     // The application never sees the second request. After the last output, the server lingers.
     assert!(server.request(at(0)).unwrap().is_none());
     assert_eq!(
@@ -387,7 +405,7 @@ fn a_shutdown_drains_the_request_in_flight_and_refuses_the_one_that_the_applicat
 fn a_shutdown_tells_the_client_which_requests_the_server_did_not_process() {
     const PIPELINED: &[u8] = b"GET /a HTTP/1.1\r\nhost: a\r\n\r\nGET /b HTTP/1.1\r\nhost: a\r\n\r\n";
     let has_close = |bytes: &[u8]| bytes.windows(17).any(|line| line == b"connection: close");
-    let ends = |server: &mut Http1| {
+    let ends = |server: &mut Http| {
         while server.release().is_none() {
             assert!(server.request(at(0)).unwrap().is_none());
             server.end_input();
@@ -398,12 +416,12 @@ fn a_shutdown_tells_the_client_which_requests_the_server_did_not_process() {
     // The head of the response in flight is out with no `close`: the next request gets 503.
     let mut server = plain();
     give(&mut server, PIPELINED);
-    server.request(at(0)).unwrap().expect("the first request");
-    assert!(server.respond(&ok(Framing::Length(2)), at(0)).unwrap());
-    server.write(&Lease::from(&b"o"[..]), at(0)).unwrap();
+    let (stream, _) = server.request(at(0)).unwrap().expect("the first request");
+    assert!(server.respond(stream, &ok(Some(2)), at(0)).unwrap());
+    server.write(stream, &Lease::from(&b"o"[..]), at(0)).unwrap();
     server.shutdown(Deadline::at(at(1_000)), at(0)).unwrap();
-    server.write(&Lease::from(&b"k"[..]), at(0)).unwrap();
-    server.finish(at(0)).unwrap();
+    server.write(stream, &Lease::from(&b"k"[..]), at(0)).unwrap();
+    server.finish(stream, at(0)).unwrap();
     assert!(server.request(at(0)).unwrap().is_none());
     let bytes = take(&mut server);
     let (first, refusal) = bytes.split_at(bytes.windows(2).position(|pair| pair == b"ok").unwrap() + 2);
@@ -422,11 +440,11 @@ fn a_shutdown_tells_the_client_which_requests_the_server_did_not_process() {
     // The head of the response in flight is not out: it gets `close`, and nothing follows it.
     let mut server = plain();
     give(&mut server, PIPELINED);
-    server.request(at(0)).unwrap().expect("the first request");
+    let (stream, _) = server.request(at(0)).unwrap().expect("the first request");
     server.shutdown(Deadline::at(at(1_000)), at(0)).unwrap();
-    assert!(server.respond(&ok(Framing::Length(2)), at(0)).unwrap());
-    server.write(&Lease::from(&b"ok"[..]), at(0)).unwrap();
-    server.finish(at(0)).unwrap();
+    assert!(server.respond(stream, &ok(Some(2)), at(0)).unwrap());
+    server.write(stream, &Lease::from(&b"ok"[..]), at(0)).unwrap();
+    server.finish(stream, at(0)).unwrap();
     assert!(server.request(at(0)).unwrap().is_none());
     let bytes = take(&mut server);
     assert!(bytes.starts_with(b"HTTP/1.1 200 ") && has_close(&bytes) && bytes.ends_with(b"ok"));
@@ -480,7 +498,7 @@ fn over_tls_a_shutdown_sends_close_notify_before_the_linger() {
         .unwrap();
     engine.finish(plaintext).unwrap();
     let mut server = tls(&[b"http/1.1"]);
-    let exchange = |peer: &mut Connection<Tls<h1::Client>>, server: &mut Http1| {
+    let exchange = |peer: &mut Connection<Tls<h1::Client>>, server: &mut Http| {
         while peer.drive(Some(at(0))).unwrap().is_some() {}
         while let Some(output) = peer.output() {
             give(server, output.region.bytes());
@@ -496,11 +514,11 @@ fn over_tls_a_shutdown_sends_close_notify_before_the_linger() {
         head
     };
     let request = (0..8).find_map(|_| exchange(&mut peer, &mut server));
-    assert!(request.is_some(), "the request reached the server");
+    let (stream, _) = request.expect("the request reached the server");
     server.shutdown(Deadline::at(at(1_000)), at(0)).unwrap();
-    assert!(server.respond(&ok(Framing::Length(2)), at(0)).unwrap());
-    server.write(&Lease::from(&b"ok"[..]), at(0)).unwrap();
-    server.finish(at(0)).unwrap();
+    assert!(server.respond(stream, &ok(Some(2)), at(0)).unwrap());
+    server.write(stream, &Lease::from(&b"ok"[..]), at(0)).unwrap();
+    server.finish(stream, at(0)).unwrap();
     assert!(exchange(&mut peer, &mut server).is_none());
     while peer.drive(Some(at(0))).unwrap().is_some() {}
     // The transport did not end: the close_notify of the server ended the input of the client.
@@ -536,13 +554,13 @@ fn the_linger_discards_late_bytes_and_ends_at_the_end_of_input_its_bytes_or_its_
             &mut server,
             b"POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 100000\r\n\r\nfirst bytes",
         );
-        server.request(at(0)).unwrap().expect("a request");
+        let (stream, _) = server.request(at(0)).unwrap().expect("a request");
         let too_large = Response {
             status: Status::new(413).unwrap(),
             fields: &[],
-            body: Framing::Length(0),
+            length: Some(0),
         };
-        assert!(server.respond(&too_large, at(0)).unwrap());
+        assert!(server.respond(stream, &too_large, at(0)).unwrap());
         assert!(server.request(at(0)).unwrap().is_none());
         // The linger starts after the last output.
         assert_matches!(
@@ -587,18 +605,18 @@ fn a_request_that_waits_for_100_continue_gets_it_at_the_first_read_of_its_body()
         &mut server,
         b"POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 2\r\nexpect: 100-continue\r\n\r\n",
     );
-    server.request(at(0)).unwrap().expect("a request");
+    let (stream, _) = server.request(at(0)).unwrap().expect("a request");
     assert!(
         take(&mut server).is_empty(),
         "no 100 before the application reads the body"
     );
     let mut region = WriteLoan::new(Backing::from(Vec::with_capacity(16)));
-    assert_matches!(server.read_into(at(0), &mut region).unwrap(), Read::Wait);
+    assert_matches!(server.read_into(stream, at(0), &mut region).unwrap(), Read::Wait);
     assert_eq!(take(&mut server), b"HTTP/1.1 100 Continue\r\n\r\n");
     give(&mut server, b"ok");
-    assert_matches!(server.read_into(at(0), &mut region).unwrap(), Read::Bytes(2));
+    assert_matches!(server.read_into(stream, at(0), &mut region).unwrap(), Read::Bytes(2));
     assert_matches!(
-        server.read_into(at(0), &mut region).unwrap(),
+        server.read_into(stream, at(0), &mut region).unwrap(),
         Read::Done(Outcome::Complete(_))
     );
 }
@@ -610,12 +628,12 @@ fn a_reset_inside_the_request_body_ends_it_reset_not_truncated() {
         &mut server,
         b"POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 10\r\n\r\nfour",
     );
-    server.request(at(0)).unwrap().expect("a request");
+    let (stream, _) = server.request(at(0)).unwrap().expect("a request");
     let mut region = WriteLoan::new(Backing::from(Vec::with_capacity(16)));
-    assert_matches!(server.read_into(at(0), &mut region).unwrap(), Read::Bytes(4));
+    assert_matches!(server.read_into(stream, at(0), &mut region).unwrap(), Read::Bytes(4));
     server.reset();
     assert_matches!(
-        server.read_into(at(0), &mut region).unwrap(),
+        server.read_into(stream, at(0), &mut region).unwrap(),
         Read::Done(Outcome::Reset(None))
     );
     assert_matches!(server.release(), Some(Closed { result: Err(error), .. }) if error.kind() == Kind::Partial);
@@ -635,8 +653,8 @@ fn over_tls_the_head_timeout_bounds_the_handshake() {
 
 #[test]
 fn over_tls_a_client_that_selects_another_protocol_ends_the_server() {
-    let mut client = tls_client(&[b"h2"]);
-    let mut server = tls(&[b"h2", b"http/1.1"]);
+    let mut client = tls_client(&[b"spdy/3.1"]);
+    let mut server = tls(&[b"spdy/3.1", b"http/1.1"]);
     assert!(client.send(&get(), Deadline::at(at(60_000)), at(0)).unwrap());
     for _ in 0..8 {
         while let Some(output) = client.output() {

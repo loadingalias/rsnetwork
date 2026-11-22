@@ -80,6 +80,7 @@ impl Encoder {
     }
 
     /// Encodes `lines` as one header block, in their order, after the filled bytes of `out`.
+    /// Each name goes in lowercase, as HTTP/2 requires (RFC 9113, section 8.2.1).
     ///
     /// A line is indexed when an entry has its name and value. Otherwise, it is a literal with
     /// the index of its name when an entry has the name, and it goes into the dynamic table when
@@ -132,12 +133,12 @@ impl Encoder {
                 Some(index) => integer::encode(index as u64, prefix, flags, &mut put),
                 None => {
                     put(&[flags]);
-                    string(line.name, &mut put);
+                    name(line.name, &mut put);
                 }
             }
             string(line.value, &mut put);
             if insert {
-                self.table.insert(line.name, line.value);
+                self.table.insert_folded(line.name, line.value);
             }
         }
         Ok(())
@@ -152,13 +153,32 @@ fn string_len(bytes: &[u8]) -> usize {
 /// Writes `bytes` as a string literal (RFC 7541, section 5.2): a Huffman string when it is
 /// shorter.
 fn string(bytes: &[u8], put: &mut impl FnMut(&[u8])) {
-    let huffman = huffman::encoded_len(bytes);
+    let huffman = huffman::encoded_len(bytes.iter().copied());
     if huffman < bytes.len() {
         integer::encode(huffman as u64, 7, 0x80, &mut *put);
-        huffman::encode(bytes, put);
+        huffman::encode(bytes.iter().copied(), put);
     } else {
         integer::encode(bytes.len() as u64, 7, 0x00, &mut *put);
         put(bytes);
+    }
+}
+
+/// Writes the name `bytes` in lowercase as a string literal, as [`string`] does.
+fn name(bytes: &[u8], put: &mut impl FnMut(&[u8])) {
+    let folded = || bytes.iter().map(u8::to_ascii_lowercase);
+    let huffman = huffman::encoded_len(folded());
+    if huffman < bytes.len() {
+        integer::encode(huffman as u64, 7, 0x80, &mut *put);
+        huffman::encode(folded(), put);
+    } else {
+        integer::encode(bytes.len() as u64, 7, 0x00, &mut *put);
+        let mut piece = [0_u8; 64];
+        for chunk in bytes.chunks(piece.len()) {
+            let piece = &mut piece[..chunk.len()];
+            piece.copy_from_slice(chunk);
+            piece.make_ascii_lowercase();
+            put(piece);
+        }
     }
 }
 

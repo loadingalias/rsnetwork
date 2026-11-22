@@ -1,6 +1,12 @@
 //! The client: send a request with a deadline, read its response head and its body, and close.
 //!
-//! [`Http1`] is one HTTP/1.1 connection over TCP or TLS, with no I/O. A binding, or the
+//! [`Http1`] is one HTTP/1.1 connection over TCP or TLS, with no I/O, and [`Http2`] is one HTTP/2
+//! connection. They have the same calls, with the same message, body, deadline, and trust rules.
+//! An [`Http2`] carries many streams at a time, so each of its calls names the [`Stream`].
+//!
+//! [`Stream`]: crate::message::Stream
+//!
+//! The rest of this page is about [`Http1`]. [`Http2`] says where it differs. A binding, or the
 //! application in a [caller-driven host](crate::host), moves the bytes of the transport with the
 //! same calls as a [`Connection`]: [`received`](Http1::received) or [`receive`](Http1::receive),
 //! [`output`](Http1::output) and [`ack`](Http1::ack), and [`wait`](Http1::wait) to know when to
@@ -27,6 +33,8 @@
 //! - **One connection.** When the connection ends, the client takes no more requests: make a new
 //!   one.
 
+mod http2;
+
 use core::alloc::Layout;
 use core::num::{NonZeroU32, NonZeroUsize};
 
@@ -36,18 +44,25 @@ use rstypes::time::{ClockDomain, Deadline, Instant};
 
 use crate::body::{Collect, Consumer, Outcome, Part, Read};
 use crate::drive::{AckError, ActionId, Endpoint, Error, Kind, Output, Outstanding, Received, TurnLimits};
-use crate::h1::{self, BodyLimits, ClientEvent, Framing, RetainedResponse};
+use crate::h1::{self, BodyLimits, ClientEvent, Framing};
+use crate::h2;
 use crate::host::{Connection, Io, Wait};
 use crate::link::{Link, earliest, queues};
+use crate::message::ResponseHead;
 #[cfg(feature = "tls")]
 use crate::tls::{self, ClientConfig, Closure, Negotiated, Tls};
 use crate::value::{Authority, Field, Method, Target};
 
-/// The limits of an HTTP/1.1 client connection, which the caller sets.
+pub use http2::Http2;
+
+/// The limits of a client connection, which the caller sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// The response head. Its `head_bytes` is also the size of the region of each request head.
+    /// The HTTP/1.1 response head. Its `head_bytes` is also the size of the region of each
+    /// request head, in each version.
     pub head: h1::Limits,
+    /// The HTTP/2 connection of [`Http2`]: its settings, its header blocks, and its windows.
+    pub h2: h2::Limits,
     /// The response body, its drain, and its trailers.
     pub body: BodyLimits,
     /// The work of one drive.
@@ -56,19 +71,23 @@ pub struct Limits {
     pub queue: NonZeroUsize,
 }
 
-/// A request: its method, target, authority, fields, and the framing of its body.
+/// A request: its method, target, authority, fields, and the length of its body.
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
     /// The method, for example `Method::GET`.
     pub method: Method<'a>,
     /// The request target, for example `/search?q=tls`.
     pub target: Target<'a>,
-    /// The authority of the target URI. The client writes it as the Host field.
+    /// The authority of the target URI. HTTP/1.1 writes it as the Host field, and HTTP/2 as the
+    /// `:authority`.
     pub authority: Authority<'a>,
-    /// The other fields, in their order. A Host field refuses.
+    /// The other fields, in their order. `host`, `content-length`, and `transfer-encoding`
+    /// refuse: the authority and the length give them. On HTTP/2, a connection-specific field
+    /// refuses (RFC 9113, section 8.2.2).
     pub fields: &'a [Field<'a>],
-    /// The framing of the request body: `Length(0)` for no body, `Length(n)`, or `Chunked`.
-    pub body: Framing,
+    /// The length of the request body: `Some(0)` for no body, `Some(n)`, or `None` when the length
+    /// is not known. HTTP/1.1 sends an unknown length in chunks.
+    pub length: Option<u64>,
 }
 
 /// The place of the client in the current exchange.
@@ -100,7 +119,7 @@ pub struct Http1 {
     state: State,
     /// The deadline of the exchange in flight.
     deadline: Option<Deadline>,
-    head: Option<RetainedResponse>,
+    head: Option<ResponseHead>,
     /// The framing of the response body.
     framing: Framing,
     body: Consumer,
@@ -113,7 +132,7 @@ impl Http1 {
     /// connection is charged to `budget`. Refuses with [`Kind::Overload`], and allocates nothing,
     /// when the budget cannot pay.
     pub fn plain(limits: Limits, clock: ClockDomain, budget: &Budget) -> Result<Self, Error> {
-        let heads = heads(&limits, budget)?;
+        let heads = heads(&limits, budget, 1)?;
         let (inbound, outbound) = queues(limits.queue, budget)?;
         let engine = h1::Client::new(limits.head, limits.body, limits.turn, &outbound, budget)?;
         let connection = Connection::new(engine, inbound, outbound, Some(clock))?;
@@ -133,7 +152,7 @@ impl Http1 {
         clock: ClockDomain,
         budget: &Budget,
     ) -> Result<Self, Error> {
-        let heads = heads(&limits, budget)?;
+        let heads = heads(&limits, budget, 1)?;
         let (inbound, outbound) = queues(limits.queue, budget)?;
         let engine = h1::Client::new(limits.head, limits.body, limits.turn, &outbound, budget)?;
         let tls = Tls::client(config, name, engine, (inbound, outbound), tls, budget)?;
@@ -156,8 +175,8 @@ impl Http1 {
         }
     }
 
-    /// Sends `request`, with `deadline` for the whole exchange, at `now`. A request with
-    /// `Framing::Length(0)` is complete at once. For another body, send it with
+    /// Sends `request`, with `deadline` for the whole exchange, at `now`. A request with the
+    /// length `Some(0)` is complete at once. For another body, send it with
     /// [`write`](Self::write), and end it with [`finish`](Self::finish).
     ///
     /// A body of the exchange before that the application did not read to its end drains first,
@@ -200,10 +219,11 @@ impl Http1 {
             target,
             authority,
             fields,
-            body,
+            length,
         } = *request;
+        let body = length.map_or(Framing::Chunked, Framing::Length);
         engine.request(outbound, method, target, authority, fields, body, head)?;
-        if body == Framing::Length(0) {
+        if length == Some(0) {
             engine.finish(outbound)?;
         }
         self.state = State::Head;
@@ -256,7 +276,7 @@ impl Http1 {
     /// not count. Refuses with [`Kind::Misuse`] when no request is in flight, with
     /// [`Kind::Deadline`] at the deadline, and with the error of the connection when it ended
     /// first, for example [`Kind::Uncertain`] when it closed before the head.
-    pub fn response(&mut self, now: Instant) -> Result<Option<RetainedResponse>, Error> {
+    pub fn response(&mut self, now: Instant) -> Result<Option<ResponseHead>, Error> {
         self.live(now)?;
         if self.state == State::Idle || self.state == State::Draining {
             return Err(misuse("no request is in flight"));
@@ -420,7 +440,7 @@ impl Http1 {
             ClientEvent::Informational(_) => {}
             ClientEvent::Response(head) => {
                 self.framing = head.head().framing();
-                self.head = Some(head);
+                self.head = Some(ResponseHead::h1_form(head));
                 self.state = State::Body;
             }
             ClientEvent::Data(data) => {
@@ -548,11 +568,11 @@ impl Io for Http1 {
     }
 }
 
-/// The pool of the region of each request head: one slot of `head_bytes`.
-fn heads(limits: &Limits, budget: &Budget) -> Result<Pool, Error> {
+/// The pool of the regions of request heads: `slots` slots of `head_bytes`.
+fn heads(limits: &Limits, budget: &Budget, slots: u32) -> Result<Pool, Error> {
     let slot =
         Layout::array::<u8>(limits.head.head_bytes).map_err(|_| misuse("the head region of a request is too large"))?;
-    Pool::new(budget, NonZeroU32::MIN, slot).map_err(|refused| match refused {
+    Pool::new(budget, NonZeroU32::new(slots).unwrap_or(NonZeroU32::MIN), slot).map_err(|refused| match refused {
         PoolRefused::Budget(_) => Error::new(Kind::Overload, "the budget refused the region of a request head"),
         PoolRefused::Layout => misuse("the head region of a request is too large"),
         PoolRefused::Allocation => Error::new(

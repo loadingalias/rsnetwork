@@ -1,5 +1,5 @@
-//! The HTTP/1.1 server on Tokio: the calls of [`rsnetwork::server::Http1`], each of which awaits
-//! the progress that it needs, and a [`Server`] that accepts connections and owns their tasks.
+//! The server on Tokio: the calls of [`rsnetwork::server::Http`], each of which awaits the
+//! progress that it needs, and a [`Server`] that accepts connections and owns their tasks.
 
 use core::future::poll_fn;
 use core::num::NonZeroUsize;
@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rsnetwork::body::{Collect, Part, Read};
 use rsnetwork::buffer::{BufferMut, Lease, Pool, WriteLoan};
 use rsnetwork::drive::{Error, Kind};
-use rsnetwork::h1::{Framing, RetainedRequest};
 use rsnetwork::host::{Io as _, Wait};
-use rsnetwork::server::{Closed, Delivery, Http1 as Core, Response};
+use rsnetwork::message::{RequestHead, Stream};
+use rsnetwork::server::{Closed, Delivery, Http as Core, Response};
 use rsnetwork::time::Deadline;
 use rsnetwork::tls::Negotiated;
 use rsnetwork::value::Field;
@@ -28,39 +28,46 @@ use crate::{Clock, Socket, Step, queued};
 /// The refusal of a call after the connection ended.
 const ENDED: Error = Error::new(Kind::Misuse, "the connection ended");
 
+/// The refusal of a call of the exchange before a request.
+const NO_REQUEST: Error = Error::new(Kind::Misuse, "no request waits for a response");
+
 /// The pause after an accept that the listener refused, for example at the limit of open files:
 /// the next accept would refuse at once.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(50);
 
 /// The place where a connection of a [`Server`] goes back to its task when the handler drops it.
-type Back = Arc<Mutex<Option<Http1>>>;
+type Back = Arc<Mutex<Option<Http>>>;
 
-/// One HTTP/1.1 server connection on a Tokio TCP socket.
+/// One server connection on a Tokio TCP socket, for HTTP/1.1 and HTTP/2.
 ///
-/// It has the calls of [`rsnetwork::server::Http1`], with its rules: one exchange at a time, and
-/// a delivery that goes on after the handler finished its response. Each call awaits its own
-/// progress. A future that you drop changes nothing: the next call goes on from the state of the
+/// It has the calls of [`rsnetwork::server::Http`], with its rules, one exchange at a time: a
+/// delivery goes on after the handler finished its response, and the next
+/// [`request`](Self::request) closes the stream before it. Each call awaits its own progress. A
+/// future that you drop changes nothing: the next call goes on from the state of the
 /// connection.
 ///
 /// A connection of a [`Server`] goes back to its task when the handler drops it, and the task
 /// drives the rest of its delivery and its close. A connection that you made with
 /// [`new`](Self::new) needs [`close`](Self::close): a drop before its release resets it.
 #[derive(Debug)]
-pub struct Http1 {
+pub struct Http {
     /// The connection, until the drop.
     socket: Option<Socket<Core>>,
+    /// The stream of the last request.
+    stream: Option<Stream>,
     /// The handler has a request whose response is not finished.
     open: bool,
     back: Option<Back>,
 }
 
-impl Http1 {
+impl Http {
     /// Binds `server`, a server of the core made with [`Clock::domain`], to `stream`, an accepted
     /// TCP socket. `pool` gives the receive regions over TCP and during the linger: charge it to
     /// the budget of the server. Refuses with the error of the socket, as [`Socket::new`] does.
     pub fn new(server: Core, stream: TcpStream, pool: Pool) -> io::Result<Self> {
         Ok(Self {
             socket: Some(Socket::new(server, stream, pool)?),
+            stream: None,
             open: false,
             back: None,
         })
@@ -71,10 +78,19 @@ impl Http1 {
         self.socket.as_mut().expect("the connection is there until the drop")
     }
 
-    /// Gives the next request head when it arrives, or `None` when the connection takes no more
-    /// requests: the client closed, the connection closes, or it ended. Refuses as
-    /// [`Http1::request`](rsnetwork::server::Http1::request) does.
-    pub async fn request(&mut self) -> Result<Option<RetainedRequest>, Error> {
+    /// The stream of the last request.
+    fn current(&self) -> Result<Stream, Error> {
+        self.stream.ok_or(NO_REQUEST)
+    }
+
+    /// Closes the stream of the last request, and gives the next request head when it arrives,
+    /// or `None` when the connection takes no more requests: the client closed, the connection
+    /// closes, or it ended. Refuses as [`Http::request`](rsnetwork::server::Http::request) does.
+    pub async fn request(&mut self) -> Result<Option<RequestHead>, Error> {
+        if let Some(stream) = self.stream {
+            self.socket().connection_mut().close(stream);
+            self.open = false;
+        }
         let request = self.socket().until(|server, now| {
             Ok(match server.request(now)? {
                 Some(request) => Some(Some(request)),
@@ -84,33 +100,41 @@ impl Http1 {
         });
         let request = request.await?.flatten();
         self.open = request.is_some();
-        Ok(request)
+        Ok(request.map(|(stream, head)| {
+            self.stream = Some(stream);
+            head
+        }))
     }
 
     /// Sends the head of `response` to the request in flight. It waits while the transport holds
     /// the heads before. Send a body with [`write`](Self::write), and end it with
     /// [`finish`](Self::finish).
     pub async fn respond(&mut self, response: &Response<'_>) -> Result<(), Error> {
+        let stream = self.current()?;
         let responded = self
             .socket()
-            .until(|server, now| Ok(server.respond(response, now)?.then_some(())));
+            .until(|server, now| Ok(server.respond(stream, response, now)?.then_some(())));
         responded.await?.ok_or(ENDED)?;
         // A response with no body is finished at once.
-        self.open &= response.body != Framing::Length(0);
+        self.open &= response.length != Some(0);
         Ok(())
     }
 
     /// Queues `data` as the next bytes of the response body, with no copy. It waits while the
     /// output queue is full.
     pub async fn write(&mut self, data: &Lease) -> Result<(), Error> {
-        let written = self.socket().until(|server, now| queued(server.write(data, now)));
+        let stream = self.current()?;
+        let written = self
+            .socket()
+            .until(|server, now| queued(server.write(stream, data, now)));
         written.await?.ok_or(ENDED)
     }
 
     /// Ends the response body: the handler is complete, and [`delivery`](Self::delivery) tracks
     /// the rest. It waits while the output queue is full.
     pub async fn finish(&mut self) -> Result<(), Error> {
-        let finished = self.socket().until(|server, now| queued(server.finish(now)));
+        let stream = self.current()?;
+        let finished = self.socket().until(|server, now| queued(server.finish(stream, now)));
         finished.await?.ok_or(ENDED)?;
         self.open = false;
         Ok(())
@@ -118,9 +142,10 @@ impl Http1 {
 
     /// Ends a chunked response body with `trailers`, as [`finish`](Self::finish) does.
     pub async fn finish_with_trailers(&mut self, trailers: &[Field<'_>]) -> Result<(), Error> {
+        let stream = self.current()?;
         let finished = self
             .socket()
-            .until(|server, now| Ok(server.finish_with_trailers(trailers, now)?.then_some(())));
+            .until(|server, now| Ok(server.finish_with_trailers(stream, trailers, now)?.then_some(())));
         finished.await?.ok_or(ENDED)?;
         self.open = false;
         Ok(())
@@ -129,7 +154,8 @@ impl Http1 {
     /// Gives the next part of the request body as a view of its received region, with no copy,
     /// or its end with its outcome.
     pub async fn next(&mut self) -> Result<Part, Error> {
-        let part = self.socket().until(Core::next);
+        let stream = self.current()?;
+        let part = self.socket().until(|server, now| server.next(stream, now));
         part.await?.ok_or(ENDED)
     }
 
@@ -137,22 +163,24 @@ impl Http1 {
     /// its outcome after its last byte. It waits until a byte arrives, so it never gives
     /// [`Read::Wait`].
     pub async fn read_into<B: BufferMut>(&mut self, region: &mut WriteLoan<B>) -> Result<Read<'_>, Error> {
+        let stream = self.current()?;
         let step = self
             .socket()
-            .until(|server, now| Ok(Step::of(&server.read_into(now, region)?)));
+            .until(|server, now| Ok(Step::of(&server.read_into(stream, now, region)?)));
         match step.await?.ok_or(ENDED)? {
             Step::Bytes(count) => Ok(Read::Bytes(count)),
             Step::Full => Ok(Read::Full),
             // The outcome stays in the server, so the read gives it again.
-            Step::Done => self.socket().connection_mut().read_into(Clock.now(), region),
+            Step::Done => self.socket().connection_mut().read_into(stream, Clock.now(), region),
         }
     }
 
     /// Collects the request body into `region`, whose free capacity bounds it. It waits until the
     /// body ends or no longer fits, so it never gives [`Collect::More`].
     pub async fn collect<B: BufferMut>(&mut self, region: &mut WriteLoan<B>) -> Result<Collect, Error> {
+        let stream = self.current()?;
         let collected = self.socket().until(|server, now| {
-            Ok(match server.collect(now, region)? {
+            Ok(match server.collect(stream, now, region)? {
                 Collect::More => None,
                 collect => Some(collect),
             })
@@ -161,21 +189,23 @@ impl Http1 {
     }
 
     /// Cancels the exchange in flight, as
-    /// [`Http1::cancel`](rsnetwork::server::Http1::cancel) does: the client sees an incomplete
+    /// [`Http::cancel`](rsnetwork::server::Http::cancel) does: the client sees an incomplete
     /// response, never a complete one.
     pub fn cancel(&mut self) {
-        self.socket().connection_mut().cancel();
+        if let Some(stream) = self.stream {
+            self.socket().connection_mut().cancel(stream);
+        }
         self.open = false;
     }
 
     /// How much of the response of the last exchange the transport accepted.
     pub fn delivery(&self) -> Option<Delivery> {
         let socket = self.socket.as_ref().expect("the connection is there until the drop");
-        socket.connection().delivery()
+        socket.connection().delivery(self.stream?)
     }
 
     /// Closes the connection with `deadline`, as
-    /// [`Http1::shutdown`](rsnetwork::server::Http1::shutdown) does: it drains the exchange in
+    /// [`Http::shutdown`](rsnetwork::server::Http::shutdown) does: it drains the exchange in
     /// flight, and tells the client which requests the server did not process.
     pub fn shutdown(&mut self, deadline: Deadline) -> Result<(), Error> {
         self.socket().connection_mut().shutdown(deadline, Clock.now())
@@ -195,6 +225,9 @@ impl Http1 {
     pub async fn release(&mut self) -> Result<Closed, Error> {
         if core::mem::take(&mut self.open) {
             self.cancel();
+        }
+        if let Some(stream) = self.stream {
+            self.socket().connection_mut().close(stream);
         }
         let socket = self.socket();
         socket
@@ -219,11 +252,12 @@ impl Http1 {
     }
 }
 
-impl Drop for Http1 {
+impl Drop for Http {
     fn drop(&mut self) {
         if let (Some(socket), Some(back)) = (self.socket.take(), self.back.take()) {
             let connection = Self {
                 socket: Some(socket),
+                stream: self.stream,
                 open: self.open,
                 back: None,
             };
@@ -248,8 +282,8 @@ pub struct Report {
     pub aborted: u64,
 }
 
-/// An HTTP/1.1 server on a Tokio listener: it accepts each connection, and runs the handler for
-/// it in a task of its own, on the runtime of the caller.
+/// A server on a Tokio listener: it accepts each connection, and runs the handler for it in a
+/// task of its own, on the runtime of the caller.
 ///
 /// The server owns each task that it spawns: its accept task, and one task for each connection,
 /// at most `connections_max` at a time. [`close`](Self::close) stops the accepts, drains each
@@ -272,7 +306,7 @@ impl Server {
     pub fn serve<M, H, F>(listener: TcpListener, connections_max: NonZeroUsize, make: M, handler: H) -> Self
     where
         M: FnMut() -> Result<(Core, Pool), Error> + Send + 'static,
-        H: Fn(Http1) -> F + Send + Sync + 'static,
+        H: Fn(Http) -> F + Send + Sync + 'static,
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {
         let (close, signal) = watch::channel(None);
@@ -284,7 +318,7 @@ impl Server {
     }
 
     /// Closes the server: it stops the accepts, and each connection drains with `deadline`, as
-    /// [`Http1::shutdown`] says. Then it joins each task. At `deadline`, it aborts the tasks that
+    /// [`Http::shutdown`] says. Then it joins each task. At `deadline`, it aborts the tasks that
     /// did not end, for example a handler that waits for another future. Gives what the server did.
     pub async fn close(mut self, deadline: Deadline) -> Report {
         self.close.send_replace(Some(deadline));
@@ -323,7 +357,7 @@ async fn accept<M, H, F>(
 ) -> Report
 where
     M: FnMut() -> Result<(Core, Pool), Error> + Send + 'static,
-    H: Fn(Http1) -> F + Send + Sync + 'static,
+    H: Fn(Http) -> F + Send + Sync + 'static,
     F: Future<Output = Result<(), Error>> + Send + 'static,
 {
     let mut tasks = JoinSet::new();
@@ -418,12 +452,13 @@ where
 /// Gives whether the connection and the handler ended with no error.
 async fn run<H, F>(socket: Socket<Core>, handler: Arc<H>) -> bool
 where
-    H: Fn(Http1) -> F,
+    H: Fn(Http) -> F,
     F: Future<Output = Result<(), Error>>,
 {
     let back = Back::default();
-    let connection = Http1 {
+    let connection = Http {
         socket: Some(socket),
+        stream: None,
         open: false,
         back: Some(Arc::clone(&back)),
     };

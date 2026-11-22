@@ -7,7 +7,7 @@ use rsnetwork::body::{Collect, Part, Read};
 use rsnetwork::buffer::{BufferMut, Lease, Pool, WriteLoan};
 use rsnetwork::client::{Http1 as Core, Request};
 use rsnetwork::drive::{Error, Kind};
-use rsnetwork::h1::RetainedResponse;
+use rsnetwork::message::ResponseHead;
 use rsnetwork::time::Deadline;
 use rsnetwork::tls::Negotiated;
 use tokio::net::TcpStream;
@@ -67,7 +67,7 @@ impl Http1 {
     /// Gives the response head of the request in flight, when it arrives. Refuses as
     /// [`Http1::response`](rsnetwork::client::Http1::response) does, for example with
     /// [`Kind::Deadline`] at the deadline.
-    pub async fn response(&mut self) -> Result<RetainedResponse, Error> {
+    pub async fn response(&mut self) -> Result<ResponseHead, Error> {
         let response = self.socket.until(Core::response);
         response.await?.ok_or(ENDED)
     }

@@ -16,7 +16,9 @@ use rsnetwork::capacity::Budget;
 use rsnetwork::client::{Http1, Limits, Request};
 use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Received, TurnLimits};
 use rsnetwork::h1::{self, BodyLimits, Framing, Server, ServerEvent};
+use rsnetwork::h2;
 use rsnetwork::host::{Connection, Engine, Io as _, Wait};
+use rsnetwork::message::ResponseHead;
 use rsnetwork::time::{ClockDomain, Deadline, Instant, Suspend};
 use rsnetwork::tls::{
     CertificateDer, ClientConfig, ClientOptions, Entropy, Identity, Limits as TlsLimits, PrivateKeyDer, Resumption,
@@ -51,8 +53,21 @@ const TURN: TurnLimits = TurnLimits {
     frames: 1 << 10,
 };
 
+/// The HTTP/2 limits, which an HTTP/1.1 client does not use.
+const H2: h2::Limits = h2::Limits {
+    settings: h2::Settings {
+        max_concurrent_streams: 8,
+        max_header_list_size: 4096,
+        ..h2::Settings::INITIAL
+    },
+    work: 64 * 1024,
+    encoder_table_bytes: 4096,
+    connection_window: 1 << 20,
+};
+
 const LIMITS: Limits = Limits {
     head: HEAD,
+    h2: H2,
     body: BODY,
     turn: TURN,
     queue: NonZeroUsize::new(16).unwrap(),
@@ -100,7 +115,7 @@ fn get() -> Request<'static> {
         target: Target::new(b"/").unwrap(),
         authority: Authority::new(b"server.test").unwrap(),
         fields: &[],
-        body: Framing::Length(0),
+        length: Some(0),
     }
 }
 
@@ -365,7 +380,7 @@ fn give<E: Engine>(to: &mut Connection<E>, mut bytes: &[u8]) {
 
 /// The response head of the request in flight. As a binding does, the transport moves the bytes
 /// between the calls.
-fn head(pair: &mut Pair, now: Instant) -> h1::RetainedResponse {
+fn head(pair: &mut Pair, now: Instant) -> ResponseHead {
     for _ in 0..16 {
         if let Some(head) = pair.client.response(now).unwrap() {
             return head;
@@ -406,7 +421,7 @@ fn a_slow_body_meets_its_original_deadline_with_its_partial_progress() {
         let deadline = Deadline::at(at(1_000));
         send(&mut pair, &get(), deadline, at(0)).unwrap();
         let head = head(&mut pair, at(10));
-        assert_eq!(head.head().status(), Status::new(200).unwrap(), "{transport:?}");
+        assert_eq!(head.status(), Status::new(200).unwrap(), "{transport:?}");
 
         // From here, the application calls only the body.
         let mut region = WriteLoan::new(Vec::with_capacity(256));
@@ -648,7 +663,7 @@ fn a_response_before_the_end_of_the_request_body_leaves_the_client_working() {
         let mut pair = Pair::new(transport, vec![reply]);
         let post = Request {
             method: Method::POST,
-            body: Framing::Length(9),
+            length: Some(9),
             ..get()
         };
         send(&mut pair, &post, Deadline::at(at(1_000)), at(0)).unwrap();

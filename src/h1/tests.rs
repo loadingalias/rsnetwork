@@ -6,9 +6,10 @@ use core::num::NonZeroUsize;
 use rstypes::buffer::WriteLoan;
 
 use super::{
-    Framing, Limits, ParseError, RequestHead, RequestParser, ResponseParser, Version, WriteError, begin_chunk,
-    end_chunk, last_chunk, write_head, write_request,
+    Framing, Limits, ParseError, RequestHead, RequestParser, ResponseParser, WriteError, begin_chunk, end_chunk,
+    last_chunk, write_head, write_request,
 };
+use crate::message::Version;
 use crate::value::{Field, Method, Status, Target};
 
 /// The method, target, fields, consumed count, and framing of a head.

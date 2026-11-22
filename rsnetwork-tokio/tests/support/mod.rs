@@ -15,7 +15,8 @@ use rsnetwork::buffer::Pool;
 use rsnetwork::capacity::Budget;
 use rsnetwork::client::{self, Request};
 use rsnetwork::drive::TurnLimits;
-use rsnetwork::h1::{self, BodyLimits, Framing};
+use rsnetwork::h1::{self, BodyLimits};
+use rsnetwork::h2;
 use rsnetwork::server::{self, Linger, Response};
 use rsnetwork::tls::{
     self, CertificateDer, ClientConfig, ClientOptions, Entropy, Identity, PrivateKeyDer, Resumption, ServerConfig,
@@ -40,7 +41,7 @@ pub(crate) const ALERT_RECORD: usize = 5 + 2 + 1 + 16;
 /// The longest that a test waits for a peer.
 pub(crate) const PATIENCE: Duration = Duration::from_secs(10);
 
-const HEAD: h1::Limits = h1::Limits {
+pub(crate) const HEAD: h1::Limits = h1::Limits {
     head_bytes: 1024,
     fields: 16,
     name_bytes: 64,
@@ -48,7 +49,7 @@ const HEAD: h1::Limits = h1::Limits {
 };
 
 /// A drain of 64 bytes: the rest of a body within it drains, and a longer rest closes.
-const BODY: BodyLimits = BodyLimits {
+pub(crate) const BODY: BodyLimits = BodyLimits {
     body_bytes: 1 << 26,
     drain_bytes: 64,
     extension_bytes: 64,
@@ -56,12 +57,24 @@ const BODY: BodyLimits = BodyLimits {
     trailer_fields: 4,
 };
 
-const TURN: TurnLimits = TurnLimits {
+/// The HTTP/2 limits, which these HTTP/1.1 tests do not use.
+const H2: h2::Limits = h2::Limits {
+    settings: h2::Settings {
+        max_concurrent_streams: 8,
+        max_header_list_size: 4096,
+        ..h2::Settings::INITIAL
+    },
+    work: 64 * 1024,
+    encoder_table_bytes: 4096,
+    connection_window: 1 << 20,
+};
+
+pub(crate) const TURN: TurnLimits = TurnLimits {
     bytes: 1 << 20,
     frames: 1 << 10,
 };
 
-const QUEUE: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+pub(crate) const QUEUE: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
 /// The time that a server waits for a request head, also over TLS.
 pub(crate) const HEAD_TIMEOUT: Duration = Duration::from_millis(300);
@@ -143,6 +156,7 @@ pub(crate) fn client_config() -> ClientConfig {
 pub(crate) fn core_client(transport: Transport) -> client::Http1 {
     let limits = client::Limits {
         head: HEAD,
+        h2: H2,
         body: BODY,
         turn: TURN,
         queue: QUEUE,
@@ -164,20 +178,22 @@ pub(crate) fn core_client(transport: Transport) -> client::Http1 {
 pub(crate) fn server_limits() -> server::Limits {
     server::Limits {
         head: HEAD,
+        h2: H2,
         body: BODY,
         turn: TURN,
         queue: QUEUE,
         head_timeout: Some(HEAD_TIMEOUT),
         linger: LINGER,
+        cleartext: server::Cleartext::Http1,
     }
 }
 
 /// A server of the core over `transport`, on the clock of the binding.
-pub(crate) fn core_server(transport: Transport) -> server::Http1 {
+pub(crate) fn core_server(transport: Transport) -> server::Http {
     let limits = server_limits();
     match transport {
-        Transport::Plain => server::Http1::plain(limits, Clock.domain(), &budget()).unwrap(),
-        Transport::Tls => server::Http1::tls(&server_config(), (limits, TLS), Clock.domain(), &budget()).unwrap(),
+        Transport::Plain => server::Http::plain(limits, Clock.domain(), &budget()).unwrap(),
+        Transport::Tls => server::Http::tls(&server_config(), (limits, TLS), Clock.domain(), &budget()).unwrap(),
     }
 }
 
@@ -188,9 +204,9 @@ pub(crate) async fn client(transport: Transport, address: SocketAddr) -> rsnetwo
 }
 
 /// A server of the binding over `transport` on the next connection of `listener`.
-pub(crate) async fn server(transport: Transport, listener: &tokio::net::TcpListener) -> rsnetwork_tokio::server::Http1 {
+pub(crate) async fn server(transport: Transport, listener: &tokio::net::TcpListener) -> rsnetwork_tokio::server::Http {
     let (stream, _) = listener.accept().await.unwrap();
-    rsnetwork_tokio::server::Http1::new(core_server(transport), stream, pool(&budget())).unwrap()
+    rsnetwork_tokio::server::Http::new(core_server(transport), stream, pool(&budget())).unwrap()
 }
 
 /// A listener on a free loopback port.
@@ -206,15 +222,15 @@ pub(crate) fn get() -> Request<'static> {
         target: Target::new(b"/").unwrap(),
         authority: Authority::new(b"server.test").unwrap(),
         fields: &[],
-        body: Framing::Length(0),
+        length: Some(0),
     }
 }
 
-pub(crate) fn ok(body: Framing) -> Response<'static> {
+pub(crate) fn ok(length: Option<u64>) -> Response<'static> {
     Response {
         status: Status::new(200).unwrap(),
         fields: &[],
-        body,
+        length,
     }
 }
 

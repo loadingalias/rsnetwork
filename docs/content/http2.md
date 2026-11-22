@@ -10,10 +10,12 @@ The `rsnetwork::h2` module is HTTP/2 (RFC 9113). It has two parts:
   and the drain after a GOAWAY. It ends the connection with a GOAWAY of the RFC 9113 code of each
   connection error, and resets a stream with the code of each stream error.
 
-rsnetwork is in development and has no release. The client and server APIs of HTTP/2 come later.
-The engine gives HTTP messages as header sections and body bytes. It does not check pseudo-header
-fields or `content-length` (RFC 9113, sections 8.1.1 and 8.3), so check them before you use a
-message.
+rsnetwork is in development and has no release. To send and serve HTTP/2 requests, use the
+[client](client.md#http2) and the [server](server.md): they run this engine, and they check each
+message as RFC 9113, section 8, says. This page is about the engine itself. The engine gives HTTP
+messages as header sections and body bytes. It does not check pseudo-header fields or
+`content-length` (RFC 9113, sections 8.1.1 and 8.3), so check them before you use a message from
+it.
 
 ## The model
 

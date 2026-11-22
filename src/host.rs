@@ -171,6 +171,8 @@ mod sealed {
 
     impl Sealed for crate::h1::Server {}
     impl Sealed for crate::h1::Client {}
+    impl Sealed for crate::server::Protocol {}
+    impl Sealed for crate::h2::session::Session {}
     #[cfg(feature = "tls")]
     impl<E: super::Engine> Sealed for crate::tls::Tls<E> {}
     #[cfg(feature = "tls")]
@@ -178,7 +180,8 @@ mod sealed {
 
     impl<E> Sealed for super::Connection<E> {}
     impl Sealed for crate::client::Http1 {}
-    impl Sealed for crate::server::Http1 {}
+    impl Sealed for crate::client::Http2 {}
+    impl Sealed for crate::server::Http {}
     #[cfg(feature = "tls")]
     impl Sealed for crate::tls::Stream {}
 }
@@ -237,7 +240,7 @@ pub enum Wait {
     /// its write side, and then give each received byte as before, until the end of input or
     /// `deadline`. The server reads and discards those bytes, so a reset of the peer does not
     /// discard a response that it has not read yet. Then the end follows. Only
-    /// [`server::Http1`](crate::server::Http1) waits so.
+    /// [`server::Http`](crate::server::Http) waits so.
     Linger {
         /// The end of the linger.
         deadline: Deadline,
@@ -251,8 +254,8 @@ pub enum Wait {
 ///
 /// A binding, or the application in its own event loop, makes them for each connection: a
 /// [`Connection`], a [`client::Http1`](crate::client::Http1), a
-/// [`server::Http1`](crate::server::Http1), and a `tls::Stream`. So one binding moves the bytes
-/// of each. Each implementation tells what it adds to these rules.
+/// [`client::Http2`](crate::client::Http2), a [`server::Http`](crate::server::Http), and a
+/// `tls::Stream`. So one binding moves the bytes of each. Each implementation tells what it adds to these rules.
 pub trait Io: sealed::Sealed {
     /// The end of the connection that [`release`](Self::release) gives.
     type End;
@@ -388,6 +391,11 @@ impl<E: Engine> Connection<E> {
     /// The output queue, for a look at its state.
     pub(crate) fn queue(&self) -> &Outbound {
         &self.outbound
+    }
+
+    /// Whether the transport failed.
+    pub(crate) fn is_reset(&self) -> bool {
+        self.reset
     }
 
     /// Drops the connection before its terminal release, and reports the output that the

@@ -33,7 +33,12 @@ to its alignment, a 16-byte entry for each slot, and the shared state of the poo
 | Join of an HTTP/2 header block that does not decode in place | Its bytes for a block in one frame, or `work` for a block that continues: see [HTTP/2](http2.md#header-blocks) | When the block arrives, until its decode |
 | TLS input region | A pool of one slot of `input_bytes` | When a receive needs a region, until the last view of its plaintext and the writable rest of the region drop |
 | TLS sealed regions | One 32-byte mark for each entry of the plaintext output queue: the record layer seals no more regions before the transport accepts their records | `Tls::client` and `Tls::server` |
-| HTTP/1.1 server regions | A pool of two slots of `head_bytes`, for response heads and trailer sections | `server::Http1::plain` and `server::Http1::tls` |
+| Server regions | A pool of two slots of `head_bytes`, for response heads and trailer sections, in each version | `server::Http::plain` and `server::Http::tls` |
+| Client request regions | A pool of `head_bytes` slots for request heads: one for HTTP/1.1, two for HTTP/2 | `client::Http1` and `client::Http2` constructors |
+| HTTP/2 stream table of the client and the server | One entry for each of `max_concurrent_streams` | `client::Http2` constructors, and `server::Http` when it selects HTTP/2 |
+| HTTP/2 delivery marks of the server | Two marks for each entry of the plaintext output queue: one mark for each frame that carries DATA or ends a stream, until the transport accepts it | `server::Http` when it selects HTTP/2 |
+| HTTP/2 request or response head of the vocabulary | The decoded lines, copied into a region of their exact size | When the head arrives, until its last copy drops |
+| HTTP/2 body parts that wait for a read | Up to 4 views of received regions for each stream. A later part is copied into one buffer of the stream, at most its receive window | When the part arrives, until the application reads it |
 | Output region of the host | Nothing: your host charges the region, for example through its pool | `Connection::output_region` |
 | Receive regions of `host::Tcp` and of the Tokio binding | Nothing: you charge its `Pool` to the budget that you give `Pool::new` | `Tcp::new`, and `new` of each type of `rsnetwork-tokio` |
 | TLS ciphertext output | Its capacity, and the one allocation of the lease that owns it. Before a call of rustls, also twice the bytes that the call can write | When the connection writes, until the transport releases the last view |
@@ -103,8 +108,9 @@ bounds it. Each turn makes at least one step, so a small limit slows an engine b
 | A QPACK encoder that floods the encoder stream | Its dynamic table, which `table_bytes` bounds | `work` bounds each read of the encoder stream: see [QPACK](qpack.md#limits) |
 
 The head timeout of the server bounds the time of a slow head: see
-[HTTP/1.1](http1.md#framing-and-connection-rules). In `server::Http1` over TLS, it also bounds the
-TLS handshake. After the last output, the [linger](server.md#linger) of `server::Http1` discards the
+[HTTP/1.1](http1.md#framing-and-connection-rules). On HTTP/2, it bounds the time with no stream.
+In `server::Http` over TLS, it also bounds the TLS handshake. After the last output, the
+[linger](server.md#linger) of `server::Http` discards the
 bytes of a peer that goes on sending, up to `linger.bytes` and `linger.time`. Bound the time of a slow body with your own
 deadline for it, and end the connection when it passes.
 

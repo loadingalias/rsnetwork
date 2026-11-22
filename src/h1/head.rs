@@ -6,6 +6,7 @@ use core::fmt;
 use rstypes::buffer::{Buffer as _, Lease};
 
 use crate::drive::{Error, Kind};
+use crate::message::Version;
 use crate::value::{Field, Status, decimal};
 
 /// The limits of one head, which the caller sets.
@@ -39,27 +40,16 @@ pub struct BodyLimits {
     pub trailer_fields: usize,
 }
 
-/// The version of a message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Version {
-    /// HTTP/1.0 (RFC 9112, appendix C.2).
-    Http10,
-    /// HTTP/1.1.
-    Http11,
-}
-
-impl Version {
-    /// Reads `HTTP/1.0` or `HTTP/1.1`. Another version in the same syntax refuses as
-    /// [`ParseError::Version`], and other bytes as [`ParseError::Malformed`].
-    pub(super) fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        match bytes {
-            b"HTTP/1.1" => Ok(Self::Http11),
-            b"HTTP/1.0" => Ok(Self::Http10),
-            [b'H', b'T', b'T', b'P', b'/', major, b'.', minor] if major.is_ascii_digit() && minor.is_ascii_digit() => {
-                Err(ParseError::Version)
-            }
-            _ => Err(ParseError::Malformed),
+/// Reads `HTTP/1.0` or `HTTP/1.1`. Another version in the same syntax refuses as
+/// [`ParseError::Version`], and other bytes as [`ParseError::Malformed`].
+pub(super) fn parse_version(bytes: &[u8]) -> Result<Version, ParseError> {
+    match bytes {
+        b"HTTP/1.1" => Ok(Version::Http11),
+        b"HTTP/1.0" => Ok(Version::Http10),
+        [b'H', b'T', b'T', b'P', b'/', major, b'.', minor] if major.is_ascii_digit() && minor.is_ascii_digit() => {
+            Err(ParseError::Version)
         }
+        _ => Err(ParseError::Malformed),
     }
 }
 
@@ -218,13 +208,13 @@ fn list(value: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// Splits the first line from `bytes` at its LF. The line has no CR LF.
-pub(super) fn split_line(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+pub(crate) fn split_line(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     let (line, rest) = bytes.split_once(|&byte| byte == b'\n')?;
     Some((line.trim_suffix(b"\r"), rest))
 }
 
 /// Splits a field line at its first colon into the name and the value with no whitespace around it.
-fn field_parts(line: &[u8]) -> Option<(&[u8], &[u8])> {
+pub(crate) fn field_parts(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let (name, value) = line.split_once(|&byte| byte == b':')?;
     Some((name, trim_whitespace(value)))
 }
@@ -249,30 +239,6 @@ pub(super) fn offset(head: &[u8], part: &[u8]) -> usize {
 pub(super) fn view_of(region: &Lease, head: &[u8]) -> Option<Lease> {
     let start = head.as_ptr().addr().checked_sub(region.as_ptr().addr())?;
     region.view(start..start.checked_add(head.len())?)
-}
-
-/// An iterator over the field lines of a head, in their received order.
-#[derive(Clone)]
-pub struct Fields<'a> {
-    /// The field lines that remain, each with its CR LF. The parser checked each of them.
-    pub(crate) block: &'a [u8],
-}
-
-impl<'a> Iterator for Fields<'a> {
-    type Item = Field<'a>;
-
-    fn next(&mut self) -> Option<Field<'a>> {
-        let (line, rest) = split_line(self.block)?;
-        self.block = rest;
-        let (name, value) = field_parts(line)?;
-        Some(Field { name, value })
-    }
-}
-
-impl fmt::Debug for Fields<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Fields").finish_non_exhaustive()
-    }
 }
 
 /// A refusal of a head.

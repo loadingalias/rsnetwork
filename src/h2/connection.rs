@@ -5,6 +5,7 @@ use core::alloc::Layout;
 use core::fmt;
 use core::num::NonZeroU32;
 use core::time::Duration;
+use std::collections::VecDeque;
 
 use rstypes::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, WriteLoan};
 use rstypes::capacity::{Budget, Permit};
@@ -96,6 +97,32 @@ pub struct Connection {
     deadline: Option<Deadline>,
     /// The end of the connection.
     end: Option<Result<(), Error>>,
+    /// The frames in the output that carry DATA or end a stream, when the application tracks
+    /// their delivery.
+    marks: Option<Marks>,
+}
+
+/// A frame in the output that carries DATA or ends a stream, for the delivery of each stream.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Mark {
+    pub(crate) stream: u32,
+    /// The bytes that the output queue took, up to the end of the frame.
+    pub(crate) end: u64,
+    /// The DATA bytes of the frame.
+    pub(crate) payload: u32,
+    pub(crate) end_stream: bool,
+}
+
+/// The marks of the frames that the transport has not accepted, in their order.
+struct Marks {
+    ring: VecDeque<Mark>,
+    _charge: Permit,
+}
+
+impl Marks {
+    fn full(&self) -> bool {
+        self.ring.len() == self.ring.capacity()
+    }
 }
 
 /// An event of the connection.
@@ -415,6 +442,7 @@ impl Connection {
             settings_timeout: Some(SETTINGS_TIMEOUT),
             deadline: None,
             end: None,
+            marks: None,
         };
         // The settings that differ from their initial values, and then the push setting.
         let mut settings = [0; 36];
@@ -589,9 +617,23 @@ impl Connection {
         self.writable(outbound)?;
         let interim = stream::interim(lines.clone().next());
         self.streams.sendable(stream, interim, end_stream)?;
+        if end_stream && !self.mark_room() {
+            return Err(full());
+        }
         self.block(outbound, stream, lines, end_stream, region)?;
+        if end_stream {
+            self.mark(outbound, stream, 0, true);
+        }
         self.streams.sent(stream, interim, end_stream);
         Ok(())
+    }
+
+    /// The free capacity that a region of [`headers`](Self::headers) needs for `lines` now: the
+    /// longest block, and the header of each of its frames.
+    pub(crate) fn block_room<'a>(&self, lines: impl Iterator<Item = FieldLine<'a>> + Clone) -> usize {
+        let needed = self.encoder.needed(lines);
+        let frames = needed.div_ceil(self.peer.max_frame_size as usize).max(1);
+        needed.saturating_add(frames.saturating_mul(HEAD))
     }
 
     /// Writes a header block on `stream` into `region`, and queues its frames.
@@ -680,7 +722,7 @@ impl Connection {
         }
         // The empty frame goes after the answer that waits, so the frames stay in their order.
         self.writable(outbound)?;
-        if outbound.free() == 0 {
+        if outbound.free() == 0 || !self.mark_room() {
             return Err(full());
         }
         let head = Head {
@@ -692,6 +734,7 @@ impl Connection {
         let mut slot = WriteLoan::new(self.pool.acquire().map_err(|_| full())?);
         slot.fill_from(&head.encode());
         push_region(outbound, Lease::from(slot.into_inner()))?;
+        self.mark(outbound, stream, 0, true);
         self.streams.sent(stream, false, true);
         Ok(())
     }
@@ -701,14 +744,18 @@ impl Connection {
     /// view of a chunk. Gives whether a frame waits for room.
     fn send(&mut self, outbound: &mut Outbound) -> Result<bool, Fault> {
         while outbound.free() >= 2 + outbound.limit() / DATA_SHARE {
+            if !self.mark_room() {
+                return Ok(self.streams.ready());
+            }
             let Ok(slot) = self.pool.acquire() else {
                 return Ok(self.streams.ready());
             };
             let Some((stream, part, end_stream)) = self.streams.next_frame() else {
                 return Ok(false);
             };
+            let payload = narrow(part.initialized());
             let head = Head {
-                length: narrow(part.initialized()),
+                length: payload,
                 kind: Kind::Data,
                 flags: flag(end_stream, END_STREAM),
                 stream,
@@ -719,6 +766,7 @@ impl Connection {
             for region in [Lease::from(slot.into_inner()), part] {
                 outbound.push(region).map_err(|_| internal())?;
             }
+            self.mark(outbound, stream, payload, end_stream);
         }
         Ok(self.streams.ready())
     }
@@ -731,8 +779,22 @@ impl Connection {
     /// stream is not open, and for a server with `REFUSED_STREAM`: each stream that a server
     /// knows went up to it, so it is not "unprocessed" (section 8.7).
     pub fn reset(&mut self, outbound: &mut Outbound, stream: u32, code: ErrorCode) -> Result<(), Error> {
-        self.writable(outbound)?;
         self.streams.resettable(stream, code)?;
+        self.reset_stream(outbound, stream, code)
+    }
+
+    /// Resets `stream` of a server, whose header section did not go up to the application, with
+    /// `REFUSED_STREAM`: the server did not process it, so the client can send it again (RFC
+    /// 9113, section 8.7). Refuses as [`reset`](Self::reset) does.
+    pub(crate) fn refuse(&mut self, outbound: &mut Outbound, stream: u32) -> Result<(), Error> {
+        self.reset_stream(outbound, stream, ErrorCode::REFUSED_STREAM)
+    }
+
+    fn reset_stream(&mut self, outbound: &mut Outbound, stream: u32, code: ErrorCode) -> Result<(), Error> {
+        self.writable(outbound)?;
+        if !self.streams.is_open(stream) {
+            return Err(Error::new(ErrorKind::Misuse, "the stream is not open"));
+        }
         if outbound.free() == 0 {
             return Err(full());
         }
@@ -751,6 +813,78 @@ impl Connection {
     /// open, or it was closed.
     pub fn close(&mut self, stream: u32) -> Result<(), Error> {
         self.streams.free(stream)
+    }
+
+    /// Keeps the slot of each stream that ended, also with no reset, until [`close`](Self::close):
+    /// the application then holds at most `max_concurrent_streams` streams.
+    pub(crate) fn hold_streams(&mut self) {
+        self.streams.hold_done = true;
+    }
+
+    /// The role of the endpoint.
+    pub(crate) fn role(&self) -> Role {
+        self.role
+    }
+
+    /// Whether `stream` is open or half-closed.
+    pub(crate) fn is_open(&self, stream: u32) -> bool {
+        self.streams.is_open(stream)
+    }
+
+    /// Whether `stream` ended and holds its slot until [`close`](Self::close).
+    pub(crate) fn is_held(&self, stream: u32) -> bool {
+        self.streams.is_held(stream)
+    }
+
+    /// Records a [`Mark`] for each frame that carries DATA or ends a stream, from now on: at most
+    /// two for each entry of `outbound`, charged to `budget`. The plaintext output and the records
+    /// of TLS that the transport has not accepted each hold at most the entries of the queue, so
+    /// the marks never fill while the transport accepts the output.
+    pub(crate) fn track(&mut self, outbound: &Outbound, budget: &Budget) -> Result<(), Error> {
+        let capacity = outbound.limit().saturating_mul(2);
+        let bytes = Layout::array::<Mark>(capacity)
+            .map_err(|_| Error::new(ErrorKind::Overload, "the marks of the output are too large"))?
+            .size();
+        let charge = budget
+            .reserve(bytes as u64)
+            .map_err(|_| Error::new(ErrorKind::Overload, "the budget refused the marks of the output"))?;
+        let mut ring = VecDeque::new();
+        ring.try_reserve_exact(capacity)
+            .map_err(|_| Error::new(ErrorKind::Overload, "the memory for the marks is not available"))?;
+        self.marks = Some(Marks { ring, _charge: charge });
+        Ok(())
+    }
+
+    /// Takes the first mark whose frame is in the first `accepted` bytes of the output.
+    pub(crate) fn take_mark(&mut self, accepted: u64) -> Option<Mark> {
+        let marks = self.marks.as_mut()?;
+        marks.ring.pop_front_if(|mark| mark.end <= accepted)
+    }
+
+    /// The first mark whose frame the transport did not accept whole.
+    pub(crate) fn front_mark(&self) -> Option<Mark> {
+        self.marks.as_ref()?.ring.front().copied()
+    }
+
+    /// Whether a new mark has room: always, when the application tracks no delivery.
+    fn mark_room(&self) -> bool {
+        !self.marks.as_ref().is_some_and(Marks::full)
+    }
+
+    /// Records the frame on `stream` that ends with the last byte of `outbound`.
+    fn mark(&mut self, outbound: &Outbound, stream: u32, payload: u32, end_stream: bool) {
+        if let Some(marks) = &mut self.marks {
+            assert!(
+                !marks.full(),
+                "each push of a marked frame checks the room of the marks"
+            );
+            marks.ring.push_back(Mark {
+                stream,
+                end: outbound.pushed(),
+                payload,
+                end_stream,
+            });
+        }
     }
 
     /// Releases `bytes` data bytes of `stream` that the consumer is done with: the bytes of

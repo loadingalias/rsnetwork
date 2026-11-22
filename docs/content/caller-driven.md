@@ -39,7 +39,7 @@ trait `host::Io`: import it with `use rsnetwork::host::Io as _;`. In each turn o
 | `Blocked::Input` | Received bytes, or the end of the input |
 | `Blocked::Output` | The socket to accept output: the engine has output that must go first |
 | `Blocked::Capacity(n)` | `n` more bytes of capacity, for example after your code consumes a body |
-| `Blocked::Streams` | HTTP/2 only: a free stream slot. Your code closes a stream that a reset ended, when its handler ends. The HTTP/1.1 engines never give it |
+| `Blocked::Streams` | HTTP/2 only: a free stream slot. Your code closes a stream when its handler ends: with `server::Http::close`, or with `h2::Connection::close` after a reset. The HTTP/1.1 engines never give it |
 
 Wait only for the cause that `blocked` names. A socket can almost always take output, so a loop
 that also waits for that while the engine waits for input wakes at once, again and again. Write
@@ -148,7 +148,8 @@ assert_eq!(connection.release(), Some(Ok(())));
 ## Bind a TCP socket
 
 With the `tcp` feature, `host::Tcp` moves the bytes between one nonblocking `std::net::TcpStream`
-and one connection: a `Connection`, a `client::Http1`, a `server::Http1`, or a `tls::Stream`. Your
+and one connection: a `Connection`, a `client::Http1`, a `client::Http2`, a `server::Http`, or a
+`tls::Stream`. Your
 loop keeps the poller and the clock. The socket spawns no task and starts no thread. `Tcp` also
 takes another socket through the trait `host::Socket`, for example the socket of a runtime: see
 [readiness hosts](adapters.md#readiness-hosts).
@@ -240,9 +241,10 @@ use rsnetwork::buffer::{Buffer as _, Lease, Pool};
 use rsnetwork::capacity::Budget;
 use rsnetwork::client::{self, Request};
 use rsnetwork::drive::TurnLimits;
-use rsnetwork::h1::{self, BodyLimits, Framing};
+use rsnetwork::h1::{self, BodyLimits};
+use rsnetwork::h2;
 use rsnetwork::host::{Io as _, Next, Tcp};
-use rsnetwork::server::{self, Linger, Response};
+use rsnetwork::server::{self, Cleartext, Linger, Response};
 use rsnetwork::time::{ClockDomain, Deadline, Instant, Suspend};
 use rsnetwork::value::{Authority, Method, Status, Target};
 
@@ -254,6 +256,8 @@ let body = BodyLimits {
     trailer_bytes: 4 * 1024,
     trailer_fields: 16,
 };
+let settings = h2::Settings { max_concurrent_streams: 100, max_header_list_size: 16 * 1024, ..h2::Settings::INITIAL };
+let h2 = h2::Limits { settings, work: 64 * 1024, encoder_table_bytes: 4096, connection_window: 1 << 20 };
 let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
 let queue = NonZeroUsize::new(16).expect("not zero");
 let linger = Linger { time: Duration::from_secs(5), bytes: 64 * 1024 };
@@ -271,27 +275,30 @@ let listener = TcpListener::bind("127.0.0.1:0")?;
 let mut near = Tcp::new(TcpStream::connect(listener.local_addr()?)?, pool()?)?;
 let mut far = Tcp::new(listener.accept()?.0, pool()?)?;
 
-let mut client = client::Http1::plain(client::Limits { head, body, turn, queue }, clock, &budget)?;
-let limits = server::Limits { head, body, turn, queue, head_timeout: Some(Duration::from_secs(30)), linger };
-let mut server = server::Http1::plain(limits, clock, &budget)?;
+let mut client = client::Http1::plain(client::Limits { head, h2, body, turn, queue }, clock, &budget)?;
+let head_timeout = Some(Duration::from_secs(30));
+let cleartext = Cleartext::Http1;
+let limits = server::Limits { head, h2, body, turn, queue, head_timeout, linger, cleartext };
+let mut server = server::Http::plain(limits, clock, &budget)?;
 
 let request = Request {
     method: Method::GET,
     target: Target::new(b"/hello")?,
     authority: Authority::new(b"127.0.0.1")?,
     fields: &[],
-    body: Framing::Length(0),
+    length: Some(0),
 };
 let deadline = Deadline::at(Instant::new(clock, 30_000_000_000));
 client.send(&request, deadline, now())?;
 let (mut answered, mut response, mut received, mut closed) = (false, None, Vec::new(), false);
 loop {
     // Call each connection: only its calls drive it.
-    if server.request(now())?.is_some() {
-        let hello = Response { status: Status::new(200)?, fields: &[], body: Framing::Length(5) };
-        answered = server.respond(&hello, now())?;
-        server.write(&Lease::from(b"hello".to_vec()), now())?;
-        server.finish(now())?;
+    if let Some((stream, _head)) = server.request(now())? {
+        let hello = Response { status: Status::new(200)?, fields: &[], length: Some(5) };
+        answered = server.respond(stream, &hello, now())?;
+        server.write(stream, &Lease::from(b"hello".to_vec()), now())?;
+        server.finish(stream, now())?;
+        server.close(stream);
     }
     if response.is_none() {
         response = client.response(now())?;
@@ -320,14 +327,14 @@ assert!(near.close(&client).is_empty() && far.close(&server).is_empty());
 ## TLS over the socket
 
 A TLS connection runs over `host::Tcp` with the same loop. Make it with `client::Http1::tls`,
-`server::Http1::tls`, `tls::Stream::connect`, or `tls::Stream::accept`, and give its socket a pool
-of one small slot. In the example, the client over TLS is:
+`client::Http2::tls`, `server::Http::tls`, `tls::Stream::connect`, or `tls::Stream::accept`, and
+give its socket a pool of one small slot. In the example, the client over TLS is:
 
 ```rust
 // `config` is a `tls::ClientConfig`, and `tls` is the `tls::Limits` of the connection.
 let slot = Layout::array::<u8>(4096)?;
 let mut near = Tcp::new(TcpStream::connect(address)?, Pool::new(&budget, NonZeroU32::MIN, slot)?)?;
-let limits = client::Limits { head, body, turn, queue };
+let limits = client::Limits { head, h2, body, turn, queue };
 let mut client = client::Http1::tls(&config, "example.com", (limits, tls), clock, &budget)?;
 ```
 

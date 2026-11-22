@@ -2,7 +2,8 @@
 
 A binding connects the rsnetwork protocol engines to a host: a runtime, or the event loop of your
 application. It moves received bytes, output, time, and wakes between the host and each
-connection: a `host::Connection`, a `client::Http1`, a `server::Http1`, or a `tls::Stream`. These
+connection: a `host::Connection`, a `client::Http1`, a `client::Http2`, a `server::Http`, or a
+`tls::Stream`. These
 connections have the same calls, which the sealed trait `host::Io` names. Thus one binding takes
 any `C: Io` and moves the bytes of each. The binding calls the connection directly. It implements
 no trait of rsnetwork, and no dispatch layer is between the two.
@@ -112,8 +113,9 @@ A completion host, for example io_uring, owns each buffer until its operation co
 
 ## Clients and servers
 
-`client::Http1` and `server::Http1` are one HTTP/1.1 connection over TCP or TLS each, and a binding
-moves their bytes with the calls of `host::Io`, as for a `Connection`. Their calls of the exchange are the
+`client::Http1`, `client::Http2`, and `server::Http` are one connection over TCP or TLS each: the
+server for HTTP/1.1 and HTTP/2. A binding moves their bytes with the calls of `host::Io`, as for a
+`Connection`. Their calls of the exchange are the
 handler interface: see [send requests](client.md) and [serve requests](server.md). `tls::Stream` is
 a byte stream over TLS for other protocols: see [send a byte stream over TLS](tls-stream.md). A binding adds
 its own handler form over these calls, for example an async function, and owns the progress of the
@@ -130,7 +132,8 @@ connections between threads can do so: `Connection<Server>` and `Connection<Clie
 A binding creates no executor and detaches no work. It spawns its tasks on the runtime of the
 application, owns them, and joins them. It drives each connection until `release()` gives its
 result. `release()` takes no time, so drive the connection with a call that takes `now`, for
-example `server::Http1::request(now)`: else a linger or a deadline never ends. The
+example `server::Http::request(now)` or `client::Http2::drive(now)`: else a linger or a deadline
+never ends, and an HTTP/2 client does not answer the SETTINGS and PING of its server. The
 [Tokio server](tokio.md#a-server-and-its-tasks) does so after each handler. At a shutdown, it calls `abandon()` and keeps each output region that the transport holds
 until the transport completes it. A socket that closes before the release resets the connection,
 so the peer cannot read the close as the end of the data. `host::Tcp::close` does so, and reports

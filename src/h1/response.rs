@@ -5,7 +5,8 @@ use core::fmt;
 use rstypes::buffer::{Buffer as _, Lease};
 
 use super::Framing;
-use super::head::{Coding, Facts, Fields, Limits, ParseError, Search, Version, offset, scan, split_head, view_of};
+use super::head::{Coding, Facts, Limits, ParseError, Search, offset, parse_version, scan, split_head, view_of};
+use crate::message::{Fields, Version};
 use crate::value::{Method, Status};
 
 /// Parses HTTP/1.1 and HTTP/1.0 response heads in received bytes, with no copy and no
@@ -47,7 +48,7 @@ fn check<'a>(head: &'a [u8], limits: &Limits, method: Method<'_>) -> Result<Resp
     // status-line = HTTP-version SP status-code SP [ reason-phrase ] (RFC 9112, section 4). The
     // parser also accepts no space after the status code, as sent by some servers.
     let (version, rest) = status_line.split_at_checked(8).ok_or(ParseError::Malformed)?;
-    let version = Version::parse(version)?;
+    let version = parse_version(version)?;
     let [b' ', hundreds, tens, ones, rest @ ..] = rest else {
         return Err(ParseError::Malformed);
     };

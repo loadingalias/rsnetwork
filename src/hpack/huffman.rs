@@ -414,8 +414,11 @@ impl Partial {
 }
 
 /// The length in bytes of the Huffman string of `bytes`, with its padding.
-pub(crate) fn encoded_len(bytes: &[u8]) -> usize {
-    let bits: u64 = bytes.iter().map(|&byte| u64::from(CODES[usize::from(byte)].1)).sum();
+pub(crate) fn encoded_len(bytes: impl IntoIterator<Item = u8>) -> usize {
+    let bits: u64 = bytes
+        .into_iter()
+        .map(|byte| u64::from(CODES[usize::from(byte)].1))
+        .sum();
     usize::try_from(bits.div_ceil(8)).unwrap_or(usize::MAX)
 }
 
@@ -425,12 +428,12 @@ pub(crate) fn encoded_len(bytes: &[u8]) -> usize {
     clippy::cast_possible_truncation,
     reason = "each byte is the next 8 bits of the code"
 )]
-pub(crate) fn encode(bytes: &[u8], mut put: impl FnMut(&[u8])) {
+pub(crate) fn encode(bytes: impl IntoIterator<Item = u8>, mut put: impl FnMut(&[u8])) {
     let mut piece = [0_u8; 64];
     let mut used = 0;
     // The low `bits` bits of `acc` wait to be written, in order from the most significant.
     let (mut acc, mut bits) = (0_u64, 0_u32);
-    for &byte in bytes {
+    for byte in bytes {
         let (code, len) = CODES[usize::from(byte)];
         acc = (acc << len) | u64::from(code);
         bits += u32::from(len);

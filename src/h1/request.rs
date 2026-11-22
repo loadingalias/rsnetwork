@@ -5,7 +5,8 @@ use core::fmt;
 use rstypes::buffer::{Buffer as _, Lease};
 
 use super::Framing;
-use super::head::{Coding, Facts, Fields, Limits, ParseError, Search, Version, offset, scan, split_head, view_of};
+use super::head::{Coding, Facts, Limits, ParseError, Search, offset, parse_version, scan, split_head, view_of};
+use crate::message::{Fields, Version};
 use crate::value::{Authority, Method, Target, TargetForm};
 
 /// Parses HTTP/1.1 and HTTP/1.0 request heads in received bytes, with no copy and no allocation.
@@ -55,7 +56,7 @@ fn check<'a>(head: &'a [u8], limits: &Limits) -> Result<RequestHead<'a>, ParseEr
     let (Ok(method), Ok(target)) = (Method::new(method), Target::new(target)) else {
         return Err(ParseError::Malformed);
     };
-    let version = Version::parse(version)?;
+    let version = parse_version(version)?;
     // Only CONNECT has the authority form, and only OPTIONS has the asterisk form (RFC 9112,
     // section 3.2). A CONNECT request has the authority form (RFC 9110, section 9.3.6).
     let form = target.form();
@@ -77,7 +78,7 @@ fn check<'a>(head: &'a [u8], limits: &Limits) -> Result<RequestHead<'a>, ParseEr
     let host = match (facts.host, version) {
         (Some(value), _) => Some(Authority::new(value).map_err(|_| ParseError::Malformed)?),
         (None, Version::Http10) => None,
-        (None, Version::Http11) => return Err(ParseError::Malformed),
+        (None, _) => return Err(ParseError::Malformed),
     };
     let authority = match form {
         TargetForm::Absolute { authority, .. } | TargetForm::Authority(authority) => Some(authority),

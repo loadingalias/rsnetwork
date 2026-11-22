@@ -1,7 +1,7 @@
 //! The Tokio binding of rsnetwork: the protocol engines of the core on the Tokio runtime of the
 //! application.
 //!
-//! - [`client::Http1`], [`server::Http1`], and [`tls::Stream`] are the connections of the core
+//! - [`client::Http1`], [`server::Http`], and [`tls::Stream`] are the connections of the core
 //!   on a Tokio TCP socket. Each call awaits the progress that it needs, so a body read moves its
 //!   own bytes: no task and no second object to poll.
 //! - [`server::Server`] accepts connections, and runs a handler for each one in a task of its own.
@@ -27,8 +27,9 @@
 //! use rsnetwork::capacity::Budget;
 //! use rsnetwork::client::{self, Request};
 //! use rsnetwork::drive::TurnLimits;
-//! use rsnetwork::h1::{self, BodyLimits, Framing};
-//! use rsnetwork::server::{self, Linger, Response};
+//! use rsnetwork::h1::{self, BodyLimits};
+//! use rsnetwork::h2;
+//! use rsnetwork::server::{self, Cleartext, Linger, Response};
 //! use rsnetwork::value::{Authority, Method, Status, Target};
 //! use rsnetwork_tokio::Clock;
 //! use rsnetwork_tokio::server::Server;
@@ -45,7 +46,11 @@
 //! let queue = NonZeroUsize::new(16).expect("not zero");
 //! let linger = Linger { time: Duration::from_secs(5), bytes: 64 * 1024 };
 //! let head_timeout = Some(Duration::from_secs(30));
-//! let server_limits = server::Limits { head, body, turn, queue, head_timeout, linger };
+//! // The HTTP/2 connection, which a server over TLS can select with ALPN `h2`.
+//! let h2_settings = h2::Settings { max_concurrent_streams: 100, max_header_list_size: 16 * 1024, ..h2::Settings::INITIAL };
+//! let h2 = h2::Limits { settings: h2_settings, work: 64 * 1024, encoder_table_bytes: 4096, connection_window: 1 << 20 };
+//! let cleartext = Cleartext::Http1;
+//! let server_limits = server::Limits { head, h2, body, turn, queue, head_timeout, linger, cleartext };
 //! let budget = Budget::new(NonZeroU64::new(1 << 24).expect("not zero"));
 //! // Each socket has 4 receive regions of 16 KiB, charged to the budget.
 //! let slot = Layout::array::<u8>(16 * 1024)?;
@@ -62,12 +67,12 @@
 //!     // Each accepted connection gets a server of the core and its receive regions.
 //!     let make = {
 //!         let (budget, pool) = (budget.clone(), pool.clone());
-//!         move || Ok((server::Http1::plain(server_limits, Clock.domain(), &budget)?, pool()?))
+//!         move || Ok((server::Http::plain(server_limits, Clock.domain(), &budget)?, pool()?))
 //!     };
 //!     let connections = NonZeroUsize::new(1024).expect("not zero");
 //!     let server = Server::serve(listener, connections, make, move |mut connection| async move {
 //!         while connection.request().await?.is_some() {
-//!             let hello = Response { status: ok, fields: &[], body: Framing::Length(5) };
+//!             let hello = Response { status: ok, fields: &[], length: Some(5) };
 //!             connection.respond(&hello).await?;
 //!             connection.write(&Lease::from(&b"hello"[..])).await?;
 //!             connection.finish().await?;
@@ -75,7 +80,7 @@
 //!         Ok(())
 //!     });
 //!
-//!     let core = client::Http1::plain(client::Limits { head, body, turn, queue }, Clock.domain(), &budget)?;
+//!     let core = client::Http1::plain(client::Limits { head, h2, body, turn, queue }, Clock.domain(), &budget)?;
 //!     let stream = tokio::net::TcpStream::connect(address).await?;
 //!     let mut client = rsnetwork_tokio::client::Http1::new(core, stream, pool()?)?;
 //!     let request = Request {
@@ -83,11 +88,11 @@
 //!         target: Target::new(b"/hello")?,
 //!         authority: Authority::new(b"127.0.0.1")?,
 //!         fields: &[],
-//!         body: Framing::Length(0),
+//!         length: Some(0),
 //!     };
 //!     // One deadline covers the response head and each byte of the body.
 //!     client.send(&request, Clock.deadline(Duration::from_secs(5))).await?;
-//!     assert_eq!(client.response().await?.head().status(), ok);
+//!     assert_eq!(client.response().await?.status(), ok);
 //!     let mut region = WriteLoan::new(Vec::with_capacity(64));
 //!     assert!(matches!(client.collect(&mut region).await?, Collect::Complete(None)));
 //!     assert_eq!(region.filled(), b"hello");

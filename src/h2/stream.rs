@@ -226,6 +226,8 @@ pub(super) struct Streams {
     /// The last stream of the peer's last GOAWAY.
     peer_goaway: Option<u32>,
     pub(super) drain: Drain,
+    /// A stream that both sides ended also keeps its slot until the application closes it.
+    pub(super) hold_done: bool,
 }
 
 impl Streams {
@@ -266,6 +268,7 @@ impl Streams {
             local_initial: i64::from(local.initial_window_size),
             peer_goaway: None,
             drain: Drain::Open,
+            hold_done: false,
         })
     }
 
@@ -299,12 +302,27 @@ impl Streams {
         stream
     }
 
-    /// Removes the stream at `index` when both of its sides sent END_STREAM.
+    /// Removes the stream at `index` when both of its sides sent END_STREAM. With `hold_done`, its
+    /// slot stays held until the application closes it.
     fn close_done(&mut self, index: usize) {
         let stream = &self.table[index];
         if stream.sending == Part::Done && stream.receiving == Part::Done {
-            self.remove(index);
+            if self.hold_done {
+                self.hold(index);
+            } else {
+                self.remove(index);
+            }
         }
+    }
+
+    /// Whether stream `id` is open or half-closed.
+    pub(super) fn is_open(&self, id: u32) -> bool {
+        self.find(id).is_some()
+    }
+
+    /// Whether stream `id` holds a slot until the application closes it.
+    pub(super) fn is_held(&self, id: u32) -> bool {
+        self.held.contains(&id)
     }
 
     /// Ends the stream at `index` with a reset of the peer or of the endpoint. The stream is
@@ -843,10 +861,15 @@ impl Streams {
         Ok(())
     }
 
-    /// Ends stream `id`, which the endpoint reset. Its chunk drops.
+    /// Ends stream `id`, which the endpoint reset. Its chunk drops. With `hold_done`, its slot
+    /// stays held until the application closes it.
     pub(super) fn close(&mut self, id: u32) {
         if let Some(index) = self.find(id) {
-            self.remove(index);
+            if self.hold_done {
+                self.hold(index);
+            } else {
+                self.remove(index);
+            }
         }
     }
 

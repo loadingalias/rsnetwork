@@ -189,7 +189,7 @@ fn write<B: BufferMut>(out: &mut WriteLoan<B>, pieces: impl Fn(&mut dyn FnMut(&[
     clippy::cast_possible_truncation,
     reason = "a digit is less than the radix, which is at most 16"
 )]
-fn digits(mut value: u64, radix: u64, buf: &mut [u8; 20]) -> &[u8] {
+pub(crate) fn digits(mut value: u64, radix: u64, buf: &mut [u8; 20]) -> &[u8] {
     let mut start = buf.len();
     loop {
         start -= 1;

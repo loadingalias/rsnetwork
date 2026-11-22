@@ -20,11 +20,14 @@ use std::thread;
 use std::time::Instant;
 
 use rsnetwork::body::{Collect, Outcome, Part, Read};
-use rsnetwork::buffer::{Buffer as _, Lease, WriteLoan};
-use rsnetwork::drive::Kind;
-use rsnetwork::h1::Framing;
-use rsnetwork_tokio::Clock;
+use rsnetwork::buffer::{Backing, Buffer as _, Lease, WriteLoan};
+use rsnetwork::drive::{Inbound, Kind, Outbound};
+use rsnetwork::h1::{self, Framing, ServerEvent};
+use rsnetwork::host::{Connection, Io as _};
+use rsnetwork::tls::Tls;
+use rsnetwork::value::Status;
 use rsnetwork_tokio::client::Http1;
+use rsnetwork_tokio::{Clock, Socket};
 use support::{ALERT_RECORD, Last, PATIENCE, Proxy, Transport, get, ok, on_each_runtime};
 
 /// The deadline of the exchanges whose peer stops.
@@ -45,17 +48,46 @@ async fn body(client: &mut Http1, length: usize) -> Vec<u8> {
     bytes
 }
 
-/// A server of the binding over `transport` that answers one request with `UNTIL_CLOSE`, a body
-/// that the close delimits, and then closes.
-fn until_close(transport: Transport, listener: tokio::net::TcpListener) {
+/// A server over TLS that answers one request with `UNTIL_CLOSE`, a body that the close
+/// delimits, and then closes. It is the HTTP/1.1 engine of the core on the socket of the binding,
+/// because the server vocabulary sends a body of unknown length in chunks.
+fn until_close(listener: tokio::net::TcpListener) {
     tokio::spawn(async move {
-        let mut server = support::server(transport, &listener).await;
-        server.request().await.unwrap().expect("a request");
-        server.respond(&ok(Framing::Close)).await.unwrap();
-        server.write(&Lease::from(UNTIL_CLOSE)).await.unwrap();
-        server.finish().await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let budget = support::budget();
+        let queues = || {
+            (
+                Inbound::new(support::QUEUE, &budget).unwrap(),
+                Outbound::new(support::QUEUE, &budget).unwrap(),
+            )
+        };
+        let (inbound, outbound) = queues();
+        let engine = h1::Server::new(support::HEAD, support::BODY, support::TURN, &outbound, &budget).unwrap();
+        let tls = Tls::server(
+            &support::server_config(),
+            engine,
+            (inbound, outbound),
+            support::TLS,
+            &budget,
+        )
+        .unwrap();
+        let (inbound, outbound) = queues();
+        let connection = Connection::new(tls, inbound, outbound, Some(Clock.domain())).unwrap();
+        let mut socket = Socket::new(connection, stream, support::pool(&budget)).unwrap();
         // A proxy can cut or reset the stream, so the end of this server is not checked here.
-        let _closed = server.close().await;
+        let _released = socket
+            .until(|connection, now| {
+                if let Some(ServerEvent::Request(_)) = connection.drive(Some(now))? {
+                    let (server, plaintext) = connection.parts().0.parts();
+                    let head = Backing::from(Vec::with_capacity(256));
+                    let ok = Status::new(200).unwrap();
+                    server.respond(plaintext, ok, &[], Framing::Close, head)?;
+                    server.send(plaintext, &Lease::from(UNTIL_CLOSE))?;
+                    server.finish(plaintext)?;
+                }
+                Ok(connection.release())
+            })
+            .await;
     });
 }
 
@@ -68,7 +100,7 @@ fn a_slow_body_meets_its_original_deadline_with_its_partial_progress() {
             tokio::spawn(async move {
                 let mut server = support::server(transport, &listener).await;
                 server.request().await.unwrap().expect("a request");
-                server.respond(&ok(Framing::Length(100))).await.unwrap();
+                server.respond(&ok(Some(100))).await.unwrap();
                 server.write(&Lease::from(&b"0123456789"[..])).await.unwrap();
                 core::future::pending::<()>().await;
             });
@@ -132,11 +164,11 @@ fn an_unread_body_drains_before_the_next_request_or_the_connection_closes() {
                     let mut server = support::server(transport, &listener).await;
                     while server.request().await.unwrap().is_some() {
                         if requests.fetch_add(1, Ordering::Relaxed) == 0 {
-                            server.respond(&ok(Framing::Length(40))).await.unwrap();
+                            server.respond(&ok(Some(40))).await.unwrap();
                             server.write(&Lease::from(vec![b'a'; 8])).await.unwrap();
                             server.write(&Lease::from(vec![b'b'; 32])).await.unwrap();
                         } else {
-                            server.respond(&ok(Framing::Length(6))).await.unwrap();
+                            server.respond(&ok(Some(6))).await.unwrap();
                             server.write(&Lease::from(&b"second"[..])).await.unwrap();
                         }
                         server.finish().await.unwrap();
@@ -172,7 +204,7 @@ fn an_unread_body_drains_before_the_next_request_or_the_connection_closes() {
                     let mut server = support::server(transport, &listener).await;
                     server.request().await.unwrap().expect("a request");
                     requests.fetch_add(1, Ordering::Relaxed);
-                    server.respond(&ok(Framing::Length(1000))).await.unwrap();
+                    server.respond(&ok(Some(1000))).await.unwrap();
                     server.write(&Lease::from(vec![b'a'; 8])).await.unwrap();
                     core::future::pending::<()>().await;
                 });
@@ -197,7 +229,7 @@ fn over_tls_a_body_that_the_close_delimits_is_complete_only_after_close_notify()
     on_each_runtime(|| async {
         // The server sends `close_notify` after the body.
         let (listener, address) = support::listener().await;
-        until_close(Transport::Tls, listener);
+        until_close(listener);
         let mut client = support::client(Transport::Tls, address).await;
         client.send(&get(), Clock.deadline(PATIENCE)).await.unwrap();
         client.response().await.unwrap();
@@ -207,7 +239,7 @@ fn over_tls_a_body_that_the_close_delimits_is_complete_only_after_close_notify()
 
         // The stream ends before the `close_notify` record, the last record of the server.
         let (listener, address) = support::listener().await;
-        until_close(Transport::Tls, listener);
+        until_close(listener);
         let proxy = Proxy::new(address, Last::Cut);
         let mut client = support::client(Transport::Tls, proxy.address).await;
         client.send(&get(), Clock.deadline(PATIENCE)).await.unwrap();
@@ -227,7 +259,7 @@ fn a_close_after_the_exchange_sends_close_notify_and_releases_the_client() {
         let serving = tokio::spawn(async move {
             let mut server = support::server(Transport::Tls, &listener).await;
             server.request().await.unwrap().expect("a request");
-            server.respond(&ok(Framing::Length(4))).await.unwrap();
+            server.respond(&ok(Some(4))).await.unwrap();
             server.write(&Lease::from(&b"done"[..])).await.unwrap();
             server.finish().await.unwrap();
             assert!(server.request().await.unwrap().is_none());
@@ -282,7 +314,7 @@ fn a_reset_ends_a_body_that_the_close_delimits_as_reset_not_complete() {
 
         // Over TLS, the connection resets before the `close_notify` record.
         let (listener, address) = support::listener().await;
-        until_close(Transport::Tls, listener);
+        until_close(listener);
         let proxy = Proxy::new(address, Last::Reset);
         let mut client = support::client(Transport::Tls, proxy.address).await;
         client.send(&get(), Clock.deadline(PATIENCE)).await.unwrap();

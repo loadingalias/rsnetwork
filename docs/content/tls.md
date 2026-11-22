@@ -172,9 +172,9 @@ fn serve(
 Send each output of the connection, and acknowledge it, as without TLS. The engine encrypts its
 plaintext output in the next drive, so drive again after you answer an event.
 
-For HTTP/1.1 requests over TLS, `client::Http1::tls` makes these layers for you: see
-[send HTTP/1.1 requests with a deadline](client.md). For an HTTP/1.1 server, `server::Http1::tls`
-does: see [serve HTTP/1.1 requests](server.md). For a protocol other than HTTP, `tls::Stream` gives
+For requests over TLS, `client::Http1::tls` and `client::Http2::tls` make these layers for you:
+see [send HTTP/1.1 and HTTP/2 requests with a deadline](client.md). For a server, `server::Http::tls`
+does, and ALPN selects HTTP/1.1 or HTTP/2: see [serve HTTP/1.1 and HTTP/2 requests](server.md). For a protocol other than HTTP, `tls::Stream` gives
 a byte stream over TLS: see [send a byte stream over TLS](tls-stream.md).
 
 The record layer seals at most one plaintext region for each entry of the plaintext output queue
@@ -223,8 +223,8 @@ region, the region ends, and the records after it go into the own output of the 
 their order. A record of data can end early to fill the region. `output_region` refuses with
 `Kind::Misuse`, and gives the region back, when the connection holds a region already, when the
 region holds bytes, or when it is smaller than a record of one byte: 23 bytes. A connection with no
-TLS refuses with `Kind::Unsupported`. `client::Http1`, `server::Http1`, and `tls::Stream` have the
-same two calls.
+TLS refuses with `Kind::Unsupported`. `client::Http1`, `client::Http2`, `server::Http`, and
+`tls::Stream` have the same two calls.
 
 `handshake` counts the bytes of a handshake message after the handshake, for example a session
 ticket, that arrives in two or more records or received regions. These parts join in a buffer of

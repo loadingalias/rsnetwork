@@ -15,7 +15,8 @@ use rsnetwork::body::Outcome;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Endpoint, Inbound, Kind, Outbound, Progress, Received, TurnLimits};
-use rsnetwork::h1::{Framing, Server, ServerEvent, Version};
+use rsnetwork::h1::{Framing, Server, ServerEvent};
+use rsnetwork::message::Version;
 use rsnetwork::value::Status;
 
 mod differential;
@@ -132,6 +133,7 @@ fn serve(input: &[u8]) -> Reading {
                 let version = match head.version() {
                     Version::Http10 => "HTTP/1.0",
                     Version::Http11 => "HTTP/1.1",
+                    Version::Http2 => panic!("an HTTP/1.1 head has no HTTP/2 version"),
                 };
                 let persistence = if head.persistent() { "keep" } else { "close" };
                 let lines = fields(head.fields().map(|field| (field.name(), field.value())));

@@ -33,8 +33,8 @@ fn each_byte_value_survives_a_round_trip() {
     strings.push(all.iter().rev().copied().collect());
     for string in strings {
         let mut code = Vec::new();
-        encode(&string, |piece| code.extend_from_slice(piece));
-        assert_eq!(code.len(), encoded_len(&string));
+        encode(string.iter().copied(), |piece| code.extend_from_slice(piece));
+        assert_eq!(code.len(), encoded_len(string.iter().copied()));
         let mut out = Vec::new();
         assert_eq!(decode(&code, &mut out, usize::MAX), Ok(string.len()));
         assert_eq!(out, string);

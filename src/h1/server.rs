@@ -8,12 +8,13 @@ use rstypes::capacity::Budget;
 use rstypes::time::{Deadline, Instant};
 
 use super::body::{BodyReader, BodyWriter, Read, cut, full, misuse, write_error};
-use super::head::{BodyLimits, Limits, ParseError, Version};
+use super::head::{BodyLimits, Limits, ParseError};
 use super::join::{Join, Step, join};
 use super::write::write_response;
 use super::{Framing, RequestHead, RequestParser, RetainedRequest};
 use crate::body::Outcome;
 use crate::drive::{Blocked, Error, Inbound, Kind, Outbound, Progress, Turn, TurnLimits, Work};
+use crate::message::Version;
 use crate::value::{Field, Method, Status};
 
 /// The default head timeout of a [`Server`]: 30 seconds. It is the default header read timeout of

@@ -102,10 +102,11 @@ A `Body` tells what a sender has:
 | `Buffered(lease)` | The length of the lease | Yes, for example after a redirect or for a retry |
 | `OneShot { length }` | `length`, if the application knows it before the first byte | No: the application produces the bytes once |
 
-`body.length()` and `body.replayable()` give these facts. For HTTP/1.1, `Framing::from(&body)`
-gives `Framing::Length(n)` for a known length and `Framing::Chunked` for an unknown one. Give it to
-`respond` or `request`, then send the bytes with `send` and end the body with `finish`. No body
-needs collection before it is sent.
+`body.length()` and `body.replayable()` give these facts. `body.length()` is the `length` of a
+`client::Request` or a `server::Response`, in each version. For the HTTP/1.1 engines,
+`Framing::from(&body)` gives `Framing::Length(n)` for a known length and `Framing::Chunked` for an
+unknown one. Give it to `respond` or `request`, then send the bytes with `send` and end the body
+with `finish`. No body needs collection before it is sent.
 
 ## Debug output
 

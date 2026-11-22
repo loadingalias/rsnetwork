@@ -386,17 +386,17 @@ impl Encode {
 
 /// The length of the string literal of `bytes` with a length prefix of `prefix` bits.
 fn string_len(bytes: &[u8], prefix: u32) -> usize {
-    let len = huffman::encoded_len(bytes).min(bytes.len());
+    let len = huffman::encoded_len(bytes.iter().copied()).min(bytes.len());
     integer::len(len as u64, prefix) + len
 }
 
 /// Writes `bytes` as a string literal (RFC 9204, section 4.1.2) with a length prefix of `prefix`
 /// bits after the `flags` bits: a Huffman string when it is shorter.
 fn string<B: BufferMut>(out: &mut WriteLoan<B>, bytes: &[u8], prefix: u32, flags: u8) {
-    let huffman = huffman::encoded_len(bytes);
+    let huffman = huffman::encoded_len(bytes.iter().copied());
     if huffman < bytes.len() {
         put(out, huffman as u64, prefix, flags | 1 << prefix);
-        huffman::encode(bytes, |piece| {
+        huffman::encode(bytes.iter().copied(), |piece| {
             out.fill_from(piece);
         });
     } else {

@@ -29,7 +29,7 @@ const CAPACITY: Error = Error::new(
 /// [`host::Tcp`](rsnetwork::host::Tcp), and waits until the socket or a deadline can help. Thus
 /// it drives each vocabulary of the core, also a [`Connection`](rsnetwork::host::Connection) of
 /// your own engine. [`client::Http1`](crate::client::Http1),
-/// [`server::Http1`](crate::server::Http1), and [`tls::Stream`](crate::tls::Stream) are calls
+/// [`server::Http`](crate::server::Http), and [`tls::Stream`](crate::tls::Stream) are calls
 /// over it.
 ///
 /// A socket that drops before the release of its connection, or with output that did not go,

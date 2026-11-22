@@ -55,7 +55,9 @@ assert_eq!(decoded[2], (&b"authorization"[..], &b"Bearer mF_9.B5f-4.1JqM"[..], t
    is an iterator of `FieldLine` that the encoder can clone, because it reads the lines two times.
    `out` is a `WriteLoan` over your region, and the block goes after its filled bytes.
 
-The encoder writes each line in its shortest form:
+The encoder writes each line in its shortest form, and each name in lowercase, as HTTP/2 needs
+(RFC 9113, section 8.2.1). Thus `Content-Type` and `content-type` are one name, and one table
+entry:
 
 - A line that a table entry has, with its name and value, is one index.
 - Another line is a literal. It names the entry of its name when an entry has the name, and it
@@ -67,7 +69,8 @@ The encoder writes each line in its shortest form:
 `encode` first calculates the longest block that the lines can give. If your region has fewer
 free bytes, it refuses with `EncodeError::Full { needed, available }`, and it writes and changes
 nothing. Encode again into a region with at least `needed` free bytes. HPACK carries any bytes, so
-the encoder does not check names or values. HTTP/2 needs lowercase names (RFC 9113, section 8.2).
+the encoder does not check names or values. The decoder keeps the bytes that it receives: the
+HTTP/2 client and server refuse an uppercase name in a received section.
 
 ## Decode a header block
 

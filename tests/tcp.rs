@@ -22,9 +22,11 @@ use rsnetwork::buffer::{Backing, Buffer as _, Lease, Pool};
 use rsnetwork::capacity::Budget;
 use rsnetwork::client::{self, Request};
 use rsnetwork::drive::{Inbound, Kind, Outbound, TurnLimits};
-use rsnetwork::h1::{self, BodyLimits, Client, ClientEvent, Framing, Server, ServerEvent};
+use rsnetwork::h1::{self, BodyLimits, ClientEvent, Framing, Server, ServerEvent};
+use rsnetwork::h2;
 use rsnetwork::host::{Connection, Io, Next, Tcp, Wait};
-use rsnetwork::server::{self, Delivery, Linger, Response};
+use rsnetwork::message::{self, ResponseHead, Version};
+use rsnetwork::server::{self, Cleartext, Delivery, Linger, Response};
 use rsnetwork::time::{ClockDomain, Deadline, Instant, Suspend};
 use rsnetwork::tls::{
     CertificateDer, ClientConfig, ClientOptions, Copies, Entropy, Identity, Limits as TlsLimits, PrivateKeyDer,
@@ -62,8 +64,21 @@ const TURN: TurnLimits = TurnLimits {
 
 const QUEUE: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 
+const H2: h2::Limits = h2::Limits {
+    settings: h2::Settings {
+        max_concurrent_streams: 8,
+        max_header_list_size: 4096,
+        initial_window_size: 1 << 20,
+        ..h2::Settings::INITIAL
+    },
+    work: 64 * 1024,
+    encoder_table_bytes: 4096,
+    connection_window: 8 << 20,
+};
+
 const CLIENT: client::Limits = client::Limits {
     head: HEAD,
+    h2: H2,
     body: BODY,
     turn: TURN,
     queue: QUEUE,
@@ -71,6 +86,7 @@ const CLIENT: client::Limits = client::Limits {
 
 const SERVER: server::Limits = server::Limits {
     head: HEAD,
+    h2: H2,
     body: BODY,
     turn: TURN,
     queue: QUEUE,
@@ -79,6 +95,7 @@ const SERVER: server::Limits = server::Limits {
         time: Duration::from_secs(30),
         bytes: 1 << 20,
     },
+    cleartext: Cleartext::Http1,
 };
 
 const TLS: TlsLimits = TlsLimits {
@@ -195,26 +212,128 @@ fn client_config(protocols: &[&[u8]]) -> ClientConfig {
     .unwrap()
 }
 
-/// A plain client and a plain server, each with its socket and a receive pool, or a TLS client and
-/// a TLS server, whose sockets have a pool of one region: TLS lends its input region.
-fn pair(tls: bool) -> ((client::Http1, Tcp), (server::Http1, Tcp)) {
+/// The client of one version, for the tests that run on each: an HTTP/1.1 client, or an HTTP/2
+/// client with the stream of its one request.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a test holds one client in place, as an application does"
+)]
+enum Client {
+    H1(client::Http1),
+    H2(client::Http2, Option<message::Stream>),
+}
+
+impl Client {
+    /// Sends `request`. Gives whether the client took it.
+    fn send(&mut self, request: &Request<'_>, deadline: Deadline, now: Instant) -> bool {
+        match self {
+            Self::H1(client) => client.send(request, deadline, now).unwrap(),
+            Self::H2(client, stream) => {
+                *stream = client.send(request, deadline, now).unwrap();
+                stream.is_some()
+            }
+        }
+    }
+
+    fn stream(stream: Option<message::Stream>) -> message::Stream {
+        stream.expect("the request went out")
+    }
+
+    fn write(&mut self, data: &Lease, now: Instant) -> Result<(), rsnetwork::drive::Error> {
+        match self {
+            Self::H1(client) => client.write(data, now),
+            Self::H2(client, stream) => client.write(Self::stream(*stream), data, now),
+        }
+    }
+
+    fn finish(&mut self, now: Instant) -> Result<(), rsnetwork::drive::Error> {
+        match self {
+            Self::H1(client) => client.finish(now),
+            Self::H2(client, stream) => client.finish(Self::stream(*stream), now),
+        }
+    }
+
+    fn response(&mut self, now: Instant) -> Option<ResponseHead> {
+        match self {
+            Self::H1(client) => client.response(now).unwrap(),
+            Self::H2(client, stream) => client.response(Self::stream(*stream), now).unwrap(),
+        }
+    }
+
+    fn next(&mut self, now: Instant) -> Option<Part> {
+        match self {
+            Self::H1(client) => client.next(now).unwrap(),
+            Self::H2(client, stream) => client.next(Self::stream(*stream), now).unwrap(),
+        }
+    }
+
+    fn close(&mut self, now: Instant) {
+        match self {
+            Self::H1(client) => client.close(now).unwrap(),
+            Self::H2(client, _) => client.close(now).unwrap(),
+        }
+    }
+
+    fn pump(&mut self, socket: &mut Tcp) -> Next {
+        match self {
+            Self::H1(client) => pump(socket, client),
+            Self::H2(client, _) => pump(socket, client),
+        }
+    }
+
+    fn release(&self) -> Option<Result<(), rsnetwork::drive::Error>> {
+        match self {
+            Self::H1(client) => client.release(),
+            Self::H2(client, _) => client.release(),
+        }
+    }
+
+    fn close_socket(&self, socket: Tcp) -> bool {
+        match self {
+            Self::H1(client) => socket.close(client).is_empty(),
+            Self::H2(client, _) => socket.close(client).is_empty(),
+        }
+    }
+}
+
+/// A client and a server of `version`, each with its socket. Over TCP, each socket has a receive
+/// pool. Over TLS, the server offers `h2` and `http/1.1` and the client the one of its version,
+/// and each socket has a pool of one region: TLS lends its input region.
+fn pair(tls: bool, version: Version) -> ((Client, Tcp), (server::Http, Tcp)) {
     let (near, far) = sockets();
     let budget = budget();
-    if tls {
-        let client = client::Http1::tls(&client_config(&[]), "server.test", (CLIENT, TLS), CLOCK, &budget).unwrap();
-        let server = server::Http1::tls(&server_config(&[]), (SERVER, TLS), CLOCK, &budget).unwrap();
+    let h2 = version == Version::Http2;
+    let cleartext = if h2 { Cleartext::Http2 } else { Cleartext::Http1 };
+    let limits = server::Limits { cleartext, ..SERVER };
+    let protocols: &[&[u8]] = if h2 { &[b"h2"] } else { &[b"http/1.1"] };
+    let (client, server) = if tls {
+        let config = client_config(protocols);
+        let client = if h2 {
+            Client::H2(
+                client::Http2::tls(&config, "server.test", (CLIENT, TLS), CLOCK, &budget).unwrap(),
+                None,
+            )
+        } else {
+            Client::H1(client::Http1::tls(&config, "server.test", (CLIENT, TLS), CLOCK, &budget).unwrap())
+        };
+        let config = server_config(&[b"h2", b"http/1.1"]);
         (
-            (client, Tcp::new(near, tls_pool(&budget)).unwrap()),
-            (server, Tcp::new(far, tls_pool(&budget)).unwrap()),
+            client,
+            server::Http::tls(&config, (limits, TLS), CLOCK, &budget).unwrap(),
         )
     } else {
-        let client = client::Http1::plain(CLIENT, CLOCK, &budget).unwrap();
-        let server = server::Http1::plain(SERVER, CLOCK, &budget).unwrap();
-        (
-            (client, Tcp::new(near, pool(&budget)).unwrap()),
-            (server, Tcp::new(far, pool(&budget)).unwrap()),
-        )
-    }
+        let client = if h2 {
+            Client::H2(client::Http2::plain(CLIENT, CLOCK, &budget).unwrap(), None)
+        } else {
+            Client::H1(client::Http1::plain(CLIENT, CLOCK, &budget).unwrap())
+        };
+        (client, server::Http::plain(limits, CLOCK, &budget).unwrap())
+    };
+    let pool = if tls { tls_pool } else { pool };
+    (
+        (client, Tcp::new(near, pool(&budget)).unwrap()),
+        (server, Tcp::new(far, pool(&budget)).unwrap()),
+    )
 }
 
 fn pump<C: Io>(socket: &mut Tcp, connection: &mut C) -> Next {
@@ -231,15 +350,19 @@ fn written(result: Result<(), rsnetwork::drive::Error>) -> bool {
     }
 }
 
-/// Over TCP and over TLS, a client sends a request body of 256 KiB, and the server answers with a
-/// body of 4 MiB. Each body has more parts than the output queue holds, so each write meets a full
-/// queue, which over TLS only a drive frees. Each side gets each byte. The server delivers its response complete, the client
-/// closes, and each connection releases with no output left.
+/// On HTTP/1.1 and HTTP/2, over TCP and over TLS, a client sends a request body of 256 KiB, and
+/// the server answers with a body of 4 MiB. Each body has more parts than the output queue holds,
+/// so each write meets a full queue, which over TLS only a drive frees. Each side gets each byte.
+/// The server delivers its response complete, the client closes, and each connection releases
+/// with no output left.
 #[test]
-fn a_client_and_a_server_exchange_their_bodies_through_their_sockets_over_tcp_and_over_tls() {
-    for tls in [false, true] {
+fn a_client_and_a_server_exchange_their_bodies_through_their_sockets_on_each_version_over_tcp_and_over_tls() {
+    for (tls, version) in [false, true]
+        .into_iter()
+        .flat_map(|tls| [(tls, Version::Http11), (tls, Version::Http2)])
+    {
         let clock = Clock::new();
-        let ((mut client, mut near), (mut server, mut far)) = pair(tls);
+        let ((mut client, mut near), (mut server, mut far)) = pair(tls, version);
         // The request body: 256 KiB in parts of 8 KiB, each a view of one region.
         let upload = Lease::from(vec![b'q'; 8 * 1024]);
         let (uploads, sent) = (32, 256 * 1024);
@@ -248,86 +371,102 @@ fn a_client_and_a_server_exchange_their_bodies_through_their_sockets_over_tcp_an
             target: Target::new(b"/upload").unwrap(),
             authority: Authority::new(b"server.test").unwrap(),
             fields: &[],
-            body: Framing::Length(sent as u64),
+            length: Some(sent as u64),
         };
-        assert!(client.send(&request, clock.deadline(), clock.now()).unwrap());
         let mut uploaded_parts = 0;
 
         let part = Lease::from(vec![b'x'; PART]);
         let length = (PARTS * PART) as u64;
         let (mut uploaded, mut downloaded, mut parts) = (0, 0, 0);
         let (mut request_end, mut response_end, mut head) = (None, None, None);
-        let (mut serving, mut closed) = (false, false);
+        let (mut sending, mut serving, mut closed) = (true, None, false);
         let ends = loop {
             clock.guard();
             let now = clock.now();
+            if sending {
+                sending = !client.send(&request, clock.deadline(), now);
+            }
             // The client sends its body while the output queue takes it.
-            while uploaded_parts < uploads && written(client.write(&upload, now)) {
+            while !sending && uploaded_parts < uploads && written(client.write(&upload, now)) {
                 uploaded_parts += 1;
                 if uploaded_parts == uploads {
                     client.finish(now).unwrap();
                 }
             }
             // The handler: the request, its body, and the response.
-            if !serving {
-                serving = server.request(now).unwrap().is_some();
+            if serving.is_none() {
+                serving = server.request(now).unwrap().map(|(stream, head)| {
+                    assert_eq!(head.version(), version, "tls: {tls}");
+                    stream
+                });
             }
-            while serving && request_end.is_none() {
-                match server.next(now).unwrap() {
+            while let Some(stream) = serving
+                && request_end.is_none()
+            {
+                match server.next(stream, now).unwrap() {
                     Some(Part::Data(data)) => uploaded += data.initialized(),
                     Some(Part::End(outcome)) => {
                         request_end = Some(outcome);
                         let response = Response {
                             status: Status::new(200).unwrap(),
                             fields: &[],
-                            body: Framing::Length(length),
+                            length: Some(length),
                         };
-                        assert!(server.respond(&response, now).unwrap());
+                        assert!(server.respond(stream, &response, now).unwrap());
                     }
                     None => break,
                 }
             }
-            while request_end.is_some() && parts < PARTS && written(server.write(&part, now)) {
+            while let Some(stream) = serving
+                && request_end.is_some()
+                && parts < PARTS
+                && written(server.write(stream, &part, now))
+            {
                 parts += 1;
                 if parts == PARTS {
-                    server.finish(now).unwrap();
+                    server.finish(stream, now).unwrap();
                 }
             }
             if parts == PARTS {
                 assert!(server.request(now).unwrap().is_none(), "the client sends one request");
             }
             // The client: the response head, its body, and the close.
-            if head.is_none() {
-                head = client
-                    .response(now)
-                    .unwrap()
-                    .map(|response| response.head().status().code());
+            if head.is_none() && !sending {
+                head = client.response(now).map(|response| response.status().code());
             }
             while head.is_some() && response_end.is_none() {
-                match client.next(now).unwrap() {
+                match client.next(now) {
                     Some(Part::Data(data)) => downloaded += data.initialized(),
                     Some(Part::End(outcome)) => response_end = Some(outcome),
                     None => break,
                 }
             }
-            if response_end.is_some() && !closed {
-                client.close(now).unwrap();
+            if let Some(stream) = serving
+                && response_end.is_some()
+                && !closed
+            {
+                assert_eq!(
+                    server.delivery(stream),
+                    Some(Delivery::Complete { accepted: length }),
+                    "tls: {tls}"
+                );
+                server.close(stream);
+                client.close(now);
                 closed = true;
             }
-            let (client_next, server_next) = (pump(&mut near, &mut client), pump(&mut far, &mut server));
+            let (client_next, server_next) = (client.pump(&mut near), pump(&mut far, &mut server));
             if (client_next, server_next) == (Next::Released, Next::Released) {
                 break (client.release().unwrap(), server.release().unwrap());
             }
         };
-        assert_eq!(ends.0, Ok(()), "tls: {tls}");
-        assert_eq!(ends.1.result, Ok(()), "tls: {tls}");
+        assert_eq!(ends.0, Ok(()), "tls: {tls}, {version:?}");
+        assert_eq!(ends.1.result, Ok(()), "tls: {tls}, {version:?}");
         assert_eq!(uploaded, sent);
         assert_matches!(request_end, Some(Outcome::Complete(None)));
         assert_eq!(head, Some(200));
         assert_eq!(downloaded as u64, length);
         assert_matches!(response_end, Some(Outcome::Complete(None)));
-        assert_eq!(server.delivery(), Some(Delivery::Complete { accepted: length }));
-        assert!(near.close(&client).is_empty());
+        assert!(client.close_socket(near));
         assert!(far.close(&server).is_empty());
     }
 }
@@ -345,7 +484,7 @@ fn over_tls_a_connection_through_its_socket_copies_no_received_byte() {
         )
     };
     let (inbound, outbound) = queues(&client_budget);
-    let engine = Client::new(HEAD, BODY, TURN, &outbound, &client_budget).unwrap();
+    let engine = h1::Client::new(HEAD, BODY, TURN, &outbound, &client_budget).unwrap();
     let tls = Tls::client(
         &client_config(&[]),
         "server.test",
@@ -617,7 +756,7 @@ fn the_end_of_the_stream_ends_a_body_truncated_and_a_reset_ends_it_reset() {
             target: Target::new(b"/").unwrap(),
             authority: Authority::new(b"a").unwrap(),
             fields: &[],
-            body: Framing::Length(0),
+            length: Some(0),
         };
         assert!(client.send(&request, clock.deadline(), clock.now()).unwrap());
         pump(&mut socket, &mut client);
@@ -661,21 +800,24 @@ fn at_the_linger_the_socket_half_closes_so_the_peer_reads_the_response_and_its_e
     let clock = Clock::new();
     let (near, mut peer) = sockets();
     let budget = budget();
-    let mut server = server::Http1::plain(SERVER, CLOCK, &budget).unwrap();
+    let mut server = server::Http::plain(SERVER, CLOCK, &budget).unwrap();
     let mut socket = Tcp::new(near, pool(&budget)).unwrap();
     peer.write_all(b"POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 100000\r\n\r\nfirst bytes")
         .unwrap();
     peer.set_nonblocking(true).unwrap();
-    while server.request(clock.now()).unwrap().is_none() {
+    let stream = loop {
+        if let Some((stream, _)) = server.request(clock.now()).unwrap() {
+            break stream;
+        }
         clock.guard();
         pump(&mut socket, &mut server);
-    }
+    };
     let too_large = Response {
         status: Status::new(413).unwrap(),
         fields: &[],
-        body: Framing::Length(0),
+        length: Some(0),
     };
-    assert!(server.respond(&too_large, clock.now()).unwrap());
+    assert!(server.respond(stream, &too_large, clock.now()).unwrap());
     let mut response = Vec::new();
     let mut bytes = [0; 1024];
     loop {
@@ -720,7 +862,7 @@ fn a_socket_whose_pool_is_in_use_waits_for_no_event_until_the_views_drop() {
         target: Target::new(b"/").unwrap(),
         authority: Authority::new(b"a").unwrap(),
         fields: &[],
-        body: Framing::Length(0),
+        length: Some(0),
     };
     assert!(client.send(&request, clock.deadline(), clock.now()).unwrap());
     let head = b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n";

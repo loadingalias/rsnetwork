@@ -94,6 +94,8 @@
 
 mod connection;
 pub mod frame;
+pub(crate) mod message;
+pub(crate) mod session;
 mod stream;
 
 use core::time::Duration;

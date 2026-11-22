@@ -106,6 +106,11 @@ impl<E: Engine> Link<E> {
         each!(self, connection => connection.reset());
     }
 
+    /// Whether the transport failed.
+    pub(crate) fn is_reset(&self) -> bool {
+        each!(self, connection => connection.is_reset())
+    }
+
     pub(crate) fn output_region(&mut self, region: Backing) -> Result<(), (Error, Backing)> {
         each!(self, connection => connection.output_region(region))
     }

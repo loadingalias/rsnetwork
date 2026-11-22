@@ -1,0 +1,260 @@
+//! The message model that each protocol shares: the head of a received request and of a received
+//! response, their fields, their version, and the stream of each exchange.
+//!
+//! A [`RequestHead`] and a [`ResponseHead`] have one meaning in each version. Their values are
+//! the checked values of [`value`](crate::value), and their fields keep their order, also when a
+//! name repeats. The version shows where the protocols differ:
+//!
+//! - **HTTP/1.1.** The head is a view of the received bytes, with no copy. The field names keep
+//!   their case. [`RequestHead::h1`] and [`ResponseHead::h1`] give the facts that only HTTP/1.1
+//!   has, such as persistence and `100 Continue`.
+//! - **HTTP/2.** The HPACK decoder writes each header block into one buffer of the connection.
+//!   The head copies the decoded lines into a charged region of their exact size, so its memory
+//!   follows the size of the head. The field names are lowercase (RFC 9113, section 8.2.1).
+//!
+//! [`length`](RequestHead::length) is the length of the body when the sender declared it, and
+//! `None` when the body ends with its stream or with its last chunk.
+
+use core::fmt;
+
+use crate::h1::{self, RetainedRequest, RetainedResponse};
+use crate::h2::message::{Request as H2Request, Response as H2Response};
+use crate::value::{Authority, Field, Method, Scheme, Status, Target, TargetForm};
+
+/// The version of a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Version {
+    /// HTTP/1.0 (RFC 9112, appendix C.2).
+    Http10,
+    /// HTTP/1.1 (RFC 9112).
+    Http11,
+    /// HTTP/2 (RFC 9113).
+    Http2,
+}
+
+/// The stream of one exchange on a connection: one request and its response.
+///
+/// On HTTP/2, it is the stream identifier of RFC 9113. On HTTP/1.1, the exchanges of a connection
+/// count from 1, and one is open at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Stream(pub(crate) u64);
+
+impl Stream {
+    /// The number of the stream: the HTTP/2 stream identifier, or the count of the HTTP/1.1
+    /// exchange.
+    pub const fn id(self) -> u64 {
+        self.0
+    }
+}
+
+/// An iterator over the field lines of a head or a trailer section, in their received order.
+/// Repeated names stay as separate fields.
+#[derive(Clone)]
+pub struct Fields<'a> {
+    /// The field lines that remain, each as `name: value` and CR LF. The parser or the decoder
+    /// checked each of them.
+    pub(crate) block: &'a [u8],
+}
+
+impl<'a> Iterator for Fields<'a> {
+    type Item = Field<'a>;
+
+    fn next(&mut self) -> Option<Field<'a>> {
+        let (line, rest) = h1::split_line(self.block)?;
+        self.block = rest;
+        let (name, value) = h1::field_parts(line)?;
+        Some(Field { name, value })
+    }
+}
+
+impl fmt::Debug for Fields<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Fields").finish_non_exhaustive()
+    }
+}
+
+/// The head of a received request.
+///
+/// Its `Debug` output shows only the version and the length, because the method, the target,
+/// and the fields are peer text.
+#[derive(Clone)]
+pub struct RequestHead(RequestForm);
+
+#[derive(Clone)]
+enum RequestForm {
+    H1(RetainedRequest),
+    H2(H2Request),
+}
+
+impl RequestHead {
+    pub(crate) fn h1_form(head: RetainedRequest) -> Self {
+        Self(RequestForm::H1(head))
+    }
+
+    pub(crate) fn h2_form(head: H2Request) -> Self {
+        Self(RequestForm::H2(head))
+    }
+
+    /// The method. An unknown method stays as it is.
+    pub fn method(&self) -> Method<'_> {
+        match &self.0 {
+            RequestForm::H1(head) => head.head().method(),
+            RequestForm::H2(head) => head.method(),
+        }
+    }
+
+    /// The request target, in its exact bytes: on HTTP/2, the `:path`, and the authority of a
+    /// CONNECT request, which has no `:path`.
+    pub fn target(&self) -> Target<'_> {
+        match &self.0 {
+            RequestForm::H1(head) => head.head().target(),
+            RequestForm::H2(head) => head.target(),
+        }
+    }
+
+    /// The authority of the request: on HTTP/1.1, that of the target or of the Host field
+    /// (RFC 9112, section 3.3), and on HTTP/2, the `:authority`, or else the Host field (RFC 9113,
+    /// section 8.3.1). `None` when the request has none.
+    pub fn authority(&self) -> Option<Authority<'_>> {
+        match &self.0 {
+            RequestForm::H1(head) => head.head().authority(),
+            RequestForm::H2(head) => head.authority(),
+        }
+    }
+
+    /// The scheme of the target URI: on HTTP/2, the `:scheme`, and on HTTP/1.1, the scheme of an
+    /// absolute-form target. `None` when the request does not give it.
+    pub fn scheme(&self) -> Option<Scheme<'_>> {
+        match &self.0 {
+            RequestForm::H1(head) => match head.head().target().form() {
+                TargetForm::Absolute { scheme, .. } => Some(scheme),
+                _ => None,
+            },
+            RequestForm::H2(head) => head.scheme(),
+        }
+    }
+
+    /// The fields, in their received order. On HTTP/2, the pseudo-header fields are not fields:
+    /// the other calls give their values.
+    pub fn fields(&self) -> Fields<'_> {
+        match &self.0 {
+            RequestForm::H1(head) => head.head().fields(),
+            RequestForm::H2(head) => head.fields(),
+        }
+    }
+
+    /// The length of the body that the sender declared, or `None` when the body ends with its
+    /// last chunk or with its stream.
+    pub fn length(&self) -> Option<u64> {
+        match &self.0 {
+            RequestForm::H1(head) => match head.head().framing() {
+                h1::Framing::Length(length) => Some(length),
+                h1::Framing::Chunked | h1::Framing::Close => None,
+            },
+            RequestForm::H2(head) => head.length(),
+        }
+    }
+
+    /// The version of the request.
+    pub fn version(&self) -> Version {
+        match &self.0 {
+            RequestForm::H1(head) => head.head().version(),
+            RequestForm::H2(_) => Version::Http2,
+        }
+    }
+
+    /// The HTTP/1.1 head, with the facts that only HTTP/1.1 has, or `None` on HTTP/2.
+    pub fn h1(&self) -> Option<h1::RequestHead<'_>> {
+        match &self.0 {
+            RequestForm::H1(head) => Some(head.head()),
+            RequestForm::H2(_) => None,
+        }
+    }
+}
+
+impl fmt::Debug for RequestHead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestHead")
+            .field("version", &self.version())
+            .field("length", &self.length())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The head of a received final response.
+///
+/// Its `Debug` output shows only the version, the status, and the length, because the fields
+/// are peer text.
+#[derive(Clone)]
+pub struct ResponseHead(ResponseForm);
+
+#[derive(Clone)]
+enum ResponseForm {
+    H1(RetainedResponse),
+    H2(H2Response),
+}
+
+impl ResponseHead {
+    pub(crate) fn h1_form(head: RetainedResponse) -> Self {
+        Self(ResponseForm::H1(head))
+    }
+
+    pub(crate) fn h2_form(head: H2Response) -> Self {
+        Self(ResponseForm::H2(head))
+    }
+
+    /// The status.
+    pub fn status(&self) -> Status {
+        match &self.0 {
+            ResponseForm::H1(head) => head.head().status(),
+            ResponseForm::H2(head) => head.status(),
+        }
+    }
+
+    /// The fields, in their received order. On HTTP/2, the `:status` is not a field.
+    pub fn fields(&self) -> Fields<'_> {
+        match &self.0 {
+            ResponseForm::H1(head) => head.head().fields(),
+            ResponseForm::H2(head) => head.fields(),
+        }
+    }
+
+    /// The length of the body that the server declared, or `None` when the body ends with its
+    /// last chunk, with its stream, or with the close of the connection. A response to HEAD, and
+    /// a 204 or 304 response, has `Some(0)`.
+    pub fn length(&self) -> Option<u64> {
+        match &self.0 {
+            ResponseForm::H1(head) => match head.head().framing() {
+                h1::Framing::Length(length) => Some(length),
+                h1::Framing::Chunked | h1::Framing::Close => None,
+            },
+            ResponseForm::H2(head) => head.length(),
+        }
+    }
+
+    /// The version of the response.
+    pub fn version(&self) -> Version {
+        match &self.0 {
+            ResponseForm::H1(head) => head.head().version(),
+            ResponseForm::H2(_) => Version::Http2,
+        }
+    }
+
+    /// The HTTP/1.1 head, with the facts that only HTTP/1.1 has, or `None` on HTTP/2.
+    pub fn h1(&self) -> Option<h1::ResponseHead<'_>> {
+        match &self.0 {
+            ResponseForm::H1(head) => Some(head.head()),
+            ResponseForm::H2(_) => None,
+        }
+    }
+}
+
+impl fmt::Debug for ResponseHead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResponseHead")
+            .field("version", &self.version())
+            .field("status", &self.status())
+            .field("length", &self.length())
+            .finish_non_exhaustive()
+    }
+}

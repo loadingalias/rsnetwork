@@ -26,7 +26,6 @@ use std::time::Instant;
 use rsnetwork::body::{Outcome, Read};
 use rsnetwork::buffer::{Backing, Lease, WriteLoan};
 use rsnetwork::drive::Kind;
-use rsnetwork::h1::Framing;
 use rsnetwork::server::{self, Closed, Delivery, Linger, Response};
 use rsnetwork::value::Status;
 use rsnetwork_tokio::Clock;
@@ -48,7 +47,7 @@ fn a_reset_after_the_handler_finished_gives_a_partial_delivery_apart_from_the_fi
                 let mut server = support::server(transport, &listener).await;
                 server.request().await.unwrap().expect("a request");
                 let total = (PART * PARTS) as u64;
-                server.respond(&ok(Framing::Length(total))).await.unwrap();
+                server.respond(&ok(Some(total))).await.unwrap();
                 for _ in 0..PARTS {
                     server.write(&Lease::from(vec![b'x'; PART])).await.unwrap();
                 }
@@ -97,7 +96,7 @@ fn a_complete_delivery_needs_each_byte_of_the_response() {
         let serving = tokio::spawn(async move {
             let mut server = support::server(Transport::Plain, &listener).await;
             server.request().await.unwrap().expect("a request");
-            server.respond(&ok(Framing::Chunked)).await.unwrap();
+            server.respond(&ok(None)).await.unwrap();
             server.write(&Lease::from(&b"hello"[..])).await.unwrap();
             server.finish().await.unwrap();
             collect.await.unwrap();
@@ -134,16 +133,16 @@ fn a_close_drains_the_request_in_flight_refuses_the_one_that_the_handler_did_not
         let proceed = Arc::new(Notify::new());
         let handler = {
             let proceed = Arc::clone(&proceed);
-            move |mut connection: rsnetwork_tokio::server::Http1| {
+            move |mut connection: rsnetwork_tokio::server::Http| {
                 let (events, proceed) = (events.clone(), Arc::clone(&proceed));
                 async move {
                     events.send(Event::Started).unwrap();
                     while let Some(request) = connection.request().await? {
-                        connection.respond(&ok(Framing::Length(2))).await?;
+                        connection.respond(&ok(Some(2))).await?;
                         connection.write(&Lease::from(&b"ok"[..])).await?;
                         connection.finish().await?;
                         // The close comes before the handler asks for `/b`.
-                        if request.head().target().as_bytes() == b"/a" {
+                        if request.target().as_bytes() == b"/a" {
                             events.send(Event::First).unwrap();
                             proceed.notified().await;
                         }
@@ -217,7 +216,7 @@ fn over_tls_a_shutdown_sends_close_notify_before_the_linger() {
             let mut server = support::server(Transport::Tls, &listener).await;
             server.request().await.unwrap().expect("a request");
             server.shutdown(Clock.deadline(Duration::from_secs(5))).unwrap();
-            server.respond(&ok(Framing::Length(2))).await.unwrap();
+            server.respond(&ok(Some(2))).await.unwrap();
             server.write(&Lease::from(&b"ok"[..])).await.unwrap();
             server.finish().await.unwrap();
             assert!(server.request().await.unwrap().is_none());
@@ -281,16 +280,16 @@ fn the_linger_discards_late_bytes_and_ends_at_the_end_of_input_its_bytes_or_its_
                 linger: LINGER,
                 ..support::server_limits()
             };
-            let core = server::Http1::plain(limits, Clock.domain(), &support::budget()).unwrap();
+            let core = server::Http::plain(limits, Clock.domain(), &support::budget()).unwrap();
             let mut server =
-                rsnetwork_tokio::server::Http1::new(core, stream, support::pool(&support::budget())).unwrap();
+                rsnetwork_tokio::server::Http::new(core, stream, support::pool(&support::budget())).unwrap();
             server.request().await.unwrap().expect("a request");
             let started = Instant::now();
             // The server does not read the body, which is longer than the drain.
             let too_large = Response {
                 status: Status::new(413).unwrap(),
                 fields: &[],
-                body: Framing::Length(0),
+                length: Some(0),
             };
             server.respond(&too_large).await.unwrap();
             assert!(server.request().await.unwrap().is_none());

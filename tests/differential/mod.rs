@@ -8,7 +8,8 @@
 //! its field-line parser for the trailer section. `tests/h1_differential.rs` and the
 //! `differential` fuzz target include this module.
 
-use rsnetwork::h1::{BodyLimits, ChunkDecoder, ChunkStep, Framing, Limits, RequestParser, Version};
+use rsnetwork::h1::{BodyLimits, ChunkDecoder, ChunkStep, Framing, Limits, RequestParser};
+use rsnetwork::message::Version;
 
 /// The head limits of the conformance suite.
 pub(crate) const LIMITS: Limits = Limits {
@@ -127,6 +128,7 @@ fn rsnetwork(input: &[u8]) -> (Reading, bool) {
     let version = match head.version() {
         Version::Http10 => "HTTP/1.0",
         Version::Http11 => "HTTP/1.1",
+        Version::Http2 => panic!("an HTTP/1.1 head has no HTTP/2 version"),
     };
     let lines = fields(head.fields().map(|field| (field.name(), field.value())));
     let (method, target) = (text(head.method().as_bytes()), text(head.target().as_bytes()));

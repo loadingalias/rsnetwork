@@ -102,10 +102,12 @@ use crate::body::Body;
 
 pub use chunked::{ChunkDecoder, ChunkStep};
 pub use client::{Client, ClientEvent};
-pub use head::{BodyLimits, Fields, Limits, ParseError, Version};
+pub use head::{BodyLimits, Limits, ParseError};
+pub(crate) use head::{field_parts, split_line};
 pub use request::{RequestHead, RequestParser, RetainedRequest};
 pub use response::{ResponseHead, ResponseParser, RetainedResponse};
 pub use server::{HEAD_TIMEOUT, Server, ServerEvent};
+pub(crate) use write::digits;
 pub use write::{WriteError, begin_chunk, end_chunk, last_chunk, write_head, write_request};
 
 /// The framing of a message body: how its end is found.

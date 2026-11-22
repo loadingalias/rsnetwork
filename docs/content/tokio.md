@@ -1,13 +1,13 @@
 # Run the engines on Tokio
 
-The package `rsnetwork-tokio` runs the HTTP/1.1 client, the HTTP/1.1 server, and the TLS stream of
-rsnetwork on the Tokio runtime of your application. Each call awaits the progress that it needs,
+The package `rsnetwork-tokio` runs the HTTP/1.1 client, the server, and the TLS stream of rsnetwork
+on the Tokio runtime of your application. Each call awaits the progress that it needs,
 so a body read moves its own bytes. You poll no second object, and the client spawns no task. A
 server spawns one task for each connection, owns it, and joins it at its close.
 
 rsnetwork is in development and has no release. `rsnetwork-tokio` is a package of the rsnetwork
 repository. It has run evidence on macOS (aarch64), on the current-thread runtime and the
-multi-thread runtime of Tokio.
+multi-thread runtime of Tokio, on HTTP/1.1 and TLS streams.
 
 ## Prerequisites
 
@@ -43,8 +43,9 @@ use rsnetwork::buffer::{Lease, Pool, WriteLoan};
 use rsnetwork::capacity::Budget;
 use rsnetwork::client::{self, Request};
 use rsnetwork::drive::TurnLimits;
-use rsnetwork::h1::{self, BodyLimits, Framing};
-use rsnetwork::server::{self, Linger, Response};
+use rsnetwork::h1::{self, BodyLimits};
+use rsnetwork::h2;
+use rsnetwork::server::{self, Cleartext, Linger, Response};
 use rsnetwork::value::{Authority, Method, Status, Target};
 use rsnetwork_tokio::Clock;
 use rsnetwork_tokio::server::Server;
@@ -61,7 +62,11 @@ let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
 let queue = NonZeroUsize::new(16).expect("not zero");
 let linger = Linger { time: Duration::from_secs(5), bytes: 64 * 1024 };
 let head_timeout = Some(Duration::from_secs(30));
-let server_limits = server::Limits { head, body, turn, queue, head_timeout, linger };
+// The HTTP/2 connection, which a server over TLS can select with ALPN `h2`.
+let h2_settings = h2::Settings { max_concurrent_streams: 100, max_header_list_size: 16 * 1024, ..h2::Settings::INITIAL };
+let h2 = h2::Limits { settings: h2_settings, work: 64 * 1024, encoder_table_bytes: 4096, connection_window: 1 << 20 };
+let cleartext = Cleartext::Http1;
+let server_limits = server::Limits { head, h2, body, turn, queue, head_timeout, linger, cleartext };
 let budget = Budget::new(NonZeroU64::new(1 << 24).expect("not zero"));
 // Each socket has 4 receive regions of 16 KiB, charged to the budget.
 let slot = Layout::array::<u8>(16 * 1024)?;
@@ -78,12 +83,12 @@ runtime.block_on(async {
     // Each accepted connection gets a server of the core and its receive regions.
     let make = {
         let (budget, pool) = (budget.clone(), pool.clone());
-        move || Ok((server::Http1::plain(server_limits, Clock.domain(), &budget)?, pool()?))
+        move || Ok((server::Http::plain(server_limits, Clock.domain(), &budget)?, pool()?))
     };
     let connections = NonZeroUsize::new(1024).expect("not zero");
     let server = Server::serve(listener, connections, make, move |mut connection| async move {
         while connection.request().await?.is_some() {
-            let hello = Response { status: ok, fields: &[], body: Framing::Length(5) };
+            let hello = Response { status: ok, fields: &[], length: Some(5) };
             connection.respond(&hello).await?;
             connection.write(&Lease::from(&b"hello"[..])).await?;
             connection.finish().await?;
@@ -91,7 +96,7 @@ runtime.block_on(async {
         Ok(())
     });
 
-    let core = client::Http1::plain(client::Limits { head, body, turn, queue }, Clock.domain(), &budget)?;
+    let core = client::Http1::plain(client::Limits { head, h2, body, turn, queue }, Clock.domain(), &budget)?;
     let stream = tokio::net::TcpStream::connect(address).await?;
     let mut client = rsnetwork_tokio::client::Http1::new(core, stream, pool()?)?;
     let request = Request {
@@ -99,11 +104,11 @@ runtime.block_on(async {
         target: Target::new(b"/hello")?,
         authority: Authority::new(b"127.0.0.1")?,
         fields: &[],
-        body: Framing::Length(0),
+        length: Some(0),
     };
     // One deadline covers the response head and each byte of the body.
     client.send(&request, Clock.deadline(Duration::from_secs(5))).await?;
-    assert_eq!(client.response().await?.head().status(), ok);
+    assert_eq!(client.response().await?.status(), ok);
     let mut region = WriteLoan::new(Vec::with_capacity(64));
     assert!(matches!(client.collect(&mut region).await?, Collect::Complete(None)));
     assert_eq!(region.filled(), b"hello");
@@ -116,7 +121,7 @@ runtime.block_on(async {
 })?;
 ```
 
-Over TLS, make the core connection with `client::Http1::tls` or `server::Http1::tls`. The rest
+Over TLS, make the core connection with `client::Http1::tls` or `server::Http::tls`. The rest
 does not change. A TLS connection lends its own input region, so one small slot in its pool is
 enough: see [receive regions](caller-driven.md#receive-regions).
 
@@ -129,15 +134,17 @@ rules of its call in the core, and awaits what the core call says to wait for:
 | Type | Calls that await | Calls that do not wait |
 | --- | --- | --- |
 | `client::Http1` | `send`, `write`, `finish`, `response`, `next`, `read_into`, `collect`, `close` | `delivered`, `cancel`, `negotiated` |
-| `server::Http1` | `request`, `respond`, `write`, `finish`, `finish_with_trailers`, `next`, `read_into`, `collect`, `release`, `close` | `cancel`, `delivery`, `shutdown`, `negotiated` |
+| `server::Http` | `request`, `respond`, `write`, `finish`, `finish_with_trailers`, `next`, `read_into`, `collect`, `release`, `close` | `cancel`, `delivery`, `shutdown`, `negotiated` |
 | `tls::Stream` | `handshake`, `read_into`, `next`, `write`, `close` | `written`, `sent`, `closure` |
 
 - A call gives its value when the core gives one. `read_into` never gives `Read::Wait`, and
   `collect` never gives `Collect::More`.
 - `write` and `finish` wait while the output queue is full.
 - After a call gives its value, the binding writes its output at once, with no wait.
-- `server::Http1::request` gives `None` when the connection takes no more requests: the client
-  closed, the connection closes, or it ended.
+- `server::Http` serves one exchange at a time, on each version. `request` closes the stream of
+  the request before it, and gives the next request head, or `None` when the connection takes no
+  more requests: the client closed, the connection closes, or it ended. The calls of the exchange
+  act on the stream of the last request.
 - `tls::Stream::handshake` waits until the handshake completed, and gives what it negotiated.
 - `close` ends the connection, waits until the transport accepted each output, and closes the
   socket. Over TLS, the end sends `close_notify`.
@@ -156,13 +163,13 @@ that runtime.
 - For each accepted socket, `make` gives a server of the core, made with `Clock.domain()`, and the
   pool of its receive regions. A refusal of `make` drops that connection, and `Report::refused`
   counts it.
-- `handler` takes the connection, a `server::Http1`, and serves its requests in order. When the
+- `handler` takes the connection, a `server::Http`, and serves its requests in order. When the
   handler returns or drops the connection, the task drives the rest: the delivery of the last
   response, the close, and the linger. A response that the handler did not finish is cancelled, so
   the client sees it incomplete. The client learns which later requests the server did not
   process, as the [server](server.md#close) says.
 - `server.close(deadline)` stops the accepts. Each connection drains with `deadline`, as
-  `server::Http1::shutdown` says: the exchange in flight completes, and the client learns which
+  `server::Http::shutdown` says: the exchange in flight completes, and the client learns which
   requests the server did not process. Then the close joins each task. At `deadline`, it aborts
   each task that did not end, for example a handler that waits for another future.
 - A server that drops before its close aborts each of its tasks, and each connection resets.
@@ -179,9 +186,9 @@ that runtime.
 A handler that moves its connection to another task keeps it: the task of the server then does not
 drive the rest of that connection. Keep the connection in the handler.
 
-`server::Http1::release` gives the end of a connection as a `server::Closed`, and then `delivery`
+`server::Http::release` gives the end of a connection as a `server::Closed`, and then `delivery`
 gives the final delivery of its last response. Thus the end of the handler and the delivery of its
-response are two results. Without a `Server`, make a connection with `server::Http1::new` on a
+response are two results. Without a `Server`, make a connection with `server::Http::new` on a
 socket that you accepted, and call `close` when you are done with it.
 
 ## Cancellation and drop

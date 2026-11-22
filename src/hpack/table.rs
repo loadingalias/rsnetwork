@@ -85,6 +85,13 @@ impl Bytes<'_> {
     pub(crate) fn is(&self, other: &[u8]) -> bool {
         other.len() == self.len() && other.starts_with(self.0) && other.ends_with(self.1)
     }
+
+    /// Whether the bytes are `other`, with no regard to the case of ASCII letters.
+    fn is_folded(&self, other: &[u8]) -> bool {
+        other.len() == self.len()
+            && other[..self.0.len()].eq_ignore_ascii_case(self.0)
+            && other[self.0.len()..].eq_ignore_ascii_case(self.1)
+    }
 }
 
 /// One entry: where its name starts in the ring, and the lengths of its name and value. The value
@@ -182,6 +189,15 @@ impl Table {
     /// Adds an entry (RFC 7541, section 4.4). It first evicts the oldest entries until the new
     /// entry fits. An entry larger than the maximum size empties the table and is not added.
     pub(crate) fn insert(&mut self, name: &[u8], value: &[u8]) {
+        self.insert_with(name, value, false);
+    }
+
+    /// Adds an entry as [`insert`](Self::insert) does, with its name in lowercase.
+    pub(crate) fn insert_folded(&mut self, name: &[u8], value: &[u8]) {
+        self.insert_with(name, value, true);
+    }
+
+    fn insert_with(&mut self, name: &[u8], value: &[u8], fold: bool) {
         let size = name.len().saturating_add(value.len()).saturating_add(OVERHEAD);
         while !self.entries.is_empty() && self.size + size > self.max {
             self.evict();
@@ -192,8 +208,8 @@ impl Table {
         // The entries hold at most `max - OVERHEAD` bytes with the new one, so it fits in the
         // ring, and the count stays in the capacity of `entries`.
         let start = (self.head + self.used) % self.ring.len();
-        self.write(name);
-        self.write(value);
+        self.write(name, fold);
+        self.write(value, false);
         self.entries.push_front(Entry {
             start,
             name: name.len(),
@@ -202,12 +218,18 @@ impl Table {
         self.size += size;
     }
 
-    fn write(&mut self, bytes: &[u8]) {
+    /// Writes `bytes` after the entries, in lowercase when `fold` is true.
+    fn write(&mut self, bytes: &[u8], fold: bool) {
         let len = self.ring.len();
         let at = (self.head + self.used) % len;
         let first = bytes.len().min(len - at);
-        self.ring[at..at + first].copy_from_slice(&bytes[..first]);
-        self.ring[..bytes.len() - first].copy_from_slice(&bytes[first..]);
+        let (front, back) = bytes.split_at(first);
+        self.ring[at..at + first].copy_from_slice(front);
+        self.ring[..back.len()].copy_from_slice(back);
+        if fold {
+            self.ring[at..at + first].make_ascii_lowercase();
+            self.ring[..back.len()].make_ascii_lowercase();
+        }
         self.used += bytes.len();
     }
 
@@ -231,7 +253,8 @@ impl Table {
     }
 
     /// The smallest index of an entry with `name` and `value`, and of an entry with `name`, in
-    /// the static table and then in this table (RFC 7541, section 2.3.3).
+    /// the static table and then in this table (RFC 7541, section 2.3.3). The names compare with
+    /// no regard to case: the encoder sends and inserts each name in lowercase.
     pub(crate) fn find(&self, name: &[u8], value: &[u8]) -> (Option<usize>, Option<usize>) {
         let (mut exact, mut named) = (None, None);
         let dynamic =
@@ -242,7 +265,7 @@ impl Table {
             .map(|(index, &(entry_name, entry_value))| (index + 1, (Bytes(entry_name, &[]), Bytes(entry_value, &[]))))
             .chain(dynamic)
         {
-            if entry_name.is(name) {
+            if entry_name.is_folded(name) {
                 named.get_or_insert(index);
                 if entry_value.is(value) {
                     exact = Some(index);

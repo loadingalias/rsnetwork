@@ -10,7 +10,8 @@
 #![no_main]
 
 use rsnetwork::buffer::WriteLoan;
-use rsnetwork::h1::{Fields, Framing, Limits, RequestParser, ResponseParser, write_head, write_request};
+use rsnetwork::h1::{Framing, Limits, RequestParser, ResponseParser, write_head, write_request};
+use rsnetwork::message::Fields;
 use rsnetwork::value::{Authority, Field, Host, Method, Status, Target, TargetForm};
 use rsnetwork_fuzz::allocated;
 

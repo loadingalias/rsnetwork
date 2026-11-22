@@ -29,7 +29,7 @@ use core::fmt;
 
 use rstypes::buffer::{Buffer as _, BufferMut, Lease, WriteLoan};
 
-use crate::h1::Fields;
+use crate::message::Fields;
 
 /// The terminal outcome of a body. Only `Complete` makes the bytes a complete value.
 #[derive(Clone, Debug)]

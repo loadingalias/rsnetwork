@@ -1,7 +1,12 @@
 //! Sans-I/O HTTP and QUIC networking. This crate is in development.
 //!
 //! [`value`] holds the checked values of HTTP: methods, request targets, statuses, field lines,
-//! authorities, and schemes. Each protocol of the core uses them.
+//! authorities, and schemes. Each protocol of the core uses them. [`message`] is the message model
+//! that each protocol shares: the heads of a received request and response, and the stream of
+//! each exchange.
+//!
+//! [`client`] and [`server`] are the application API: an HTTP/1.1 client and an HTTP/2 client, and
+//! one server for HTTP/1.1 and HTTP/2. Each is one connection with no I/O.
 //!
 //! [`h1`] is HTTP/1.1, with HTTP/1.0 peers, for servers and clients: a server engine and a client
 //! engine, and the parsers and writers that they use. It does no I/O, so any runtime or event
@@ -43,6 +48,7 @@ pub mod h2;
 pub mod host;
 pub mod hpack;
 mod link;
+pub mod message;
 pub mod qpack;
 pub mod server;
 #[cfg(feature = "tls")]
