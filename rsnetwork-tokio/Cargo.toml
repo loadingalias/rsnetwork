@@ -1,0 +1,25 @@
+[package]
+name = "rsnetwork-tokio"
+version = "0.1.0-alpha.1"
+description = "The Tokio binding of rsnetwork: HTTP/1.1 clients and servers and TLS streams on the Tokio runtime of the application."
+repository = "https://github.com/loadingalias/rsnetwork"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+include = ["/src"]
+
+[dependencies]
+# The core, with TLS and the socket rules of `host::Tcp`.
+rsnetwork = { path = "..", version = "0.1.0-alpha.1", features = ["tcp"] }
+# The Tokio runtime of the application: its tasks and blocking pool (`rt`), its sockets (`net`),
+# the close signal of a server (`sync`), and its timer (`time`). It starts no runtime.
+tokio = { version = "1.54.1", default-features = false, features = ["net", "rt", "sync", "time"] }
+# The receive into the uninitialized room of a region, on the socket that Tokio registered.
+socket2 = "0.6.5"
+
+[dev-dependencies]
+# The tests run each case on a current-thread and on a multi-thread runtime.
+tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -15,7 +15,7 @@
 //! [`Io`] holds the calls that move the bytes of a connection: of a [`Connection`], and of each
 //! connection of the application API. A binding makes them for each connection, so it moves the
 //! bytes of each with one loop. With the `tcp` feature, [`Tcp`] is that loop over a nonblocking
-//! std TCP socket.
+//! TCP socket: a std socket, or the socket of a runtime through [`Socket`].
 //!
 //! ```
 //! use core::net::{Ipv4Addr, SocketAddr};
@@ -94,7 +94,7 @@ use crate::time::{ClockDomain, Deadline, Instant};
 mod tcp;
 
 #[cfg(feature = "tcp")]
-pub use tcp::{Next, Tcp};
+pub use tcp::{Next, Socket, Tcp};
 
 /// A protocol engine that a [`Connection`] drives. The engines of this crate implement it.
 pub trait Engine: sealed::Sealed {

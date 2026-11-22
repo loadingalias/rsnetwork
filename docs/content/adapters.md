@@ -7,9 +7,10 @@ connections have the same calls, which the sealed trait `host::Io` names. Thus o
 any `C: Io` and moves the bytes of each. The binding calls the connection directly. It implements
 no trait of rsnetwork, and no dispatch layer is between the two.
 
-This page is a first draft of the adapter guide. rsnetwork is in development and has no release,
-and it has no runtime binding yet. Its one binding, `host::Tcp`, binds a caller-driven host to a
-std TCP socket: see [bind a TCP socket](caller-driven.md#bind-a-tcp-socket).
+This page is a first draft of the adapter guide. rsnetwork is in development and has no release.
+It has two bindings: `host::Tcp` binds a caller-driven host to a nonblocking TCP socket (see
+[bind a TCP socket](caller-driven.md#bind-a-tcp-socket)), and the package `rsnetwork-tokio` runs
+the connections on Tokio (see [run the engines on Tokio](tokio.md)).
 [Drive a connection from your own event loop](caller-driven.md) gives the connection calls and a
 complete example.
 
@@ -19,7 +20,8 @@ complete example.
 | --- | --- | --- |
 | `rsnetwork` | The protocol engines and the caller-driven host, `rsnetwork::host` | `rstypes`, the shared buffer, capacity, and time types of the runtime family, with no scheduler and no driver |
 | `rsnetwork` with the `tls` feature, on by default | Also [TLS 1.3](tls.md), `rsnetwork::tls` | Also rustls and the `rscrypto-rustls` provider, with their dependencies: no C, and no cryptography other than rscrypto |
-| `rsnetwork` with the `tcp` feature, off by default | Also `host::Tcp`, the binding of a caller-driven host to a nonblocking std TCP socket | No new crate. Until `Read::read_buf` and `TcpStream::set_linger` are stable in std, it needs the nightly toolchain that rsnetwork pins |
+| `rsnetwork` with the `tcp` feature, off by default | Also `host::Tcp`, the binding of a caller-driven host to a nonblocking TCP socket, and `host::Socket`, the calls of that socket | No new crate. Until `Read::read_buf` and `TcpStream::set_linger` are stable in std, it needs the nightly toolchain that rsnetwork pins |
+| `rsnetwork-tokio` | The [Tokio binding](tokio.md): the client, the server, and the TLS stream on Tokio, a `Server` that owns its tasks, and bounded blocking jobs | `rsnetwork` with `tcp`, Tokio 1.54 with `rt`, `net`, `sync`, and `time`, and socket2: no C |
 
 A binding that needs a runtime is a package of its own, which depends on `rsnetwork` and on that
 runtime. `rsnetwork` never depends on a binding. Thus:
@@ -35,7 +37,8 @@ default: `tcp`. Thus a protocol-only build also has no socket code.
 
 `cargo xtask check` enforces the layout on each target. It fails when the protocol-only build holds
 a crate other than `rsnetwork` and `rstypes`. It also fails when the default build, or a build
-with all features, adds a crate outside the closure of the `tls` feature.
+with all features, adds a crate outside the closure of the `tls` feature, and when
+`rsnetwork-tokio` adds a crate outside its approved list.
 
 ## Host effects
 
@@ -89,7 +92,11 @@ A readiness host, for example epoll, kqueue, or Tokio, tells when a socket can r
 - Write each output when it comes. Wait for the socket to be writable only after it accepted a part
   of an output.
 
-`host::Tcp` is this loop for a std TCP socket: see [what a pump does](caller-driven.md#what-a-pump-does).
+`host::Tcp` is this loop for a TCP socket: see [what a pump does](caller-driven.md#what-a-pump-does).
+It takes a std `TcpStream` by default, or another `host::Socket`: a socket of a runtime that must see
+each read and write. A runtime such as Tokio clears its readiness only when its own read or write
+finds no byte, so the socket of the binding reads and writes through the runtime, and the binding
+waits for readiness between pumps. The Tokio binding does so: see [run the engines on Tokio](tokio.md).
 
 ### Completion hosts
 
@@ -122,7 +129,9 @@ connections between threads can do so: `Connection<Server>` and `Connection<Clie
 
 A binding creates no executor and detaches no work. It spawns its tasks on the runtime of the
 application, owns them, and joins them. It drives each connection until `release()` gives its
-result. At a shutdown, it calls `abandon()` and keeps each output region that the transport holds
+result. `release()` takes no time, so drive the connection with a call that takes `now`, for
+example `server::Http1::request(now)`: else a linger or a deadline never ends. The
+[Tokio server](tokio.md#a-server-and-its-tasks) does so after each handler. At a shutdown, it calls `abandon()` and keeps each output region that the transport holds
 until the transport completes it. A socket that closes before the release resets the connection,
 so the peer cannot read the close as the end of the data. `host::Tcp::close` does so, and reports
 the output that did not go.
@@ -131,5 +140,6 @@ the output that did not go.
 
 - A wake when capacity is free again. It needs a release listener in the shared capacity types. Until
   then, drive again after your code releases capacity, for example after it consumes a body.
-- Name resolution and other blocking jobs, with a bound.
+- Name resolution and other blocking jobs, with a bound, in the core. The Tokio binding has
+  `Blocking`: see [blocking jobs and host lookups](tokio.md#blocking-jobs-and-host-lookups).
 - A send of several output regions in one call.

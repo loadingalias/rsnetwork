@@ -15,7 +15,9 @@ cargo xtask test -E 'binary(h1_conformance)'
 
 The suite runs the server and client engines on the caller-driven host, in memory, with no
 socket and no runtime. With the `tcp` feature, which `cargo xtask test` turns on, it also runs each
-vector over a loopback TCP socket through `host::Tcp`. A failure names the vector, its RFC
+vector over a loopback TCP socket through `host::Tcp`. `cargo xtask test` also runs the suite of
+the [Tokio binding](tokio.md), `-p rsnetwork-tokio -E 'binary(h1_conformance)'`: each vector over a
+loopback socket on a current-thread and on a multi-thread runtime. A failure names the vector, its RFC
 sections, and the schedule or the seed. It shows the result of the run, and for a schedule also
 the result of the whole input.
 
@@ -95,7 +97,8 @@ entries, so pipelined requests meet output backpressure.
 The suite has two parts:
 
 - `tests/conformance/mod.rs` holds the vectors, their permitted outcomes, the schedules, and the
-  record of the steps. It does no I/O.
+  record of the steps. It also holds the application of each side (`serve` and `fetch`), the
+  trait `Carry` of a transport, and `Memory`, the transport in memory. It does no I/O.
 - `tests/h1_conformance.rs` is the runner of the caller-driven host. Each round, the transport
   receives one region or the end of input, the host drives until the connection waits, and the
   transport makes one write. Its module `tcp` is the runner of `host::Tcp` over a loopback socket.
@@ -103,9 +106,13 @@ The suite has two parts:
   arrived. Only a pump that then finds no byte in the socket proves that the client received each
   byte that the server sent before its next request.
 
-A binding adds a runner of its own, as a test file of this package that includes the module with
-`mod conformance;`. A test of another package includes the same file with a `#[path]` attribute
-on the module. The runner must keep the rules that the permitted outcomes assume:
+A binding adds a runner of its own: a type that implements `Carry` for its transport, in a test
+file that includes the module. A test of this package includes it with `mod conformance;`, and a
+test of another package with a `#[path]` attribute on the module, as
+`rsnetwork-tokio/tests/h1_conformance.rs` does. There, the peer is a std socket in a thread of its
+own. The connection asks it for each part of the input in a call, and the call waits until the part
+arrived, so no read of the socket runs in that time. The runner must keep the rules that the
+permitted outcomes assume:
 
 1. Give the input in the regions of the schedule, and give the bytes of each response only after
    its request. Send the next request of a client only after the transport received each byte

@@ -105,6 +105,20 @@ const TLS_CLOSURE: &[&str] = &[
     "zeroize",
 ];
 
+/// The crates that the Tokio binding adds to the core with all its features: Tokio with `rt`,
+/// `net`, `sync`, and `time`, socket2, and their dependencies (N107). None builds C. A new crate
+/// here needs the approval of the user.
+const TOKIO_CLOSURE: &[&str] = &[
+    "mio",
+    "pin-project-lite",
+    "rsnetwork-tokio",
+    "socket2",
+    "tokio",
+    "wasi",
+    "windows-link",
+    "windows-sys",
+];
+
 /// Environment variables that change compilation without notice. Each command
 /// removes them, so only the checked-in configuration applies. Each variable
 /// that starts with `CARGO_BUILD_`, `CARGO_PROFILE_`, or `CARGO_TARGET_` is
@@ -263,25 +277,41 @@ impl Repo {
         self.closure()
     }
 
-    /// Fails when a build of `rsnetwork` holds a crate outside its list. The protocol-only build
-    /// (no default features) holds only [`PROTOCOL_CLOSURE`]: no executor, socket driver, or
-    /// Tokio. The default build, and a build with all features, add only [`TLS_CLOSURE`]: the
-    /// `tcp` feature adds no crate. It reads the normal and build
-    /// dependencies of `rsnetwork` on every target.
+    /// Fails when a build of a package holds a crate outside its list. The protocol-only build
+    /// of `rsnetwork` (no default features) holds only [`PROTOCOL_CLOSURE`]: no executor, socket
+    /// driver, or Tokio. The default build, and a build with all features, add only
+    /// [`TLS_CLOSURE`]: the `tcp` feature adds no crate. `rsnetwork-tokio` adds only
+    /// [`TOKIO_CLOSURE`]. It reads the normal and build dependencies on every target.
     fn closure(&self) -> Result<(), Failure> {
         eprintln!("── closure");
         let started = Instant::now();
-        for (build, features, tls) in [
-            ("a protocol-only build", Some("--no-default-features"), &[][..]),
-            ("the default build", None, TLS_CLOSURE),
-            ("a build with all features", Some("--all-features"), TLS_CLOSURE),
+        for (package, build, features, lists) in [
+            (
+                "rsnetwork",
+                "a protocol-only build",
+                Some("--no-default-features"),
+                &[][..],
+            ),
+            ("rsnetwork", "the default build", None, &[TLS_CLOSURE][..]),
+            (
+                "rsnetwork",
+                "a build with all features",
+                Some("--all-features"),
+                &[TLS_CLOSURE][..],
+            ),
+            (
+                "rsnetwork-tokio",
+                "a build with all features",
+                Some("--all-features"),
+                &[TLS_CLOSURE, TOKIO_CLOSURE][..],
+            ),
         ] {
             let mut args = vec![
                 "tree",
                 "--locked",
                 "--quiet",
                 "-p",
-                "rsnetwork",
+                package,
                 "-e",
                 "normal,build",
                 "--target",
@@ -307,13 +337,13 @@ impl Repo {
             let mut outside: Vec<&str> = tree
                 .lines()
                 .filter_map(|line| line.split_whitespace().next())
-                .filter(|name| !PROTOCOL_CLOSURE.contains(name) && !tls.contains(name))
+                .filter(|name| !PROTOCOL_CLOSURE.contains(name) && !lists.iter().any(|list| list.contains(name)))
                 .collect();
             outside.sort_unstable();
             outside.dedup();
             if !outside.is_empty() {
                 return Err(Failure::new(format!(
-                    "closure: {build} of rsnetwork holds {}; a binding takes its runtime in its own package, and a new crate needs approval",
+                    "closure: {build} of {package} holds {}; a binding takes its runtime in its own package, and a new crate needs approval",
                     outside.join(", ")
                 )));
             }

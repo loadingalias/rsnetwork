@@ -70,7 +70,8 @@ has nothing to give yet, it gives `false`, `None`, `Read::Wait`, or `Collect::Mo
 `server.wait()` says, move the bytes, and call again. This function answers each request with the
 bytes of its body, until the connection ends. `host` is your loop: it waits, moves the bytes of
 the socket, for example with [`host::Tcp`](caller-driven.md#bind-a-tcp-socket), and gives the
-time.
+time. On Tokio, each call awaits instead, and a `Server` runs a handler for each connection: see
+[run the engines on Tokio](tokio.md).
 
 ```rust
 use rsnetwork::body::Collect;

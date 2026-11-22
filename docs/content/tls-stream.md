@@ -11,7 +11,8 @@ loop, moves the ciphertext of the socket: see [drive a connection from your own 
 ## Prerequisites
 
 - A host that moves bytes between the socket and the stream, for example
-  [`host::Tcp`](caller-driven.md#tls-over-the-socket), and reads a monotonic clock.
+  [`host::Tcp`](caller-driven.md#tls-over-the-socket), and reads a monotonic clock. On Tokio,
+  `rsnetwork_tokio::tls::Stream` awaits each call: see [run the engines on Tokio](tokio.md).
 - A `tls::ClientConfig` or a `tls::ServerConfig`, as on the [TLS page](tls.md#configure-each-end).
   The ALPN name of your protocol goes in its `protocols`.
 - `tls::StreamLimits`: the `tls::Limits` of the connection, the size of each queue, and the

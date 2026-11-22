@@ -5,7 +5,8 @@ drives from its own event loop, with no runtime. Your loop owns the socket, or a
 source, and the clock. The connection spawns no task, starts no thread, and does not need `Send`.
 
 rsnetwork is in development and has no release. To move the bytes of a std TCP socket, use
-[`host::Tcp`](#bind-a-tcp-socket). To connect the engines to a runtime instead, see
+[`host::Tcp`](#bind-a-tcp-socket). To run the engines on Tokio, see
+[run the engines on Tokio](tokio.md). To connect them to another runtime, see
 [Write a binding](adapters.md). To run the same connection over TLS 1.3, see
 [Run a connection over TLS 1.3](tls.md).
 
@@ -148,7 +149,9 @@ assert_eq!(connection.release(), Some(Ok(())));
 
 With the `tcp` feature, `host::Tcp` moves the bytes between one nonblocking `std::net::TcpStream`
 and one connection: a `Connection`, a `client::Http1`, a `server::Http1`, or a `tls::Stream`. Your
-loop keeps the poller and the clock. The socket spawns no task and starts no thread.
+loop keeps the poller and the clock. The socket spawns no task and starts no thread. `Tcp` also
+takes another socket through the trait `host::Socket`, for example the socket of a runtime: see
+[readiness hosts](adapters.md#readiness-hosts).
 
 Prerequisites:
 

@@ -1,7 +1,9 @@
-//! The binding of a caller-driven host to a nonblocking std TCP socket.
+//! The binding of a caller-driven host to a nonblocking TCP socket.
 
+use core::mem::MaybeUninit;
+use core::net::SocketAddr;
 use core::time::Duration;
-use std::io::{self, BorrowedBuf, ErrorKind, Read as _, Write as _};
+use std::io::{self, BorrowedBuf, ErrorKind, Read as _};
 use std::net::{Shutdown, TcpStream};
 
 use rstypes::buffer::{Backing, Buffer as _, BufferMut as _, Pool, WriteLoan};
@@ -10,9 +12,60 @@ use rstypes::time::Deadline;
 use super::{Io, Wait};
 use crate::drive::{Blocked, Ecn, Endpoint, Error, Outstanding, Received};
 
-/// One nonblocking std TCP socket, which moves the bytes of one connection of a caller-driven
-/// host: a [`Connection`](super::Connection), a `client::Http1`, a `server::Http1`, or a
-/// `tls::Stream`.
+/// The calls of a nonblocking TCP socket that [`Tcp`] makes. A std [`TcpStream`] has them. A
+/// binding implements them for the socket of its runtime, for example a runtime that must see
+/// each read and write to know when the socket is ready again.
+///
+/// Each call returns at once. A socket that cannot move a byte now refuses with
+/// [`ErrorKind::WouldBlock`].
+pub trait Socket {
+    /// Makes the socket ready for [`Tcp`]: nonblocking, with `TCP_NODELAY`, because each output
+    /// region is its own write. Gives the address of the peer and the address of this end.
+    fn open(&mut self) -> io::Result<(SocketAddr, SocketAddr)>;
+
+    /// Reads into `spare` with no zeroing, and gives the bytes that it read: the start of
+    /// `spare`. No byte means the end of input.
+    fn read<'a>(&mut self, spare: &'a mut [MaybeUninit<u8>]) -> io::Result<&'a mut [u8]>;
+
+    /// Writes the first bytes of `bytes`, and gives how many.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize>;
+
+    /// Shuts down the write side: the peer reads the end of the stream after the last byte.
+    fn shutdown_write(&mut self) -> io::Result<()>;
+
+    /// Makes the close of the socket a reset (`SO_LINGER` 0).
+    fn reset_at_close(&mut self) -> io::Result<()>;
+}
+
+impl Socket for TcpStream {
+    fn open(&mut self) -> io::Result<(SocketAddr, SocketAddr)> {
+        self.set_nonblocking(true)?;
+        self.set_nodelay(true)?;
+        Ok((self.peer_addr()?, self.local_addr()?))
+    }
+
+    fn read<'a>(&mut self, spare: &'a mut [MaybeUninit<u8>]) -> io::Result<&'a mut [u8]> {
+        let mut buffer = BorrowedBuf::from(spare);
+        self.read_buf(buffer.unfilled())?;
+        Ok(buffer.into_filled_mut())
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        io::Write::write(self, bytes)
+    }
+
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        self.shutdown(Shutdown::Write)
+    }
+
+    fn reset_at_close(&mut self) -> io::Result<()> {
+        self.set_linger(Some(Duration::ZERO))
+    }
+}
+
+/// One nonblocking TCP socket, which moves the bytes of one connection of a caller-driven host: a
+/// [`Connection`](super::Connection), a `client::Http1`, a `server::Http1`, or a `tls::Stream`.
+/// The socket is a std [`TcpStream`] by default, or another [`Socket`].
 ///
 /// The application owns the event loop, its poller, and its clock. In each turn, it calls the
 /// connection, for example `client.response(now)`, then [`pump`](Self::pump), and does what
@@ -125,8 +178,8 @@ use crate::drive::{Blocked, Ecn, Endpoint, Error, Outstanding, Received};
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug)]
-pub struct Tcp {
-    socket: TcpStream,
+pub struct Tcp<S = TcpStream> {
+    socket: S,
     endpoint: Endpoint,
     /// The receive regions of a connection that lends none.
     pool: Pool,
@@ -187,19 +240,19 @@ enum Read {
     Starved,
 }
 
-impl Tcp {
-    /// Takes a connected socket, and sets it to nonblocking mode with `TCP_NODELAY`.
+impl<S: Socket> Tcp<S> {
+    /// Takes a connected socket, and opens it with [`Socket::open`]: nonblocking, with
+    /// `TCP_NODELAY`.
     ///
     /// `pool` gives the receive regions when the connection lends none: over TCP, and during the
     /// linger of a server, which discards the bytes. Charge it to the budget of the connection. A
     /// TLS connection lends its own input region, so one small slot is enough for it. Refuses with
     /// the error of the socket when it cannot set the mode or read the two addresses.
-    pub fn new(socket: TcpStream, pool: Pool) -> io::Result<Self> {
-        socket.set_nonblocking(true)?;
-        socket.set_nodelay(true)?;
+    pub fn new(mut socket: S, pool: Pool) -> io::Result<Self> {
+        let (peer, local) = socket.open()?;
         let endpoint = Endpoint {
-            peer: socket.peer_addr()?,
-            local: socket.local_addr()?,
+            peer,
+            local,
             ecn: Ecn::NotEct,
             segment: None,
         };
@@ -218,7 +271,7 @@ impl Tcp {
 
     /// The socket, for example to register it with the poller of the application. Do not read or
     /// write it.
-    pub fn socket(&self) -> &TcpStream {
+    pub fn socket(&self) -> &S {
         &self.socket
     }
 
@@ -290,11 +343,11 @@ impl Tcp {
     /// After the release of a connection with no such output, the peer reads the end of the
     /// stream. Else the close resets the connection: the peer cannot read the bytes that did not
     /// go as a complete message, for example a body that the close delimits.
-    pub fn close<C: Io>(self, connection: &C) -> Outstanding {
+    pub fn close<C: Io>(mut self, connection: &C) -> Outstanding {
         let outstanding = connection.outstanding();
         if connection.release().is_none() || !outstanding.is_empty() {
             // A socket that refuses the option failed already, so its close sends no end either.
-            drop(self.socket.set_linger(Some(Duration::ZERO)));
+            drop(self.socket.reset_at_close());
         }
         outstanding
     }
@@ -306,7 +359,7 @@ impl Tcp {
         connection.release()?;
         if !self.failed && !self.shut && connection.outstanding().is_empty() {
             // The connection ended, so a failure of the socket now changes no outcome.
-            self.shut = self.socket.shutdown(Shutdown::Write).is_ok();
+            self.shut = self.socket.shutdown_write().is_ok();
         }
         Some(Next::Released)
     }
@@ -328,10 +381,12 @@ impl Tcp {
             result = Err(ErrorKind::Interrupted.into());
             0
         } else {
-            loan.fill_with(|spare| {
-                let mut buffer = BorrowedBuf::from(spare);
-                result = self.socket.read_buf(buffer.unfilled());
-                buffer.into_filled_mut()
+            loan.fill_with(|spare| match self.socket.read(spare) {
+                Ok(read) => read,
+                Err(error) => {
+                    result = Err(error);
+                    &mut []
+                }
             })
         };
         let region = loan.into_inner();
@@ -432,7 +487,7 @@ impl Tcp {
         if !connection.outstanding().is_empty() {
             return false;
         }
-        match self.socket.shutdown(Shutdown::Write) {
+        match self.socket.shutdown_write() {
             Ok(()) => {
                 self.shut = true;
                 false

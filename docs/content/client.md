@@ -63,7 +63,7 @@ Each call of the exchange takes the time `now`. When a call has nothing to give 
 `false`, `None`, or `Read::Wait`. Then wait as `client.wait()` says, move the bytes, and call
 again. This function sends one GET and copies the body into `region`. `host` is your loop: it
 waits, moves the bytes of the socket, for example with [`host::Tcp`](caller-driven.md#bind-a-tcp-socket),
-and gives the time.
+and gives the time. On Tokio, each call awaits instead: see [run the engines on Tokio](tokio.md).
 
 ```rust
 use rsnetwork::body::{Outcome, Read};
