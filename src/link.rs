@@ -13,7 +13,7 @@ use crate::drive::Kind;
 use crate::drive::{Accepted, AckError, ActionId, Endpoint, Error, Inbound, Outbound, Output, Outstanding, Received};
 use crate::host::{Connection, Engine, Io, Wait};
 #[cfg(feature = "tls")]
-use crate::tls::{Closure, Negotiated, Tls};
+use crate::tls::{Closure, ExportError, Negotiated, Tls};
 
 /// The transport of a connection.
 #[derive(Debug)]
@@ -156,6 +156,19 @@ impl<E: Engine> Link<E> {
         match self {
             Self::Plain(_) => None,
             Self::Tls(connection) => connection.parts().0.negotiated(),
+        }
+    }
+
+    /// Derives exporter material of a TLS connection, as [`Tls::export`] does. Over TCP, refuses
+    /// with [`ExportError::Unavailable`].
+    #[cfg(feature = "tls")]
+    pub(crate) fn export(&self, label: &[u8], context: &[u8], output: &mut [u8]) -> Result<(), ExportError> {
+        match self {
+            Self::Plain(_) => {
+                output.fill(0);
+                Err(ExportError::Unavailable)
+            }
+            Self::Tls(connection) => connection.export(label, context, output),
         }
     }
 

@@ -172,6 +172,7 @@ Each request has its own `Stream`. The stream keeps its place from its request u
 | `delivery(stream)` | How much of the response the transport accepted: see [delivery](#delivery) |
 | `shutdown(deadline, now)` | Closes the connection: see [close](#close) |
 | `negotiated()` | Over TLS, the group, the ALPN name, the kind of handshake, and the client certificate when the client showed one, after the handshake completed: see [negotiated facts](tls.md#negotiated-facts) |
+| `export(label, context, &mut output)` | Over TLS, keying material from the regular exporter of the connection: see [bind a proof to a TLS connection](exporter.md). Over TCP, `ExportError::Unavailable` |
 | `changed(each)` | Gives `each` each stream whose exchange changed since the last call: a part or the end of its request body, its last chunk went to the output, it ended, or its request is new. A binding that shares the connection among handles wakes only their handles. The end of the connection changes each stream |
 | `wait()` | When to call again: now, when the transport gives what the connection waits for, at a deadline, during the linger, or never after the end |
 | `reset()` | The transport failed: see [reset](#reset) |

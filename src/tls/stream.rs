@@ -9,7 +9,7 @@ use rstypes::buffer::{Backing, Buffer as _, BufferMut, Lease, WriteLoan};
 use rstypes::capacity::Budget;
 use rstypes::time::{ClockDomain, Deadline, Instant};
 
-use super::{ClientConfig, Closure, Limits, Negotiated, ServerConfig, Tls};
+use super::{ClientConfig, Closure, ExportError, Limits, Negotiated, ServerConfig, Tls};
 use crate::body::{Consumer, Outcome, Part, Read};
 use crate::drive::{
     AckError, ActionId, Blocked, Endpoint, Error, Inbound, Kind, Outbound, Output, Outstanding, Progress, Received,
@@ -206,6 +206,12 @@ impl Stream {
     /// name, the kind of handshake, and the authentication of the peer.
     pub fn negotiated(&self) -> Option<Negotiated<'_>> {
         self.connection.engine().negotiated()
+    }
+
+    /// Derives `output.len()` bytes of keying material with `label` and `context` from the regular
+    /// exporter of the stream, as [`Tls::export`] says.
+    pub fn export(&self, label: &[u8], context: &[u8], output: &mut [u8]) -> Result<(), ExportError> {
+        self.connection.export(label, context, output)
     }
 
     /// How the input of the peer ended, or `None` before its end.

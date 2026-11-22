@@ -94,6 +94,7 @@ a `Truncated` end.
 | `close(now)` | Ends the stream: it sends `close_notify` after the bytes that it took, and reads no more. A read after it ends `Outcome::Cancelled`, unless the peer closed first |
 | `drive(now)` | Drives the stream: the handshake, the encryption of the bytes that wait, and the close. Call it each time that `wait()` says. Each read and write also drives the stream |
 | `negotiated()` | The security evidence after the handshake: see [evidence](#evidence) |
+| `export(label, context, &mut output)` | Keying material from the regular exporter of the stream, the same at both ends: see [bind a proof to a TLS connection](exporter.md) |
 | `closure()` | How the input of the peer ended: `Closure::Notified`, `Unnotified`, or `Reset` |
 | `wait()` | When to call again: now, when the transport gives what the stream waits for, at the handshake deadline, or never after the end |
 | `received`, `receive`, `region`, `output`, `ack`, `end_input`, `reset`, `outstanding`, `release` | The transport calls, as on a [host connection](caller-driven.md). Call `end_input` when the peer closed its side, and `reset` when the transport failed |

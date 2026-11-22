@@ -11,7 +11,7 @@ use rsnetwork::drive::{Error, Kind};
 use rsnetwork::host::Io as _;
 use rsnetwork::message::{ResponseHead, Stream};
 use rsnetwork::time::Deadline;
-use rsnetwork::tls::Negotiated;
+use rsnetwork::tls::{ExportError, Negotiated};
 use tokio::net::TcpStream;
 
 use crate::shared::{Shared, Waits};
@@ -128,6 +128,12 @@ impl Http1 {
         self.socket.connection_mut().negotiated()
     }
 
+    /// Derives `output.len()` bytes of keying material with `label` and `context` from the regular
+    /// exporter of the connection, as [`Http1::export`](rsnetwork::client::Http1::export) does.
+    pub fn export(&self, label: &[u8], context: &[u8], output: &mut [u8]) -> Result<(), ExportError> {
+        self.socket.connection().export(label, context, output)
+    }
+
     /// Ends the connection: the exchange in flight ends with it, and over TLS the client sends
     /// `close_notify`. It waits until the transport accepted each output, and then closes the
     /// socket. Gives the end of the connection.
@@ -198,6 +204,12 @@ impl Http2 {
     /// not call the connection or one of its exchanges.
     pub fn negotiated<T>(&self, read: impl FnOnce(Option<Negotiated<'_>>) -> T) -> T {
         read(self.shared.lock().socket.connection_mut().negotiated())
+    }
+
+    /// Derives `output.len()` bytes of keying material with `label` and `context` from the regular
+    /// exporter of the connection, as [`Http2::export`](rsnetwork::client::Http2::export) does.
+    pub fn export(&self, label: &[u8], context: &[u8], output: &mut [u8]) -> Result<(), ExportError> {
+        self.shared.lock().socket.connection().export(label, context, output)
     }
 
     /// Ends the connection: each exchange in flight ends with it, the client sends GOAWAY, and over

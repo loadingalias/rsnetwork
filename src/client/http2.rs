@@ -531,6 +531,14 @@ impl Http2 {
         self.link.negotiated()
     }
 
+    /// Derives `output.len()` bytes of keying material with `label` and `context` from the regular
+    /// exporter of the TLS connection, as [`Tls::export`] says. Over TCP, refuses with
+    /// [`ExportError::Unavailable`](tls::ExportError::Unavailable).
+    #[cfg(feature = "tls")]
+    pub fn export(&self, label: &[u8], context: &[u8], output: &mut [u8]) -> Result<(), tls::ExportError> {
+        self.link.export(label, context, output)
+    }
+
     fn find(&self, stream: Stream) -> Option<usize> {
         self.exchanges
             .iter()

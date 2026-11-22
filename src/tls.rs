@@ -31,11 +31,15 @@
 //!   generator whose child streams replay a run byte for byte ([`Entropy`]).
 //! - **Resumption.** Sessions resume only in the process that made them ([`Resumption`]).
 //! - **0-RTT.** Off: neither end sends or accepts early data.
+//! - **Exporter.** [`Tls::export`] derives keying material from the regular exporter of the
+//!   established connection (RFC 8446, section 7.5), for example to bind a proof of possession to
+//!   the connection. It is not authorization and not freshness: see [`ExportError`].
 //! - **End.** A `close_notify` of the peer ends the input of the inner engine. When the transport
 //!   ends with no `close_notify`, the inner engine also sees the end, and [`Tls::closure`] reports
 //!   [`Closure::Unnotified`]. Only a protocol with its own framing can then tell that no byte is
 //!   lost.
 
+mod export;
 mod memory;
 mod peer;
 mod record;
@@ -70,11 +74,12 @@ use rustls::server::{
 };
 use rustls::split::SplitConnection;
 use rustls::{
-    ClientSide, CommonState, ConnectionTrafficSecrets, ExtractedSecrets, HandshakeKind, MessageHandler, RootCertStore,
-    ServerSide, SideData, SupportedCipherSuite, Tcp, TlsInputBuffer,
+    ClientSide, CommonState, ConnectionTrafficSecrets, ExtractedSecrets, HandshakeKind, KeyingMaterialExporter,
+    MessageHandler, RootCertStore, ServerSide, SideData, SupportedCipherSuite, Tcp, TlsInputBuffer,
 };
 use sent::Sent;
 
+pub use export::{EXPORT_CONTEXT_MAX, EXPORT_LABEL_MAX, EXPORT_OUTPUT_MAX, ExportError, RESERVED_LABEL_PREFIX};
 pub use rscrypto::ChaCha20Rng;
 pub use rustls::pki_types::pem::PemObject;
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
@@ -644,11 +649,15 @@ enum Kernel {
 }
 
 impl Kernel {
-    /// The connection after the handshake of `session`, and its traffic keys.
-    fn new(session: Session) -> Result<(Self, ExtractedSecrets), Error> {
+    /// The connection after the handshake of `session`, its traffic keys, and its exporter.
+    fn new(session: Session) -> Result<(Self, ExtractedSecrets, KeyingMaterialExporter), Error> {
         match session {
-            Session::Client(connection) => keys(connection).map(|(secrets, kernel)| (Self::Client(kernel), secrets)),
-            Session::Server(connection) => keys(connection).map(|(secrets, kernel)| (Self::Server(kernel), secrets)),
+            Session::Client(connection) => {
+                keys(connection).map(|(secrets, kernel, exporter)| (Self::Client(kernel), secrets, exporter))
+            }
+            Session::Server(connection) => {
+                keys(connection).map(|(secrets, kernel, exporter)| (Self::Server(kernel), secrets, exporter))
+            }
         }
     }
 
@@ -678,12 +687,20 @@ impl Kernel {
     }
 }
 
-/// The traffic keys of the connection after `connection`'s handshake, and its kernel state.
-fn keys<S: SideData>(connection: rustls::Connection<S, Tcp>) -> Result<(ExtractedSecrets, KernelConnection<S>), Error> {
-    connection
+/// The traffic keys of the connection after `connection`'s handshake, its kernel state, and its
+/// regular exporter. rustls gives the exporter one time, and the kernel state does not keep it, so
+/// the record layer keeps it.
+fn keys<S: SideData>(
+    mut connection: rustls::Connection<S, Tcp>,
+) -> Result<(ExtractedSecrets, KernelConnection<S>, KeyingMaterialExporter), Error> {
+    let exporter = connection
+        .exporter()
+        .map_err(|_| Error::new(Kind::Unsupported, "rustls did not give the exporter"))?;
+    let (secrets, kernel) = connection
         .split()
         .and_then(SplitConnection::dangerous_into_kernel_connection)
-        .map_err(|_| no_keys())
+        .map_err(|_| no_keys())?;
+    Ok((secrets, kernel, exporter))
 }
 
 /// The protection of the keys of one direction and their sequence number.
@@ -710,6 +727,8 @@ const FATAL: u8 = 2;
 /// The record layer of one end after the handshake.
 struct Records {
     kernel: Kernel,
+    /// The regular exporter of the connection (RFC 8446, section 7.5).
+    exporter: KeyingMaterialExporter,
     /// The protection of the records of the peer.
     rx: Protection,
     /// The protection of the records of this end.
@@ -728,7 +747,7 @@ struct Records {
 
 impl Records {
     fn new(
-        kernel: Kernel,
+        (kernel, exporter): (Kernel, KeyingMaterialExporter),
         secrets: &ExtractedSecrets,
         key_records_max: u64,
         (chain, tickets): (u64, Option<Arc<ClientStore>>),
@@ -745,6 +764,7 @@ impl Records {
             chain,
             tickets,
             kernel,
+            exporter,
         })
     }
 
@@ -1789,14 +1809,14 @@ impl<E: Engine> Tls<E> {
             return Ok(());
         };
         self.facts = Facts::of(session.common())?;
-        let (kernel, secrets) = Kernel::new(session)?;
+        let (kernel, secrets, exporter) = Kernel::new(session)?;
         let kept = match kernel {
             Kernel::Client(_) => peer,
             Kernel::Server(_) => 0,
         };
         self.held.hand_off(self.cost.kernel, kept + evidence);
         self.phase = Phase::Records(Records::new(
-            kernel,
+            (kernel, exporter),
             &secrets,
             self.limits.key_records_max,
             (peer, self.tickets.take()),

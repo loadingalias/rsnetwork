@@ -6,7 +6,7 @@ use std::io;
 use rsnetwork::body::{Part, Read};
 use rsnetwork::buffer::{BufferMut, Lease, Pool, WriteLoan};
 use rsnetwork::drive::{Error, Kind};
-use rsnetwork::tls::{Closure, Negotiated, Stream as Core};
+use rsnetwork::tls::{Closure, ExportError, Negotiated, Stream as Core};
 use tokio::net::TcpStream;
 
 use crate::{Clock, Socket, Step, queued};
@@ -89,6 +89,12 @@ impl Stream {
     /// How the input of the peer ended, or `None` before its end.
     pub fn closure(&self) -> Option<Closure> {
         self.socket.connection().closure()
+    }
+
+    /// Derives `output.len()` bytes of keying material with `label` and `context` from the regular
+    /// exporter of the stream, as [`Stream::export`](rsnetwork::tls::Stream::export) does.
+    pub fn export(&self, label: &[u8], context: &[u8], output: &mut [u8]) -> Result<(), ExportError> {
+        self.socket.connection().export(label, context, output)
     }
 
     /// Ends the stream: it sends `close_notify` after the bytes that it took, waits until the

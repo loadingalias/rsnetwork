@@ -251,6 +251,10 @@ authentication are two guarantees, so a hybrid `group` does not make the authent
 post-quantum. The connection keeps its copy of the certificate, charged to its budget, until it
 drops.
 
+`Tls::export(label, context, &mut output)` derives keying material from the regular exporter of
+the connection, for example to bind a proof of possession to it: see [bind a proof to a TLS
+connection](exporter.md).
+
 ## Keys after the handshake
 
 rustls keeps the key schedule after the handshake. The record layer uses it for these messages:
@@ -383,5 +387,5 @@ budget of the connection. The memory of rustls is charged too, before rustls can
   cannot pay, the turn is `Progress::Blocked(Blocked::Capacity(n))`, and the handshake goes on in a
   later drive. The working memory of a call is large for its input, so size the budget for it: see
   [limits](limits.md#tls-handshakes).
-- After the handshake, the connection keeps the charge of the key schedule of rustls, and on a
-  client one copy of the chain of the server.
+- After the handshake, the connection keeps the charge of the key schedule of rustls and of its
+  exporter, and on a client one copy of the chain of the server.

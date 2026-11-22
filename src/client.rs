@@ -367,6 +367,14 @@ impl Http1 {
         self.link.negotiated()
     }
 
+    /// Derives `output.len()` bytes of keying material with `label` and `context` from the regular
+    /// exporter of the TLS connection, as [`Tls::export`] says. Over TCP, refuses with
+    /// [`ExportError::Unavailable`](tls::ExportError::Unavailable).
+    #[cfg(feature = "tls")]
+    pub fn export(&self, label: &[u8], context: &[u8], output: &mut [u8]) -> Result<(), tls::ExportError> {
+        self.link.export(label, context, output)
+    }
+
     /// Refuses a call after the end of the client, and a time on another clock.
     fn live(&self, now: Instant) -> Result<(), Error> {
         if let Some(error) = self.end {

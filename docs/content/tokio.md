@@ -136,12 +136,12 @@ to wait for:
 
 | Type | Calls that await | Calls that do not wait |
 | --- | --- | --- |
-| `client::Http1` | `send`, `write`, `finish`, `response`, `next`, `read_into`, `collect`, `close` | `delivered`, `cancel`, `negotiated` |
-| `client::Http2` | `send`, `drive`, `close` | `negotiated` |
+| `client::Http1` | `send`, `write`, `finish`, `response`, `next`, `read_into`, `collect`, `close` | `delivered`, `cancel`, `negotiated`, `export` |
+| `client::Http2` | `send`, `drive`, `close` | `negotiated`, `export` |
 | `client::Exchange` | `write`, `finish`, `response`, `next`, `read_into`, `collect` | `delivered` |
 | `server::Http` | `request`, `close` | `shutdown` |
-| `server::Exchange` | `respond`, `write`, `finish`, `finish_with_trailers`, `next`, `read_into`, `collect` | `head`, `cancel`, `delivery`, `negotiated` |
-| `tls::Stream` | `handshake`, `read_into`, `next`, `write`, `close` | `written`, `sent`, `closure` |
+| `server::Exchange` | `respond`, `write`, `finish`, `finish_with_trailers`, `next`, `read_into`, `collect` | `head`, `cancel`, `delivery`, `negotiated`, `export` |
+| `tls::Stream` | `handshake`, `read_into`, `next`, `write`, `close` | `written`, `sent`, `closure`, `export` |
 
 - A call gives its value when the core gives one. `read_into` never gives `Read::Wait`, and
   `collect` never gives `Collect::More`.
@@ -158,6 +158,8 @@ to wait for:
 - `negotiated(read)` of `client::Http2` and `server::Exchange` gives `read` what the TLS handshake
   negotiated, and gives what `read` gives. `read` runs under the lock of the connection, so it must
   not call the connection or one of its exchanges.
+- `export(label, context, &mut output)` derives keying material from the regular exporter of the
+  TLS connection: see [bind a proof to a TLS connection](exporter.md).
 - `tls::Stream::handshake` waits until the handshake completed, and gives what it negotiated.
 - `close` ends the connection, and waits until the transport accepted each output. Over TLS, the
   end sends `close_notify`. `client::Http1` and `tls::Stream` then close the socket. A connection

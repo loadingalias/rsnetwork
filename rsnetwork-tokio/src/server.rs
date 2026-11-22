@@ -17,7 +17,7 @@ use rsnetwork::host::{Io as _, Wait};
 use rsnetwork::message::{RequestHead, Stream, Version};
 use rsnetwork::server::{Closed, Delivery, Http as Core, Response};
 use rsnetwork::time::Deadline;
-use rsnetwork::tls::Negotiated;
+use rsnetwork::tls::{ExportError, Negotiated};
 use rsnetwork::value::Field;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -239,6 +239,13 @@ impl Exchange {
     /// one of its exchanges.
     pub fn negotiated<T>(&self, read: impl FnOnce(Option<Negotiated<'_>>) -> T) -> T {
         read(self.shared.lock().socket.connection_mut().negotiated())
+    }
+
+    /// Derives `output.len()` bytes of keying material with `label` and `context` from the regular
+    /// exporter of the connection of the exchange, as
+    /// [`Http::export`](rsnetwork::server::Http::export) does.
+    pub fn export(&self, label: &[u8], context: &[u8], output: &mut [u8]) -> Result<(), ExportError> {
+        self.shared.lock().socket.connection().export(label, context, output)
     }
 }
 

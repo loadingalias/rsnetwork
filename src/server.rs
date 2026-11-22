@@ -600,6 +600,14 @@ impl Http {
         self.link.negotiated()
     }
 
+    /// Derives `output.len()` bytes of keying material with `label` and `context` from the regular
+    /// exporter of the TLS connection, as [`Tls::export`] says. Over TCP, refuses with
+    /// [`ExportError::Unavailable`](tls::ExportError::Unavailable).
+    #[cfg(feature = "tls")]
+    pub fn export(&self, label: &[u8], context: &[u8], output: &mut [u8]) -> Result<(), tls::ExportError> {
+        self.link.export(label, context, output)
+    }
+
     /// Selects the version after the TLS handshake. Gives whether it selected one.
     fn select(&mut self, now: Instant) -> Result<bool, Error> {
         if !matches!(self.exchanges, Exchanges::Pending) {

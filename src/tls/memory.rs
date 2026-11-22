@@ -8,8 +8,8 @@
 //!   keeps a bound of the chain of the peer that rustls can keep, and gives the rest back. The
 //!   output has its own charge: before a call, the growth of the bytes that the call can write,
 //!   and after the call, its capacity.
-//! - **Kernel.** At the hand-off, the charge drops to the state of the kernel connection, and on a
-//!   client to the exact size of the chain that rustls keeps for its tickets.
+//! - **Kernel.** At the hand-off, the charge drops to the state of the kernel connection and its
+//!   exporter, and on a client to the exact size of the chain that rustls keeps for its tickets.
 //! - **Sessions.** The stores of a configuration charge each session to the budget of the
 //!   configuration. When rustls takes a session, the store charge ends, and the store charges the
 //!   session and its later copies to the connection, or gives no session.
@@ -67,6 +67,9 @@ const FLIGHT: usize = 4 * 1024;
 /// a KeyUpdate and of a session ticket.
 const KERNEL_CLIENT: u64 = 1024;
 const KERNEL_SERVER: u64 = 512;
+/// The regular exporter that each connection keeps after the handshake: the exporter secret of
+/// at most 64 bytes, its length, and the suite, in one allocation of rustls.
+const EXPORTER: u64 = 128;
 /// A ticket in the client store besides its chain and its ticket: the shared parts, the secret,
 /// the server name, and the ALPN name.
 const TICKET: u64 = 1024;
@@ -99,7 +102,7 @@ impl Cost {
             read: READ_CLIENT,
             kept: KEPT,
             transcript: identity,
-            kernel: KERNEL_CLIENT,
+            kernel: KERNEL_CLIENT + EXPORTER,
         }
     }
 
@@ -111,7 +114,7 @@ impl Cost {
             read: READ_SERVER,
             kept: client_roots.map_or(0, |_| KEPT),
             transcript: client_roots.is_some(),
-            kernel: KERNEL_SERVER,
+            kernel: KERNEL_SERVER + EXPORTER,
         }
     }
 }
