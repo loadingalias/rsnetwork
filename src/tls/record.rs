@@ -9,9 +9,7 @@ use core::ops::Range;
 
 use rscrypto::aead::Nonce96;
 use rscrypto::aead::expert::AeadWithNonce as _;
-use rscrypto::{
-    Aead, AeadGather, Aes128Gcm, Aes128GcmKey, Aes256Gcm, Aes256GcmKey, ChaCha20Poly1305, ChaCha20Poly1305Key,
-};
+use rscrypto::{AeadGather, Aes128Gcm, Aes128GcmKey, Aes256Gcm, Aes256GcmKey, ChaCha20Poly1305, ChaCha20Poly1305Key};
 use rstypes::buffer::{Backing, WriteLoan};
 use rustls::ConnectionTrafficSecrets;
 use rustls::error::AlertDescription;
@@ -56,12 +54,19 @@ impl Violation {
     }
 }
 
-/// The bytes of the record that starts `pending`, from its header: `None` until the header is
-/// complete. Refuses a header that RFC 8446 forbids after the handshake.
-pub(super) fn length(pending: &[u8]) -> Result<Option<usize>, Violation> {
-    let Some(header) = pending.first_chunk::<HEADER>() else {
+/// The bytes of the record that starts at `first` and continues in `second`, from its header:
+/// `None` until the header is complete. Refuses a header that RFC 8446 forbids after the
+/// handshake.
+pub(super) fn length(first: &[u8], second: &[u8]) -> Result<Option<usize>, Violation> {
+    let mut header = [0; HEADER];
+    let filled = header
+        .iter_mut()
+        .zip(first.iter().chain(second))
+        .map(|(slot, byte)| *slot = *byte)
+        .count();
+    if filled < HEADER {
         return Ok(None);
-    };
+    }
     if header[0] != OUTER[0] {
         return Err(Violation::new(
             AlertDescription::UnexpectedMessage,
@@ -146,43 +151,57 @@ impl Protection {
         Nonce96::from_bytes(nonce)
     }
 
-    /// Opens `record`, one complete record with its header, in place. Gives its content type and
-    /// the range of its content. A refused record keeps no plaintext.
-    pub(super) fn open(&mut self, record: &mut [u8]) -> Result<Opened, Violation> {
+    /// Opens one complete record with its header, in place. Its bytes are `first` and then
+    /// `second`: the whole record and no bytes, or the end of one received region and the start
+    /// of the next. Gives its content type and the range of its content in the record. A refused
+    /// record keeps no plaintext: the cipher clears both parts when the tag fails.
+    pub(super) fn open(&mut self, first: &mut [u8], second: &mut [u8]) -> Result<Opened, Violation> {
         const BAD_TAG: Violation =
             Violation::new(AlertDescription::BadRecordMac, "a TLS record failed its authentication");
-        let Some((header, body)) = record.split_first_chunk_mut::<HEADER>() else {
+        let Some(tag_start) = (first.len() + second.len())
+            .checked_sub(TAG)
+            .filter(|&start| start >= HEADER)
+        else {
             return Err(BAD_TAG);
         };
-        let aad = *header;
-        let Some((text, tag)) = body.split_last_chunk_mut::<TAG>() else {
-            return Err(BAD_TAG);
-        };
+        let aad: [u8; HEADER] = gather(first, second, 0);
+        let tag: [u8; TAG] = gather(first, second, tag_start);
+        let mut text = within(first, second, HEADER..tag_start);
         let nonce = self.nonce();
         let opened = match &self.cipher {
-            Cipher::Aes128(cipher) => open(cipher, &nonce, &aad, text, tag),
-            Cipher::Aes256(cipher) => open(cipher, &nonce, &aad, text, tag),
-            Cipher::ChaCha(cipher) => open(cipher, &nonce, &aad, text, tag),
+            Cipher::Aes128(cipher) => open(cipher, &nonce, &aad, &mut text, &tag),
+            Cipher::Aes256(cipher) => open(cipher, &nonce, &aad, &mut text, &tag),
+            Cipher::ChaCha(cipher) => open(cipher, &nonce, &aad, &mut text, &tag),
         };
         opened.map_err(|()| BAD_TAG)?;
         self.seq = self.seq.checked_add(1).ok_or(Violation::new(
             AlertDescription::UnexpectedMessage,
             "the peer sent more TLS records under one key than a sequence number counts",
         ))?;
-        if text.len() > CONTENT_MAX + 1 {
+        if tag_start - HEADER > CONTENT_MAX + 1 {
             return Err(Violation::new(
                 AlertDescription::RecordOverflow,
                 "a TLS record has more content than the protocol allows",
             ));
         }
         // The content type is the last byte that is not padding (RFC 8446, section 5.4).
-        let Some(end) = text.iter().rposition(|&byte| byte != 0) else {
+        let [head, tail] = text;
+        let last = tail
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .map(|at| head.len() + at)
+            .or_else(|| head.iter().rposition(|&byte| byte != 0));
+        let Some(end) = last else {
             return Err(Violation::new(
                 AlertDescription::UnexpectedMessage,
                 "a TLS record has no content type",
             ));
         };
-        let content = match text[end] {
+        let kind = match end.checked_sub(head.len()) {
+            None => head[end],
+            Some(at) => tail[at],
+        };
+        let content = match kind {
             21 => Content::Alert,
             22 => Content::Handshake,
             23 => Content::Data,
@@ -313,16 +332,44 @@ fn seal_spare<'a, A: AeadGather<Nonce = Nonce96>>(
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SealRefused;
 
-/// Opens `text` in place with `cipher`. The cipher clears `text` when the tag fails.
-fn open<A: Aead<Nonce = Nonce96>>(
+/// The ranges in each part of the bytes `range` of a record whose first `seam` bytes are in its
+/// first part, and whose other bytes are in its second part.
+pub(super) fn split(range: Range<usize>, seam: usize) -> [Range<usize>; 2] {
+    [
+        range.start.min(seam)..range.end.min(seam),
+        range.start.saturating_sub(seam)..range.end.saturating_sub(seam),
+    ]
+}
+
+/// The bytes `range` of a record whose bytes are `first` and then `second`, in each part. The
+/// caller keeps `range` in the record.
+fn within<'a>(first: &'a mut [u8], second: &'a mut [u8], range: Range<usize>) -> [&'a mut [u8]; 2] {
+    let [in_first, in_second] = split(range, first.len());
+    [&mut first[in_first], &mut second[in_second]]
+}
+
+/// The `N` bytes from `start` of a record whose bytes are `first` and then `second`. The caller
+/// keeps them in the record.
+fn gather<const N: usize>(first: &mut [u8], second: &mut [u8], start: usize) -> [u8; N] {
+    let [head, tail] = within(first, second, start..start + N);
+    let mut bytes = [0; N];
+    let (to_head, to_tail) = bytes.split_at_mut(head.len());
+    to_head.copy_from_slice(head);
+    to_tail.copy_from_slice(tail);
+    bytes
+}
+
+/// Opens the parts of `text` in place with `cipher`, as one ciphertext. The cipher clears each
+/// part when the tag fails.
+fn open<A: AeadGather<Nonce = Nonce96>>(
     cipher: &A,
     nonce: &Nonce96,
     aad: &[u8],
-    text: &mut [u8],
+    text: &mut [&mut [u8]],
     tag: &[u8; TAG],
 ) -> Result<(), ()> {
     let tag = A::tag_from_slice(tag).map_err(|_| ())?;
-    cipher.decrypt_in_place(nonce, aad, text, &tag).map_err(|_| ())
+    cipher.decrypt_in_place_segments(nonce, aad, text, &tag).map_err(|_| ())
 }
 
 /// Seals the parts of `plaintext`, `len` bytes, with `cipher` after the bytes of `out`, and then

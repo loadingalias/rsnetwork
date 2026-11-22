@@ -71,16 +71,23 @@ fn ends() -> [End; 2] {
     ]
 }
 
+/// A record opens the same in one region and split across two at any byte: in its header, its
+/// content, its content type, or its tag.
 #[test]
-fn the_rfc_8448_application_records_open_at_their_sequence_numbers() {
+fn the_rfc_8448_application_records_open_at_their_sequence_numbers_split_at_each_byte() {
     for end in ends() {
-        let mut protection = protection(end.key, end.iv);
-        for (content, plaintext, record) in end.records {
-            let mut record = hex(record);
-            assert_eq!(length(&record).unwrap(), Some(record.len()));
-            let opened = protection.open(&mut record).unwrap();
-            assert_eq!(opened.content, content);
-            assert_eq!(&record[opened.range], &plaintext[..]);
+        let longest = end.records.iter().map(|(_, _, record)| record.len() / 2).max().unwrap();
+        for seam in 0..=longest {
+            let mut protection = protection(end.key, end.iv);
+            for (content, plaintext, record) in &end.records {
+                let mut record = hex(record);
+                let len = record.len();
+                let (first, second) = record.split_at_mut(seam.min(len));
+                assert_eq!(length(first, second).unwrap(), Some(len), "seam {seam}");
+                let opened = protection.open(first, second).unwrap();
+                assert_eq!(opened.content, *content, "seam {seam}");
+                assert_eq!(&record[opened.range], &plaintext[..], "seam {seam}");
+            }
         }
     }
 }

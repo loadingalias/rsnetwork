@@ -67,7 +67,7 @@ dependencies = [
 [[package]]
 name = "rscrypto"
 version = "0.12.0"
-source = "git+https://github.com/loadingalias/rscrypto?branch=main#4b1899d17821da07a2866510036fe57e3a820e89"
+source = "git+https://github.com/loadingalias/rscrypto?branch=main#d867e6cbb56fd6661cf67ec6949a5aa645249ef0"
 dependencies = [
  "getrandom",
 ]
@@ -75,7 +75,7 @@ dependencies = [
 [[package]]
 name = "rscrypto-rustls"
 version = "0.0.0"
-source = "git+https://github.com/loadingalias/rscrypto?branch=main#4b1899d17821da07a2866510036fe57e3a820e89"
+source = "git+https://github.com/loadingalias/rscrypto?branch=main#d867e6cbb56fd6661cf67ec6949a5aa645249ef0"
 dependencies = [
  "getrandom",
  "rscrypto",

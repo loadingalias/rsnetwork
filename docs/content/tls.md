@@ -190,13 +190,19 @@ host uses decides the copies of received bytes:
 | Receive form | Calls | Copies |
 | --- | --- | --- |
 | The tail of the input region | `Connection::region()`, then `Connection::received(region, ..)` with the same region | None. A record that continues after a receive joins its first bytes in place |
-| A region of the host, for example one that the kernel selected | `Connection::received(region, ..)` with that region | When a record continues into it from the region before: the rest of that record, less than one record (`partial`) |
+| A region of the host, for example one that the kernel selected | `Connection::received(region, ..)` with that region | None after the handshake when a record that continues into it ends in it: the record opens across both regions in place. A record in three or more regions, or a record of the handshake in two, copies its bytes before its last region (`partial`) |
 | A read-only region | `Connection::receive(Received)` | Each byte, into a writable region (`received`). A region larger than `input_bytes` copies in parts: the records of each part open before the next part |
 
 The plaintext of each record reaches the engine in the drive that decrypts it, with no copy. The
 connection freezes the region up to the end of the record, and the rest of the region stays
 writable for the next receive. A record that does not fit in the rest of its region moves to a new
 region (`partial`).
+
+A record in two regions of the host reaches the engine as two plaintext regions, one in each
+received region. The record opens only after its tag passes, so no byte of a refused record
+reaches the engine. While a region of the host waits after a partial record,
+`Connection::region()` gives `None`, and `Connection::received` gives the next region back. Drive
+the connection, and then give that region again.
 
 ## Output regions of the host
 
@@ -221,7 +227,8 @@ TLS refuses with `Kind::Unsupported`. `client::Http1`, `server::Http1`, and `tls
 same two calls.
 
 `handshake` counts the bytes of a handshake message after the handshake, for example a session
-ticket, that arrives in two or more records. These parts join in a buffer of their own. `encrypted`
+ticket, that arrives in two or more records or received regions. These parts join in a buffer of
+their own. `encrypted`
 counts the plaintext that encryption wrote into ciphertext, which each sent byte needs. One request
 and its response, received into the lent tail of the input region, copy no received byte.
 

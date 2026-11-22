@@ -18,7 +18,7 @@
 //!   region, so a record that continues after a receive completes in place. A region that the host
 //!   owns, for example one that the kernel selected, goes to
 //!   [`host::Io::received`](crate::host::Io::received): a record that continues
-//!   into it costs one copy of the rest of that record. A read-only region goes to
+//!   into it opens across both regions in place. A read-only region goes to
 //!   [`host::Io::receive`](crate::host::Io::receive), and costs one copy of its
 //!   bytes.
 //! - **Delivery.** The plaintext of each record reaches the inner engine in the turn that opens
@@ -45,6 +45,7 @@ pub(crate) mod stream;
 use core::alloc::Layout;
 use core::fmt;
 use core::num::{NonZeroU32, NonZeroUsize};
+use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::borrow::Cow;
 use std::sync::{Arc, PoisonError, RwLock};
@@ -513,10 +514,13 @@ pub struct Limits {
 pub struct Copies {
     /// Received bytes from a read-only region, which an open in place needs in a writable one.
     pub received: u64,
-    /// Bytes of a partial record that moved to a new input region.
+    /// Bytes of a partial record that moved to a new input region: a record that does not fit in
+    /// the rest of its region, a record of the handshake in two regions, or a record in three or
+    /// more regions of the host. A record after the handshake in two regions opens in place.
     pub partial: u64,
     /// Bytes of a handshake message after the handshake, for example a session ticket, whose
-    /// records hold it in two or more parts: the parts join in a buffer of their own.
+    /// records or received regions hold it in two or more parts: the parts join in a buffer of
+    /// their own.
     pub handshake: u64,
     /// Plaintext that encryption wrote into the ciphertext output. Each sent byte needs it.
     pub encrypted: u64,
@@ -1266,6 +1270,13 @@ struct Next {
     start: usize,
 }
 
+impl Next {
+    /// The bytes after the ones that completed the record.
+    fn bytes(&self) -> &[u8] {
+        self.backing.bytes().get(self.start..).unwrap_or_default()
+    }
+}
+
 /// The place of the input region that the host holds for a receive.
 struct Lent {
     address: usize,
@@ -1322,6 +1333,9 @@ pub struct Tls<E> {
     region: Option<Region>,
     lent: Option<Lent>,
     next: Option<Next>,
+    /// The plaintext of a record in the second of its two regions, which waits for a place in the
+    /// inbound queue of the inner engine.
+    unqueued: Option<Lease>,
     /// The facts of the last received region.
     endpoint: Option<Endpoint>,
     capacity: u64,
@@ -1447,6 +1461,7 @@ impl<E: Engine> Tls<E> {
             region: None,
             lent: None,
             next: None,
+            unqueued: None,
             endpoint: None,
             capacity: 0,
             written,
@@ -1531,7 +1546,8 @@ impl<E: Engine> Tls<E> {
             self.inbound.end();
         }
         let input_ended = inbound.ended() && inbound.front().is_none() && self.next.is_none();
-        let partial = self.region.is_some();
+        // Plaintext that waits for a place stops the open, so it is not the end of the input.
+        let partial = self.region.is_some() || self.unqueued.is_some();
         if input_ended && partial && !stopped && self.wait.is_none() {
             return Err(Error::new(Kind::Partial, "the transport ended inside a TLS record").into());
         }
@@ -1624,7 +1640,7 @@ impl<E: Engine> Tls<E> {
                 Some(region) if region.room() > 0 => region,
                 // The complete records of a full region open first, and then only the rest of a
                 // partial record moves.
-                Some(region) if region.pending().len() >= record_end(region.pending()) => break,
+                Some(region) if region.pending().len() >= record_end(region.pending(), &[]) => break,
                 Some(_) => {
                     self.relocate()?;
                     let Some(region) = &mut self.region else { break };
@@ -1667,14 +1683,19 @@ impl<E: Engine> Tls<E> {
     }
 
     /// Copies from the waiting region of the host the bytes that complete the pending record.
+    /// After the handshake, a record that ends in that region opens across both, with no copy.
     fn complete_from_next(&mut self) -> Result<(), Error> {
+        let records = matches!(self.phase, Phase::Records(_));
         loop {
             let (Some(region), Some(next)) = (&self.region, &self.next) else {
                 return Ok(());
             };
-            let pending = region.pending();
-            let need = record_end(pending).saturating_sub(pending.len());
-            let rest = next.backing.bytes().get(next.start..).unwrap_or_default();
+            let (pending, rest) = (region.pending(), next.bytes());
+            let end = record_end(pending, rest);
+            if records && pending.len() + rest.len() >= end {
+                return Ok(());
+            }
+            let need = end.saturating_sub(pending.len());
             let take = need.min(rest.len());
             if take == 0 {
                 return Ok(());
@@ -1685,8 +1706,7 @@ impl<E: Engine> Tls<E> {
             let (Some(region), Some(next)) = (&mut self.region, &mut self.next) else {
                 return Ok(());
             };
-            let rest = next.backing.bytes().get(next.start..).unwrap_or_default();
-            let added = region.append(rest.get(..take).unwrap_or_default());
+            let added = region.append(next.bytes().get(..take).unwrap_or_default());
             self.copies.partial += added as u64;
             next.start += added;
             if next.start == next.backing.initialized() {
@@ -1712,7 +1732,7 @@ impl<E: Engine> Tls<E> {
             let next = match unread {
                 // rustls refuses a header that is longer than a record, with its alert.
                 [_, _, _, high, low, ..] if usize::from(u16::from_be_bytes([*high, *low])) > PROTECTED_MAX => HEADER,
-                _ => record_end(unread),
+                _ => record_end(unread, &[]),
             };
             if next > unread.len() || work.reached(&self.limits.turn) {
                 return Ok(());
@@ -1787,37 +1807,49 @@ impl<E: Engine> Tls<E> {
     /// Opens the complete records of the input region in place, until a limit of the turn stops
     /// it or the inbound queue of the inner engine has no place. Gives whether such a stop left
     /// records to open. The plaintext of each record reaches the inner engine at once, as a view
-    /// of the frozen part of the region.
+    /// of the frozen part of the region. A record that ends in the waiting region of the host
+    /// opens across both regions, and the input continues in the second one.
     fn open(&mut self, work: &mut Work) -> Result<bool, Fault> {
-        let (Phase::Records(records), Some(region), Some(endpoint)) =
-            (&mut self.phase, &mut self.region, self.endpoint)
-        else {
+        let (Phase::Records(records), Some(endpoint)) = (&mut self.phase, self.endpoint) else {
             return Ok(false);
         };
         loop {
+            // The plaintext of a record in its second region goes before each later record.
+            if let Some(plaintext) = self.unqueued.take() {
+                if self.inbound.free() == 0 {
+                    self.unqueued = Some(plaintext);
+                    return Ok(true);
+                }
+                push(&mut self.inbound, plaintext, endpoint, self.capacity);
+            }
+            let Some(region) = &mut self.region else {
+                return Ok(false);
+            };
             if self.notified {
                 // The peer closed: each later byte is ignored (RFC 8446, section 6.1).
                 region.start = region.backing.initialized();
                 return Ok(false);
             }
             let pending = region.pending();
-            let Some(len) = record::length(pending)? else {
+            let rest = self.next.as_ref().map_or(&[][..], Next::bytes);
+            let Some(len) = record::length(pending, rest)? else {
                 return Ok(false);
             };
-            if pending.len() < len {
+            if pending.len() + rest.len() < len {
                 return Ok(false);
             }
             if self.inbound.free() == 0 || work.reached(&self.limits.turn) {
                 return Ok(true);
             }
-            let start = region.start;
-            let end = start + len;
-            let Some(record) = region.backing.bytes_mut().get_mut(start..end) else {
-                return Ok(false);
+            // The first `seam` bytes of the record are in this region, and the rest in the next.
+            let (start, seam) = (region.start, pending.len().min(len));
+            let first = &mut region.backing.bytes_mut()[start..start + seam];
+            let second = match &mut self.next {
+                Some(next) if seam < len => &mut next.backing.bytes_mut()[next.start..next.start + len - seam],
+                _ => &mut [],
             };
-            let opened = records.rx.open(record)?;
-            let content = record.get(opened.range.clone()).unwrap_or_default();
-            region.start = end;
+            let opened = records.rx.open(first, second)?;
+            region.start = start + seam;
             work.add(len, 1);
             if opened.content != Content::Handshake && records.joined.is_some() {
                 return Err(Violation::new(
@@ -1826,37 +1858,85 @@ impl<E: Engine> Tls<E> {
                 )
                 .into());
             }
+            let [content_first, content_second] = record::split(opened.range, seam);
+            let in_first = start + content_first.start..start + content_first.end;
+            let mut in_second = 0..0;
+            // A record that ends in the next region moves the input there. The region before it
+            // is done.
+            let mut done = self.next.take_if(|_| seam < len).map(|next| {
+                let end = next.start + len - seam;
+                in_second = next.start + content_second.start..next.start + content_second.end;
+                core::mem::replace(
+                    region,
+                    Region {
+                        backing: next.backing,
+                        start: end,
+                        seen: end,
+                    },
+                )
+            });
             match opened.content {
-                Content::Data if content.is_empty() => {}
                 Content::Data => {
-                    let range = start + opened.range.start..start + opened.range.end;
-                    if let Some(plaintext) = region.freeze_prefix(end).view(range) {
+                    let before = done.as_mut().unwrap_or(&mut *region);
+                    if !in_first.is_empty()
+                        && let Some(plaintext) = before.freeze_prefix(before.start).view(in_first)
+                    {
                         push(&mut self.inbound, plaintext, endpoint, self.capacity);
+                    }
+                    if !in_second.is_empty()
+                        && let Some(plaintext) = region.freeze_prefix(region.start).view(in_second)
+                    {
+                        if self.inbound.free() > 0 {
+                            push(&mut self.inbound, plaintext, endpoint, self.capacity);
+                        } else {
+                            self.unqueued = Some(plaintext);
+                        }
                     }
                 }
                 Content::Handshake => {
-                    records.handshake(content, self.limits.input_bytes, &self.budget, &mut self.copies)?
+                    let limit = self.limits.input_bytes;
+                    match parts(done.as_ref(), region, [in_first, in_second]) {
+                        [content, []] | [[], content] => {
+                            records.handshake(content, limit, &self.budget, &mut self.copies)?;
+                        }
+                        // The two parts join in a buffer of their own, as a message in two records
+                        // does.
+                        [head, tail] => {
+                            let mut joined = Bytes::joined(&self.budget);
+                            joined.reserve(head.len() + tail.len(), MESSAGE_REFUSED)?;
+                            joined.bytes.extend_from_slice(head);
+                            joined.bytes.extend_from_slice(tail);
+                            self.copies.handshake += joined.bytes.len() as u64;
+                            records.handshake(&joined.bytes, limit, &self.budget, &mut self.copies)?;
+                        }
+                    }
                 }
-                Content::Alert => match *content {
-                    [_, description] => match AlertDescription(description) {
-                        AlertDescription::CloseNotify => self.notified = true,
-                        // A close_notify follows (RFC 8446, section 6.1).
-                        AlertDescription::UserCanceled => {}
-                        alert => return Err(refused(&rustls::Error::AlertReceived(alert)).into()),
-                    },
-                    [] => {
-                        return Err(
-                            Violation::new(AlertDescription::UnexpectedMessage, "a TLS alert record is empty").into(),
-                        );
+                Content::Alert => {
+                    let [head, tail] = parts(done.as_ref(), region, [in_first, in_second]);
+                    let mut content = head.iter().chain(tail);
+                    match (content.next(), content.next(), content.next()) {
+                        (Some(_), Some(&description), None) => match AlertDescription(description) {
+                            AlertDescription::CloseNotify => self.notified = true,
+                            // A close_notify follows (RFC 8446, section 6.1).
+                            AlertDescription::UserCanceled => {}
+                            alert => return Err(refused(&rustls::Error::AlertReceived(alert)).into()),
+                        },
+                        (None, ..) => {
+                            return Err(Violation::new(
+                                AlertDescription::UnexpectedMessage,
+                                "a TLS alert record is empty",
+                            )
+                            .into());
+                        }
+                        _ => {
+                            return Err(Violation::new(
+                                AlertDescription::DecodeError,
+                                "a TLS alert record does not hold exactly one alert",
+                            )
+                            .into());
+                        }
                     }
-                    _ => {
-                        return Err(Violation::new(
-                            AlertDescription::DecodeError,
-                            "a TLS alert record does not hold exactly one alert",
-                        )
-                        .into());
-                    }
-                },
+                }
             }
         }
     }
@@ -1982,11 +2062,21 @@ fn push(inbound: &mut Inbound, region: Lease, endpoint: Endpoint, capacity: u64)
     );
 }
 
-/// The end of the record that starts `pending`: its header and its payload. A partial header
-/// needs at least its 5 bytes.
-fn record_end(pending: &[u8]) -> usize {
-    match pending {
-        [_, _, _, high, low, ..] => HEADER + usize::from(u16::from_be_bytes([*high, *low])),
+/// The bytes `in_first` of the region where a record starts, which is `done` when the record ends
+/// in `region`, and the bytes `in_second` of `region`.
+fn parts<'a>(done: Option<&'a Region>, region: &'a Region, [in_first, in_second]: [Range<usize>; 2]) -> [&'a [u8]; 2] {
+    [
+        done.unwrap_or(region).backing.bytes().get(in_first).unwrap_or_default(),
+        region.backing.bytes().get(in_second).unwrap_or_default(),
+    ]
+}
+
+/// The end of the record that starts at `first` and continues in `second`: its header and its
+/// payload. A partial header needs at least its 5 bytes.
+fn record_end(first: &[u8], second: &[u8]) -> usize {
+    let mut length = first.iter().chain(second).skip(3);
+    match (length.next(), length.next()) {
+        (Some(&high), Some(&low)) => HEADER + usize::from(u16::from_be_bytes([high, low])),
         _ => HEADER,
     }
 }
@@ -2036,9 +2126,14 @@ impl<E: Engine> Engine for Tls<E> {
         if self.lent.is_some() {
             return Err(Error::new(Kind::Misuse, "the lent TLS input region has not come back"));
         }
+        // The input continues after the waiting region of the host, not in the tail of the
+        // region before it: the next bytes go into a region of the host.
+        if self.next.is_some() {
+            return Ok(None);
+        }
         if let Some(region) = &self.region {
             let pending = region.pending();
-            if region.room() < record_end(pending).saturating_sub(pending.len()).max(1) {
+            if region.room() < record_end(pending, &[]).saturating_sub(pending.len()).max(1) {
                 self.relocate()?;
             }
         }

@@ -46,6 +46,8 @@ const VALID: u64 = 1_798_761_600;
 const EXPIRED: u64 = 2_114_380_800;
 
 const BODY: &[u8] = b"hello over tls";
+/// The record of `BODY`: its header, the body, its content type, and its tag.
+const BODY_RECORD: usize = 5 + BODY.len() + 1 + 16;
 
 const HEAD: HeadLimits = HeadLimits {
     head_bytes: 1024,
@@ -182,8 +184,14 @@ struct Pair {
 
 /// A client connection to the server `name`, with its own budget.
 fn client(config: &ClientConfig, name: &str, limits: Limits) -> Connection<Tls<Client>> {
+    client_with_queue(config, name, limits, 16)
+}
+
+/// A client connection whose engine takes at most `places` plaintext regions at a time.
+fn client_with_queue(config: &ClientConfig, name: &str, limits: Limits, places: usize) -> Connection<Tls<Client>> {
     let budget = budget();
-    let (inbound, outbound) = queues(&budget);
+    let inbound = Inbound::new(NonZeroUsize::new(places).unwrap(), &budget).unwrap();
+    let outbound = Outbound::new(NonZeroUsize::new(16).unwrap(), &budget).unwrap();
     let engine = Client::new(HEAD, BODY_LIMITS, TURN, &outbound, &budget).unwrap();
     let tls = Tls::client(config, name, engine, (inbound, outbound), limits, &budget).unwrap();
     let (inbound, outbound) = queues(&budget);
@@ -241,12 +249,7 @@ impl Pair {
     fn run(&mut self) {
         for _ in 0..1024 {
             drive(&mut self.server, answer);
-            let (body, ended) = (&mut self.body, &mut self.ended);
-            drive(&mut self.client, |_, event| match event {
-                ClientEvent::Data(data) => body.extend_from_slice(data.bytes()),
-                ClientEvent::End(_) => *ended = true,
-                _ => {}
-            });
+            self.drive_client();
             take(&mut self.server, &mut self.to_client, self.parts);
             take(&mut self.client, &mut self.to_server, self.parts);
             let moved = [
@@ -264,6 +267,39 @@ impl Pair {
             }
         }
         panic!("the connections still move bytes after 1024 rounds");
+    }
+
+    /// Drives the client until it waits, and keeps the body and the end of its response.
+    fn drive_client(&mut self) {
+        let (body, ended) = (&mut self.body, &mut self.ended);
+        drive(&mut self.client, |_, event| match event {
+            ClientEvent::Data(data) => body.extend_from_slice(data.bytes()),
+            ClientEvent::End(_) => *ended = true,
+            _ => {}
+        });
+    }
+
+    /// Sends a GET request to the server, and gives the ciphertext of its response, which the
+    /// client has not received. The body of the response is its last record.
+    fn response(&mut self) -> Vec<u8> {
+        self.body.clear();
+        self.ended = false;
+        self.request(&[]);
+        drive(&mut self.client, |_, _| {});
+        let mut to_server = VecDeque::new();
+        take(&mut self.client, &mut to_server, 1);
+        for part in to_server {
+            give(&mut self.server, &part, Receive::Lent);
+        }
+        drive(&mut self.server, answer);
+        let mut to_client = VecDeque::new();
+        take(&mut self.server, &mut to_client, 1);
+        let response: Vec<u8> = to_client.into_iter().flatten().collect();
+        // The header of the last record: application data of `BODY_RECORD` bytes.
+        let body = response.len() - BODY_RECORD;
+        let [high, low] = u16::try_from(BODY_RECORD - 5).unwrap().to_be_bytes();
+        assert_eq!(response[body..body + 5], [23, 3, 3, high, low]);
+        response
     }
 
     fn client_error(&self) -> Option<Error> {
@@ -450,38 +486,85 @@ fn a_region_of_the_host_too_small_for_a_record_of_one_byte_refuses_and_comes_bac
 }
 
 #[test]
-fn a_record_split_across_two_regions_opens_and_copies_at_most_the_rest_of_one_record() {
+fn a_record_split_across_two_regions_opens_in_place_with_no_copy() {
     let (client, server) = (
         client_config(CA, None, VALID, Resumption::Off),
         server_config(None, Resumption::Off),
     );
+    // The bytes after each seam: in the record of the head, and in the header, the body, the
+    // content type, and the tag of the record of the body.
+    let seams = [BODY_RECORD + 10, BODY_RECORD - 2, BODY_RECORD - 9, BODY_RECORD - 19, 3];
     for receive in [Receive::Lent, Receive::Host] {
         let mut pair = Pair::new(&client, "server.test", &server);
         pair.request(&[]);
         pair.run();
-        // A second request, whose response record arrives in two regions.
-        pair.body.clear();
-        pair.ended = false;
-        let before = copies(&mut pair).0;
-        pair.receive = receive;
-        pair.parts = 2;
-        pair.request(&[]);
-        pair.run();
-        assert_eq!(pair.client_error(), None, "{receive:?}");
-        assert_eq!(pair.body, BODY, "{receive:?}");
-        let after = copies(&mut pair).0;
-        let partial = after.partial - before.partial;
-        match receive {
-            // The second half arrives in the tail of the same region, and the record opens there:
-            // only encryption copies.
-            Receive::Lent => assert_eq!(Copies { encrypted: 0, ..after }, Copies::default()),
-            // The rest of the record moves from the second region: less than one record.
-            _ => assert!(
-                partial > 0 && partial < rsnetwork::tls::RECORD_BYTES_MAX as u64,
-                "{partial}"
-            ),
+        for after in seams {
+            let response = pair.response();
+            let (first, second) = response.split_at(response.len() - after);
+            give(&mut pair.client, first, receive);
+            pair.drive_client();
+            give(&mut pair.client, second, receive);
+            pair.drive_client();
+            let delivered = (pair.client_error(), &pair.body[..], pair.ended);
+            assert_eq!(
+                delivered,
+                (None, BODY, true),
+                "{receive:?}, {after} bytes after the seam"
+            );
         }
+        // Each received byte opened where it arrived: only encryption copied.
+        let copied = Copies {
+            encrypted: 0,
+            ..copies(&mut pair).0
+        };
+        assert_eq!(copied, Copies::default(), "{receive:?}");
     }
+}
+
+#[test]
+fn a_record_with_a_wrong_tag_in_two_regions_ends_the_connection_and_gives_no_byte_of_it() {
+    let mut pair = Pair::new(
+        &client_config(CA, None, VALID, Resumption::Off),
+        "server.test",
+        &server_config(None, Resumption::Off),
+    );
+    pair.request(&[]);
+    pair.run();
+    let mut response = pair.response();
+    *response.last_mut().unwrap() ^= 1;
+    // The first 4 bytes of the body are in the first region, and the client drives between the
+    // regions.
+    let (first, second) = response.split_at(response.len() - BODY_RECORD + 9);
+    give(&mut pair.client, first, Receive::Host);
+    pair.drive_client();
+    give(&mut pair.client, second, Receive::Host);
+    pair.drive_client();
+    let error = pair.client_error().unwrap();
+    assert_eq!(
+        (error.kind(), error.reason()),
+        (Kind::Malformed, "a TLS record failed its authentication")
+    );
+    assert_eq!(pair.body, b"");
+}
+
+#[test]
+fn a_record_in_two_regions_reaches_an_engine_that_takes_one_region_at_a_time() {
+    let (client, server) = (
+        client_config(CA, None, VALID, Resumption::Off),
+        server_config(None, Resumption::Off),
+    );
+    let mut pair = Pair::new(&client, "server.test", &server);
+    pair.client = client_with_queue(&client, "server.test", LIMITS, 1);
+    pair.request(&[]);
+    pair.run();
+    let response = pair.response();
+    // The body is in both regions, so its plaintext reaches the engine as two regions.
+    let (first, second) = response.split_at(response.len() - BODY_RECORD + 9);
+    give(&mut pair.client, first, Receive::Host);
+    pair.drive_client();
+    give(&mut pair.client, second, Receive::Host);
+    pair.drive_client();
+    assert_eq!((pair.client_error(), &pair.body[..], pair.ended), (None, BODY, true));
 }
 
 #[test]
@@ -572,6 +655,29 @@ fn a_second_connection_of_the_same_process_resumes_its_session() {
         kinds.push(pair.client.parts().0.negotiated().unwrap().handshake);
     }
     assert_eq!(kinds, [Handshake::Full, Handshake::Resumed]);
+}
+
+#[test]
+fn a_session_ticket_in_two_regions_of_the_host_joins_and_resumes_the_next_connection() {
+    let (client, server) = (client_config(CA, None, VALID, SESSIONS), server_config(None, SESSIONS));
+    let mut first = Pair::new(&client, "server.test", &server);
+    // Each output reaches the client in two regions of the host, so a ticket record is in both.
+    first.receive = Receive::Host;
+    first.parts = 2;
+    first.request(&[]);
+    first.run();
+    assert_eq!(first.body, BODY);
+    assert!(
+        copies(&mut first).0.handshake > 0,
+        "no ticket record was in two regions"
+    );
+    let mut second = Pair::new(&client, "server.test", &server);
+    second.request(&[]);
+    second.run();
+    assert_eq!(
+        second.client.parts().0.negotiated().unwrap().handshake,
+        Handshake::Resumed
+    );
 }
 
 #[test]
@@ -836,6 +942,32 @@ fn a_key_update_that_the_peer_asks_for_changes_both_keys_over_each_suite() {
         assert_eq!(peer.data.windows(6).filter(|bytes| bytes == b"GET / ").count(), 2);
         // The second request is the first record under the new key of the client.
         assert_eq!(peer.keys().rx.0, 1, "{:?}", suite.common.suite);
+    }
+}
+
+#[test]
+fn a_record_of_the_peer_in_two_regions_of_the_host_opens_in_place_over_each_suite() {
+    let config = client_config(CA, None, VALID, Resumption::Off);
+    for suite in SUITES {
+        let mut peer = Peer::new(&peer_config(suite, None));
+        let mut client = client(&config, "server.test", LIMITS);
+        let mut body = Vec::new();
+        exchange(&mut client, &mut peer, &mut body);
+        request(&mut client, &[]);
+        exchange(&mut client, &mut peer, &mut body);
+        // The response is one record, and each region holds a half of it.
+        let response = peer.send(RESPONSE);
+        let (first, second) = response.split_at(response.len() / 2);
+        give(&mut client, first, Receive::Host);
+        exchange(&mut client, &mut peer, &mut body);
+        give(&mut client, second, Receive::Host);
+        exchange(&mut client, &mut peer, &mut body);
+        assert_eq!(body, BODY, "{:?}", suite.common.suite);
+        let copied = Copies {
+            encrypted: 0,
+            ..client.parts().0.copies()
+        };
+        assert_eq!(copied, Copies::default(), "{:?}", suite.common.suite);
     }
 }
 
