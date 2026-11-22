@@ -14,7 +14,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "=0.4.13"
-rsnetwork = { path = "..", default-features = false }
+# The QUIC targets need the `tls` feature: the provider of the packet and header protection.
+rsnetwork = { path = "..", default-features = false, features = ["tls"] }
 # The independent parser of the `differential` target, as in the dev-dependencies of rsnetwork.
 httparse = "=1.10.1"
 
@@ -92,6 +93,20 @@ bench = false
 [[bin]]
 name = "differential"
 path = "fuzz_targets/differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_packet"
+path = "fuzz_targets/quic_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_frame"
+path = "fuzz_targets/quic_frame.rs"
 test = false
 doc = false
 bench = false

@@ -50,6 +50,8 @@ pub mod hpack;
 mod link;
 pub mod message;
 pub mod qpack;
+#[cfg(feature = "tls")]
+pub mod quic;
 pub mod server;
 #[cfg(feature = "tls")]
 pub mod tls;
