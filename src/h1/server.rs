@@ -73,6 +73,9 @@ pub struct Server {
     request: Request,
     /// The connection closes after the current response.
     close: bool,
+    /// A shutdown came after the client last learned of a close: the next request head that is
+    /// complete in the queue gets `503` with `connection: close`, and then the connection ends.
+    refusing: bool,
     /// The application cancelled the response inside the request body: the next drive gives that
     /// body its `End(Outcome::Cancelled)`.
     cancelled: bool,
@@ -183,6 +186,7 @@ impl Server {
             write: Write::Idle,
             request: Request::default(),
             close: false,
+            refusing: false,
             cancelled: false,
             hold: false,
             end: None,
@@ -305,6 +309,11 @@ impl Server {
             let reader = match &mut self.read {
                 // A pipelined request waits for the response before it.
                 ReadState::Head if self.write != Write::Idle => return Ok(None),
+                // After a shutdown, also a part of a head at the end of input ends with no error.
+                ReadState::Head if self.refusing => {
+                    self.refuse_head(inbound)?;
+                    return Ok(None);
+                }
                 ReadState::Head if inbound.front().is_none() && inbound.ended() => {
                     self.end = Some(match self.join {
                         Some(_) => Err(Error::new(Kind::Partial, "the request head ended before its end")),
@@ -468,7 +477,7 @@ impl Server {
     /// Ends the exchange of a request and its response: the connection closes, or the next request
     /// can start.
     fn next(&mut self) {
-        if self.close {
+        if self.close && !self.refusing {
             self.end = Some(Ok(()));
         } else {
             self.read = ReadState::Head;
@@ -676,16 +685,37 @@ impl Server {
         self.hold = hold;
     }
 
-    /// Takes no new request: the connection ends after the exchange in flight, and its response
-    /// gets `connection: close` when its head is not out yet. With no exchange in flight, the
-    /// connection ends at once, also when a part of a request head arrived: the engine did not
-    /// accept that request, so the client can send it again (RFC 9112, section 9.6). The bytes of
-    /// a pipelined request stay unread.
+    /// Takes no new request, and tells the client which requests the server did not process.
+    /// The application sees no request after it.
+    ///
+    /// - The response of the exchange in flight gets `connection: close` when its head is not out
+    ///   yet. A server that sends `close` processes no later request on the connection (RFC 9112,
+    ///   section 9.6), so the client can send each later request again.
+    /// - Else, after the exchange in flight, or at once with none, the next request head that is
+    ///   complete in the queue gets `503` with `connection: close`: the server did not process it
+    ///   (RFC 9110, section 15.6.4). Then the connection ends. With no complete head, it ends with
+    ///   no response, and the bytes of a part of a head stay unread.
+    ///
+    /// The next drive takes the step.
     pub fn shutdown(&mut self) {
+        self.refusing = self.end.is_none()
+            && match self.write {
+                Write::Idle => true,
+                Write::Waiting => false,
+                Write::Body | Write::Done => !self.close,
+            };
         self.close = true;
-        if self.waits_for_head() {
-            self.end = Some(Ok(()));
+    }
+
+    /// Answers the request head that is complete in the queue after a shutdown, as
+    /// [`shutdown`](Self::shutdown) says, and ends the connection.
+    fn refuse_head(&mut self, inbound: &mut Inbound) -> Result<(), ParseError> {
+        self.refusing = false;
+        if self.head(inbound)?.is_some() {
+            self.owed = Some(b"HTTP/1.1 503 \r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
         }
+        self.end = Some(Ok(()));
+        Ok(())
     }
 
     /// Cancels the current response. The connection closes after the bytes that `outbound`

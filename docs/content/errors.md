@@ -37,6 +37,8 @@ Each module keeps its own error type, with the detail that its caller needs. Eac
 | `h1::ParseError::Version`, `TransferCoding` | `Unsupported` |
 | `h1::ParseError::Malformed`, `Framing` | `Malformed` |
 | `drive::AckError` | `Misuse` |
+| `buffer::PoolRefused::Budget` and `Allocation` | `Overload` |
+| `buffer::PoolRefused::Layout` | `Misuse` |
 
 The reason of the converted error is the `Display` text of the module error.
 

@@ -25,8 +25,9 @@
 //!   in whole records over TLS. A peer that resets the connection after the handler finished
 //!   makes the delivery [`Delivery::Partial`], with `finished` true.
 //! - **Close.** A close has four steps, and each is its own event. [`shutdown`](Http1::shutdown)
-//!   refuses new work: a request that the application did not see gets `503` and
-//!   `connection: close`. The exchange in flight drains until its deadline. Then the protocol
+//!   refuses new work, and tells the client which requests the server did not process: with
+//!   `connection: close` on the response in flight, or with `503` for its next request. The
+//!   exchange in flight drains until its deadline. Then the protocol
 //!   closes: over TLS with `close_notify`, and then the TCP half-close. The terminal release
 //!   follows.
 //! - **Linger.** After the last output, [`wait`](Http1::wait) gives
@@ -456,8 +457,11 @@ impl Http1 {
     }
 
     /// Closes the connection at `now`: it refuses new work, drains the exchange in flight, and
-    /// then closes the protocol and lingers. A request that the application did not see gets
-    /// `503` with `connection: close`, and the client can send it again. At `deadline`, the
+    /// then closes the protocol and lingers. The response in flight gets `connection: close` when
+    /// its head is not out yet. Else the next request whose head arrived whole, which the
+    /// application does not see, gets `503` with `connection: close`. Thus the client can send
+    /// each request that the server did not process again, as
+    /// [`h1::Server::shutdown`](crate::h1::Server::shutdown) says. At `deadline`, the
     /// connection ends whatever remains, and [`Closed::cleanup`] reports
     /// [`Kind::Deadline`]. Refuses with [`Kind::Misuse`] when `deadline` or `now` is not on the
     /// clock of the server.

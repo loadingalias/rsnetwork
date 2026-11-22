@@ -170,11 +170,13 @@ write count when its last record went.
 
 `shutdown(deadline, now)` closes the connection in four steps, and each one is its own event:
 
-1. **Refuse new work.** The server takes no new request. A request that arrived and that your
-   handler did not see gets `503` with `connection: close`. The client can send it again, because
-   no handler ran for it. Bytes of a request after it stay unread.
-2. **Drain the exchange in flight.** Your handler goes on. Its response gets `connection: close`
-   when its head is not out yet.
+1. **Refuse new work.** The server takes no new request, and the client learns which requests it
+   did not process. The response in flight gets `connection: close` when its head is not out yet:
+   a server that sends `close` processes no later request (RFC 9112, section 9.6). Else the next
+   request whose head arrived whole gets `503` with `connection: close`, also when the server did
+   not read its bytes yet. The client can send each of these requests again, also a POST, because
+   no handler ran for it. Bytes of a request after it, and a part of a head, stay unread.
+2. **Drain the exchange in flight.** Your handler goes on.
 3. **Close the protocol.** Over TLS, the server sends `close_notify`. Then the [linger](#linger)
    half-closes the transport.
 4. **Release.** `release()` gives `Closed` when the transport accepted each output and the linger

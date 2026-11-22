@@ -42,7 +42,7 @@ use rsnetwork::body::Collect;
 use rsnetwork::buffer::{Lease, Pool, WriteLoan};
 use rsnetwork::capacity::Budget;
 use rsnetwork::client::{self, Request};
-use rsnetwork::drive::{Error, Kind, TurnLimits};
+use rsnetwork::drive::TurnLimits;
 use rsnetwork::h1::{self, BodyLimits, Framing};
 use rsnetwork::server::{self, Linger, Response};
 use rsnetwork::value::{Authority, Method, Status, Target};
@@ -78,11 +78,7 @@ runtime.block_on(async {
     // Each accepted connection gets a server of the core and its receive regions.
     let make = {
         let (budget, pool) = (budget.clone(), pool.clone());
-        move || {
-            let refused = |_| Error::new(Kind::Overload, "the budget refused the receive regions");
-            let pool = pool().map_err(refused)?;
-            Ok((server::Http1::plain(server_limits, Clock.domain(), &budget)?, pool))
-        }
+        move || Ok((server::Http1::plain(server_limits, Clock.domain(), &budget)?, pool()?))
     };
     let connections = NonZeroUsize::new(1024).expect("not zero");
     let server = Server::serve(listener, connections, make, move |mut connection| async move {
@@ -163,11 +159,12 @@ that runtime.
 - `handler` takes the connection, a `server::Http1`, and serves its requests in order. When the
   handler returns or drops the connection, the task drives the rest: the delivery of the last
   response, the close, and the linger. A response that the handler did not finish is cancelled, so
-  the client sees it incomplete. A request that comes after the handler gets `503`.
+  the client sees it incomplete. The client learns which later requests the server did not
+  process, as the [server](server.md#close) says.
 - `server.close(deadline)` stops the accepts. Each connection drains with `deadline`, as
-  `server::Http1::shutdown` says: the exchange in flight completes, and a request that the handler
-  did not see gets `503` with `connection: close`. Then the close joins each task. At `deadline`,
-  it aborts each task that did not end, for example a handler that waits for another future.
+  `server::Http1::shutdown` says: the exchange in flight completes, and the client learns which
+  requests the server did not process. Then the close joins each task. At `deadline`, it aborts
+  each task that did not end, for example a handler that waits for another future.
 - A server that drops before its close aborts each of its tasks, and each connection resets.
 
 `close` gives a `Report`:

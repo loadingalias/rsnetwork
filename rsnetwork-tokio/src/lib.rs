@@ -26,7 +26,7 @@
 //! use rsnetwork::buffer::{Lease, Pool, WriteLoan};
 //! use rsnetwork::capacity::Budget;
 //! use rsnetwork::client::{self, Request};
-//! use rsnetwork::drive::{Error, Kind, TurnLimits};
+//! use rsnetwork::drive::TurnLimits;
 //! use rsnetwork::h1::{self, BodyLimits, Framing};
 //! use rsnetwork::server::{self, Linger, Response};
 //! use rsnetwork::value::{Authority, Method, Status, Target};
@@ -62,11 +62,7 @@
 //!     // Each accepted connection gets a server of the core and its receive regions.
 //!     let make = {
 //!         let (budget, pool) = (budget.clone(), pool.clone());
-//!         move || {
-//!             let refused = |_| Error::new(Kind::Overload, "the budget refused the receive regions");
-//!             let pool = pool().map_err(refused)?;
-//!             Ok((server::Http1::plain(server_limits, Clock.domain(), &budget)?, pool))
-//!         }
+//!         move || Ok((server::Http1::plain(server_limits, Clock.domain(), &budget)?, pool()?))
 //!     };
 //!     let connections = NonZeroUsize::new(1024).expect("not zero");
 //!     let server = Server::serve(listener, connections, make, move |mut connection| async move {

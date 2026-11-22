@@ -176,7 +176,7 @@ impl Http1 {
 
     /// Closes the connection with `deadline`, as
     /// [`Http1::shutdown`](rsnetwork::server::Http1::shutdown) does: it drains the exchange in
-    /// flight, and refuses the next request with `503`.
+    /// flight, and tells the client which requests the server did not process.
     pub fn shutdown(&mut self, deadline: Deadline) -> Result<(), Error> {
         self.socket().connection_mut().shutdown(deadline, Clock.now())
     }
@@ -188,8 +188,8 @@ impl Http1 {
 
     /// Ends the connection, and drives it until its release: the delivery of the last response,
     /// the close, and the linger. A response that is not finished is cancelled, so the client
-    /// sees it incomplete, and a request that comes after it gets `503`, as
-    /// [`shutdown`](Self::shutdown) says. The delivery and the linger bound the close, and a
+    /// sees it incomplete. The client learns which later requests the server did not process,
+    /// as [`shutdown`](Self::shutdown) says. The delivery and the linger bound the close, and a
     /// close of the [`Server`] adds its deadline. Gives the end of the connection, and
     /// [`delivery`](Self::delivery) then gives the final delivery of the last response.
     pub async fn release(&mut self) -> Result<Closed, Error> {

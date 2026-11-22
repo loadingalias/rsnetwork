@@ -125,7 +125,7 @@ queues yourself:
 | `accept_body` | Sends `100 Continue` to a request that waits for it, and starts the read of its body |
 | `inform` | Sends an informational response with a status from 102 to 199, for example 103 |
 | `cancel` | Stops the response with no end of its body. A request body that did not end gets `End(Outcome::Cancelled)`. The connection then ends |
-| `shutdown` | Takes no new request. The connection ends after the exchange in flight, whose response gets `connection: close` when its head is not out yet. With no exchange in flight, it ends at once. A pipelined request stays unread |
+| `shutdown` | Takes no new request, and the application sees none after it. The response in flight gets `connection: close` when its head is not out yet. Else, after the exchange in flight or at once, the next request head that arrived whole gets `503` with `connection: close`, and then the connection ends. A part of a head stays unread. The next drive takes the step |
 | `hold_body(hold)` | While `hold` is true, a drive gives no event of the request body, and its bytes wait in the queue. Hold the body while your code cannot take a part of it. A drain goes on |
 
 `send` and `finish` refuse with `Kind::Overload` when the `Outbound` queue or the pool is full,

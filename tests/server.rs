@@ -380,6 +380,81 @@ fn a_shutdown_drains_the_request_in_flight_and_refuses_the_one_that_the_applicat
     );
 }
 
+/// After a shutdown, the client learns which requests the server did not process: from
+/// `connection: close` on the response in flight, or from `503` for its next request, also when
+/// the bytes of that request arrived and the engine did not read them yet.
+#[test]
+fn a_shutdown_tells_the_client_which_requests_the_server_did_not_process() {
+    const PIPELINED: &[u8] = b"GET /a HTTP/1.1\r\nhost: a\r\n\r\nGET /b HTTP/1.1\r\nhost: a\r\n\r\n";
+    let has_close = |bytes: &[u8]| bytes.windows(17).any(|line| line == b"connection: close");
+    let ends = |server: &mut Http1| {
+        while server.release().is_none() {
+            assert!(server.request(at(0)).unwrap().is_none());
+            server.end_input();
+        }
+        server.release().map(|closed| closed.result)
+    };
+
+    // The head of the response in flight is out with no `close`: the next request gets 503.
+    let mut server = plain();
+    give(&mut server, PIPELINED);
+    server.request(at(0)).unwrap().expect("the first request");
+    assert!(server.respond(&ok(Framing::Length(2)), at(0)).unwrap());
+    server.write(&Lease::from(&b"o"[..]), at(0)).unwrap();
+    server.shutdown(Deadline::at(at(1_000)), at(0)).unwrap();
+    server.write(&Lease::from(&b"k"[..]), at(0)).unwrap();
+    server.finish(at(0)).unwrap();
+    assert!(server.request(at(0)).unwrap().is_none());
+    let bytes = take(&mut server);
+    let (first, refusal) = bytes.split_at(bytes.windows(2).position(|pair| pair == b"ok").unwrap() + 2);
+    assert!(
+        first.starts_with(b"HTTP/1.1 200 ") && !has_close(first),
+        "{}",
+        first.escape_ascii()
+    );
+    assert!(
+        refusal.starts_with(b"HTTP/1.1 503 ") && has_close(refusal),
+        "{}",
+        refusal.escape_ascii()
+    );
+    assert_eq!(ends(&mut server), Some(Ok(())));
+
+    // The head of the response in flight is not out: it gets `close`, and nothing follows it.
+    let mut server = plain();
+    give(&mut server, PIPELINED);
+    server.request(at(0)).unwrap().expect("the first request");
+    server.shutdown(Deadline::at(at(1_000)), at(0)).unwrap();
+    assert!(server.respond(&ok(Framing::Length(2)), at(0)).unwrap());
+    server.write(&Lease::from(&b"ok"[..]), at(0)).unwrap();
+    server.finish(at(0)).unwrap();
+    assert!(server.request(at(0)).unwrap().is_none());
+    let bytes = take(&mut server);
+    assert!(bytes.starts_with(b"HTTP/1.1 200 ") && has_close(&bytes) && bytes.ends_with(b"ok"));
+    assert_eq!(ends(&mut server), Some(Ok(())));
+
+    // No exchange in flight, and a head that arrived whole: it gets 503, and the application
+    // never sees it.
+    let mut server = plain();
+    give(&mut server, b"GET /c HTTP/1.1\r\nhost: a\r\n\r\n");
+    server.shutdown(Deadline::at(at(1_000)), at(0)).unwrap();
+    assert!(server.request(at(0)).unwrap().is_none());
+    let bytes = take(&mut server);
+    assert!(
+        bytes.starts_with(b"HTTP/1.1 503 ") && has_close(&bytes),
+        "{}",
+        bytes.escape_ascii()
+    );
+    assert_eq!(ends(&mut server), Some(Ok(())));
+
+    // A part of a head gets no response.
+    let mut server = plain();
+    give(&mut server, b"GET /c HTT");
+    server.shutdown(Deadline::at(at(1_000)), at(0)).unwrap();
+    assert!(server.request(at(0)).unwrap().is_none());
+    assert_eq!(take(&mut server), b"");
+    assert_eq!(ends(&mut server), Some(Ok(())));
+}
+
 #[test]
 fn over_tls_a_shutdown_sends_close_notify_before_the_linger() {
     // The peer is the client engine of the core over TLS, which the test drives explicitly.

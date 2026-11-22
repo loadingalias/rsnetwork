@@ -66,7 +66,7 @@ use core::net::SocketAddr;
 use core::num::NonZeroUsize;
 use std::collections::VecDeque;
 
-use rstypes::buffer::{Buffer as _, Lease};
+use rstypes::buffer::{Buffer as _, Lease, PoolRefused};
 use rstypes::capacity::{Budget, Permit};
 use rstypes::time::Deadline;
 
@@ -526,6 +526,20 @@ impl core::error::Error for AckError {}
 impl From<AckError> for Error {
     fn from(error: AckError) -> Self {
         Self::new(Kind::Misuse, error.reason())
+    }
+}
+
+/// The refusal of a pool of regions, for example the receive regions of a socket. A call that
+/// makes a pool can then refuse with `?`.
+impl From<PoolRefused> for Error {
+    fn from(refused: PoolRefused) -> Self {
+        match refused {
+            PoolRefused::Budget(_) => Self::new(Kind::Overload, "the budget refused the regions of a pool"),
+            PoolRefused::Layout => Self::new(Kind::Misuse, "the regions of a pool have no valid layout"),
+            PoolRefused::Allocation => {
+                Self::new(Kind::Overload, "the memory for the regions of a pool is not available")
+            }
+        }
     }
 }
 
