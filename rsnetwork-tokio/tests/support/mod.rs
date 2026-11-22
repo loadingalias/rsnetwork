@@ -57,8 +57,8 @@ pub(crate) const BODY: BodyLimits = BodyLimits {
     trailer_fields: 4,
 };
 
-/// The HTTP/2 limits, which these HTTP/1.1 tests do not use.
-const H2: h2::Limits = h2::Limits {
+/// The HTTP/2 limits: at most 8 streams at a time.
+pub(crate) const H2: h2::Limits = h2::Limits {
     settings: h2::Settings {
         max_concurrent_streams: 8,
         max_header_list_size: 4096,
@@ -130,7 +130,7 @@ pub(crate) fn server_config() -> ServerConfig {
             key: PrivateKeyDer::try_from(key.to_vec()).unwrap(),
         },
         client_roots: None,
-        protocols: &[b"http/1.1"],
+        protocols: &[b"h2", b"http/1.1"],
         resumption: Resumption::Off,
         budget: &budget(),
         clock: Arc::new(At),
@@ -139,11 +139,16 @@ pub(crate) fn server_config() -> ServerConfig {
     .unwrap()
 }
 
+/// A client configuration with ALPN `http/1.1`, which the server selects.
 pub(crate) fn client_config() -> ClientConfig {
+    client_with(&[b"http/1.1"])
+}
+
+fn client_with(protocols: &[&[u8]]) -> ClientConfig {
     ClientConfig::new(ClientOptions {
         roots: &[CertificateDer::from(CA.to_vec())],
         identity: None,
-        protocols: &[b"http/1.1"],
+        protocols,
         resumption: Resumption::Off,
         budget: &budget(),
         clock: Arc::new(At),
@@ -154,23 +159,60 @@ pub(crate) fn client_config() -> ClientConfig {
 
 /// A client of the core over `transport`, on the clock of the binding.
 pub(crate) fn core_client(transport: Transport) -> client::Http1 {
-    let limits = client::Limits {
-        head: HEAD,
-        h2: H2,
-        body: BODY,
-        turn: TURN,
-        queue: QUEUE,
-    };
     match transport {
-        Transport::Plain => client::Http1::plain(limits, Clock.domain(), &budget()).unwrap(),
+        Transport::Plain => client::Http1::plain(CLIENT, Clock.domain(), &budget()).unwrap(),
         Transport::Tls => client::Http1::tls(
             &client_config(),
             "server.test",
-            (limits, TLS),
+            (CLIENT, TLS),
             Clock.domain(),
             &budget(),
         )
         .unwrap(),
+    }
+}
+
+/// The limits of a client of the tests.
+const CLIENT: client::Limits = client::Limits {
+    head: HEAD,
+    h2: H2,
+    body: BODY,
+    turn: TURN,
+    queue: QUEUE,
+};
+
+/// An HTTP/2 client of the core over `transport`, on the clock of the binding: with prior
+/// knowledge over TCP, and with ALPN `h2` over TLS.
+pub(crate) fn core_h2_client(transport: Transport) -> client::Http2 {
+    match transport {
+        Transport::Plain => client::Http2::plain(CLIENT, Clock.domain(), &budget()).unwrap(),
+        Transport::Tls => client::Http2::tls(
+            &client_with(&[b"h2"]),
+            "server.test",
+            (CLIENT, TLS),
+            Clock.domain(),
+            &budget(),
+        )
+        .unwrap(),
+    }
+}
+
+/// An HTTP/2 client of the binding over `transport`, connected to `address`.
+pub(crate) async fn h2_client(transport: Transport, address: SocketAddr) -> rsnetwork_tokio::client::Http2 {
+    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    rsnetwork_tokio::client::Http2::new(core_h2_client(transport), stream, pool(&budget())).unwrap()
+}
+
+/// A server of the core over `transport` that serves HTTP/2: with prior knowledge over TCP, and
+/// when ALPN selects `h2` over TLS.
+pub(crate) fn core_h2_server(transport: Transport) -> server::Http {
+    let limits = server::Limits {
+        cleartext: server::Cleartext::Http2,
+        ..server_limits()
+    };
+    match transport {
+        Transport::Plain => server::Http::plain(limits, Clock.domain(), &budget()).unwrap(),
+        Transport::Tls => server::Http::tls(&server_config(), (limits, TLS), Clock.domain(), &budget()).unwrap(),
     }
 }
 
@@ -207,6 +249,15 @@ pub(crate) async fn client(transport: Transport, address: SocketAddr) -> rsnetwo
 pub(crate) async fn server(transport: Transport, listener: &tokio::net::TcpListener) -> rsnetwork_tokio::server::Http {
     let (stream, _) = listener.accept().await.unwrap();
     rsnetwork_tokio::server::Http::new(core_server(transport), stream, pool(&budget())).unwrap()
+}
+
+/// An HTTP/2 server of the binding over `transport` on the next connection of `listener`.
+pub(crate) async fn h2_server(
+    transport: Transport,
+    listener: &tokio::net::TcpListener,
+) -> rsnetwork_tokio::server::Http {
+    let (stream, _) = listener.accept().await.unwrap();
+    rsnetwork_tokio::server::Http::new(core_h2_server(transport), stream, pool(&budget())).unwrap()
 }
 
 /// A listener on a free loopback port.

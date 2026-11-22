@@ -1,8 +1,8 @@
 //! One connection of the core on one Tokio TCP socket.
 
 use core::future::poll_fn;
-use core::pin::pin;
-use core::task::Poll;
+use core::pin::{Pin, pin};
+use core::task::{Context, Poll, ready};
 use std::io;
 
 use rsnetwork::buffer::Pool;
@@ -10,8 +10,8 @@ use rsnetwork::drive::{Error, Kind, Outstanding};
 use rsnetwork::host::{Io, Next, Tcp};
 use rsnetwork::time::{Deadline, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
 use tokio::task::coop;
+use tokio::time::Sleep;
 
 use crate::Clock;
 use crate::stream::Stream;
@@ -29,8 +29,8 @@ const CAPACITY: Error = Error::new(
 /// [`host::Tcp`](rsnetwork::host::Tcp), and waits until the socket or a deadline can help. Thus
 /// it drives each vocabulary of the core, also a [`Connection`](rsnetwork::host::Connection) of
 /// your own engine. [`client::Http1`](crate::client::Http1),
-/// [`server::Http`](crate::server::Http), and [`tls::Stream`](crate::tls::Stream) are calls
-/// over it.
+/// [`client::Http2`](crate::client::Http2), [`server::Http`](crate::server::Http), and
+/// [`tls::Stream`](crate::tls::Stream) are calls over it.
 ///
 /// A socket that drops before the release of its connection, or with output that did not go,
 /// resets the connection, as [`close`](Self::close) does.
@@ -40,16 +40,20 @@ pub struct Socket<C: Io> {
     /// The socket, until the close.
     tcp: Option<Tcp<Stream>>,
     clock: Clock,
-    close: Option<Close<C>>,
 }
 
-/// The close of a server, which a connection of its own sees in each wait.
-#[derive(Debug)]
-struct Close<C> {
-    signal: watch::Receiver<Option<Deadline>>,
-    /// Starts the close of the connection, for example its drain.
-    start: fn(&mut C, Deadline, Instant) -> Result<(), Error>,
-    started: bool,
+/// What one turn of a call gave.
+pub(crate) enum Turn<T> {
+    /// The call gave its value, or `None` after the release.
+    Done(Option<T>),
+    /// Call again now: bytes moved, or the connection has more work.
+    Now,
+    /// Call again when the socket can read (`read`) or write (`write`), or at `deadline`.
+    Wait {
+        read: bool,
+        write: bool,
+        deadline: Option<Deadline>,
+    },
 }
 
 impl<C: Io> Socket<C> {
@@ -65,23 +69,7 @@ impl<C: Io> Socket<C> {
             connection,
             tcp: Some(Tcp::new(Stream(stream), pool)?),
             clock: Clock,
-            close: None,
         })
-    }
-
-    /// Makes each wait see the close of a server: then `start` begins the close of the
-    /// connection, one time.
-    pub(crate) fn with_close(
-        mut self,
-        signal: watch::Receiver<Option<Deadline>>,
-        start: fn(&mut C, Deadline, Instant) -> Result<(), Error>,
-    ) -> Self {
-        self.close = Some(Close {
-            signal,
-            start,
-            started: false,
-        });
-        self
     }
 
     /// The connection, for its calls that do not wait, for example its state.
@@ -111,21 +99,76 @@ impl<C: Io> Socket<C> {
         &mut self,
         mut call: impl FnMut(&mut C, Instant) -> Result<Option<T>, Error>,
     ) -> Result<Option<T>, Error> {
-        loop {
-            self.closing()?;
-            let tcp = self.tcp.as_mut().expect("the socket is there until the close");
-            if let Some(value) = call(&mut self.connection, self.clock.now())? {
-                // The output of the call goes now, also when the next call comes late. A pump
-                // refuses only an input region, after its writes, and the next call meets that.
-                let _pumped = tcp.pump(&mut self.connection);
-                return Ok(Some(value));
+        let mut sleep = pin!(None);
+        poll_fn(|cx| {
+            loop {
+                match self.turn(&mut call)? {
+                    Turn::Done(value) => return Poll::Ready(Ok(value)),
+                    Turn::Now => ready!(coop::poll_proceed(cx)).made_progress(),
+                    Turn::Wait { read, write, deadline } => {
+                        if !self.ready(cx, (read, write, deadline), sleep.as_mut()) {
+                            return Poll::Pending;
+                        }
+                    }
+                }
             }
-            match tcp.pump(&mut self.connection)? {
-                Next::Now => coop::consume_budget().await,
-                Next::Wait { read, write, deadline } => self.wait(read, write, deadline).await?,
-                Next::Released => return call(&mut self.connection, self.clock.now()),
-            }
+        })
+        .await
+    }
+
+    /// Calls `call` one time with the time now, and moves the bytes of the connection. After the
+    /// call that gives a value, it writes the output of that call, with no wait. Refuses as
+    /// [`until`](Self::until) says.
+    pub(crate) fn turn<T>(
+        &mut self,
+        call: &mut impl FnMut(&mut C, Instant) -> Result<Option<T>, Error>,
+    ) -> Result<Turn<T>, Error> {
+        let tcp = self.tcp.as_mut().expect("the socket is there until the close");
+        if let Some(value) = call(&mut self.connection, self.clock.now())? {
+            // The output of the call goes now, also when the next call comes late. A pump
+            // refuses only an input region, after its writes, and the next call meets that.
+            let _pumped = tcp.pump(&mut self.connection);
+            return Ok(Turn::Done(Some(value)));
         }
+        Ok(match tcp.pump(&mut self.connection)? {
+            Next::Now => Turn::Now,
+            Next::Wait {
+                read: false,
+                write: false,
+                deadline: None,
+            } => return Err(CAPACITY),
+            Next::Wait { read, write, deadline } => Turn::Wait { read, write, deadline },
+            Next::Released => Turn::Done(call(&mut self.connection, self.clock.now())?),
+        })
+    }
+
+    /// Makes `cx` wake when the socket can read (`read`) or write (`write`), or at `deadline`, on
+    /// `sleep`. Gives whether one of them is ready now: then turn again.
+    pub(crate) fn ready(
+        &self,
+        cx: &mut Context<'_>,
+        (read, write, deadline): (bool, bool, Option<Deadline>),
+        mut sleep: Pin<&mut Option<Sleep>>,
+    ) -> bool {
+        let stream = &self
+            .tcp
+            .as_ref()
+            .expect("the socket is there until the close")
+            .socket()
+            .0;
+        if (read && stream.poll_read_ready(cx).is_ready()) || (write && stream.poll_write_ready(cx).is_ready()) {
+            return true;
+        }
+        let Some(deadline) = deadline else {
+            return false;
+        };
+        let at = self.clock.tokio(deadline);
+        match sleep.as_mut().as_pin_mut() {
+            Some(timer) if timer.deadline() == at => {}
+            Some(timer) => timer.reset(at),
+            None => sleep.set(Some(tokio::time::sleep_until(at))),
+        }
+        sleep.as_pin_mut().is_some_and(|timer| timer.poll(cx).is_ready())
     }
 
     /// Moves the bytes of the connection until its release: its end, after the transport
@@ -150,58 +193,6 @@ impl<C: Io> Socket<C> {
             Some(tcp) => tcp.close(&self.connection),
             None => self.connection.outstanding(),
         }
-    }
-
-    /// Starts the close of the connection, one time, after the server signalled its close.
-    fn closing(&mut self) -> Result<(), Error> {
-        let Some(close) = &mut self.close else {
-            return Ok(());
-        };
-        if close.started {
-            return Ok(());
-        }
-        let Some(deadline) = *close.signal.borrow_and_update() else {
-            return Ok(());
-        };
-        close.started = true;
-        (close.start)(&mut self.connection, deadline, self.clock.now())
-    }
-
-    /// Waits until the socket can read (`read`) or write (`write`), until `deadline`, or until the
-    /// server signals its close.
-    async fn wait(&mut self, read: bool, write: bool, deadline: Option<Deadline>) -> Result<(), Error> {
-        if !read && !write && deadline.is_none() {
-            return Err(CAPACITY);
-        }
-        let signalled = {
-            let stream = &self
-                .tcp
-                .as_ref()
-                .expect("the socket is there until the close")
-                .socket()
-                .0;
-            let mut sleep = pin!(deadline.map(|deadline| tokio::time::sleep_until(self.clock.tokio(deadline))));
-            let signal = self.close.as_mut().filter(|close| !close.started);
-            let mut changed = pin!(signal.map(|close| close.signal.changed()));
-            poll_fn(|cx| {
-                if let Some(Poll::Ready(changed)) = changed.as_mut().as_pin_mut().map(|changed| changed.poll(cx)) {
-                    return Poll::Ready(changed.is_ok());
-                }
-                let ready = (read && stream.poll_read_ready(cx).is_ready())
-                    || (write && stream.poll_write_ready(cx).is_ready())
-                    || sleep
-                        .as_mut()
-                        .as_pin_mut()
-                        .is_some_and(|sleep| sleep.poll(cx).is_ready());
-                if ready { Poll::Ready(true) } else { Poll::Pending }
-            })
-            .await
-        };
-        // A server that dropped its signal closes no more connections.
-        if !signalled {
-            self.close = None;
-        }
-        Ok(())
     }
 }
 

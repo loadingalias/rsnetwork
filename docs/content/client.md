@@ -228,13 +228,14 @@ fn both(
 | Rule | `Http2` |
 | --- | --- |
 | Streams | The connection carries at most the smaller of its own and the server's `SETTINGS_MAX_CONCURRENT_STREAMS`. At the limit, `send` gives `None`: wait, and send again. A stream keeps its place until you `cancel` it, or until its exchange ended, you read the end, and a new request needs the place |
-| Deadline | The deadline of a request ends only its stream, with `RST_STREAM` and `CANCEL`. The connection goes on. `delivered(stream)` gives the part that arrived. Then `cancel(stream)` frees its place |
+| Deadline | The deadline of a request ends only its stream, with `RST_STREAM` and `CANCEL`, at the first drive after it, also when you do not call that stream. The connection goes on. `delivered(stream)` gives the part that arrived. Then `cancel(stream)` frees its place |
 | Cancel | `cancel(stream)` resets the stream with `CANCEL`, and the connection goes on. No body drains |
 | Reuse | The connection carries new requests until the server sends GOAWAY or the connection ends. Then `send` refuses with `Kind::Misuse`: make a new client |
 | Not processed | A request above the last stream of a GOAWAY, or that the server resets with `REFUSED_STREAM`, ends with `Kind::Overload`: no handler ran for it, so send it again, on a new connection after a GOAWAY |
 | Write | Each stream holds one chunk of its body at a time. `write` refuses with `Kind::Overload` while the chunk before waits for the output: send the output, and write again. `finish` never waits: the end goes after the last chunk |
 | Idle | `drive(now)` drives the connection when no call of an exchange runs: it answers the SETTINGS and PING of the server, sends the resets of `cancel`, and reads a GOAWAY. Call it each time that `wait()` says while you have no exchange to call, because a server ends a connection whose SETTINGS get no acknowledgement |
 | Close | `close(now)` ends each exchange in flight, and sends GOAWAY, and over TLS `close_notify` |
+| Changed streams | `changed(each)` gives `each` each stream whose exchange changed since the last call: its response head or a failure arrived, a part or the end of its body, its last chunk went to the output, its deadline came, or the connection ended. A binding that shares the connection among handles wakes only their handles |
 | Fields | A connection-specific field, `te` other than `trailers`, `host`, and `content-length` refuse with `Kind::Misuse`. The client sends `:method`, `:scheme`, `:authority`, and `:path`, and each field name in lowercase. CONNECT refuses with `Kind::Unsupported`: the client opens no tunnel |
 | TCP | `Http2::plain` uses prior knowledge (RFC 9113, section 3.3): the server must take HTTP/2 over TCP |
 | TLS | List `h2` in the protocols of the configuration. The server must select `h2`: another protocol, also no protocol, ends the client with `Kind::Unsupported` |

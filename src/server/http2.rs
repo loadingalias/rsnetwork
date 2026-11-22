@@ -78,6 +78,8 @@ struct Exchange {
     ended: bool,
     /// The handler closed the stream.
     closed: bool,
+    /// The stream changed since the last [`Http::changed`].
+    changed: bool,
 }
 
 impl Exchange {
@@ -93,6 +95,7 @@ impl Exchange {
             reset: None,
             ended: false,
             closed: false,
+            changed: true,
         }
     }
 
@@ -162,6 +165,15 @@ impl H2 {
             goaway: false,
             body_bytes: limits.body.body_bytes,
         })
+    }
+
+    /// Gives each stream that changed since the last call, as [`Http::changed`] says.
+    pub(super) fn changed(&mut self, mut each: impl FnMut(Stream)) {
+        for exchange in &mut self.exchanges {
+            if core::mem::take(&mut exchange.changed) {
+                each(Stream(u64::from(exchange.id)));
+            }
+        }
     }
 
     fn find(&self, stream: Stream) -> Option<usize> {
@@ -473,6 +485,15 @@ impl Http {
     }
 
     pub(super) fn h2_event(&mut self, step: Step) -> Result<(), Error> {
+        if let Step::Trailers { stream, .. }
+        | Step::Data { stream, .. }
+        | Step::Reset { stream, .. }
+        | Step::Sent { stream }
+        | Step::TooLarge { stream } = step
+            && let Some(index) = self.h2().find(Stream(u64::from(stream)))
+        {
+            self.h2().exchanges[index].changed = true;
+        }
         let shutdown = self.shutdown.is_some();
         let budget = self.budget.clone();
         let h2 = self.h2();
@@ -627,6 +648,7 @@ impl Http {
             }
             exchange.ended = true;
             exchange.reset = None;
+            exchange.changed = true;
         }
         self.h2().exchanges.retain(|exchange| !exchange.closed);
     }
@@ -907,6 +929,7 @@ impl Http {
     pub(super) fn h2_expire(&mut self, error: Error) {
         for exchange in &mut self.h2().exchanges {
             exchange.end(Outcome::Cancelled, error);
+            exchange.changed = true;
         }
     }
 

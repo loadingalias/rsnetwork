@@ -1,13 +1,16 @@
 # Run the engines on Tokio
 
-The package `rsnetwork-tokio` runs the HTTP/1.1 client, the server, and the TLS stream of rsnetwork
-on the Tokio runtime of your application. Each call awaits the progress that it needs,
-so a body read moves its own bytes. You poll no second object, and the client spawns no task. A
-server spawns one task for each connection, owns it, and joins it at its close.
+The package `rsnetwork-tokio` runs the HTTP/1.1 and HTTP/2 clients, the server of both versions,
+and the TLS stream of rsnetwork on the Tokio runtime of your application. Each call awaits the
+progress that it needs, so a body read moves its own bytes. You poll no second object, and the
+client spawns no task. On HTTP/2, each stream has its own handle, which can go to a task of its
+own. A server spawns one task for each connection, and on HTTP/2 one task for each stream. It owns
+each task, and joins it at its close.
 
 rsnetwork is in development and has no release. `rsnetwork-tokio` is a package of the rsnetwork
 repository. It has run evidence on macOS (aarch64), on the current-thread runtime and the
-multi-thread runtime of Tokio, on HTTP/1.1 and TLS streams.
+multi-thread runtime of Tokio: HTTP/1.1, HTTP/2 over TCP with prior knowledge and over TLS with
+ALPN `h2`, and TLS streams.
 
 ## Prerequisites
 
@@ -86,14 +89,12 @@ runtime.block_on(async {
         move || Ok((server::Http::plain(server_limits, Clock.domain(), &budget)?, pool()?))
     };
     let connections = NonZeroUsize::new(1024).expect("not zero");
-    let server = Server::serve(listener, connections, make, move |mut connection| async move {
-        while connection.request().await?.is_some() {
-            let hello = Response { status: ok, fields: &[], length: Some(5) };
-            connection.respond(&hello).await?;
-            connection.write(&Lease::from(&b"hello"[..])).await?;
-            connection.finish().await?;
-        }
-        Ok(())
+    // The handler runs once for each request, with its exchange.
+    let server = Server::serve(listener, connections, make, move |mut exchange| async move {
+        let hello = Response { status: ok, fields: &[], length: Some(5) };
+        exchange.respond(&hello).await?;
+        exchange.write(&Lease::from(&b"hello"[..])).await?;
+        exchange.finish().await
     });
 
     let core = client::Http1::plain(client::Limits { head, h2, body, turn, queue }, Clock.domain(), &budget)?;
@@ -127,30 +128,99 @@ enough: see [receive regions](caller-driven.md#receive-regions).
 
 ## The calls
 
-Each type binds one connection of the core to one Tokio `TcpStream`, with `new(connection, stream,
-pool)`. `new` sets `TCP_NODELAY`, and refuses with the `io::Error` of the socket. Each call has the
-rules of its call in the core, and awaits what the core call says to wait for:
+`client::Http1`, `client::Http2`, `server::Http`, and `tls::Stream` each bind one connection of the
+core to one Tokio `TcpStream`, with `new(connection, stream, pool)`. `new` sets `TCP_NODELAY`, and
+refuses with the `io::Error` of the socket. An exchange is the handle of one stream: a request and
+its response. Each call has the rules of its call in the core, and awaits what the core call says
+to wait for:
 
 | Type | Calls that await | Calls that do not wait |
 | --- | --- | --- |
 | `client::Http1` | `send`, `write`, `finish`, `response`, `next`, `read_into`, `collect`, `close` | `delivered`, `cancel`, `negotiated` |
-| `server::Http` | `request`, `respond`, `write`, `finish`, `finish_with_trailers`, `next`, `read_into`, `collect`, `release`, `close` | `cancel`, `delivery`, `shutdown`, `negotiated` |
+| `client::Http2` | `send`, `drive`, `close` | `negotiated` |
+| `client::Exchange` | `write`, `finish`, `response`, `next`, `read_into`, `collect` | `delivered` |
+| `server::Http` | `request`, `close` | `shutdown` |
+| `server::Exchange` | `respond`, `write`, `finish`, `finish_with_trailers`, `next`, `read_into`, `collect` | `head`, `cancel`, `delivery`, `negotiated` |
 | `tls::Stream` | `handshake`, `read_into`, `next`, `write`, `close` | `written`, `sent`, `closure` |
 
 - A call gives its value when the core gives one. `read_into` never gives `Read::Wait`, and
   `collect` never gives `Collect::More`.
-- `write` and `finish` wait while the output queue is full.
+- `write` and `finish` wait while the output has no room. On HTTP/2, `write` also waits while the
+  chunk before waits for the output.
 - After a call gives its value, the binding writes its output at once, with no wait.
-- `server::Http` serves one exchange at a time, on each version. `request` closes the stream of
-  the request before it, and gives the next request head, or `None` when the connection takes no
-  more requests: the client closed, the connection closes, or it ended. The calls of the exchange
-  act on the stream of the last request.
+- `server::Http::request` gives each request on its own `server::Exchange`, or `None` when the
+  connection takes no more requests: the client closed, the connection closes, or it ended. On
+  HTTP/1.1, the next request comes after the exchange before it dropped and the transport accepted
+  its response. On HTTP/2, requests come while the exchanges before them go on.
+- An exchange that drops ends its stream. A server exchange closes it, and cancels a response that
+  is not finished, so the client sees it incomplete. A client exchange cancels it: when its
+  exchange did not end, the stream resets with `CANCEL`, and the connection goes on.
+- `negotiated(read)` of `client::Http2` and `server::Exchange` gives `read` what the TLS handshake
+  negotiated, and gives what `read` gives. `read` runs under the lock of the connection, so it must
+  not call the connection or one of its exchanges.
 - `tls::Stream::handshake` waits until the handshake completed, and gives what it negotiated.
-- `close` ends the connection, waits until the transport accepted each output, and closes the
-  socket. Over TLS, the end sends `close_notify`.
+- `close` ends the connection, and waits until the transport accepted each output. Over TLS, the
+  end sends `close_notify`. `client::Http1` and `tls::Stream` then close the socket. A connection
+  with exchanges closes its socket when its last handle drops.
 
 The rules of each core call are on the pages of the [client](client.md), the [server](server.md),
 and the [TLS stream](tls-stream.md).
+
+## HTTP/2: streams in tasks of their own
+
+`client::Http2` is one HTTP/2 connection, which many tasks share: each clone is one more handle of
+the same connection. `send` gives a `client::Exchange` for each request. Two tasks send on one
+connection at the same time. This example continues the one above, against a server that serves
+HTTP/2 over TCP with prior knowledge (`Cleartext::Http2`):
+
+```rust
+use rsnetwork::message::ResponseHead;
+
+let core = client::Http2::plain(client::Limits { head, h2, body, turn, queue }, Clock.domain(), &budget)?;
+let stream = tokio::net::TcpStream::connect(address).await?;
+let client = rsnetwork_tokio::client::Http2::new(core, stream, pool()?)?;
+let mut tasks = tokio::task::JoinSet::new();
+for target in [&b"/a"[..], b"/b"] {
+    let request = Request {
+        method: Method::GET,
+        target: Target::new(target)?,
+        authority: Authority::new(b"127.0.0.1")?,
+        fields: &[],
+        length: Some(0),
+    };
+    let client = client.clone();
+    tasks.spawn(async move {
+        let mut exchange = client.send(&request, Clock.deadline(Duration::from_secs(5))).await?;
+        let head: ResponseHead = exchange.response().await?;
+        let mut region = WriteLoan::new(Vec::with_capacity(64));
+        let collected = exchange.collect(&mut region).await?;
+        Ok::<_, rsnetwork::drive::Error>((head.status(), collected, region.into_inner()))
+    });
+}
+while let Some(done) = tasks.join_next().await {
+    let (status, collected, body) = done??;
+    assert_eq!(status, ok);
+    assert!(matches!(collected, Collect::Complete(None)));
+    assert_eq!(body, b"hello");
+}
+client.close().await?;
+```
+
+- **Drive.** The connection has no task of its own. The handle that awaits drives the connection
+  for each stream, under a short lock that no wait holds. After each turn, only the handles whose
+  streams changed wake. Thus a stalled body holds back only its own stream.
+- **Idle.** Only an awaited call drives the connection. While no exchange awaits, await
+  `client.drive()`, for example in a task of your own, so the client answers the SETTINGS and PING
+  of the server and reads a GOAWAY. `drive` gives the end of the connection.
+- **Places.** At the stream limit, `send` waits until a stream frees its place. The calls that
+  wait take the places in their order.
+- **Deadline.** The deadline of a request ends only its stream, with `RST_STREAM` and `CANCEL`,
+  also when no call of that stream runs. The calls of the stream then refuse with
+  `Kind::Deadline`, and `delivered()` gives the part of the body that arrived.
+- **Close.** `close()` ends each exchange in flight, sends GOAWAY, and over TLS `close_notify`. A
+  connection whose last handle drops before its close resets.
+
+The rules of each stream are those of the core [HTTP/2 client](client.md#http2).
 
 ## A server and its tasks
 
@@ -163,15 +233,18 @@ that runtime.
 - For each accepted socket, `make` gives a server of the core, made with `Clock.domain()`, and the
   pool of its receive regions. A refusal of `make` drops that connection, and `Report::refused`
   counts it.
-- `handler` takes the connection, a `server::Http`, and serves its requests in order. When the
-  handler returns or drops the connection, the task drives the rest: the delivery of the last
-  response, the close, and the linger. A response that the handler did not finish is cancelled, so
-  the client sees it incomplete. The client learns which later requests the server did not
-  process, as the [server](server.md#close) says.
+- `handler` runs once for each request, with its `server::Exchange`. On HTTP/1.1, it runs in the
+  task of its connection, one request at a time. On HTTP/2, each request gets a handler task of its
+  own, at most `SETTINGS_MAX_CONCURRENT_STREAMS` for each connection, because a stream keeps its
+  place until its exchange drops.
+- When the exchange drops, the task of the connection drives the rest: the delivery of the
+  response, the next requests, the close, and the linger. A response that the handler did not
+  finish is cancelled, so the client sees it incomplete.
 - `server.close(deadline)` stops the accepts. Each connection drains with `deadline`, as
-  `server::Http::shutdown` says: the exchange in flight completes, and the client learns which
-  requests the server did not process. Then the close joins each task. At `deadline`, it aborts
-  each task that did not end, for example a handler that waits for another future.
+  `server::Http::shutdown` says: the exchanges in flight complete, and the client learns which
+  requests the server did not process, as the [server](server.md#close) says. Then the close joins
+  each task, also each handler task. At `deadline`, it aborts each task that did not end, for
+  example a handler that waits for another future.
 - A server that drops before its close aborts each of its tasks, and each connection resets.
 
 `close` gives a `Report`:
@@ -180,16 +253,18 @@ that runtime.
 | --- | --- |
 | `accepted` | The connections that the server accepted and served |
 | `refused` | The accepts that failed, or whose connection could not start |
-| `failed` | The connections that ended with an error, whose handler gave an error, or whose handler panicked |
+| `failed` | The connections that ended with an error, or of which a handler gave an error or panicked |
 | `aborted` | The connections whose task the close stopped at its deadline |
 
-A handler that moves its connection to another task keeps it: the task of the server then does not
-drive the rest of that connection. Keep the connection in the handler.
+The end of the handler and the delivery of its response are two results: `exchange.delivery()`
+gives how much of the response the transport accepted, also after the handler finished it. An
+HTTP/1.1 handler that moves its exchange to another task holds the next request of its connection
+until the exchange drops.
 
-`server::Http::release` gives the end of a connection as a `server::Closed`, and then `delivery`
-gives the final delivery of its last response. Thus the end of the handler and the delivery of its
-response are two results. Without a `Server`, make a connection with `server::Http::new` on a
-socket that you accepted, and call `close` when you are done with it.
+Without a `Server`, make a connection with `server::Http::new` on a socket that you accepted, take
+each request with `request`, and call `close` when you are done with it. `close` gives the end of
+the connection as a `server::Closed`. Its drain waits for each exchange in flight, so drop or
+finish each exchange first.
 
 ## Cancellation and drop
 
@@ -197,7 +272,9 @@ A future that you drop changes nothing: the connection keeps its state, and the 
 from it. To bound a wait, give the exchange a deadline, or drop the future of the call.
 
 A client, a server connection, or a TLS stream that drops before its close resets the connection,
-so the peer cannot read the cut as the end of the data. Its output that did not go is lost.
+so the peer cannot read the cut as the end of the data. Its output that did not go is lost. A
+connection with exchanges resets when its last handle drops before its close. An exchange that
+drops ends only its own stream: see [the calls](#the-calls).
 
 ## Blocking jobs and host lookups
 

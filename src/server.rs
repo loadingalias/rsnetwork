@@ -581,6 +581,19 @@ impl Http {
         }
     }
 
+    /// Gives each stream whose exchange changed since the last call: a part or the end of its
+    /// request body, the output took its last chunk, or the stream ended. A new request changes
+    /// its stream too. A binding that shares the connection among handles wakes the handle of
+    /// each stream that it gives, and no other. The end of the connection, when
+    /// [`wait`](Self::wait) gives [`Wait::Ended`] or [`Wait::Linger`], changes each stream.
+    pub fn changed(&mut self, each: impl FnMut(Stream)) {
+        match &mut self.exchanges {
+            Exchanges::H1(h1) => h1.changed(each),
+            Exchanges::H2(h2) => h2.changed(each),
+            Exchanges::Pending => {}
+        }
+    }
+
     /// What the TLS handshake negotiated, or `None` before it completed and over TCP.
     #[cfg(feature = "tls")]
     pub fn negotiated(&mut self) -> Option<Negotiated<'_>> {

@@ -499,6 +499,36 @@ fn a_slow_body_meets_its_deadline_on_its_stream_and_the_connection_goes_on() {
 }
 
 #[test]
+fn a_deadline_resets_its_stream_at_the_next_drive_also_with_no_call_of_its_own() {
+    let mut pair = Pair::plain();
+    let slow = pair.send(&get(b"/slow"), Deadline::at(at(1_000)), at(0));
+    let quick = pair.send(&get(b"/quick"), Deadline::at(at(5_000)), at(0));
+    let (first, _) = pair.request(at(0));
+    pair.request(at(0));
+    pair.client.changed(drop);
+    // The host drives the idle client at the deadline, and calls no exchange.
+    pair.client.drive(at(1_000)).unwrap();
+    let mut changed = Vec::new();
+    pair.client.changed(|stream| changed.push(stream));
+    assert_eq!(changed, [slow]);
+    // The next wait is the deadline of the other stream, so a host that waits as it says does
+    // not wake again at once.
+    assert_matches!(
+        pair.client.wait(),
+        Wait::Until { deadline: Some(deadline), .. } if deadline == Deadline::at(at(5_000))
+    );
+    assert_matches!(pair.client.response(slow, at(1_000)), Err(error) if error.kind() == Kind::Deadline);
+    // The reset reached the server, and the other stream goes on.
+    pair.transport(at(1_000));
+    assert!(pair.server.request(at(1_000)).unwrap().is_none());
+    assert_matches!(
+        pair.server.respond(first, &ok(Some(2)), at(1_000)),
+        Err(error) if error.kind() == Kind::Partial
+    );
+    assert!(pair.client.response(quick, at(1_000)).unwrap().is_none());
+}
+
+#[test]
 fn over_tls_the_deadline_covers_the_handshake() {
     let config = client_config(&[b"h2"]);
     let mut client = client::Http2::tls(&config, "server.test", (CLIENT_LIMITS, TLS), clock(), &budget()).unwrap();

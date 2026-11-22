@@ -99,9 +99,9 @@ fn a_slow_body_meets_its_original_deadline_with_its_partial_progress() {
             let (listener, address) = support::listener().await;
             tokio::spawn(async move {
                 let mut server = support::server(transport, &listener).await;
-                server.request().await.unwrap().expect("a request");
-                server.respond(&ok(Some(100))).await.unwrap();
-                server.write(&Lease::from(&b"0123456789"[..])).await.unwrap();
+                let mut exchange = server.request().await.unwrap().expect("a request");
+                exchange.respond(&ok(Some(100))).await.unwrap();
+                exchange.write(&Lease::from(&b"0123456789"[..])).await.unwrap();
                 core::future::pending::<()>().await;
             });
             let mut client = support::client(transport, address).await;
@@ -162,16 +162,16 @@ fn an_unread_body_drains_before_the_next_request_or_the_connection_closes() {
                 let requests = Arc::clone(&requests);
                 tokio::spawn(async move {
                     let mut server = support::server(transport, &listener).await;
-                    while server.request().await.unwrap().is_some() {
+                    while let Some(mut exchange) = server.request().await.unwrap() {
                         if requests.fetch_add(1, Ordering::Relaxed) == 0 {
-                            server.respond(&ok(Some(40))).await.unwrap();
-                            server.write(&Lease::from(vec![b'a'; 8])).await.unwrap();
-                            server.write(&Lease::from(vec![b'b'; 32])).await.unwrap();
+                            exchange.respond(&ok(Some(40))).await.unwrap();
+                            exchange.write(&Lease::from(vec![b'a'; 8])).await.unwrap();
+                            exchange.write(&Lease::from(vec![b'b'; 32])).await.unwrap();
                         } else {
-                            server.respond(&ok(Some(6))).await.unwrap();
-                            server.write(&Lease::from(&b"second"[..])).await.unwrap();
+                            exchange.respond(&ok(Some(6))).await.unwrap();
+                            exchange.write(&Lease::from(&b"second"[..])).await.unwrap();
                         }
-                        server.finish().await.unwrap();
+                        exchange.finish().await.unwrap();
                     }
                     server.close().await.unwrap()
                 })
@@ -202,10 +202,10 @@ fn an_unread_body_drains_before_the_next_request_or_the_connection_closes() {
                 let requests = Arc::clone(&requests);
                 tokio::spawn(async move {
                     let mut server = support::server(transport, &listener).await;
-                    server.request().await.unwrap().expect("a request");
+                    let mut exchange = server.request().await.unwrap().expect("a request");
                     requests.fetch_add(1, Ordering::Relaxed);
-                    server.respond(&ok(Some(1000))).await.unwrap();
-                    server.write(&Lease::from(vec![b'a'; 8])).await.unwrap();
+                    exchange.respond(&ok(Some(1000))).await.unwrap();
+                    exchange.write(&Lease::from(vec![b'a'; 8])).await.unwrap();
                     core::future::pending::<()>().await;
                 });
             }
@@ -258,10 +258,11 @@ fn a_close_after_the_exchange_sends_close_notify_and_releases_the_client() {
         let (listener, address) = support::listener().await;
         let serving = tokio::spawn(async move {
             let mut server = support::server(Transport::Tls, &listener).await;
-            server.request().await.unwrap().expect("a request");
-            server.respond(&ok(Some(4))).await.unwrap();
-            server.write(&Lease::from(&b"done"[..])).await.unwrap();
-            server.finish().await.unwrap();
+            let mut exchange = server.request().await.unwrap().expect("a request");
+            exchange.respond(&ok(Some(4))).await.unwrap();
+            exchange.write(&Lease::from(&b"done"[..])).await.unwrap();
+            exchange.finish().await.unwrap();
+            drop(exchange);
             assert!(server.request().await.unwrap().is_none());
             server.close().await.unwrap()
         });

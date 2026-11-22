@@ -48,6 +48,8 @@ pub(super) struct H1 {
     count: u64,
     /// The handler did not close the stream of the last exchange.
     open: bool,
+    /// The exchange changed since the last [`Http::changed`].
+    changed: bool,
 }
 
 impl H1 {
@@ -61,12 +63,20 @@ impl H1 {
             response: None,
             count: 0,
             open: false,
+            changed: false,
         }
     }
 
     /// Whether `stream` is the stream of the last exchange.
     fn is(&self, stream: Stream) -> bool {
         stream == Stream(self.count) && self.count > 0
+    }
+
+    /// Gives the stream of the last exchange when it changed since the last call.
+    pub(super) fn changed(&mut self, each: impl FnOnce(Stream)) {
+        if core::mem::take(&mut self.changed) && self.count > 0 {
+            each(Stream(self.count));
+        }
     }
 
     /// How much of the response of `stream` the transport accepted, of the `sent` bytes.
@@ -336,6 +346,7 @@ impl Http {
     }
 
     pub(super) fn h1_event(&mut self, event: ServerEvent) {
+        self.h1().changed = true;
         match event {
             ServerEvent::Request(head) => self.h1().next = Some(head),
             ServerEvent::Data(data) => {
@@ -355,6 +366,7 @@ impl Http {
     pub(super) fn h1_expire(&mut self, error: Error) {
         let sent = self.link.accepted();
         let h1 = self.h1();
+        h1.changed = true;
         h1.fail(error, sent);
         if h1.state == State::Exchange {
             h1.body.end(Outcome::Cancelled);

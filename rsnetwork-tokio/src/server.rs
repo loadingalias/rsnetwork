@@ -8,13 +8,13 @@ use core::task::Poll;
 use core::time::Duration;
 use std::io;
 use std::panic;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
-use rsnetwork::body::{Collect, Part, Read};
+use rsnetwork::body::{Collect, Outcome, Part, Read};
 use rsnetwork::buffer::{BufferMut, Lease, Pool, WriteLoan};
 use rsnetwork::drive::{Error, Kind};
 use rsnetwork::host::{Io as _, Wait};
-use rsnetwork::message::{RequestHead, Stream};
+use rsnetwork::message::{RequestHead, Stream, Version};
 use rsnetwork::server::{Closed, Delivery, Http as Core, Response};
 use rsnetwork::time::Deadline;
 use rsnetwork::tls::Negotiated;
@@ -23,41 +23,31 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 
+use crate::shared::{Shared, Waits};
 use crate::{Clock, Socket, Step, queued};
 
 /// The refusal of a call after the connection ended.
 const ENDED: Error = Error::new(Kind::Misuse, "the connection ended");
 
-/// The refusal of a call of the exchange before a request.
-const NO_REQUEST: Error = Error::new(Kind::Misuse, "no request waits for a response");
-
 /// The pause after an accept that the listener refused, for example at the limit of open files:
 /// the next accept would refuse at once.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(50);
 
-/// The place where a connection of a [`Server`] goes back to its task when the handler drops it.
-type Back = Arc<Mutex<Option<Http>>>;
-
 /// One server connection on a Tokio TCP socket, for HTTP/1.1 and HTTP/2.
 ///
-/// It has the calls of [`rsnetwork::server::Http`], with its rules, one exchange at a time: a
-/// delivery goes on after the handler finished its response, and the next
-/// [`request`](Self::request) closes the stream before it. Each call awaits its own progress. A
-/// future that you drop changes nothing: the next call goes on from the state of the
-/// connection.
+/// It has the calls of [`rsnetwork::server::Http`], with its rules. [`request`](Self::request)
+/// gives each request on its own [`Exchange`], which can go to a task of its own. The handle
+/// that awaits drives the connection for each exchange, under a short lock, and wakes only the
+/// handles whose streams changed: no task, no channel, and no copy. On HTTP/1.1, the next request
+/// comes after the exchange before it dropped and the transport accepted its response. On
+/// HTTP/2, requests come while the exchanges before them go on, at most
+/// `SETTINGS_MAX_CONCURRENT_STREAMS`.
 ///
-/// A connection of a [`Server`] goes back to its task when the handler drops it, and the task
-/// drives the rest of its delivery and its close. A connection that you made with
-/// [`new`](Self::new) needs [`close`](Self::close): a drop before its release resets it.
+/// A connection needs [`close`](Self::close): when its last handle drops before its release, it
+/// resets.
 #[derive(Debug)]
 pub struct Http {
-    /// The connection, until the drop.
-    socket: Option<Socket<Core>>,
-    /// The stream of the last request.
-    stream: Option<Stream>,
-    /// The handler has a request whose response is not finished.
-    open: bool,
-    back: Option<Back>,
+    shared: Arc<Shared<Core>>,
 }
 
 impl Http {
@@ -65,33 +55,20 @@ impl Http {
     /// TCP socket. `pool` gives the receive regions over TCP and during the linger: charge it to
     /// the budget of the server. Refuses with the error of the socket, as [`Socket::new`] does.
     pub fn new(server: Core, stream: TcpStream, pool: Pool) -> io::Result<Self> {
-        Ok(Self {
-            socket: Some(Socket::new(server, stream, pool)?),
-            stream: None,
-            open: false,
-            back: None,
-        })
+        Ok(Self::bind(Socket::new(server, stream, pool)?))
     }
 
-    /// The connection. It is there until the drop.
-    fn socket(&mut self) -> &mut Socket<Core> {
-        self.socket.as_mut().expect("the connection is there until the drop")
-    }
-
-    /// The stream of the last request.
-    fn current(&self) -> Result<Stream, Error> {
-        self.stream.ok_or(NO_REQUEST)
-    }
-
-    /// Closes the stream of the last request, and gives the next request head when it arrives,
-    /// or `None` when the connection takes no more requests: the client closed, the connection
-    /// closes, or it ended. Refuses as [`Http::request`](rsnetwork::server::Http::request) does.
-    pub async fn request(&mut self) -> Result<Option<RequestHead>, Error> {
-        if let Some(stream) = self.stream {
-            self.socket().connection_mut().close(stream);
-            self.open = false;
+    fn bind(socket: Socket<Core>) -> Self {
+        Self {
+            shared: Arc::new(Shared::new(socket)),
         }
-        let request = self.socket().until(|server, now| {
+    }
+
+    /// Gives the next request on its own exchange when it arrives, or `None` when the connection
+    /// takes no more requests: the client closed, the connection closes, or it ended. Refuses as
+    /// [`Http::request`](rsnetwork::server::Http::request) does.
+    pub async fn request(&mut self) -> Result<Option<Exchange>, Error> {
+        let request = self.shared.until(Waits::Connection, |server, now| {
             Ok(match server.request(now)? {
                 Some(request) => Some(Some(request)),
                 None if matches!(server.wait(), Wait::Linger { .. } | Wait::Ended(_)) => Some(None),
@@ -99,63 +76,117 @@ impl Http {
             })
         });
         let request = request.await?.flatten();
-        self.open = request.is_some();
-        Ok(request.map(|(stream, head)| {
-            self.stream = Some(stream);
-            head
+        Ok(request.map(|(stream, head)| Exchange {
+            shared: Arc::clone(&self.shared),
+            stream,
+            head,
+            end: None,
         }))
     }
 
-    /// Sends the head of `response` to the request in flight. It waits while the transport holds
-    /// the heads before. Send a body with [`write`](Self::write), and end it with
+    /// Closes the connection with `deadline`, as
+    /// [`Http::shutdown`](rsnetwork::server::Http::shutdown) does: it drains the exchanges in
+    /// flight, and tells the client which requests the server did not process.
+    pub fn shutdown(&self, deadline: Deadline) -> Result<(), Error> {
+        self.shared.change(|server| server.shutdown(deadline, Clock.now()))
+    }
+
+    /// Ends the connection, and drives it until its release: the delivery of each response, the
+    /// close, and the linger. The client learns which later requests the server did not process,
+    /// as [`shutdown`](Self::shutdown) says. The drain waits for each exchange in flight, so drop
+    /// or finish them first. The delivery and the linger bound the close, and a close of the
+    /// [`Server`] adds its deadline. Gives the end of the connection.
+    pub async fn close(self) -> Result<Closed, Error> {
+        self.shared
+            .change(|server| server.shutdown(Clock.deadline(Duration::MAX), Clock.now()))?;
+        // Each call gives the time to the server, so its linger and its deadlines end.
+        let released = self.shared.until(Waits::Connection, |server, now| {
+            server.request(now)?;
+            Ok(server.release())
+        });
+        released.await?.ok_or(ENDED)
+    }
+}
+
+/// One exchange of a server connection: a request and its response, on one stream.
+///
+/// It has the calls of [`rsnetwork::server::Http`] for its stream, with its rules: a delivery
+/// goes on after the handler finished its response. Each call awaits its own progress, and a
+/// future that you drop changes nothing. An exchange that drops ends its handler, as
+/// [`Http::close`](rsnetwork::server::Http::close) says: a response that is not finished is
+/// cancelled, so the client sees it incomplete.
+#[derive(Debug)]
+pub struct Exchange {
+    shared: Arc<Shared<Core>>,
+    stream: Stream,
+    head: RequestHead,
+    /// The outcome of the request body, after the read that gave it.
+    end: Option<Outcome>,
+}
+
+impl Exchange {
+    /// The head of the request.
+    pub fn head(&self) -> &RequestHead {
+        &self.head
+    }
+
+    /// What a call that sends waits for: on HTTP/1.1 also room in the output, which the
+    /// connection gives in turn.
+    fn sending(&self) -> Waits {
+        match self.head.version() {
+            Version::Http2 => Waits::Stream(self.stream),
+            Version::Http10 | Version::Http11 => Waits::Place(Some(self.stream)),
+        }
+    }
+
+    /// Sends the head of `response`. It waits while the transport holds the heads before, in the
+    /// order of the exchanges that wait. Send a body with [`write`](Self::write), and end it with
     /// [`finish`](Self::finish).
     pub async fn respond(&mut self, response: &Response<'_>) -> Result<(), Error> {
-        let stream = self.current()?;
-        let responded = self
-            .socket()
-            .until(|server, now| Ok(server.respond(stream, response, now)?.then_some(())));
-        responded.await?.ok_or(ENDED)?;
-        // A response with no body is finished at once.
-        self.open &= response.length != Some(0);
-        Ok(())
+        let stream = self.stream;
+        let responded = self.shared.until(Waits::Place(Some(stream)), |server, now| {
+            Ok(server.respond(stream, response, now)?.then_some(()))
+        });
+        responded.await?.ok_or(ENDED)
     }
 
     /// Queues `data` as the next bytes of the response body, with no copy. It waits while the
-    /// output queue is full.
+    /// output has no room for it.
     pub async fn write(&mut self, data: &Lease) -> Result<(), Error> {
-        let stream = self.current()?;
+        let stream = self.stream;
         let written = self
-            .socket()
-            .until(|server, now| queued(server.write(stream, data, now)));
+            .shared
+            .until(self.sending(), |server, now| queued(server.write(stream, data, now)));
         written.await?.ok_or(ENDED)
     }
 
     /// Ends the response body: the handler is complete, and [`delivery`](Self::delivery) tracks
-    /// the rest. It waits while the output queue is full.
+    /// the rest. It waits while the output has no room.
     pub async fn finish(&mut self) -> Result<(), Error> {
-        let stream = self.current()?;
-        let finished = self.socket().until(|server, now| queued(server.finish(stream, now)));
-        finished.await?.ok_or(ENDED)?;
-        self.open = false;
-        Ok(())
+        let stream = self.stream;
+        let finished = self
+            .shared
+            .until(self.sending(), |server, now| queued(server.finish(stream, now)));
+        finished.await?.ok_or(ENDED)
     }
 
-    /// Ends a chunked response body with `trailers`, as [`finish`](Self::finish) does.
+    /// Ends the response body with `trailers`, as [`finish`](Self::finish) does. On HTTP/1.1,
+    /// only a chunked body carries them.
     pub async fn finish_with_trailers(&mut self, trailers: &[Field<'_>]) -> Result<(), Error> {
-        let stream = self.current()?;
-        let finished = self
-            .socket()
-            .until(|server, now| Ok(server.finish_with_trailers(stream, trailers, now)?.then_some(())));
-        finished.await?.ok_or(ENDED)?;
-        self.open = false;
-        Ok(())
+        let stream = self.stream;
+        let finished = self.shared.until(Waits::Place(Some(stream)), |server, now| {
+            Ok(server.finish_with_trailers(stream, trailers, now)?.then_some(()))
+        });
+        finished.await?.ok_or(ENDED)
     }
 
     /// Gives the next part of the request body as a view of its received region, with no copy,
     /// or its end with its outcome.
     pub async fn next(&mut self) -> Result<Part, Error> {
-        let stream = self.current()?;
-        let part = self.socket().until(|server, now| server.next(stream, now));
+        let stream = self.stream;
+        let part = self
+            .shared
+            .until(Waits::Stream(stream), |server, now| server.next(stream, now));
         part.await?.ok_or(ENDED)
     }
 
@@ -163,23 +194,26 @@ impl Http {
     /// its outcome after its last byte. It waits until a byte arrives, so it never gives
     /// [`Read::Wait`].
     pub async fn read_into<B: BufferMut>(&mut self, region: &mut WriteLoan<B>) -> Result<Read<'_>, Error> {
-        let stream = self.current()?;
-        let step = self
-            .socket()
-            .until(|server, now| Ok(Step::of(&server.read_into(stream, now, region)?)));
-        match step.await?.ok_or(ENDED)? {
-            Step::Bytes(count) => Ok(Read::Bytes(count)),
-            Step::Full => Ok(Read::Full),
-            // The outcome stays in the server, so the read gives it again.
-            Step::Done => self.socket().connection_mut().read_into(stream, Clock.now(), region),
-        }
+        let (stream, end) = (self.stream, &mut self.end);
+        let step = self.shared.until(Waits::Stream(stream), |server, now| {
+            let read = server.read_into(stream, now, region)?;
+            if let Read::Done(outcome) = read {
+                *end = Some(outcome.clone());
+            }
+            Ok(Step::of(&read))
+        });
+        Ok(match step.await?.ok_or(ENDED)? {
+            Step::Bytes(count) => Read::Bytes(count),
+            Step::Full => Read::Full,
+            Step::Done => Read::Done(self.end.as_ref().expect("the read that ended kept the outcome")),
+        })
     }
 
     /// Collects the request body into `region`, whose free capacity bounds it. It waits until the
     /// body ends or no longer fits, so it never gives [`Collect::More`].
     pub async fn collect<B: BufferMut>(&mut self, region: &mut WriteLoan<B>) -> Result<Collect, Error> {
-        let stream = self.current()?;
-        let collected = self.socket().until(|server, now| {
+        let stream = self.stream;
+        let collected = self.shared.until(Waits::Stream(stream), |server, now| {
             Ok(match server.collect(stream, now, region)? {
                 Collect::More => None,
                 collect => Some(collect),
@@ -188,81 +222,30 @@ impl Http {
         collected.await?.ok_or(ENDED)
     }
 
-    /// Cancels the exchange in flight, as
-    /// [`Http::cancel`](rsnetwork::server::Http::cancel) does: the client sees an incomplete
-    /// response, never a complete one.
+    /// Cancels the exchange, as [`Http::cancel`](rsnetwork::server::Http::cancel) does: the
+    /// client sees an incomplete response, never a complete one.
     pub fn cancel(&mut self) {
-        if let Some(stream) = self.stream {
-            self.socket().connection_mut().cancel(stream);
-        }
-        self.open = false;
+        let stream = self.stream;
+        self.shared.change(|server| server.cancel(stream));
     }
 
-    /// How much of the response of the last exchange the transport accepted.
+    /// How much of the response the transport accepted, or `None` before the response.
     pub fn delivery(&self) -> Option<Delivery> {
-        let socket = self.socket.as_ref().expect("the connection is there until the drop");
-        socket.connection().delivery(self.stream?)
+        self.shared.lock().socket.connection().delivery(self.stream)
     }
 
-    /// Closes the connection with `deadline`, as
-    /// [`Http::shutdown`](rsnetwork::server::Http::shutdown) does: it drains the exchange in
-    /// flight, and tells the client which requests the server did not process.
-    pub fn shutdown(&mut self, deadline: Deadline) -> Result<(), Error> {
-        self.socket().connection_mut().shutdown(deadline, Clock.now())
-    }
-
-    /// What the TLS handshake negotiated, or `None` before it completed and over TCP.
-    pub fn negotiated(&mut self) -> Option<Negotiated<'_>> {
-        self.socket().connection_mut().negotiated()
-    }
-
-    /// Ends the connection, and drives it until its release: the delivery of the last response,
-    /// the close, and the linger. A response that is not finished is cancelled, so the client
-    /// sees it incomplete. The client learns which later requests the server did not process,
-    /// as [`shutdown`](Self::shutdown) says. The delivery and the linger bound the close, and a
-    /// close of the [`Server`] adds its deadline. Gives the end of the connection, and
-    /// [`delivery`](Self::delivery) then gives the final delivery of the last response.
-    pub async fn release(&mut self) -> Result<Closed, Error> {
-        if core::mem::take(&mut self.open) {
-            self.cancel();
-        }
-        if let Some(stream) = self.stream {
-            self.socket().connection_mut().close(stream);
-        }
-        let socket = self.socket();
-        socket
-            .connection_mut()
-            .shutdown(Clock.deadline(Duration::MAX), Clock.now())?;
-        // Each call gives the time to the server, so its linger and its deadlines end.
-        let released = socket.until(|server, now| {
-            server.request(now)?;
-            Ok(server.release())
-        });
-        released.await?.ok_or(ENDED)
-    }
-
-    /// Drives the connection until its release, as [`release`](Self::release) does. Then it
-    /// closes the socket, and gives the end of the connection.
-    pub async fn close(mut self) -> Result<Closed, Error> {
-        let closed = self.release().await?;
-        let socket = self.socket.take().expect("the connection is there until the drop");
-        let unsent = socket.close();
-        assert!(unsent.is_empty(), "a released connection has no output that did not go");
-        Ok(closed)
+    /// Gives `read` what the TLS handshake negotiated, or `None` over TCP, and gives what `read`
+    /// gives. `read` runs under the lock of the connection, so it must not call the connection or
+    /// one of its exchanges.
+    pub fn negotiated<T>(&self, read: impl FnOnce(Option<Negotiated<'_>>) -> T) -> T {
+        read(self.shared.lock().socket.connection_mut().negotiated())
     }
 }
 
-impl Drop for Http {
+impl Drop for Exchange {
     fn drop(&mut self) {
-        if let (Some(socket), Some(back)) = (self.socket.take(), self.back.take()) {
-            let connection = Self {
-                socket: Some(socket),
-                stream: self.stream,
-                open: self.open,
-                back: None,
-            };
-            *back.lock().unwrap_or_else(PoisonError::into_inner) = Some(connection);
-        }
+        let stream = self.stream;
+        self.shared.change(|server| server.close(stream));
     }
 }
 
@@ -282,13 +265,17 @@ pub struct Report {
     pub aborted: u64,
 }
 
-/// A server on a Tokio listener: it accepts each connection, and runs the handler for it in a
-/// task of its own, on the runtime of the caller.
+/// A server on a Tokio listener: it accepts each connection, drives it in a task of its own, on
+/// the runtime of the caller, and runs the handler once for each request.
 ///
-/// The server owns each task that it spawns: its accept task, and one task for each connection,
-/// at most `connections_max` at a time. [`close`](Self::close) stops the accepts, drains each
-/// connection, and joins each task. A server that drops before its close aborts each task, and
-/// each connection resets.
+/// On HTTP/1.1, the handler runs in the task of its connection, one request at a time. On
+/// HTTP/2, each request gets a handler task of its own, at most `SETTINGS_MAX_CONCURRENT_STREAMS`
+/// for each connection, because a stream keeps its place until its exchange drops.
+///
+/// The server owns each task that it spawns: its accept task, one task for each connection, at
+/// most `connections_max` at a time, and the handler tasks of each connection.
+/// [`close`](Self::close) stops the accepts, drains each connection, and joins each task. A
+/// server that drops before its close aborts each task, and each connection resets.
 #[derive(Debug)]
 pub struct Server {
     task: Option<JoinHandle<Report>>,
@@ -301,12 +288,13 @@ impl Server {
     ///
     /// For each accepted socket, `make` gives a server of the core, made with
     /// [`Clock::domain`], and the pool of its receive regions: over TCP or over TLS, charged to the
-    /// budget that you select. Then `handler` serves the connection, and the task drives the rest
-    /// of its delivery after the handler returns. Call it in a task of the runtime.
+    /// budget that you select. Then `handler` serves each request on its [`Exchange`], and the
+    /// connection drives the rest of its delivery after the exchange drops. Call it in a task of
+    /// the runtime.
     pub fn serve<M, H, F>(listener: TcpListener, connections_max: NonZeroUsize, make: M, handler: H) -> Self
     where
         M: FnMut() -> Result<(Core, Pool), Error> + Send + 'static,
-        H: Fn(Http) -> F + Send + Sync + 'static,
+        H: Fn(Exchange) -> F + Send + Sync + 'static,
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {
         let (close, signal) = watch::channel(None);
@@ -357,7 +345,7 @@ async fn accept<M, H, F>(
 ) -> Report
 where
     M: FnMut() -> Result<(Core, Pool), Error> + Send + 'static,
-    H: Fn(Http) -> F + Send + Sync + 'static,
+    H: Fn(Exchange) -> F + Send + Sync + 'static,
     F: Future<Output = Result<(), Error>> + Send + 'static,
 {
     let mut tasks = JoinSet::new();
@@ -401,10 +389,10 @@ where
             // A dropped server aborts this task: its tasks abort with the set.
             Event::Close(false) => return report,
             Event::Ended(ended) => record(&mut report, ended),
-            Event::Accepted(Ok((stream, _))) => match start(stream, &mut make, signal.clone()) {
+            Event::Accepted(Ok((stream, _))) => match start(stream, &mut make) {
                 Some(socket) => {
                     report.accepted = report.accepted.saturating_add(1);
-                    tasks.spawn(run(socket, Arc::clone(&handler)));
+                    tasks.spawn(run(socket, Arc::clone(&handler), signal.clone()));
                 }
                 None => report.refused = report.refused.saturating_add(1),
             },
@@ -437,39 +425,96 @@ where
     }
 }
 
-/// The connection of `stream`, with a server of `make`, which sees the close in each wait. Gives
-/// `None` when the socket or `make` refused.
-fn start<M>(stream: TcpStream, make: &mut M, signal: watch::Receiver<Option<Deadline>>) -> Option<Socket<Core>>
+/// The connection of `stream`, with a server of `make`. Gives `None` when the socket or `make`
+/// refused.
+fn start<M>(stream: TcpStream, make: &mut M) -> Option<Socket<Core>>
 where
     M: FnMut() -> Result<(Core, Pool), Error>,
 {
     let (server, pool) = make().ok()?;
-    let socket = Socket::new(server, stream, pool).ok()?;
-    Some(socket.with_close(signal, Core::shutdown))
+    Socket::new(server, stream, pool).ok()
 }
 
-/// Runs `handler` on the connection of `socket`, and then drives the rest of the connection.
-/// Gives whether the connection and the handler ended with no error.
-async fn run<H, F>(socket: Socket<Core>, handler: Arc<H>) -> bool
+/// What the task of a connection waits for.
+enum Next {
+    Request(Result<Option<Exchange>, Error>),
+    Handled(Result<Result<(), Error>, JoinError>),
+    /// The signal changed, or its server dropped (`false`).
+    Close(bool),
+}
+
+/// Serves the connection of `socket`: it runs `handler` for each request, and then drives the
+/// rest of the connection. The close of the server, which `signal` gives, starts its shutdown.
+/// Gives whether the connection and each handler ended with no error.
+async fn run<H, F>(socket: Socket<Core>, handler: Arc<H>, mut signal: watch::Receiver<Option<Deadline>>) -> bool
 where
-    H: Fn(Http) -> F,
-    F: Future<Output = Result<(), Error>>,
+    H: Fn(Exchange) -> F,
+    F: Future<Output = Result<(), Error>> + Send + 'static,
 {
-    let back = Back::default();
-    let connection = Http {
-        socket: Some(socket),
-        stream: None,
-        open: false,
-        back: Some(Arc::clone(&back)),
-    };
-    let handled = handler(connection).await;
-    let connection = back.lock().unwrap_or_else(PoisonError::into_inner).take();
-    // A handler that kept the connection, for example in another task, has its close.
-    let Some(connection) = connection else {
-        return handled.is_ok();
-    };
+    let mut connection = Http::bind(socket);
+    let mut handlers = JoinSet::new();
+    let (mut failed, mut closing) = (false, false);
+    loop {
+        let next = {
+            let mut request = pin!(connection.request());
+            let mut changed = pin!(signal.changed());
+            poll_fn(|cx| {
+                if !closing && let Poll::Ready(changed) = changed.as_mut().poll(cx) {
+                    return Poll::Ready(Next::Close(changed.is_ok()));
+                }
+                if let Poll::Ready(Some(handled)) = handlers.poll_join_next(cx) {
+                    return Poll::Ready(Next::Handled(handled));
+                }
+                request.as_mut().poll(cx).map(Next::Request)
+            })
+            .await
+        };
+        match next {
+            Next::Close(signalled) => {
+                closing = true;
+                shutdown(&connection, signalled.then(|| *signal.borrow()).flatten());
+            }
+            Next::Handled(handled) => failed |= !matches!(handled, Ok(Ok(()))),
+            Next::Request(Ok(Some(exchange))) if exchange.head().version() == Version::Http2 => {
+                handlers.spawn(handler(exchange));
+            }
+            Next::Request(Ok(Some(exchange))) => {
+                // An HTTP/1.1 handler runs in this task, and the close of the server reaches it.
+                let mut handled = pin!(handler(exchange));
+                let mut watch = signal.clone();
+                let mut changed = pin!(watch.changed());
+                let handled = poll_fn(|cx| {
+                    if !closing && let Poll::Ready(changed) = changed.as_mut().poll(cx) {
+                        closing = true;
+                        shutdown(&connection, changed.is_ok().then(|| *signal.borrow()).flatten());
+                    }
+                    handled.as_mut().poll(cx)
+                })
+                .await;
+                failed |= handled.is_err();
+            }
+            Next::Request(Ok(None)) => break,
+            Next::Request(Err(_)) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    // The connection takes no more requests: each handler ends, and then the connection releases.
+    while let Some(handled) = handlers.join_next().await {
+        failed |= !matches!(handled, Ok(Ok(())));
+    }
     let closed = connection.close().await;
-    handled.is_ok() && closed.is_ok_and(|closed| closed.result.is_ok())
+    !failed && closed.is_ok_and(|closed| closed.result.is_ok())
+}
+
+/// Starts the shutdown of `connection` at the close of the server, with its `deadline`: `None`
+/// when the server dropped its signal, which then aborts the task.
+fn shutdown(connection: &Http, deadline: Option<Deadline>) {
+    if let Some(deadline) = deadline {
+        // A connection that ended refuses the shutdown, and its next request gives the end.
+        let _refused = connection.shutdown(deadline);
+    }
 }
 
 /// Adds the end of a connection task to `report`.

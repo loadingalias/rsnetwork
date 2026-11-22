@@ -1,11 +1,15 @@
 //! The Tokio binding of rsnetwork: the protocol engines of the core on the Tokio runtime of the
 //! application.
 //!
-//! - [`client::Http1`], [`server::Http`], and [`tls::Stream`] are the connections of the core
-//!   on a Tokio TCP socket. Each call awaits the progress that it needs, so a body read moves its
-//!   own bytes: no task and no second object to poll.
-//! - [`server::Server`] accepts connections, and runs a handler for each one in a task of its own.
-//!   Its close stops the accepts, drains each connection, and joins each task.
+//! - [`client::Http1`], [`client::Http2`], [`server::Http`], and [`tls::Stream`] are the
+//!   connections of the core on a Tokio TCP socket. Each call awaits the progress that it needs,
+//!   so a body read moves its own bytes: no task and no second object to poll.
+//! - On HTTP/2, each stream has its own handle, a [`client::Exchange`] or a [`server::Exchange`],
+//!   which can go to a task of its own. The handle that awaits drives the shared connection, and
+//!   wakes only the handles whose streams changed.
+//! - [`server::Server`] accepts connections, drives each one in a task of its own, and runs the
+//!   handler once for each request: on HTTP/2 in a task for each stream. Its close stops the
+//!   accepts, drains each connection, and joins each task.
 //! - [`Blocking`] admits blocking jobs, for example host lookups, under a bound, before they go to
 //!   the blocking pool of Tokio, which has no bound of its own.
 //! - [`Socket`] is the step of each call: a connection of the core, its socket, and the [`Clock`].
@@ -70,14 +74,11 @@
 //!         move || Ok((server::Http::plain(server_limits, Clock.domain(), &budget)?, pool()?))
 //!     };
 //!     let connections = NonZeroUsize::new(1024).expect("not zero");
-//!     let server = Server::serve(listener, connections, make, move |mut connection| async move {
-//!         while connection.request().await?.is_some() {
-//!             let hello = Response { status: ok, fields: &[], length: Some(5) };
-//!             connection.respond(&hello).await?;
-//!             connection.write(&Lease::from(&b"hello"[..])).await?;
-//!             connection.finish().await?;
-//!         }
-//!         Ok(())
+//!     let server = Server::serve(listener, connections, make, move |mut exchange| async move {
+//!         let hello = Response { status: ok, fields: &[], length: Some(5) };
+//!         exchange.respond(&hello).await?;
+//!         exchange.write(&Lease::from(&b"hello"[..])).await?;
+//!         exchange.finish().await
 //!     });
 //!
 //!     let core = client::Http1::plain(client::Limits { head, h2, body, turn, queue }, Clock.domain(), &budget)?;
@@ -109,6 +110,7 @@
 mod blocking;
 pub mod client;
 pub mod server;
+mod shared;
 mod socket;
 mod stream;
 pub mod tls;

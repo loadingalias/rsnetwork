@@ -1,6 +1,7 @@
 //! The HTTP/1.1 server on the Tokio binding: the N104 cases whose result depends on the socket,
 //! the timer, or the tasks (N107), and the close of a server, which joins each task that it
-//! spawned. Each case runs on a current-thread and on a multi-thread runtime.
+//! spawned. Each case runs on a current-thread and on a multi-thread runtime. `http2.rs` has the
+//! HTTP/2 cases (N213).
 // Clippy applies `allow-unwrap-in-tests` and `allow-panic-in-tests` to the helpers of a test
 // outside `tests/` of the workspace root only under `cfg(test)`.
 #![cfg(test)]
@@ -29,7 +30,7 @@ use rsnetwork::drive::Kind;
 use rsnetwork::server::{self, Closed, Delivery, Linger, Response};
 use rsnetwork::value::Status;
 use rsnetwork_tokio::Clock;
-use rsnetwork_tokio::server::{Report, Server};
+use rsnetwork_tokio::server::{Exchange, Report, Server};
 use support::{ALERT_RECORD, HEAD_TIMEOUT, Last, PATIENCE, Proxy, Transport, ok, on_each_runtime, read_to_end};
 use tokio::sync::{Notify, mpsc as channel, oneshot};
 
@@ -45,25 +46,25 @@ fn a_reset_after_the_handler_finished_gives_a_partial_delivery_apart_from_the_fi
             let (finished, finish) = oneshot::channel();
             let serving = tokio::spawn(async move {
                 let mut server = support::server(transport, &listener).await;
-                server.request().await.unwrap().expect("a request");
+                let mut exchange = server.request().await.unwrap().expect("a request");
                 let total = (PART * PARTS) as u64;
-                server.respond(&ok(Some(total))).await.unwrap();
+                exchange.respond(&ok(Some(total))).await.unwrap();
                 for _ in 0..PARTS {
-                    server.write(&Lease::from(vec![b'x'; PART])).await.unwrap();
+                    exchange.write(&Lease::from(vec![b'x'; PART])).await.unwrap();
                 }
-                server.finish().await.unwrap();
+                exchange.finish().await.unwrap();
                 // The handler is complete, and the client reads nothing: the delivery goes on.
                 let Some(Delivery::Sending {
                     finished: true,
                     accepted,
-                }) = server.delivery()
+                }) = exchange.delivery()
                 else {
-                    panic!("{transport:?}: {:?}", server.delivery());
+                    panic!("{transport:?}: {:?}", exchange.delivery());
                 };
                 assert!(accepted < total, "{transport:?}: {accepted}");
                 finished.send(()).unwrap();
-                let closed = server.release().await.unwrap();
-                (closed, server.delivery(), total)
+                let closed = server.close().await.unwrap();
+                (closed, exchange.delivery(), total)
             });
             let mut client = support::client(transport, address).await;
             client.send(&support::get(), Clock.deadline(PATIENCE)).await.unwrap();
@@ -95,12 +96,12 @@ fn a_complete_delivery_needs_each_byte_of_the_response() {
         let (collected, collect) = oneshot::channel();
         let serving = tokio::spawn(async move {
             let mut server = support::server(Transport::Plain, &listener).await;
-            server.request().await.unwrap().expect("a request");
-            server.respond(&ok(None)).await.unwrap();
-            server.write(&Lease::from(&b"hello"[..])).await.unwrap();
-            server.finish().await.unwrap();
+            let mut exchange = server.request().await.unwrap().expect("a request");
+            exchange.respond(&ok(None)).await.unwrap();
+            exchange.write(&Lease::from(&b"hello"[..])).await.unwrap();
+            exchange.finish().await.unwrap();
             collect.await.unwrap();
-            server.delivery()
+            exchange.delivery()
         });
         let mut client = support::client(Transport::Plain, address).await;
         client.send(&support::get(), Clock.deadline(PATIENCE)).await.unwrap();
@@ -114,10 +115,10 @@ fn a_complete_delivery_needs_each_byte_of_the_response() {
     });
 }
 
-/// What a handler of the close test tells the test.
+/// What the close test learns from the server.
 #[derive(Debug, PartialEq, Eq)]
 enum Event {
-    /// A connection started.
+    /// The server accepted a connection.
     Started,
     /// The handler finished the response to `/a`, and waits.
     First,
@@ -132,26 +133,24 @@ fn a_close_drains_the_request_in_flight_refuses_the_one_that_the_handler_did_not
         let (events, mut seen) = channel::unbounded_channel();
         let proceed = Arc::new(Notify::new());
         let handler = {
-            let proceed = Arc::clone(&proceed);
-            move |mut connection: rsnetwork_tokio::server::Http| {
+            let (events, proceed) = (events.clone(), Arc::clone(&proceed));
+            move |mut exchange: Exchange| {
                 let (events, proceed) = (events.clone(), Arc::clone(&proceed));
                 async move {
-                    events.send(Event::Started).unwrap();
-                    while let Some(request) = connection.request().await? {
-                        connection.respond(&ok(Some(2))).await?;
-                        connection.write(&Lease::from(&b"ok"[..])).await?;
-                        connection.finish().await?;
-                        // The close comes before the handler asks for `/b`.
-                        if request.target().as_bytes() == b"/a" {
-                            events.send(Event::First).unwrap();
-                            proceed.notified().await;
-                        }
+                    exchange.respond(&ok(Some(2))).await?;
+                    exchange.write(&Lease::from(&b"ok"[..])).await?;
+                    exchange.finish().await?;
+                    // The close comes before the connection takes `/b`.
+                    if exchange.head().target().as_bytes() == b"/a" {
+                        events.send(Event::First).unwrap();
+                        proceed.notified().await;
                     }
                     Ok(())
                 }
             }
         };
-        let make = || {
+        let make = move || {
+            events.send(Event::Started).unwrap();
             let budget = support::budget();
             Ok((support::core_server(Transport::Plain), support::pool(&budget)))
         };
@@ -173,7 +172,7 @@ fn a_close_drains_the_request_in_flight_refuses_the_one_that_the_handler_did_not
                 Event::First => first = true,
             }
         }
-        // The close starts, and then the handler asks for the next request.
+        // The close starts, and then the handler returns.
         let mut closing = pin!(server.close(Clock.deadline(Duration::from_secs(5))));
         poll_fn(|cx| {
             assert!(closing.as_mut().poll(cx).is_pending(), "the close waits for its tasks");
@@ -214,11 +213,12 @@ fn over_tls_a_shutdown_sends_close_notify_before_the_linger() {
         let proxy = Proxy::new(address, Last::Forward);
         let serving = tokio::spawn(async move {
             let mut server = support::server(Transport::Tls, &listener).await;
-            server.request().await.unwrap().expect("a request");
+            let mut exchange = server.request().await.unwrap().expect("a request");
             server.shutdown(Clock.deadline(Duration::from_secs(5))).unwrap();
-            server.respond(&ok(Some(2))).await.unwrap();
-            server.write(&Lease::from(&b"ok"[..])).await.unwrap();
-            server.finish().await.unwrap();
+            exchange.respond(&ok(Some(2))).await.unwrap();
+            exchange.write(&Lease::from(&b"ok"[..])).await.unwrap();
+            exchange.finish().await.unwrap();
+            drop(exchange);
             assert!(server.request().await.unwrap().is_none());
             server.close().await.unwrap()
         });
@@ -283,7 +283,7 @@ fn the_linger_discards_late_bytes_and_ends_at_the_end_of_input_its_bytes_or_its_
             let core = server::Http::plain(limits, Clock.domain(), &support::budget()).unwrap();
             let mut server =
                 rsnetwork_tokio::server::Http::new(core, stream, support::pool(&support::budget())).unwrap();
-            server.request().await.unwrap().expect("a request");
+            let mut exchange = server.request().await.unwrap().expect("a request");
             let started = Instant::now();
             // The server does not read the body, which is longer than the drain.
             let too_large = Response {
@@ -291,7 +291,8 @@ fn the_linger_discards_late_bytes_and_ends_at_the_end_of_input_its_bytes_or_its_
                 fields: &[],
                 length: Some(0),
             };
-            server.respond(&too_large).await.unwrap();
+            exchange.respond(&too_large).await.unwrap();
+            drop(exchange);
             assert!(server.request().await.unwrap().is_none());
             let closed = server.close().await.unwrap();
             let elapsed = started.elapsed();
@@ -324,15 +325,16 @@ fn a_reset_inside_the_request_body_ends_it_reset_not_truncated() {
                 .unwrap();
         });
         let mut server = support::server(Transport::Plain, &listener).await;
-        server.request().await.unwrap().expect("a request");
+        let mut exchange = server.request().await.unwrap().expect("a request");
         let mut region = WriteLoan::new(Backing::from(Vec::with_capacity(16)));
         while region.filled().len() < 4 {
-            assert!(matches!(server.read_into(&mut region).await.unwrap(), Read::Bytes(_)));
+            assert!(matches!(exchange.read_into(&mut region).await.unwrap(), Read::Bytes(_)));
         }
         reset.send(()).unwrap();
         client.join().unwrap();
-        let read = server.read_into(&mut region).await.unwrap();
+        let read = exchange.read_into(&mut region).await.unwrap();
         assert!(matches!(read, Read::Done(Outcome::Reset(None))), "{read:?}");
+        drop(exchange);
         let closed = server.close().await.unwrap();
         assert!(
             matches!(closed, Closed { result: Err(error), .. } if error.kind() == Kind::Partial),

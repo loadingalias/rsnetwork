@@ -22,7 +22,7 @@ complete example.
 | `rsnetwork` | The protocol engines and the caller-driven host, `rsnetwork::host` | `rstypes`, the shared buffer, capacity, and time types of the runtime family, with no scheduler and no driver |
 | `rsnetwork` with the `tls` feature, on by default | Also [TLS 1.3](tls.md), `rsnetwork::tls` | Also rustls and the `rscrypto-rustls` provider, with their dependencies: no C, and no cryptography other than rscrypto |
 | `rsnetwork` with the `tcp` feature, off by default | Also `host::Tcp`, the binding of a caller-driven host to a nonblocking TCP socket, and `host::Socket`, the calls of that socket | No new crate. Until `Read::read_buf` and `TcpStream::set_linger` are stable in std, it needs the nightly toolchain that rsnetwork pins |
-| `rsnetwork-tokio` | The [Tokio binding](tokio.md): the client, the server, and the TLS stream on Tokio, a `Server` that owns its tasks, and bounded blocking jobs | `rsnetwork` with `tcp`, Tokio 1.54 with `rt`, `net`, `sync`, and `time`, and socket2: no C |
+| `rsnetwork-tokio` | The [Tokio binding](tokio.md): the HTTP/1.1 and HTTP/2 clients, the server, and the TLS stream on Tokio, a `Server` that owns its tasks, and bounded blocking jobs | `rsnetwork` with `tcp`, Tokio 1.54 with `rt`, `net`, `sync`, and `time`, and socket2: no C |
 
 A binding that needs a runtime is a package of its own, which depends on `rsnetwork` and on that
 runtime. `rsnetwork` never depends on a binding. Thus:
@@ -122,6 +122,14 @@ its own handler form over these calls, for example an async function, and owns t
 connection while the handler runs. The server tells when the transport accepted a response, so a
 binding reports the end of the handler and the delivery of its response as two results.
 
+An HTTP/2 connection carries many streams, and a binding can give each stream a handle of its own,
+in a task of its own. Then only one handle at a time can wait for the socket. After each call,
+`changed(each)` of `client::Http2` and `server::Http` gives the streams whose exchanges changed, so
+the binding wakes only their handles, and no other. A wake of each handle at each event costs work
+for each stream at each turn. A wake of only the handle that waits for the socket stalls the
+others. The [Tokio binding](tokio.md#http2-streams-in-tasks-of-their-own) does so with a short
+lock and no task.
+
 ## Threads
 
 A connection stays on the thread of its host, and it does not need `Send`. A binding that moves
@@ -134,7 +142,7 @@ application, owns them, and joins them. It drives each connection until `release
 result. `release()` takes no time, so drive the connection with a call that takes `now`, for
 example `server::Http::request(now)` or `client::Http2::drive(now)`: else a linger or a deadline
 never ends, and an HTTP/2 client does not answer the SETTINGS and PING of its server. The
-[Tokio server](tokio.md#a-server-and-its-tasks) does so after each handler. At a shutdown, it calls `abandon()` and keeps each output region that the transport holds
+[Tokio server](tokio.md#a-server-and-its-tasks) does so after its last request. At a shutdown, it calls `abandon()` and keeps each output region that the transport holds
 until the transport completes it. A socket that closes before the release resets the connection,
 so the peer cannot read the close as the end of the data. `host::Tcp::close` does so, and reports
 the output that did not go.

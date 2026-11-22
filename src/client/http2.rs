@@ -68,6 +68,8 @@ struct Exchange {
     ended: bool,
     /// The application left the stream.
     left: bool,
+    /// The exchange changed since the last [`Http2::changed`].
+    changed: bool,
 }
 
 impl Exchange {
@@ -85,6 +87,27 @@ impl Exchange {
             self.error.get_or_insert(error);
         }
         self.inflow.end(outcome);
+    }
+
+    /// Ends the exchange with [`Kind::Deadline`] when `now` reached its deadline, and its stream
+    /// resets.
+    fn lapse(&mut self, now: Instant) -> Result<(), Error> {
+        let reached = self
+            .deadline
+            .is_reached(now)
+            .map_err(|_| misuse("the time is not on the clock of the client"))?;
+        if reached && !self.inflow.ended() && self.error.is_none() {
+            let reason = if self.head.is_none() {
+                "the deadline came before the response head"
+            } else {
+                "the deadline came before the end of the response"
+            };
+            let error = Error::new(Kind::Deadline, reason);
+            self.refuse(ErrorCode::CANCEL, error, Outcome::Cancelled);
+            self.error = Some(error);
+            self.changed = true;
+        }
+        Ok(())
     }
 
     /// Whether the exchange ended: with an error, or with the end of its body.
@@ -296,6 +319,7 @@ impl Http2 {
             reset: None,
             ended: false,
             left: false,
+            changed: false,
         });
         // Over TLS, the drive encrypts the request.
         self.pump(now)?;
@@ -489,6 +513,18 @@ impl Http2 {
         Ok(())
     }
 
+    /// Gives each stream whose exchange changed since the last call: its response head or a
+    /// failure arrived, a part or the end of its body, the output took its last chunk, its
+    /// deadline came, or the connection ended. A binding that shares the connection among
+    /// handles wakes the handle of each stream that it gives, and no other.
+    pub fn changed(&mut self, mut each: impl FnMut(Stream)) {
+        for exchange in &mut self.exchanges {
+            if core::mem::take(&mut exchange.changed) {
+                each(Stream(u64::from(exchange.id)));
+            }
+        }
+    }
+
     /// What the TLS handshake negotiated, or `None` before it completed and over TCP.
     #[cfg(feature = "tls")]
     pub fn negotiated(&mut self) -> Option<Negotiated<'_>> {
@@ -520,20 +556,7 @@ impl Http2 {
             .filter(|&index| !self.exchanges[index].left)
             .ok_or_else(|| misuse("the stream is not open"))?;
         let exchange = &mut self.exchanges[index];
-        let reached = exchange
-            .deadline
-            .is_reached(now)
-            .map_err(|_| misuse("the time is not on the clock of the client"))?;
-        if reached && !exchange.inflow.ended() && exchange.error.is_none() {
-            let reason = if exchange.head.is_none() {
-                "the deadline came before the response head"
-            } else {
-                "the deadline came before the end of the response"
-            };
-            let error = Error::new(Kind::Deadline, reason);
-            exchange.refuse(ErrorCode::CANCEL, error, Outcome::Cancelled);
-            exchange.error = Some(error);
-        }
+        exchange.lapse(now)?;
         if let Some(error) = exchange.error
             && error.kind() == Kind::Deadline
         {
@@ -690,7 +713,12 @@ impl Http2 {
 
     /// Drives the connection one time, and takes its event. Gives whether it made progress: an
     /// event, or a turn that has more work behind it, such as the one of the server's SETTINGS.
+    /// Each exchange whose deadline came ends first, so its reset goes out also when the
+    /// application does not call it.
     fn pump(&mut self, now: Instant) -> Result<bool, Error> {
+        for exchange in self.exchanges.iter_mut().filter(|exchange| !exchange.left) {
+            exchange.lapse(now)?;
+        }
         self.settle()?;
         let step = self.turn(now)?;
         let Some(step) = step else {
@@ -700,14 +728,18 @@ impl Http2 {
             return Ok(self.link.wait() == Wait::Now);
         };
         let budget = self.budget();
-        let at = |exchanges: &[Exchange], stream: u32| exchanges.iter().position(|exchange| exchange.id == stream);
+        let at = |exchanges: &mut [Exchange], stream: u32| {
+            let index = exchanges.iter().position(|exchange| exchange.id == stream)?;
+            exchanges[index].changed = true;
+            Some(index)
+        };
         match step {
             Step::Response {
                 stream,
                 end_stream,
                 answer,
             } => {
-                let Some(index) = at(&self.exchanges, stream) else {
+                let Some(index) = at(&mut self.exchanges, stream) else {
                     return Ok(true);
                 };
                 let exchange = &mut self.exchanges[index];
@@ -742,7 +774,7 @@ impl Http2 {
                 }
             }
             Step::TooLarge { stream } => {
-                if let Some(index) = at(&self.exchanges, stream) {
+                if let Some(index) = at(&mut self.exchanges, stream) {
                     self.exchanges[index].refuse(
                         ErrorCode::CANCEL,
                         Error::new(Kind::Overload, "the response head is larger than the list limit"),
@@ -751,7 +783,7 @@ impl Http2 {
                 }
             }
             Step::Trailers { stream, trailers } => {
-                if let Some(index) = at(&self.exchanges, stream) {
+                if let Some(index) = at(&mut self.exchanges, stream) {
                     let exchange = &mut self.exchanges[index];
                     let malformed = Error::new(Kind::Malformed, "the server sent a malformed response");
                     match trailers {
@@ -779,7 +811,7 @@ impl Http2 {
                 data,
                 end_stream,
             } => {
-                let Some(index) = at(&self.exchanges, stream) else {
+                let Some(index) = at(&mut self.exchanges, stream) else {
                     return Ok(true);
                 };
                 let exchange = &mut self.exchanges[index];
@@ -807,7 +839,7 @@ impl Http2 {
                 }
             }
             Step::Reset { stream, code } => {
-                if let Some(index) = at(&self.exchanges, stream) {
+                if let Some(index) = at(&mut self.exchanges, stream) {
                     let exchange = &mut self.exchanges[index];
                     exchange.ended = true;
                     exchange.reset = None;
@@ -820,13 +852,14 @@ impl Http2 {
                 }
             }
             Step::Sent { stream } => {
-                if let Some(index) = at(&self.exchanges, stream) {
+                if let Some(index) = at(&mut self.exchanges, stream) {
                     self.exchanges[index].out.chunk = false;
                 }
             }
             Step::GoAway { last_stream } => {
                 self.goaway = true;
                 for exchange in self.exchanges.iter_mut().filter(|exchange| exchange.id > last_stream) {
+                    exchange.changed = true;
                     exchange.ended = true;
                     exchange.reset = None;
                     exchange.end(
@@ -856,6 +889,7 @@ impl Http2 {
             } else {
                 Outcome::Truncated
             };
+            exchange.changed = true;
             exchange.ended = true;
             exchange.reset = None;
             exchange.end(error, outcome);
