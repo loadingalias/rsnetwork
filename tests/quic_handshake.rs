@@ -149,7 +149,7 @@ impl Pair {
     fn give(connection: &mut Connection, datagram: Vec<u8>, now: Instant) -> Progress {
         let len = connection.local_cid().as_bytes().len();
         let mut datagrams = Datagrams::new(Backing::from(datagram), None, len);
-        connection.receive(&mut datagrams, now).progress
+        connection.receive(&mut datagrams, now).1.progress
     }
 
     fn deliver(&mut self, datagram: Vec<u8>, now: Instant) -> Progress {
@@ -188,7 +188,7 @@ impl Pair {
     }
 
     fn client_outcome(&mut self, now: Instant) -> Progress {
-        self.client.drive(now).progress
+        self.client.drive(now).1.progress
     }
 }
 
@@ -331,7 +331,7 @@ fn a_chain_inside_the_crypto_bound_completes_out_of_order_and_one_past_it_refuse
         )
     );
     // The client closed with CRYPTO_BUFFER_EXCEEDED, which the server reads as an error.
-    let server = terminal(pair.server().drive(at(0)).progress).expect("the close of the client ended the server");
+    let server = terminal(pair.server().drive(at(0)).1.progress).expect("the close of the client ended the server");
     assert_eq!(
         server.unwrap_err().reason(),
         "the peer closed the QUIC connection with a transport error"
@@ -354,7 +354,7 @@ fn a_trust_failure_closes_with_its_tls_alert_and_the_peer_reads_it() {
         (Kind::Trust, "the peer certificate chain reaches no trusted root")
     );
     // The alert went in the CRYPTO_ERROR range (RFC 9001, section 4.8).
-    let server = terminal(pair.server().drive(at(0)).progress)
+    let server = terminal(pair.server().drive(at(0)).1.progress)
         .expect("the close ended the server")
         .unwrap_err();
     assert_eq!(
@@ -374,10 +374,10 @@ fn an_idle_connection_reaches_its_idle_deadline_with_no_peer_traffic() {
     let config = client_config(CA, Resumption::Off);
     let mut client = Connection::client(&config, "server.test", limits, &budget(), at(0)).unwrap();
     assert!(!Pair::send(&mut client, at(0)).is_empty());
-    let turn = client.drive(at(4_999));
+    let (_, turn) = client.drive(at(4_999));
     assert_eq!(turn.progress, Progress::Blocked(rsnetwork::drive::Blocked::Input));
     assert_eq!(turn.deadline.map(|deadline| deadline.instant()), Some(at(5_000)));
-    let idle = terminal(client.drive(at(5_000)).progress).expect("the idle deadline ended the client");
+    let idle = terminal(client.drive(at(5_000)).1.progress).expect("the idle deadline ended the client");
     assert_eq!(
         idle.unwrap_err().reason(),
         "the QUIC connection was idle past its timeout"
@@ -393,8 +393,8 @@ fn an_idle_connection_reaches_its_idle_deadline_with_no_peer_traffic() {
     pair.run(at(0), Order::Sent);
     assert!(pair.client.is_confirmed());
     for connection in [&mut pair.client, pair.server.as_mut().unwrap()] {
-        assert_eq!(terminal(connection.drive(at(4_999)).progress), None);
-        let idle = terminal(connection.drive(at(5_000)).progress).expect("the idle deadline ended the end");
+        assert_eq!(terminal(connection.drive(at(4_999)).1.progress), None);
+        let idle = terminal(connection.drive(at(5_000)).1.progress).expect("the idle deadline ended the end");
         assert_eq!(idle.unwrap_err().kind(), Kind::Deadline);
     }
 }
@@ -409,10 +409,10 @@ fn a_handshake_that_does_not_confirm_by_its_deadline_ends() {
     let mut client = Connection::client(&config, "server.test", limits, &budget(), at(0)).unwrap();
     Pair::send(&mut client, at(0));
     assert_eq!(
-        client.drive(at(1_999)).deadline.map(|deadline| deadline.instant()),
+        client.drive(at(1_999)).1.deadline.map(|deadline| deadline.instant()),
         Some(at(2_000))
     );
-    let late = terminal(client.drive(at(2_000)).progress).expect("the handshake deadline ended the client");
+    let late = terminal(client.drive(at(2_000)).1.progress).expect("the handshake deadline ended the client");
     let error = late.unwrap_err();
     assert_eq!(
         (error.kind(), error.reason()),

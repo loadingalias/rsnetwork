@@ -6,10 +6,15 @@
 //! [`Connection::drive`] at its deadline, and then [`Connection::transmit`] until it gives no
 //! datagram. Each call returns at once: the engine does no I/O and keeps no thread.
 //!
-//! This engine has the handshake. Acknowledgements and loss recovery come with N306, streams and
-//! datagrams with N305, address validation and connection IDs with N304, and the close periods
-//! with N307. Until then a lost packet is not sent again, the engine ignores the frames of those
-//! parts, and a close ends the connection at once.
+//! After the handshake, the application opens streams, gives them regions to send, and takes the
+//! [`Event`]s of the peer: `receive` and `drive` give one event for each call, so call them again
+//! while they give one. Also call `drive` after the last `transmit`: it gives the events of the
+//! packets that went out, and the next deadline.
+//!
+//! This engine has the handshake, streams, flow control, and unreliable datagrams.
+//! Acknowledgements and loss recovery come with N306, address validation and connection IDs with
+//! N304, and the close periods with N307. Until then a lost packet is not sent again, the engine
+//! ignores the frames of those parts, and a close ends the connection at once.
 
 use core::cmp::Ordering;
 use core::fmt;
@@ -29,10 +34,11 @@ use rustls::quic::{
 use rustls::{ClientSide, ServerSide};
 
 use super::crypto::{self, Refused};
-use super::frame::Frame;
+use super::frame::{Direction, Frame, STREAMS_MAX};
 use super::packet::{self, Builder, Datagrams, Header, Kind as PacketKind, OpenError, Outgoing, Side};
 use super::params::{Parameters, Sender};
-use super::{ConnectionId, ErrorCode};
+use super::stream::{self, Event, Priority, Stop, StreamId, Streams};
+use super::{ConnectionId, ErrorCode, VARINT_MAX};
 use crate::drive::{Blocked, Error, Kind, Progress, Turn, TurnLimits, Work};
 use crate::tls::memory::{self, ClientStore, Cost, Held, Owns};
 use crate::tls::{self, Facts, Negotiated};
@@ -57,6 +63,29 @@ pub struct Limits {
     /// (RFC 9001, section 6). The connection uses the smaller of this limit and the
     /// confidentiality limit of its suite, so `u64::MAX` gives the limit of the suite.
     pub key_packets_max: u64,
+    /// The stream bytes, of each stream together, that the consumers of this end hold at one
+    /// time: the flow-control window of the connection. The peer gets more credit only for the
+    /// bytes that [`Connection::release`] gives back.
+    pub data_bytes_max: u64,
+    /// The bytes of one stream that its consumer holds at one time: the flow-control window of
+    /// each stream. A consumer that does not release holds back only its own stream, while this
+    /// window is smaller than the window of the connection.
+    pub stream_bytes_max: u64,
+    /// The bidirectional streams that the peer has open at one time. A stream stays open until
+    /// [`Connection::close_stream`].
+    pub streams_bidi_max: u64,
+    /// The unidirectional streams that the peer has open at one time.
+    pub streams_uni_max: u64,
+    /// The bytes of the pages that hold stream data that arrived out of order, for each stream
+    /// together. A page has 4 KiB and covers a fixed range of its stream, so a piece with no
+    /// neighbor counts as one page. The engine does not take a packet whose data needs more: it
+    /// sends no acknowledgement for it, the peer sends its data again, and
+    /// [`Connection::reassembly_refused`] counts it. A bound of the window of the connection and
+    /// two pages for each stream refuses nothing that the windows admit.
+    pub reassembly_bytes_max: u64,
+    /// The bytes of unreliable datagrams (RFC 9221) that wait to go out at one time, or `None`
+    /// for a connection that sends and takes none.
+    pub unreliable_bytes_max: Option<u32>,
     /// The work of one call: the received bytes and the frames that it reads, and the rustls
     /// calls that it makes, each counted as a frame.
     pub turn: TurnLimits,
@@ -65,13 +94,21 @@ pub struct Limits {
 impl Limits {
     /// An idle timeout of 30 s, a handshake timeout of 10 s, datagrams of at most 1,200 bytes,
     /// connection IDs of 8 bytes, the key limit of the suite, and 1 MiB and 4,096 frames for each
-    /// call.
+    /// call. A window of 4 MiB for the connection and of 1 MiB for each stream, 100 streams of the
+    /// peer in each direction, 6 MiB for data out of order, which the windows never reach, and no
+    /// unreliable datagrams.
     pub const DEFAULT: Self = Self {
         idle_timeout: Some(Duration::from_secs(30)),
         handshake_timeout: Duration::from_secs(10),
         datagram_bytes_max: DATAGRAM_MIN,
         cid_bytes: 8,
         key_packets_max: u64::MAX,
+        data_bytes_max: 4 << 20,
+        stream_bytes_max: 1 << 20,
+        streams_bidi_max: 100,
+        streams_uni_max: 100,
+        reassembly_bytes_max: 6 << 20,
+        unreliable_bytes_max: None,
         turn: TurnLimits {
             bytes: 1 << 20,
             frames: 4096,
@@ -339,8 +376,20 @@ pub struct Connection {
     failures: u64,
     /// The capacity that the next rustls call waits for.
     wait: Option<u64>,
-    /// Work waits for the next call: a limit of a turn stopped it.
+    /// Work waits for the next call: a limit of a turn stopped it, or the call gave an event.
     more: bool,
+    streams: Streams,
+    /// The opened packet whose frames the engine reads, after a frame that gave an event.
+    reading: Option<Reading>,
+    /// The packets that the engine did not take: it had no room for their stream data.
+    refused: u64,
+}
+
+/// The frames of an opened packet: its payload, and the offset of the next frame.
+struct Reading {
+    level: Level,
+    payload: Lease,
+    at: usize,
 }
 
 impl fmt::Debug for Connection {
@@ -401,6 +450,8 @@ fn check(limits: &Limits) -> Result<(), Error> {
         || limits.key_packets_max < 2
         || limits.handshake_timeout.is_zero()
         || limits.idle_timeout.is_some_and(|timeout| timeout.is_zero())
+        || limits.data_bytes_max.max(limits.stream_bytes_max) > VARINT_MAX
+        || limits.streams_bidi_max.max(limits.streams_uni_max) > STREAMS_MAX
     {
         return Err(Error::new(Kind::Misuse, "the QUIC limits cannot work"));
     }
@@ -567,6 +618,11 @@ impl Connection {
         let mut events = Vec::new();
         events.try_reserve_exact(EVENTS).map_err(|_| OUTPUT_REFUSED)?;
         let idle = limits.idle_timeout.map(|timeout| timeout.max(3 * PTO_INITIAL));
+        let side = if matches!(end, End::Client { .. }) {
+            Side::Client
+        } else {
+            Side::Server
+        };
         Ok(Self {
             end,
             tls,
@@ -602,6 +658,19 @@ impl Connection {
             failures: 0,
             wait: None,
             more: false,
+            streams: Streams::new(
+                side,
+                stream::Config {
+                    data_bytes: limits.data_bytes_max,
+                    stream_bytes: limits.stream_bytes_max,
+                    streams: [limits.streams_bidi_max, limits.streams_uni_max],
+                    reassembly_bytes: limits.reassembly_bytes_max,
+                    unreliable_bytes: limits.unreliable_bytes_max.map(u64::from),
+                },
+                budget,
+            ),
+            reading: None,
+            refused: 0,
         })
     }
 
@@ -612,6 +681,16 @@ impl Connection {
             original_destination_cid: server.then_some(self.original_cid),
             idle_timeout: self.limits.idle_timeout,
             initial_source_cid: Some(self.local_cid),
+            data_bytes_initial: self.limits.data_bytes_max,
+            stream_bytes_bidi_local_initial: self.limits.stream_bytes_max,
+            stream_bytes_bidi_remote_initial: self.limits.stream_bytes_max,
+            stream_bytes_uni_initial: self.limits.stream_bytes_max,
+            streams_bidi_initial: self.limits.streams_bidi_max,
+            streams_uni_initial: self.limits.streams_uni_max,
+            datagram_bytes_max: self
+                .limits
+                .unreliable_bytes_max
+                .map(|_| stream::UNRELIABLE_FRAME_BYTES_MAX),
             ..Parameters::default()
         }
     }
@@ -649,16 +728,145 @@ impl Connection {
         self.ping = true;
     }
 
-    /// Opens the packets of `datagrams`, the received region, and runs the handshake on their
-    /// CRYPTO data. A packet that this end cannot open is discarded. Stops at a limit of the
-    /// turn: then call again with the same region.
-    pub fn receive(&mut self, datagrams: &mut Datagrams, now: Instant) -> Turn {
+    /// Refuses a call of the application after the connection ended.
+    fn live(&self) -> Result<(), Error> {
+        match (self.outcome, &self.close) {
+            (Some(Err(error)), _) => Err(error),
+            (Some(Ok(())), _) => Err(Error::new(Kind::Cancelled, "the QUIC connection closed")),
+            (None, Some(close)) => Err(close.error),
+            (None, None) => Ok(()),
+        }
+    }
+
+    /// Opens the next stream of `direction` of this end. Gives `None` when the stream limit of
+    /// the peer allows no new stream: [`Event::Openable`] tells when it does.
+    ///
+    /// Refuses with [`Kind::Misuse`] before the handshake completes, with [`Kind::Overload`] when
+    /// the budget cannot pay for the stream, and with the error of a connection that ended.
+    pub fn open(&mut self, direction: Direction) -> Result<Option<StreamId>, Error> {
+        self.live()?;
+        self.streams.open(direction)
+    }
+
+    /// Gives `data` to `stream` as its next bytes, with no copy: the stream sends views of the
+    /// region, and holds it until each of its bytes is in a packet. With `end`, the bytes are the
+    /// last of the stream, and `data` can be empty. A stream holds at most
+    /// [`STREAM_REGIONS_MAX`](super::STREAM_REGIONS_MAX) regions: give the next ones after
+    /// [`Event::Sent`].
+    ///
+    /// Refuses with [`Kind::Misuse`] when the stream is not open, only receives, sent its end, or
+    /// holds its most regions, and when `data` is empty with no `end`. Refuses with
+    /// [`Kind::Cancelled`] after the peer stopped the stream, and with [`Kind::Overload`] when
+    /// the budget cannot pay.
+    pub fn send(&mut self, stream: StreamId, data: Lease, end: bool) -> Result<(), Error> {
+        self.live()?;
+        self.streams.send(stream, data, end)
+    }
+
+    /// Ends the send direction of `stream` early, with the error code `code` of the application
+    /// protocol: the regions that wait drop, and the peer gets a RESET_STREAM frame.
+    ///
+    /// Refuses with [`Kind::Misuse`] when the stream is not open, only receives, or was reset
+    /// before, and when `code` is above 2^62 - 1.
+    pub fn reset(&mut self, stream: StreamId, code: u64) -> Result<(), Error> {
+        self.live()?;
+        self.streams.reset(stream, code)
+    }
+
+    /// Ends the receive direction of `stream` early, with the error code `code` of the
+    /// application protocol: the bytes that did not go up drop, each later byte drops, and the
+    /// peer gets a STOP_SENDING frame.
+    ///
+    /// Refuses with [`Kind::Misuse`] when the stream is not open, only sends, or ended its data
+    /// before, and when `code` is above 2^62 - 1.
+    pub fn stop(&mut self, stream: StreamId, code: u64) -> Result<(), Error> {
+        self.live()?;
+        self.streams.stop(stream, code)
+    }
+
+    /// Releases `bytes` bytes of `stream` that the consumer is done with: bytes of
+    /// [`Event::Stream`] that it copied out or dropped. The peer gets their credit back, for the
+    /// stream and for the connection, when the free credit reaches the credit that it still has.
+    /// No other credit goes to the peer, so it can send at most the windows of the [`Limits`].
+    ///
+    /// Refuses with [`Kind::Misuse`] when the stream is not open or only sends, and when its
+    /// consumer holds fewer bytes.
+    pub fn release(&mut self, stream: StreamId, bytes: u64) -> Result<(), Error> {
+        self.live()?;
+        self.streams.release(stream, bytes)
+    }
+
+    /// Ends the use of `stream` by the application. Each direction of the stream ended before:
+    /// the data went up or was given with its end, or the direction was reset or stopped. The
+    /// bytes that the consumer still holds count as released. The peer gets the credit for a new
+    /// stream only after this call, so the streams that the application works on never pass
+    /// [`Limits::streams_bidi_max`] and [`Limits::streams_uni_max`].
+    ///
+    /// Refuses with [`Kind::Misuse`] when the stream is not open, or a direction of it is.
+    pub fn close_stream(&mut self, stream: StreamId) -> Result<(), Error> {
+        self.live()?;
+        self.streams.close(stream)
+    }
+
+    /// Sets the send priority of `stream`. A new stream has [`Priority::DEFAULT`].
+    ///
+    /// Refuses with [`Kind::Misuse`] when the stream is not open or only receives, and with
+    /// [`Kind::Overload`] when the budget cannot pay for a new urgency.
+    pub fn set_priority(&mut self, stream: StreamId, priority: Priority) -> Result<(), Error> {
+        self.live()?;
+        self.streams.set_priority(stream, priority)
+    }
+
+    /// The bytes that a 1-RTT packet of the largest datagram has for its frames: after its
+    /// header, with the longest packet number, and before its tag.
+    fn frame_room(&self) -> usize {
+        self.datagram_bytes()
+            .saturating_sub(1 + self.remote_cid.as_bytes().len() + 4 + packet::TAG)
+    }
+
+    /// The bytes of the largest unreliable datagram (RFC 9221) that goes out now, or `None` when
+    /// the peer takes none or [`Limits::unreliable_bytes_max`] has them off.
+    pub fn unreliable_room(&self) -> Option<usize> {
+        self.streams.unreliable_room(self.frame_room())
+    }
+
+    /// Queues `data` as one unreliable datagram (RFC 9221), with no copy. It goes out one time, in
+    /// one packet, before the data of the streams, and no loss sends it again.
+    ///
+    /// Refuses with [`Kind::Unsupported`] when the peer takes no unreliable datagram or this end
+    /// has them off, and with [`Kind::Overload`] when `data` is larger than
+    /// [`unreliable_room`](Self::unreliable_room), when the queue holds
+    /// [`Limits::unreliable_bytes_max`] bytes, and when the budget cannot pay. A refusal queues
+    /// nothing: no datagram drops with no report.
+    pub fn send_unreliable(&mut self, data: Lease) -> Result<(), Error> {
+        self.live()?;
+        self.streams.unreliable(data, self.frame_room())
+    }
+
+    /// The packets that this end did not take, because their stream data found no room in
+    /// [`Limits::reassembly_bytes_max`] or the budget. Each of them got no acknowledgement, so the
+    /// peer sends its frames again.
+    pub const fn reassembly_refused(&self) -> u64 {
+        self.refused
+    }
+
+    /// Opens the packets of `datagrams`, the received region, runs the handshake on their CRYPTO
+    /// data, and reads the frames of the streams. A packet that this end cannot open is
+    /// discarded. Gives the next event, and stops there: call again with the same region while
+    /// the call gives an event or [`Progress::Pending`].
+    pub fn receive(&mut self, datagrams: &mut Datagrams, now: Instant) -> (Option<Event>, Turn) {
         let mut work = Work::default();
         self.more = false;
         if let Err(error) = self.timers(now) {
             self.outcome = Some(Err(error));
         }
-        while self.outcome.is_none() && self.close.is_none() {
+        loop {
+            if let Some(event) = self.next_event(&mut work) {
+                return (Some(event), self.turn());
+            }
+            if self.outcome.is_some() || self.close.is_some() {
+                break;
+            }
             if work.reached(&self.limits.turn) {
                 self.more = true;
                 break;
@@ -672,29 +880,52 @@ impl Connection {
             if let Err(failure) = self.packet(packet, &mut work, now) {
                 self.fail(failure);
             }
-            if let Err(failure) = self.advance(&mut work) {
-                self.fail(failure);
-            }
         }
-        self.turn()
+        (None, self.turn())
     }
 
-    /// Runs the timers at `now`, and the handshake work that a limit of a turn or the budget
-    /// stopped. Call it at the deadline of the last turn, when capacity is free, and after a
+    /// Runs the timers at `now`, and the work that waits: the events of the streams, the frames
+    /// after an event, and the handshake work that a limit of a turn or the budget stopped. Gives
+    /// the next event. Call it at the deadline of the last turn, when capacity is free, after the
+    /// last [`transmit`](Self::transmit), and again while it gives an event or
     /// [`Progress::Pending`].
-    pub fn drive(&mut self, now: Instant) -> Turn {
+    pub fn drive(&mut self, now: Instant) -> (Option<Event>, Turn) {
         let mut work = Work::default();
         self.more = false;
         if let Err(error) = self.timers(now) {
             self.outcome = Some(Err(error));
         }
+        let event = self.next_event(&mut work);
+        (event, self.turn())
+    }
+
+    /// Gives the next event of the streams, from the events that wait and then from the frames of
+    /// the packet that the engine reads, and else runs the handshake.
+    fn next_event(&mut self, work: &mut Work) -> Option<Event> {
+        for _ in 0..2 {
+            if self.outcome.is_some() || self.close.is_some() {
+                return None;
+            }
+            let event = self
+                .streams
+                .event()
+                .map_or_else(|| self.frames(work), |event| Ok(Some(event)));
+            match event {
+                Ok(Some(event)) => {
+                    self.more = true;
+                    return Some(event);
+                }
+                Ok(None) => {}
+                Err(failure) => self.fail(failure),
+            }
+        }
         if self.outcome.is_none()
             && self.close.is_none()
-            && let Err(failure) = self.advance(&mut work)
+            && let Err(failure) = self.advance(work)
         {
             self.fail(failure);
         }
-        self.turn()
+        None
     }
 
     /// The result of a call.
@@ -766,7 +997,9 @@ impl Connection {
         let expected = space.largest.map_or(0, |largest| largest + 1);
         let opened = match level {
             Level::Data => {
-                let Some(keys) = &mut self.one_rtt else {
+                // No 1-RTT packet is read before the handshake completes (RFC 9001, section
+                // 5.7): the parameters of the peer, which the frames need, come with it.
+                let Some(keys) = self.one_rtt.as_mut().filter(|_| self.peer.is_some()) else {
                     return Ok(());
                 };
                 let unmasked = match packet.unmask(&*keys.remote.header, expected) {
@@ -827,7 +1060,12 @@ impl Connection {
         }
         self.received = true;
         self.idle_deadline = self.idle.map(|idle| after(now, idle)).transpose()?;
-        self.frames(level, &packet.payload(), work)
+        self.reading = Some(Reading {
+            level,
+            payload: packet.payload(),
+            at: 0,
+        });
+        Ok(())
     }
 
     /// Counts a packet that failed authentication, and ends the connection at the integrity
@@ -851,18 +1089,28 @@ impl Connection {
         Ok(())
     }
 
-    /// Reads the frames of an opened packet of `level`.
-    fn frames(&mut self, level: Level, payload: &Lease, work: &mut Work) -> Result<(), Failure> {
-        let mut bytes = payload.bytes();
+    /// Reads the frames of the opened packet, up to a frame that gives an event: the rest waits
+    /// for the next call. A frame whose stream data or state finds no room ends the packet, which
+    /// is then not received.
+    fn frames(&mut self, work: &mut Work) -> Result<Option<Event>, Failure> {
+        let Some(mut reading) = self.reading.take() else {
+            return Ok(None);
+        };
         let server = matches!(self.end, End::Server { .. });
-        while !bytes.is_empty() {
+        let (level, handshake_level) = (reading.level, reading.level != Level::Data);
+        loop {
+            let bytes = reading.payload.bytes().get(reading.at..).unwrap_or_default();
+            if bytes.is_empty() {
+                return Ok(None);
+            }
             let (frame, len) =
                 Frame::parse(bytes).map_err(|error| Failure::transport(error.code, error.frame_type, VIOLATION))?;
-            bytes = &bytes[len..];
+            reading.at += len;
             work.add(0, 1);
-            let handshake_level = level != Level::Data;
-            match frame {
-                Frame::Padding { .. } | Frame::Ping => {}
+            // The data of a STREAM or DATAGRAM frame is the end of its frame.
+            let data = |data: &[u8]| reading.at - data.len()..reading.at;
+            let taken = match frame {
+                Frame::Padding { .. } | Frame::Ping => Ok(None),
                 Frame::Ack(ack) => {
                     let space = &self.spaces[level as usize];
                     if ack.largest >= space.next {
@@ -874,17 +1122,24 @@ impl Connection {
                     {
                         keys.acknowledged = true;
                     }
+                    Ok(None)
                 }
-                Frame::Crypto { offset, data } => self.crypto(level, offset, data)?,
+                Frame::Crypto { offset, data } => {
+                    self.crypto(level, offset, data)?;
+                    Ok(None)
+                }
                 // A close of the application is only in 1-RTT packets (RFC 9000, section 12.4).
                 Frame::ConnectionClose { frame_type: None, .. } if handshake_level => {
                     return Err(Failure::transport(ErrorCode::PROTOCOL_VIOLATION, 0x1d, VIOLATION));
                 }
                 Frame::ConnectionClose { code, frame_type, .. } => {
                     self.outcome = Some(closed(code, frame_type));
-                    return Ok(());
+                    return Ok(None);
                 }
-                Frame::HandshakeDone if !server && !handshake_level => self.confirm(),
+                Frame::HandshakeDone if !server && !handshake_level => {
+                    self.confirm();
+                    Ok(None)
+                }
                 Frame::HandshakeDone | Frame::NewToken { .. } if server || handshake_level => {
                     return Err(Failure::transport(ErrorCode::PROTOCOL_VIOLATION, 0x1e, VIOLATION));
                 }
@@ -893,12 +1148,50 @@ impl Connection {
                 _ if handshake_level => {
                     return Err(Failure::transport(ErrorCode::PROTOCOL_VIOLATION, 0, VIOLATION));
                 }
-                // The frames of streams, datagrams, paths, and connection IDs come with N304,
-                // N305, and N307.
-                _ => {}
+                Frame::Stream {
+                    stream,
+                    offset,
+                    data: bytes,
+                    fin,
+                } => self
+                    .streams
+                    .stream_in(stream, (offset, fin), data(bytes), &reading.payload),
+                Frame::ResetStream {
+                    stream,
+                    code,
+                    final_size,
+                } => self.streams.reset_in(stream, code, final_size).map(|()| None),
+                Frame::StopSending { stream, code } => self.streams.stop_in(stream, code).map(|()| None),
+                Frame::MaxData { max } => {
+                    self.streams.max_data_in(max);
+                    Ok(None)
+                }
+                Frame::MaxStreamData { stream, max } => self.streams.max_stream_data_in(stream, max).map(|()| None),
+                Frame::MaxStreams { direction, max } => {
+                    self.streams.max_streams_in(direction, max);
+                    Ok(None)
+                }
+                Frame::StreamDataBlocked { stream, .. } => self.streams.blocked_in(stream).map(|()| None),
+                Frame::Datagram { data: bytes } => self.streams.unreliable_in(len, data(bytes), &reading.payload),
+                // The frames of paths and connection IDs come with N304 and N307. The other
+                // BLOCKED frames and a NEW_TOKEN frame change nothing.
+                _ => Ok(None),
+            };
+            match taken {
+                Ok(None) => {}
+                Ok(Some(event)) => {
+                    self.reading = Some(reading);
+                    return Ok(Some(event));
+                }
+                Err(Stop::Violation(code, frame_type)) => {
+                    return Err(Failure::transport(code, frame_type, VIOLATION));
+                }
+                Err(Stop::Refused(_)) => {
+                    self.refused = self.refused.saturating_add(1);
+                    return Ok(None);
+                }
             }
         }
-        Ok(())
     }
 
     /// Takes the CRYPTO data of a frame of `level`. Data at a level below the one that rustls
@@ -1185,6 +1478,7 @@ impl Connection {
         self.held.finished(peer, evidence, &self.own.get());
         self.validate(&parameters)?;
         self.peer = Some(parameters);
+        self.streams.peer(&parameters);
         self.idle = match (self.limits.idle_timeout, parameters.idle_timeout) {
             (Some(local), Some(remote)) => Some(local.min(remote)),
             (local, remote) => local.or(remote),
@@ -1219,6 +1513,7 @@ impl Connection {
         if self.outcome.is_some() || self.close.is_some() {
             return;
         }
+        self.reading = None;
         let keys = self.spaces.iter().any(|space| space.keys.is_some()) || self.one_rtt.is_some();
         match failure.code {
             Some((code, frame_type)) if keys => {
@@ -1236,22 +1531,19 @@ impl Connection {
     /// end has nothing to send. Call it until it gives `None`. The datagram has at most
     /// [`Limits::datagram_bytes_max`] bytes, and at least 1,200 when it carries an Initial packet.
     ///
-    /// Refuses with [`Kind::Misuse`] when `out` has fewer than 1,200 bytes.
+    /// Refuses with [`Kind::Misuse`] when `out` has fewer bytes than
+    /// [`Limits::datagram_bytes_max`].
     pub fn transmit(&mut self, out: &mut [u8], now: Instant) -> Result<Option<usize>, Error> {
-        if out.len() < DATAGRAM_MIN {
+        if out.len() < self.limits.datagram_bytes_max {
             return Err(Error::new(
                 Kind::Misuse,
-                "a QUIC datagram needs an output of 1,200 bytes or more",
+                "a QUIC datagram needs an output of the bytes of its limit",
             ));
         }
         if self.outcome.is_some() {
             return Ok(None);
         }
-        let peer = self.peer.map_or(usize::MAX, |peer| {
-            usize::try_from(peer.udp_payload_bytes_max).unwrap_or(usize::MAX)
-        });
-        let size = self.limits.datagram_bytes_max.min(peer).min(out.len());
-        let out = &mut out[..size];
+        let out = &mut out[..self.datagram_bytes()];
         let built = match self.close {
             Some(close) => self.closing(out, close, now),
             None => self.datagram(out, now),
@@ -1266,11 +1558,23 @@ impl Connection {
         }
     }
 
+    /// The bytes of the largest datagram that this end sends: its limit, and the limit of the
+    /// peer.
+    fn datagram_bytes(&self) -> usize {
+        let peer = self.peer.map_or(usize::MAX, |peer| {
+            usize::try_from(peer.udp_payload_bytes_max).unwrap_or(usize::MAX)
+        });
+        self.limits.datagram_bytes_max.min(peer)
+    }
+
     /// Whether this end has something to send at `level`.
     fn wants(&self, level: Level) -> bool {
         let space = &self.spaces[level as usize];
         match level {
-            Level::Data => self.one_rtt.is_some() && (space.send.pending() || self.handshake_done || self.ping),
+            Level::Data => {
+                self.one_rtt.is_some()
+                    && (space.send.pending() || self.handshake_done || self.ping || self.streams.pending())
+            }
             _ => space.keys.is_some() && space.send.pending(),
         }
     }
@@ -1337,8 +1641,9 @@ impl Connection {
     }
 
     /// Builds one packet of `level` at the start of `out`: a CONNECTION_CLOSE frame for `close`,
-    /// or the HANDSHAKE_DONE and CRYPTO frames that wait. Pads it to `pad` bytes. Gives its
-    /// length, or `None` when `out` has no room for a packet with a frame.
+    /// or the HANDSHAKE_DONE and CRYPTO frames and the frames of the streams that wait. Pads it
+    /// to `pad` bytes. Gives its length, or `None` when `out` has no room for a packet with a
+    /// frame.
     fn packet_out(
         &mut self,
         level: Level,
@@ -1378,6 +1683,7 @@ impl Connection {
         let full = |_: packet::BuildError| {
             Failure::local(Error::new(Kind::Unsupported, "a QUIC frame did not fit its packet"))
         };
+        let room = builder.room();
         // A packet with no room for a frame waits for the next datagram.
         let control = level == Level::Data && (self.handshake_done || self.ping);
         if close.is_none() && !control && builder.room() <= CRYPTO_FRAME_HEAD {
@@ -1408,6 +1714,13 @@ impl Connection {
                 let len = data.len();
                 builder.frame(&Frame::Crypto { offset, data }).map_err(full)?;
                 send.sent(len);
+            }
+            if level == Level::Data {
+                self.streams.write(&mut builder);
+            }
+            // A packet that took no frame, because none fits, waits for the next datagram.
+            if builder.room() == room && pad.is_none() {
+                return Ok(None);
             }
         }
         if let Some(pad) = pad {

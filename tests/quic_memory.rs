@@ -1,5 +1,7 @@
-//! The memory of a QUIC handshake against its charges: at each allocation, the live heap of each
-//! end stays within the charges of its budgets (N303, [NET Resource and Progress Bounds]).
+//! The memory of a QUIC connection against its charges: at each allocation, the live heap of each
+//! end stays within the charges of its budgets, in the handshake and with stream data out of order
+//! (N303, N305, [NET Resource and Progress Bounds]). A stream limit costs no memory for the
+//! streams that are not in use.
 
 mod counting;
 
@@ -10,11 +12,12 @@ use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
 use std::sync::Arc;
 
-use rsnetwork::buffer::Backing;
+use rsnetwork::buffer::{Backing, Lease};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::Kind;
+use rsnetwork::quic::frame::Direction;
 use rsnetwork::quic::packet::{Datagrams, Header, Kind as PacketKind};
-use rsnetwork::quic::{Connection, Limits};
+use rsnetwork::quic::{Connection, Event, Limits};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
     CertificateDer, ClientConfig, ClientOptions, Entropy, Handshake, Identity, PrivateKeyDer, Resumption, ServerConfig,
@@ -108,6 +111,11 @@ struct Profile {
     /// The packets that one 1-RTT key of the server seals, and the PINGs that it sends after the
     /// handshake.
     keys: (u64, usize),
+    /// The bytes that the client sends on one stream after the handshake. The server gets its
+    /// datagrams in groups of 32, each from its last datagram, so the data waits out of order.
+    stream_bytes: usize,
+    /// The streams of each direction that each end lets its peer open.
+    streams: u64,
 }
 
 impl Profile {
@@ -121,6 +129,8 @@ impl Profile {
             connections: 1,
             reversed: false,
             keys: (u64::MAX, 0),
+            stream_bytes: 0,
+            streams: 100,
         }
     }
 }
@@ -141,11 +151,18 @@ fn send(owner: usize, connection: &mut Connection) -> Vec<Vec<u8>> {
     panic!("a connection sends at most 512 datagrams at once");
 }
 
-/// Gives `datagram`, a region of the transport, to `connection` of `owner`.
-fn give(owner: usize, connection: &mut Connection, datagram: Vec<u8>) {
+/// Gives `datagram`, a region of the transport, to `connection` of `owner`, and gives the stream
+/// bytes of its events.
+fn give(owner: usize, connection: &mut Connection, datagram: Vec<u8>) -> usize {
     let len = connection.local_cid().as_bytes().len();
     let mut datagrams = Datagrams::new(Backing::from(datagram), None, len);
-    owned(owner, || connection.receive(&mut datagrams, now()));
+    let mut bytes = 0;
+    while let (Some(event), _) = owned(owner, || connection.receive(&mut datagrams, now())) {
+        if let Event::Stream { data, .. } = event {
+            bytes += data.as_ref().len();
+        }
+    }
+    bytes
 }
 
 /// Each long-header packet of `datagrams` in its own region: the Initial packets in order, and
@@ -177,9 +194,9 @@ fn reversed(datagrams: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     first
 }
 
-/// Runs the connections of `profile`, and gives the excess of each end and the handshake of
-/// each connection.
-fn run(profile: &Profile) -> ([u64; 2], Vec<Option<Handshake>>) {
+/// Runs the connections of `profile`, and gives the excess of each end, the handshake of each
+/// connection, and the live heap of each end before its last connection drops.
+fn run(profile: &Profile) -> ([u64; 2], Vec<Option<Handshake>>, [u64; 2]) {
     EXCESS.set([0; 2]);
     BUDGETS.with_borrow_mut(|budgets| budgets.iter_mut().for_each(Vec::clear));
     let ((leaf, key), chain, root) = (profile.leaf, &profile.chain, profile.root);
@@ -214,16 +231,22 @@ fn run(profile: &Profile) -> ([u64; 2], Vec<Option<Handshake>>) {
         })
         .unwrap()
     };
-    let server_limits = Limits {
-        key_packets_max: profile.keys.0,
+    let client_limits = Limits {
+        streams_bidi_max: profile.streams,
+        streams_uni_max: profile.streams,
         ..Limits::DEFAULT
     };
+    let server_limits = Limits {
+        key_packets_max: profile.keys.0,
+        ..client_limits
+    };
     let mut handshakes = Vec::new();
+    let mut live = [0; 2];
     for _ in 0..profile.connections {
         let client_budget = budget(CLIENT_END);
         let server_budget = budget(SERVER_END);
         let mut client = owned(CLIENT_END, || {
-            Connection::client(&client_config, "server.test", Limits::DEFAULT, &client_budget, now())
+            Connection::client(&client_config, "server.test", client_limits, &client_budget, now())
         })
         .unwrap();
         let mut server: Option<Connection> = None;
@@ -264,12 +287,29 @@ fn run(profile: &Profile) -> ([u64; 2], Vec<Option<Handshake>>) {
         }
         assert!(client.is_confirmed(), "{}: the handshake completed", profile.name);
         handshakes.push(client.negotiated().map(|evidence| evidence.handshake));
+        if profile.stream_bytes > 0 {
+            let stream = owned(CLIENT_END, || client.open(Direction::Unidirectional))
+                .unwrap()
+                .expect("the server lets the client open a stream");
+            // The data of the application is its own memory.
+            let data = Lease::from(vec![7; profile.stream_bytes]);
+            owned(CLIENT_END, || client.send(stream, data, true)).unwrap();
+            let datagrams = send(CLIENT_END, &mut client);
+            let received: usize = datagrams
+                .chunks(32)
+                .flat_map(|group| group.iter().rev())
+                .map(|datagram| give(SERVER_END, server, datagram.clone()))
+                .sum();
+            assert_eq!(received, profile.stream_bytes, "{}: the stream arrived", profile.name);
+        }
+        let heap = counting::LIVE.get();
+        live = [heap[CLIENT_END], heap[SERVER_END]];
     }
-    (EXCESS.get(), handshakes)
+    (EXCESS.get(), handshakes, live)
 }
 
 #[test]
-fn the_heap_of_each_end_of_a_quic_handshake_stays_within_its_charges() {
+fn the_heap_of_each_end_of_a_quic_connection_stays_within_its_charges() {
     counting::CHECK.set(Some(check));
     let sessions = Resumption::Process(NonZeroUsize::new(8).unwrap());
     let profiles = [
@@ -303,9 +343,14 @@ fn the_heap_of_each_end_of_a_quic_handshake_stays_within_its_charges() {
             keys: (2, 3),
             ..Profile::new("a key update of the server")
         },
+        // About 170 datagrams, which wait in the pages of the server out of order.
+        Profile {
+            stream_bytes: 200 * 1024,
+            ..Profile::new("a stream out of order")
+        },
     ];
     for profile in &profiles {
-        let (excess, handshakes) = run(profile);
+        let (excess, handshakes, _) = run(profile);
         assert_eq!(
             excess,
             [0, 0],
@@ -322,6 +367,23 @@ fn the_heap_of_each_end_of_a_quic_handshake_stays_within_its_charges() {
             assert_eq!(handshake, Some(expected), "{}: connection {connection}", profile.name);
         }
     }
+}
+
+#[test]
+fn a_stream_limit_of_10_000_allocates_nothing_for_the_streams_that_are_not_in_use() {
+    // Each end lets its peer open 100 streams, and then 10,000: the same handshake and the same
+    // one stream of data keep the same heap (NET-MEM-7).
+    let heap = |streams| {
+        let profile = Profile {
+            stream_bytes: 4 * 1024,
+            streams,
+            ..Profile::new("a stream limit")
+        };
+        run(&profile).2
+    };
+    let (few, many) = (heap(100), heap(10_000));
+    assert!(few[0] > 0 && few[1] > 0, "the heap of each end is counted");
+    assert_eq!(few, many);
 }
 
 #[test]

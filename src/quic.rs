@@ -6,6 +6,13 @@
 //!   streams under [`CRYPTO_BUFFER_BYTES_MAX`], key updates, and the idle and handshake timeouts
 //!   of [`Limits`]. 0-RTT is off. Each byte that the engine and rustls keep is charged to the
 //!   budget of the connection.
+//! - **Streams.** After the handshake, each end opens streams, gives them regions to send, and
+//!   takes an [`Event`] for each call of [`Connection::receive`] and [`Connection::drive`]. Stream
+//!   data in order goes up as views of the received regions, with no copy. The flow control of
+//!   QUIC is the only credit layer: the peer gets more credit only for the bytes that the consumer
+//!   releases. Data out of order waits in pages under [`Limits::reassembly_bytes_max`]. The send
+//!   scheduler orders the streams by their [`Priority`]. Unreliable datagrams (RFC 9221) go when
+//!   both ends take them.
 //! - **Parameters.** [`params::Parameters`] writes and checks the transport parameters of each end
 //!   (RFC 9000, section 18).
 //! - **Packets.** [`packet::Datagrams`] walks the packets of a received region in place: the
@@ -31,9 +38,12 @@ mod crypto;
 pub mod frame;
 pub mod packet;
 pub mod params;
+mod reassembly;
+mod stream;
 
 pub use connection::{Connection, Limits};
 pub use crypto::CRYPTO_BUFFER_BYTES_MAX;
+pub use stream::{Event, Priority, STREAM_REGIONS_MAX, StreamId};
 
 use core::fmt;
 
