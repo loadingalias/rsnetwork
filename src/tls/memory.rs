@@ -47,14 +47,30 @@ const KEPT: u64 = 3 * 25 / 6 + 2 * 2 + 1;
 /// The working memory of a call that does not depend on its bytes: a key exchange, a signature
 /// and its check, and the key schedule.
 const CALL: u64 = 16 * 1024;
-/// The state of a client handshake: the key shares of X25519MLKEM768 and X25519, the transcript,
-/// and the key schedule.
+/// The state of a client handshake besides its record keys: the key shares of X25519MLKEM768 and
+/// X25519, the transcript, and the key schedule.
 const CLIENT_STATE: u64 = 20 * 1024;
 /// The state of a client handshake for each ALPN name that it offers, and for each byte of a name.
 const PROTOCOL: u64 = 96;
 const PROTOCOL_BYTE: u64 = 4;
-/// The state of a server handshake.
+/// The state of a server handshake besides its record keys.
 const SERVER_STATE: u64 = 4 * 1024;
+/// The record keys that rustls holds between the calls of a handshake: one for each direction.
+const RECORD_KEYS: u64 = 2 * RECORD_KEY;
+
+/// The larger of two sizes, in a constant.
+const fn larger(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
+/// One key of the provider for a record, which rustls boxes: the largest cipher state of rscrypto
+/// on the target of the build, with its nonce and its tag. The state differs by target, so the
+/// charge is its size there: an AES-GCM key keeps 128 GHASH powers (2 KiB) on x86_64 Linux and
+/// Windows, and less on aarch64.
+const RECORD_KEY: u64 = (larger(
+    larger(size_of::<rscrypto::Aes128Gcm>(), size_of::<rscrypto::Aes256Gcm>()),
+    size_of::<rscrypto::ChaCha20Poly1305>(),
+) + 64) as u64;
 /// The state that a server adds when it asks for a client certificate.
 const SERVER_AUTH_STATE: u64 = 8 * 1024;
 /// The working memory of a call that sends the own chain, for each certificate and each byte.
@@ -98,7 +114,7 @@ impl Cost {
     pub(super) fn client(protocols: &[&[u8]], identity: bool) -> Self {
         let bytes: usize = protocols.iter().map(|name| name.len()).sum();
         Self {
-            state: CLIENT_STATE + PROTOCOL * protocols.len() as u64 + PROTOCOL_BYTE * bytes as u64,
+            state: CLIENT_STATE + RECORD_KEYS + PROTOCOL * protocols.len() as u64 + PROTOCOL_BYTE * bytes as u64,
             read: READ_CLIENT,
             kept: KEPT,
             transcript: identity,
@@ -110,7 +126,7 @@ impl Cost {
     pub(super) fn server(client_roots: Option<&[CertificateDer<'_>]>) -> Self {
         let roots: usize = client_roots.unwrap_or_default().iter().map(|root| root.len()).sum();
         Self {
-            state: SERVER_STATE + client_roots.map_or(0, |_| SERVER_AUTH_STATE + 2 * roots as u64),
+            state: SERVER_STATE + RECORD_KEYS + client_roots.map_or(0, |_| SERVER_AUTH_STATE + 2 * roots as u64),
             read: READ_SERVER,
             kept: client_roots.map_or(0, |_| KEPT),
             transcript: client_roots.is_some(),
