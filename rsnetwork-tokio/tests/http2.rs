@@ -545,9 +545,11 @@ fn a_close_of_the_server_drains_accepted_streams_refuses_new_ones_and_joins_each
 /// A second thread reads each byte of the server until the end of its stream, and gives them.
 fn raw(address: core::net::SocketAddr, frames: Vec<u8>) -> thread::JoinHandle<Vec<u8>> {
     let socket = TcpStream::connect(address).unwrap();
+    // The timeout is set before the first byte goes out: macOS refuses the call on a socket that
+    // the server closed.
+    socket.set_read_timeout(Some(PATIENCE)).unwrap();
     let mut reader = socket.try_clone().unwrap();
     let reading = thread::spawn(move || {
-        reader.set_read_timeout(Some(PATIENCE)).unwrap();
         let mut bytes = Vec::new();
         drop(reader.read_to_end(&mut bytes));
         bytes
