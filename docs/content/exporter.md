@@ -80,7 +80,9 @@ A refusal writes zeros to `output`, so the buffer holds no material.
 | `Handshake` | The handshake did not complete | Derive after it, for example after the first response or after `negotiated()` gives a value |
 | `Unavailable` | The connection runs over TCP with no TLS | Use a TLS connection |
 | `Closed` | The connection ended: this end closed or failed, the transport failed, or the input of the peer ended | Make a new connection, and a new proof on it |
-| `Profile` | The label, the context, or the length breaks a rule of the table above | Correct the request |
+| `Label` | The label is empty, longer than 249 bytes, or starts with the reserved prefix | Use a label that the table above allows |
+| `Context` | The context is longer than 1,024 bytes | Hash a longer context, and pass its digest |
+| `Length` | The output has 0 bytes or more than 8,160 bytes | Derive a shorter output, and expand it with your own KDF |
 
 On a connection that many handles share, such as `rsnetwork_tokio::client::Http2`, `export` takes
 the lock of the connection for its derivation only.

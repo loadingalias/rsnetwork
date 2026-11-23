@@ -32,10 +32,13 @@ pub enum ExportError {
     /// The connection ended: this end closed or failed, or the input of the peer ended. Only a
     /// new connection gives new material.
     Closed,
-    /// The request is outside the profile of the exporter: an empty label, a label longer than
-    /// [`EXPORT_LABEL_MAX`] or under [`RESERVED_LABEL_PREFIX`], a context longer than
-    /// [`EXPORT_CONTEXT_MAX`], or an output of 0 bytes or of more than [`EXPORT_OUTPUT_MAX`].
-    Profile,
+    /// The label is empty, longer than [`EXPORT_LABEL_MAX`], or starts with
+    /// [`RESERVED_LABEL_PREFIX`].
+    Label,
+    /// The context is longer than [`EXPORT_CONTEXT_MAX`].
+    Context,
+    /// The output has 0 bytes or more than [`EXPORT_OUTPUT_MAX`].
+    Length,
 }
 
 impl fmt::Display for ExportError {
@@ -44,7 +47,9 @@ impl fmt::Display for ExportError {
             Self::Handshake => "the TLS handshake did not complete",
             Self::Unavailable => "the connection has no TLS exporter",
             Self::Closed => "the connection ended",
-            Self::Profile => "the label, the context, or the length is outside the exporter profile",
+            Self::Label => "the exporter label is empty, too long, or under the reserved prefix",
+            Self::Context => "the exporter context is too long",
+            Self::Length => "the exporter output length is 0 or too long",
         })
     }
 }
@@ -72,14 +77,14 @@ impl<E> Tls<E> {
 
     /// The checks and the derivation of [`export`](Self::export).
     fn derive(&self, label: &[u8], context: &[u8], output: &mut [u8]) -> Result<(), ExportError> {
-        if label.is_empty()
-            || label.len() > EXPORT_LABEL_MAX
-            || label.starts_with(RESERVED_LABEL_PREFIX)
-            || context.len() > EXPORT_CONTEXT_MAX
-            || output.is_empty()
-            || output.len() > EXPORT_OUTPUT_MAX
-        {
-            return Err(ExportError::Profile);
+        if label.is_empty() || label.len() > EXPORT_LABEL_MAX || label.starts_with(RESERVED_LABEL_PREFIX) {
+            return Err(ExportError::Label);
+        }
+        if context.len() > EXPORT_CONTEXT_MAX {
+            return Err(ExportError::Context);
+        }
+        if output.is_empty() || output.len() > EXPORT_OUTPUT_MAX {
+            return Err(ExportError::Length);
         }
         let records = match &self.phase {
             Phase::Handshake(_) => return Err(ExportError::Handshake),

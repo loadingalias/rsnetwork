@@ -201,19 +201,24 @@ fn a_resumed_connection_derives_from_its_own_regular_exporter() {
 }
 
 #[test]
-fn each_request_outside_the_profile_refuses_and_leaves_zeros() {
+fn each_argument_outside_its_limit_refuses_with_its_name_and_leaves_zeros() {
     let (client, server) = connect(&configs(Resumption::Off));
     let long = vec![b'x'; EXPORT_LABEL_MAX + 1];
     let reserved = [RESERVED_LABEL_PREFIX, b"channel"].concat();
     let context = vec![0; EXPORT_CONTEXT_MAX + 1];
     let mut output = [0xff; 32];
-    for (label, context) in [(&b""[..], &b""[..]), (&long, b""), (&reserved, b""), (LABEL, &context)] {
-        assert_eq!(client.export(label, context, &mut output), Err(ExportError::Profile));
+    for (label, context, error) in [
+        (&b""[..], &b""[..], ExportError::Label),
+        (&long, b"", ExportError::Label),
+        (&reserved, b"", ExportError::Label),
+        (LABEL, &context, ExportError::Context),
+    ] {
+        assert_eq!(client.export(label, context, &mut output), Err(error));
         assert_eq!(output, [0; 32], "a refusal leaves no material");
     }
-    assert_eq!(client.export(LABEL, b"", &mut []), Err(ExportError::Profile));
+    assert_eq!(client.export(LABEL, b"", &mut []), Err(ExportError::Length));
     let mut longest = vec![0; EXPORT_OUTPUT_MAX + 1];
-    assert_eq!(client.export(LABEL, b"", &mut longest), Err(ExportError::Profile));
+    assert_eq!(client.export(LABEL, b"", &mut longest), Err(ExportError::Length));
     // The limits themselves are inside the profile, and both ends agree at them.
     let label = vec![b'x'; EXPORT_LABEL_MAX];
     let context = vec![0; EXPORT_CONTEXT_MAX];
