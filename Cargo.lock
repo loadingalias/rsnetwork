@@ -59,26 +59,33 @@ name = "rsasync"
 version = "0.1.0-alpha.2"
 source = "git+https://github.com/loadingalias/rsasync?branch=main#3e6334bc07f86ca8d39c7f0f0ed5585a93f4cfaf"
 dependencies = [
- "rscrypto",
+ "rscrypto 0.13.0 (git+https://github.com/loadingalias/rscrypto?branch=main)",
  "rsnetwork-udp",
  "rstypes",
 ]
 
 [[package]]
 name = "rscrypto"
-version = "0.12.0"
-source = "git+https://github.com/loadingalias/rscrypto?branch=main#d867e6cbb56fd6661cf67ec6949a5aa645249ef0"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e104be3abddebfbeb6b789e869de2cfa8c9129ded62b076f3b9bfc7f0e8314bd"
 dependencies = [
  "getrandom",
 ]
 
 [[package]]
+name = "rscrypto"
+version = "0.13.0"
+source = "git+https://github.com/loadingalias/rscrypto?branch=main#1271cf58563cc50f90f315fbf9d81ea0f48ce612"
+
+[[package]]
 name = "rscrypto-rustls"
-version = "0.0.0"
-source = "git+https://github.com/loadingalias/rscrypto?branch=main#d867e6cbb56fd6661cf67ec6949a5aa645249ef0"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3d7c21ef74255d0932a9dced053b1bf4c5fa53b2b8b3cfa9bcd405d34d1b13"
 dependencies = [
  "getrandom",
- "rscrypto",
+ "rscrypto 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
@@ -91,7 +98,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "httparse",
  "rsasync",
- "rscrypto",
+ "rscrypto 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rscrypto-rustls",
  "rstypes",
  "rustls",
@@ -208,7 +215,7 @@ dependencies = [
 name = "xtask"
 version = "0.0.0"
 dependencies = [
- "rscrypto",
+ "rscrypto 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]

@@ -83,16 +83,18 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rscrypto"
-version = "0.12.0"
-source = "git+https://github.com/loadingalias/rscrypto?branch=main#d867e6cbb56fd6661cf67ec6949a5aa645249ef0"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e104be3abddebfbeb6b789e869de2cfa8c9129ded62b076f3b9bfc7f0e8314bd"
 dependencies = [
  "getrandom",
 ]
 
 [[package]]
 name = "rscrypto-rustls"
-version = "0.0.0"
-source = "git+https://github.com/loadingalias/rscrypto?branch=main#d867e6cbb56fd6661cf67ec6949a5aa645249ef0"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3d7c21ef74255d0932a9dced053b1bf4c5fa53b2b8b3cfa9bcd405d34d1b13"
 dependencies = [
  "getrandom",
  "rscrypto",
