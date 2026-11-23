@@ -29,8 +29,8 @@ use rsnetwork::h1::{BodyLimits, Client, ClientEvent, Framing, Limits as HeadLimi
 use rsnetwork::host::{Connection, Engine, Io as _, Wait};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
-    CertificateDer, ChaCha20Rng, ClientConfig, ClientOptions, Closure, Copies, Entropy, Group, Handshake, Identity,
-    Limits, PrivateKeyDer, Resumption, ServerConfig, ServerOptions, TimeProvider, Tls, UnixTime,
+    Authentication, CertificateDer, ChaCha20Rng, ClientConfig, ClientOptions, Closure, Copies, Entropy, Group,
+    Handshake, Identity, Limits, PrivateKeyDer, Resumption, ServerConfig, ServerOptions, TimeProvider, Tls, UnixTime,
 };
 use rsnetwork::value::{Authority, Field, Method, Status, Target};
 
@@ -39,6 +39,12 @@ const OTHER_CA: &[u8] = include_bytes!("tls/other-ca.der");
 const SERVER: (&[u8], &[u8]) = (include_bytes!("tls/server.der"), include_bytes!("tls/server.key.der"));
 const ROTATED: (&[u8], &[u8]) = (include_bytes!("tls/rotated.der"), include_bytes!("tls/rotated.key.der"));
 const CLIENT: (&[u8], &[u8]) = (include_bytes!("tls/client.der"), include_bytes!("tls/client.key.der"));
+// An ML-DSA-65 root and intermediate, and a leaf for `server.test` with each parameter set.
+const MLDSA_CA: &[u8] = include_bytes!("tls/mldsa-ca.der");
+const MLDSA_INTERMEDIATE: &[u8] = include_bytes!("tls/mldsa-intermediate.der");
+const MLDSA44: (&[u8], &[u8]) = (include_bytes!("tls/mldsa44.der"), include_bytes!("tls/mldsa44.key.der"));
+const MLDSA65: (&[u8], &[u8]) = (include_bytes!("tls/mldsa65.der"), include_bytes!("tls/mldsa65.key.der"));
+const MLDSA87: (&[u8], &[u8]) = (include_bytes!("tls/mldsa87.der"), include_bytes!("tls/mldsa87.key.der"));
 
 /// 2027-01-01, inside the validity of each test certificate.
 const VALID: u64 = 1_798_761_600;
@@ -593,6 +599,40 @@ fn an_expired_wrong_name_or_unknown_root_certificate_refuses_with_a_trust_error(
         let error = pair.client_error().unwrap();
         assert_eq!((error.kind(), error.reason()), (Kind::Trust, reason));
         assert_eq!(pair.client.parts().0.negotiated(), None);
+    }
+}
+
+#[test]
+fn each_ml_dsa_certificate_of_the_server_names_its_own_parameter_set() {
+    let client = client_config(MLDSA_CA, None, VALID, Resumption::Off);
+    for ((leaf, key), authentication) in [
+        (MLDSA44, Authentication::MlDsa44),
+        (MLDSA65, Authentication::MlDsa65),
+        (MLDSA87, Authentication::MlDsa87),
+    ] {
+        let server = ServerConfig::new(ServerOptions {
+            identity: Identity {
+                chain: vec![certificate(leaf), certificate(MLDSA_INTERMEDIATE)],
+                key: PrivateKeyDer::try_from(key.to_vec()).unwrap(),
+            },
+            client_roots: None,
+            protocols: &[b"http/1.1"],
+            resumption: Resumption::Off,
+            budget: &budget(),
+            clock: Arc::new(At(VALID)),
+            entropy: Entropy::System,
+        })
+        .unwrap();
+        let mut pair = Pair::new(&client, "server.test", &server);
+        pair.run();
+        let evidence = pair.client.parts().0.negotiated().expect("the handshake completed");
+        assert_eq!(
+            evidence.peer,
+            Some(rsnetwork::tls::Peer {
+                certificate: leaf,
+                authentication
+            })
+        );
     }
 }
 

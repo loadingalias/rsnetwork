@@ -1,6 +1,13 @@
-//! QUIC version 1 in the core (RFC 9000 and RFC 9001): the packet layer and the frame codec, with
-//! no I/O.
+//! QUIC version 1 in the core (RFC 9000 and RFC 9001): the connection engine, the packet layer,
+//! the frame codec, and the transport parameters, with no I/O.
 //!
+//! - **Connections.** [`Connection`] runs the TLS 1.3 handshake on rustls's QUIC API, with the
+//!   configurations of [`tls`](crate::tls): the packet number spaces and their keys, the CRYPTO
+//!   streams under [`CRYPTO_BUFFER_BYTES_MAX`], key updates, and the idle and handshake timeouts
+//!   of [`Limits`]. 0-RTT is off. Each byte that the engine and rustls keep is charged to the
+//!   budget of the connection.
+//! - **Parameters.** [`params::Parameters`] writes and checks the transport parameters of each end
+//!   (RFC 9000, section 18).
 //! - **Packets.** [`packet::Datagrams`] walks the packets of a received region in place: the
 //!   coalesced packets of each datagram, and each datagram of a region that segmentation offload
 //!   filled. A packet opens in the region that it arrived in, and then freezes as a
@@ -19,8 +26,14 @@
 //!   [`SecureRandom`](rustls::crypto::SecureRandom), so a seeded source replays each packet byte
 //!   for byte.
 
+mod connection;
+mod crypto;
 pub mod frame;
 pub mod packet;
+pub mod params;
+
+pub use connection::{Connection, Limits};
+pub use crypto::CRYPTO_BUFFER_BYTES_MAX;
 
 use core::fmt;
 

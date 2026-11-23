@@ -31,6 +31,11 @@ use counting::allocations;
 const CA: &[u8] = include_bytes!("tls/ca.der");
 const SERVER: (&[u8], &[u8]) = (include_bytes!("tls/server.der"), include_bytes!("tls/server.key.der"));
 const CLIENT: (&[u8], &[u8]) = (include_bytes!("tls/client.der"), include_bytes!("tls/client.key.der"));
+// An ML-DSA-65 root and intermediate, and leaves of ML-DSA-65 and ML-DSA-87.
+const MLDSA_CA: &[u8] = include_bytes!("tls/mldsa-ca.der");
+const MLDSA_INTERMEDIATE: &[u8] = include_bytes!("tls/mldsa-intermediate.der");
+const MLDSA65: (&[u8], &[u8]) = (include_bytes!("tls/mldsa65.der"), include_bytes!("tls/mldsa65.key.der"));
+const MLDSA87: (&[u8], &[u8]) = (include_bytes!("tls/mldsa87.der"), include_bytes!("tls/mldsa87.key.der"));
 
 /// 2027-01-01, inside the validity of each test certificate.
 const VALID: u64 = 1_798_761_600;
@@ -168,6 +173,8 @@ fn unchecked() -> Budget {
 /// A shape of a connection between a client and a server.
 struct Profile {
     name: &'static str,
+    /// The leaf of the server with its key, and the root that the client trusts.
+    server: ((&'static [u8], &'static [u8]), &'static [u8]),
     /// The certificates after the leaf of the server.
     server_chain: Vec<CertificateDer<'static>>,
     /// The certificates after the leaf of the client, for mTLS, or `None`.
@@ -186,6 +193,7 @@ impl Profile {
     fn new(name: &'static str) -> Self {
         Self {
             name,
+            server: (SERVER, CA),
             server_chain: Vec::new(),
             client_chain: None,
             resumption: Resumption::Off,
@@ -201,7 +209,7 @@ impl Profile {
 fn configs(profile: &Profile) -> (ClientConfig, ServerConfig, Budget, Budget) {
     let (client_budget, server_budget) = (budget(CLIENT_END, 1 << 24), budget(SERVER_END, 1 << 24));
     let client = ClientConfig::new(ClientOptions {
-        roots: &[certificate(CA)],
+        roots: &[certificate(profile.server.1)],
         identity: profile.client_chain.clone().map(|chain| identity(CLIENT, chain)),
         protocols: &[b"h2", b"http/1.1"],
         resumption: profile.resumption,
@@ -212,7 +220,7 @@ fn configs(profile: &Profile) -> (ClientConfig, ServerConfig, Budget, Budget) {
     .unwrap();
     let client_roots = profile.client_chain.as_ref().map(|_| [certificate(CA)]);
     let server = ServerConfig::new(ServerOptions {
-        identity: identity(SERVER, profile.server_chain.clone()),
+        identity: identity(profile.server.0, profile.server_chain.clone()),
         client_roots: client_roots.as_ref().map(|roots| &roots[..]),
         protocols: &[b"http/1.1"],
         resumption: profile.resumption,
@@ -487,6 +495,18 @@ fn the_heap_of_each_end_stays_within_its_charges_in_each_profile() {
                 ..LIMITS
             },
             ..Profile::new("KeyUpdates in both directions")
+        },
+        // ML-DSA signs the handshake and each certificate of the chain.
+        Profile {
+            server: (MLDSA65, MLDSA_CA),
+            server_chain: vec![certificate(MLDSA_INTERMEDIATE)],
+            ..Profile::new("an ML-DSA-65 chain")
+        },
+        Profile {
+            server: (MLDSA87, MLDSA_CA),
+            server_chain: vec![certificate(MLDSA_INTERMEDIATE)],
+            client_chain: Some(Vec::new()),
+            ..Profile::new("mTLS with an ML-DSA-87 server")
         },
     ];
     for profile in &profiles {

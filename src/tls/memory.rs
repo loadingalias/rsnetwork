@@ -63,14 +63,26 @@ const fn larger(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
 }
 
-/// One key of the provider for a record, which rustls boxes: the largest cipher state of rscrypto
-/// on the target of the build, with its nonce and its tag. The state differs by target, so the
-/// charge is its size there: an AES-GCM key keeps 128 GHASH powers (2 KiB) on x86_64 Linux and
-/// Windows, and less on aarch64.
-const RECORD_KEY: u64 = (larger(
+/// One key of the provider for a record or a QUIC packet, which rustls boxes: the largest cipher
+/// state of rscrypto on the target of the build, with its nonce and its tag. The state differs by
+/// target, so the charge is its size there: an AES-GCM key keeps 128 GHASH powers (2 KiB) on
+/// x86_64 Linux and Windows, and less on aarch64.
+pub(crate) const RECORD_KEY: u64 = (larger(
     larger(size_of::<rscrypto::Aes128Gcm>(), size_of::<rscrypto::Aes256Gcm>()),
     size_of::<rscrypto::ChaCha20Poly1305>(),
 ) + 64) as u64;
+
+/// One QUIC header protection key of the provider, which rustls boxes: the largest header cipher
+/// state of rscrypto on the target of the build, with its tag.
+pub(crate) const HEADER_KEY: u64 = {
+    use rscrypto::aead::expert::header_protection::{
+        Aes128HeaderProtection, Aes256HeaderProtection, ChaCha20HeaderProtection,
+    };
+    (larger(
+        larger(size_of::<Aes128HeaderProtection>(), size_of::<Aes256HeaderProtection>()),
+        size_of::<ChaCha20HeaderProtection>(),
+    ) + 32) as u64
+};
 /// The state that a server adds when it asks for a client certificate.
 const SERVER_AUTH_STATE: u64 = 8 * 1024;
 /// The working memory of a call that sends the own chain, for each certificate and each byte.
@@ -94,11 +106,11 @@ const SESSION: u64 = 256;
 
 /// What the configuration of one end fixes for each of its connections.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Cost {
+pub(crate) struct Cost {
     /// The state of a handshake.
     state: u64,
     /// The bytes that a call can decode for each byte that it reads.
-    pub(super) read: u64,
+    pub(crate) read: u64,
     /// The factor of the chain of the peer that rustls keeps between calls, or 0 when the peer
     /// sends no chain.
     kept: u64,
@@ -106,12 +118,12 @@ pub(super) struct Cost {
     /// client with an identity, and a server that asks for one.
     transcript: bool,
     /// The state of the kernel connection.
-    pub(super) kernel: u64,
+    pub(crate) kernel: u64,
 }
 
 impl Cost {
     /// The cost of a client that offers `protocols`, and shows an identity when it has one.
-    pub(super) fn client(protocols: &[&[u8]], identity: bool) -> Self {
+    pub(crate) fn client(protocols: &[&[u8]], identity: bool) -> Self {
         let bytes: usize = protocols.iter().map(|name| name.len()).sum();
         Self {
             state: CLIENT_STATE + RECORD_KEYS + PROTOCOL * protocols.len() as u64 + PROTOCOL_BYTE * bytes as u64,
@@ -123,7 +135,7 @@ impl Cost {
     }
 
     /// The cost of a server, which asks for a client chain to `client_roots` when it has some.
-    pub(super) fn server(client_roots: Option<&[CertificateDer<'_>]>) -> Self {
+    pub(crate) fn server(client_roots: Option<&[CertificateDer<'_>]>) -> Self {
         let roots: usize = client_roots.unwrap_or_default().iter().map(|root| root.len()).sum();
         Self {
             state: SERVER_STATE + RECORD_KEYS + client_roots.map_or(0, |_| SERVER_AUTH_STATE + 2 * roots as u64),
@@ -139,7 +151,7 @@ impl Cost {
 /// configuration: its own chain, and the trust roots that a server names in its
 /// CertificateRequest.
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Own {
+pub(crate) struct Own {
     /// The working memory.
     work: u64,
     /// The bytes that a call can write besides [`FLIGHT`].
@@ -148,7 +160,7 @@ pub(super) struct Own {
 
 impl Own {
     /// The part for `ders`.
-    pub(super) fn new(ders: &[CertificateDer<'_>]) -> Self {
+    pub(crate) fn new(ders: &[CertificateDer<'_>]) -> Self {
         let bytes: usize = ders.iter().map(|der| der.len()).sum();
         Self {
             work: OWN * ders.len() as u64 + OWN_BYTE * bytes as u64,
@@ -159,7 +171,7 @@ impl Own {
     }
 
     /// The part for `bytes` more that a call writes, as the ALPN names of a ClientHello.
-    pub(super) fn plus_bytes(self, bytes: usize) -> Self {
+    pub(crate) fn plus_bytes(self, bytes: usize) -> Self {
         Self {
             flight: self.flight + bytes,
             ..self
@@ -167,7 +179,7 @@ impl Own {
     }
 
     /// The sum of two parts.
-    pub(super) fn plus(self, other: Self) -> Self {
+    pub(crate) fn plus(self, other: Self) -> Self {
         Self {
             work: self.work + other.work,
             flight: self.flight + other.flight,
@@ -175,12 +187,12 @@ impl Own {
     }
 
     /// The working memory of a call that reads `visible` bytes, with the factor `read`.
-    pub(super) fn work(&self, read: u64, visible: usize) -> u64 {
+    pub(crate) fn work(&self, read: u64, visible: usize) -> u64 {
         (CALL + self.work).saturating_add(read.saturating_mul(visible as u64))
     }
 
     /// The bytes that one call can write.
-    pub(super) fn flight(&self) -> usize {
+    pub(crate) fn flight(&self) -> usize {
         FLIGHT + self.flight
     }
 
@@ -193,13 +205,13 @@ impl Own {
 /// The part of the own chain of a configuration. A rotation of the identity of a server only
 /// raises it, so a call charges enough also when the identity changes while it runs.
 #[derive(Debug, Default)]
-pub(super) struct Owns {
+pub(crate) struct Owns {
     work: AtomicU64,
     flight: AtomicUsize,
 }
 
 impl Owns {
-    pub(super) fn new(own: Own) -> Self {
+    pub(crate) fn new(own: Own) -> Self {
         Self {
             work: AtomicU64::new(own.work),
             flight: AtomicUsize::new(own.flight),
@@ -207,13 +219,13 @@ impl Owns {
     }
 
     /// Raises the part to cover `own` too.
-    pub(super) fn raise(&self, own: Own) {
+    pub(crate) fn raise(&self, own: Own) {
         // Ordering: each part is a bound on its own; nothing else depends on the order.
         self.work.fetch_max(own.work, Ordering::Relaxed);
         self.flight.fetch_max(own.flight, Ordering::Relaxed);
     }
 
-    pub(super) fn get(&self) -> Own {
+    pub(crate) fn get(&self) -> Own {
         Own {
             work: self.work.load(Ordering::Relaxed),
             flight: self.flight.load(Ordering::Relaxed),
@@ -223,7 +235,7 @@ impl Owns {
 
 /// The bytes of the end-entity certificate of `identity`, which the connection keeps as the
 /// evidence of the peer.
-pub(super) fn end_entity_bytes(identity: Option<&VerifiedIdentity<'_>>) -> u64 {
+pub(crate) fn end_entity_bytes(identity: Option<&VerifiedIdentity<'_>>) -> u64 {
     match identity.map(|identity| identity.identity()) {
         Some(Identity::X509(chain)) => chain.end_entity.len() as u64,
         _ => 0,
@@ -232,7 +244,7 @@ pub(super) fn end_entity_bytes(identity: Option<&VerifiedIdentity<'_>>) -> u64 {
 
 /// The bytes that one copy of the chain of `identity` holds: each certificate, and the list of
 /// the intermediate certificates.
-pub(super) fn chain_bytes(identity: Option<&VerifiedIdentity<'_>>) -> u64 {
+pub(crate) fn chain_bytes(identity: Option<&VerifiedIdentity<'_>>) -> u64 {
     let bytes = match identity.map(|identity| identity.identity()) {
         Some(Identity::X509(chain)) => {
             chain.end_entity.len()
@@ -248,7 +260,7 @@ pub(super) fn chain_bytes(identity: Option<&VerifiedIdentity<'_>>) -> u64 {
 
 /// The charge of the rustls memory of one connection: the state of its handshake, and after the
 /// hand-off the state of its kernel connection.
-pub(super) struct Held {
+pub(crate) struct Held {
     budget: Budget,
     credit: Credit,
     /// The state that the configuration fixes, until the hand-off.
@@ -266,7 +278,7 @@ pub(super) struct Held {
 impl Held {
     /// Charges the state of a handshake of `cost` and the working memory of its first call, which
     /// sends `own`, or refuses with [`Kind::Overload`].
-    pub(super) fn new(budget: &Budget, cost: &Cost, state: u64, own: &Own) -> Result<Self, Error> {
+    pub(crate) fn new(budget: &Budget, cost: &Cost, state: u64, own: &Own) -> Result<Self, Error> {
         let mut credit = budget.credit(0);
         let state = cost.state + state;
         let transcript = if cost.transcript { own.transcript() } else { 0 };
@@ -285,13 +297,13 @@ impl Held {
     }
 
     /// Charges the working memory of the next call, or gives the units that it needs.
-    pub(super) fn charge(&mut self, work: u64) -> Result<(), u64> {
+    pub(crate) fn charge(&mut self, work: u64) -> Result<(), u64> {
         self.credit.charge(work).map_err(|_| work)
     }
 
     /// Gives back the working memory of a call that read `visible` bytes and sent `own`, and keeps
     /// the bound of what rustls can keep.
-    pub(super) fn after(&mut self, visible: usize, own: &Own) {
+    pub(crate) fn after(&mut self, visible: usize, own: &Own) {
         self.chain = self.chain.max(self.kept.saturating_mul(visible as u64));
         self.keep(self.state + self.transcript(own) + self.chain + self.sessions);
     }
@@ -300,7 +312,7 @@ impl Held {
     /// of `peer`, one for each later ticket and one for the facts of the connection, until the
     /// hand-off. The hand-off copies `evidence` bytes of the end-entity certificate before it
     /// drops them.
-    pub(super) fn finished(&mut self, peer: u64, evidence: u64, own: &Own) {
+    pub(crate) fn finished(&mut self, peer: u64, evidence: u64, own: &Own) {
         self.keep(self.state + self.transcript(own) + 2 * peer + evidence + self.sessions);
     }
 
@@ -310,7 +322,7 @@ impl Held {
     }
 
     /// At the hand-off: the state of the kernel connection, with `peer` bytes of chain that it keeps.
-    pub(super) fn hand_off(&mut self, kernel: u64, peer: u64) {
+    pub(crate) fn hand_off(&mut self, kernel: u64, peer: u64) {
         self.state = 0;
         self.chain = 0;
         self.sessions = 0;
@@ -345,7 +357,7 @@ thread_local! {
 
 /// Runs `f`, a call of the handshake, with the credit of `held` and the charge `output` of the
 /// output in the reach of the stores. Both charges come from the budget of `held`.
-pub(super) fn handshake<R>(held: &mut Held, output: &mut Credit, f: impl FnOnce() -> R) -> R {
+pub(crate) fn handshake<R>(held: &mut Held, output: &mut Credit, f: impl FnOnce() -> R) -> R {
     let call = Call::Handshake {
         credit: core::mem::replace(&mut held.credit, held.budget.credit(0)),
         output: core::mem::replace(output, held.budget.credit(0)),
@@ -366,7 +378,7 @@ pub(super) fn handshake<R>(held: &mut Held, output: &mut Credit, f: impl FnOnce(
 }
 
 /// Runs `f`, which gives a session ticket to rustls, with its charge `ticket` for the store.
-pub(super) fn ticket<R>(ticket: Ticket, f: impl FnOnce() -> R) -> R {
+pub(crate) fn ticket<R>(ticket: Ticket, f: impl FnOnce() -> R) -> R {
     run(Call::Ticket(ticket), f).0
 }
 
@@ -382,7 +394,7 @@ fn run<R>(call: Call, f: impl FnOnce() -> R) -> (R, Option<Call>) {
 }
 
 /// The charge of a session ticket that the core gives to the client store.
-pub(super) struct Ticket {
+pub(crate) struct Ticket {
     charge: Option<Permit>,
     /// The bytes of the chain in the ticket.
     chain: u64,
@@ -393,7 +405,7 @@ pub(super) struct Ticket {
 impl Ticket {
     /// The charge of a ticket that a message of `message` bytes carries to a connection whose peer
     /// showed a chain of `chain` bytes, or `None` when `budget` cannot pay for it.
-    pub(super) fn new(budget: &Budget, message: usize, chain: u64) -> Option<Self> {
+    pub(crate) fn new(budget: &Budget, message: usize, chain: u64) -> Option<Self> {
         let message = message as u64;
         let charge = budget.reserve(TICKET + chain + message).ok()?;
         Some(Self {
@@ -414,7 +426,7 @@ impl Ticket {
 
 /// The sessions of a client configuration: at most `count` tickets, the newest last, each with
 /// the charge that the core computed when it gave the ticket to rustls.
-pub(super) struct ClientStore {
+pub(crate) struct ClientStore {
     budget: Budget,
     tickets: Mutex<Vec<Stored>>,
     /// The charge of the places of the list.
@@ -458,7 +470,7 @@ fn places<T>(budget: &Budget, count: usize) -> Result<(Vec<T>, Permit), Error> {
 
 impl ClientStore {
     /// A store of `count` tickets, which charges each ticket to `budget`.
-    pub(super) fn new(budget: &Budget, count: usize) -> Result<Self, Error> {
+    pub(crate) fn new(budget: &Budget, count: usize) -> Result<Self, Error> {
         let (tickets, places) = places(budget, count)?;
         Ok(Self {
             budget: budget.clone(),
@@ -468,7 +480,7 @@ impl ClientStore {
     }
 
     /// The charge of a ticket for this store, as [`Ticket::new`] computes it.
-    pub(super) fn charge(&self, message: usize, chain: u64) -> Option<Ticket> {
+    pub(crate) fn charge(&self, message: usize, chain: u64) -> Option<Ticket> {
         Ticket::new(&self.budget, message, chain)
     }
 }
@@ -552,7 +564,7 @@ impl ClientSessionStore for ClientStore {
 
 /// The sessions of a server configuration: at most `count` encoded sessions, the newest last,
 /// each charged to the budget of the configuration.
-pub(super) struct ServerStore {
+pub(crate) struct ServerStore {
     budget: Budget,
     sessions: Mutex<Vec<Session>>,
     /// The charge of the places of the list.
@@ -567,7 +579,7 @@ struct Session {
 
 impl ServerStore {
     /// A store of `count` sessions, which charges each session to `budget`.
-    pub(super) fn new(budget: &Budget, count: usize) -> Result<Self, Error> {
+    pub(crate) fn new(budget: &Budget, count: usize) -> Result<Self, Error> {
         let (sessions, places) = places(budget, count)?;
         Ok(Self {
             budget: budget.clone(),

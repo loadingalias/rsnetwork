@@ -40,7 +40,7 @@
 //!   lost.
 
 mod export;
-mod memory;
+pub(crate) mod memory;
 mod peer;
 mod record;
 mod sent;
@@ -203,7 +203,7 @@ static SCOPED_GROUPS: [&dyn SupportedKxGroup; 2] = [&SCOPED_HYBRID, &SCOPED_X255
 
 /// The randomness of a configuration: the root generator of each stream, or `None` for the
 /// system, and the index of the next stream.
-struct Source {
+pub(crate) struct Source {
     root: Option<ChaCha20Rng>,
     next: AtomicU64,
 }
@@ -234,7 +234,7 @@ impl Source {
     }
 
     /// The stream of the next owner that `label` names, or `None` for the system.
-    fn stream(&self, label: &[u8; 8]) -> Option<replay::Stream> {
+    pub(crate) fn stream(&self, label: &[u8; 8]) -> Option<replay::Stream> {
         // Ordering: each call takes its own index; nothing else depends on the order.
         let root = self.root.as_ref()?;
         Some(replay::Stream::new(
@@ -244,7 +244,7 @@ impl Source {
 }
 
 /// Runs `f` with the draws of rustls in `stream`, or from the system when it is `None`.
-fn scoped<R>(stream: Option<&replay::Stream>, f: impl FnOnce() -> R) -> R {
+pub(crate) fn scoped<R>(stream: Option<&replay::Stream>, f: impl FnOnce() -> R) -> R {
     match stream {
         Some(stream) => replay::scope(stream, f),
         None => f(),
@@ -260,14 +260,16 @@ const KEY: &[u8; 8] = b"tls-key\0";
 /// its sessions for resumption.
 #[derive(Clone)]
 pub struct ClientConfig {
-    config: Arc<rustls::ClientConfig>,
+    pub(crate) config: Arc<rustls::ClientConfig>,
     resumption: Resumption,
-    entropy: Arc<Source>,
+    pub(crate) entropy: Arc<Source>,
     /// What each connection charges for rustls.
-    cost: Cost,
-    own: Arc<Owns>,
+    pub(crate) cost: Cost,
+    pub(crate) own: Arc<Owns>,
     /// The store of the sessions, or `None` when they do not resume.
-    store: Option<Arc<ClientStore>>,
+    pub(crate) store: Option<Arc<ClientStore>>,
+    /// The number of ALPN names that the configuration offers.
+    pub(crate) protocols: usize,
 }
 
 impl ClientConfig {
@@ -313,6 +315,7 @@ impl ClientConfig {
             cost: Cost::client(options.protocols, identity),
             own: Arc::new(Owns::new(own)),
             store,
+            protocols: options.protocols.len(),
         })
     }
 
@@ -334,13 +337,13 @@ impl fmt::Debug for ClientConfig {
 /// identity, and its sessions for resumption.
 #[derive(Clone)]
 pub struct ServerConfig {
-    config: Arc<rustls::ServerConfig>,
+    pub(crate) config: Arc<rustls::ServerConfig>,
     identity: Arc<Rotation>,
     resumption: Resumption,
-    entropy: Arc<Source>,
+    pub(crate) entropy: Arc<Source>,
     /// What each connection charges for rustls.
-    cost: Cost,
-    own: Arc<Owns>,
+    pub(crate) cost: Cost,
+    pub(crate) own: Arc<Owns>,
     /// The part of the trust roots that the CertificateRequest names.
     hints: Own,
 }
@@ -578,8 +581,9 @@ pub struct Peer<'a> {
     pub authentication: Authentication,
 }
 
-/// The key algorithm of the end-entity certificate of a peer, which signed its handshake. Each
-/// of them is a classical signature, so it gives no post-quantum authentication.
+/// The key algorithm of the end-entity certificate of a peer, which signed its handshake. ECDSA,
+/// Ed25519, and RSA are classical, so they give no post-quantum authentication. ML-DSA (FIPS 204,
+/// with the identifiers of RFC 9881) is post-quantum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Authentication {
     /// ECDSA with the P-256 curve.
@@ -590,6 +594,12 @@ pub enum Authentication {
     Ed25519,
     /// RSA.
     Rsa,
+    /// ML-DSA-44, a post-quantum signature.
+    MlDsa44,
+    /// ML-DSA-65, a post-quantum signature.
+    MlDsa65,
+    /// ML-DSA-87, a post-quantum signature.
+    MlDsa87,
 }
 
 /// How the input of a connection ended.
@@ -1022,7 +1032,7 @@ impl Protocol {
 }
 
 /// What the handshake negotiated. The connection keeps it after rustls gives its keys.
-struct Facts {
+pub(crate) struct Facts {
     group: Group,
     protocol: Option<Protocol>,
     handshake: Handshake,
@@ -1037,9 +1047,22 @@ struct Evidence {
 }
 
 impl Facts {
+    /// The evidence of the facts.
+    pub(crate) fn negotiated(&self) -> Negotiated<'_> {
+        Negotiated {
+            group: self.group,
+            protocol: self.protocol.as_ref().map(Protocol::name),
+            handshake: self.handshake,
+            peer: self.peer.as_ref().map(|evidence| Peer {
+                certificate: &evidence.certificate,
+                authentication: evidence.authentication,
+            }),
+        }
+    }
+
     /// The facts of a completed handshake, or `None` when rustls lacks one of them. Refuses with
     /// [`Kind::Overload`] when the memory for the certificate of the peer is not available.
-    fn of(common: &CommonState) -> Result<Option<Self>, Error> {
+    pub(crate) fn of(common: &CommonState) -> Result<Option<Self>, Error> {
         let peer = match common.peer_identity().map(|identity| identity.identity()) {
             Some(Chain::X509(chain)) => {
                 let der = chain.end_entity.as_ref();
@@ -1502,16 +1525,7 @@ impl<E: Engine> Tls<E> {
 
     /// What the handshake negotiated, or `None` before it completed.
     pub fn negotiated(&self) -> Option<Negotiated<'_>> {
-        let facts = self.facts.as_ref()?;
-        Some(Negotiated {
-            group: facts.group,
-            protocol: facts.protocol.as_ref().map(Protocol::name),
-            handshake: facts.handshake,
-            peer: facts.peer.as_ref().map(|evidence| Peer {
-                certificate: &evidence.certificate,
-                authentication: evidence.authentication,
-            }),
-        })
+        self.facts.as_ref().map(Facts::negotiated)
     }
 
     /// The bytes that the connection copied, by cause.
@@ -2245,7 +2259,7 @@ impl<E: fmt::Debug> fmt::Debug for Tls<E> {
 }
 
 /// The error that ends a connection, from the error of rustls. It keeps no text of the peer.
-fn refused(error: &rustls::Error) -> Error {
+pub(crate) fn refused(error: &rustls::Error) -> Error {
     match error {
         rustls::Error::InvalidCertificate(certificate) => Error::new(
             Kind::Trust,

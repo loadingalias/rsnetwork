@@ -26,6 +26,9 @@ pub(super) fn authentication(der: &[u8]) -> Option<Authentication> {
         (alg_id::ECDSA_P384, Authentication::EcdsaP384),
         (alg_id::ED25519, Authentication::Ed25519),
         (alg_id::RSA_ENCRYPTION, Authentication::Rsa),
+        (alg_id::ML_DSA_44, Authentication::MlDsa44),
+        (alg_id::ML_DSA_65, Authentication::MlDsa65),
+        (alg_id::ML_DSA_87, Authentication::MlDsa87),
     ]
     .into_iter()
     .find_map(|(id, authentication)| (id.as_ref() == algorithm).then_some(authentication))

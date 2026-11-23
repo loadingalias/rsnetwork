@@ -244,11 +244,12 @@ budget has each of their bytes back.
 | `group` | The key-exchange group, by its IANA code point: `Group::X25519_MLKEM768` or `Group::X25519` |
 | `protocol` | The ALPN name that the server selected, or `None` |
 | `handshake` | `Handshake::Full`, `Handshake::Retried` (after a HelloRetryRequest), or `Handshake::Resumed` |
-| `peer` | `Some(Peer { certificate, authentication })`: the DER of the end-entity certificate of the peer that your roots verified, and its key algorithm, `Authentication::EcdsaP256`, `EcdsaP384`, `Ed25519`, or `Rsa`. `None` for a client with no certificate |
+| `peer` | `Some(Peer { certificate, authentication })`: the DER of the end-entity certificate of the peer that your roots verified, and its key algorithm, `Authentication::EcdsaP256`, `EcdsaP384`, `Ed25519`, `Rsa`, `MlDsa44`, `MlDsa65`, or `MlDsa87`. `None` for a client with no certificate |
 
-Each `Authentication` is a classical signature. Post-quantum key exchange and post-quantum
-authentication are two guarantees, so a hybrid `group` does not make the authentication
-post-quantum. The connection keeps its copy of the certificate, charged to its budget, until it
+ECDSA, Ed25519, and RSA are classical signatures. ML-DSA (FIPS 204, with the identifiers of RFC
+9881) is a post-quantum signature. Post-quantum key exchange and post-quantum authentication are
+two guarantees, so a hybrid `group` does not make the authentication post-quantum: read
+`authentication` for that. The connection keeps its copy of the certificate, charged to its budget, until it
 drops.
 
 `Tls::export(label, context, &mut output)` derives keying material from the regular exporter of

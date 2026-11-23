@@ -135,9 +135,9 @@ accepts its records. Then `write` refuses with `Kind::Overload` until output goe
 
 `Peer::certificate` is the DER of the end-entity certificate of the peer. `Peer::authentication`
 is its key algorithm, which signed the handshake: `Authentication::EcdsaP256`, `EcdsaP384`,
-`Ed25519`, or `Rsa`. Each of them is a classical signature. Post-quantum key exchange and
-post-quantum authentication are two guarantees, so a hybrid `group` does not make the
-authentication post-quantum.
+`Ed25519`, and `Rsa` are classical signatures, and `MlDsa44`, `MlDsa65`, and `MlDsa87` are
+post-quantum signatures. Post-quantum key exchange and post-quantum authentication are two
+guarantees, so a hybrid `group` does not make the authentication post-quantum.
 
 ## Errors
 
