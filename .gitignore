@@ -9,3 +9,4 @@ AGENTS.md
 # docs/content/ is versioned.
 /docs/*
 !/docs/content/
+.claude/
