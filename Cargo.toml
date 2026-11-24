@@ -48,6 +48,12 @@ rsasync = { git = "https://github.com/loadingalias/rsasync", branch = "main" }
 name = "caller_driven"
 test = true
 
+# The loopback endpoint for the independent QUIC peer check.
+[[example]]
+name = "quic_interop"
+path = "tests/quic/interop.rs"
+required-features = ["tls"]
+
 [lints]
 workspace = true
 

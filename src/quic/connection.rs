@@ -428,6 +428,43 @@ struct Close {
     error: Error,
 }
 
+/// The code from an authenticated CONNECTION_CLOSE frame of the peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerClose {
+    /// The application protocol supplied this code.
+    Application(u64),
+    /// The peer closed the QUIC transport.
+    Transport {
+        /// The transport error code.
+        code: ErrorCode,
+        /// The frame type that triggered the close, or zero when the peer gave none.
+        frame_type: u64,
+    },
+}
+
+impl PeerClose {
+    fn outcome(self) -> Result<(), Error> {
+        match self {
+            Self::Application(_)
+            | Self::Transport {
+                code: ErrorCode::NO_ERROR,
+                ..
+            } => Ok(()),
+            Self::Transport {
+                code: ErrorCode(code @ CRYPTO_ERROR..=0x1ff),
+                ..
+            } => {
+                let alert = AlertDescription(u8::try_from(code - CRYPTO_ERROR).expect("a TLS alert fits one byte"));
+                Err(tls::refused(&rustls::Error::AlertReceived(alert)))
+            }
+            Self::Transport { .. } => Err(Error::new(
+                Kind::Malformed,
+                "the peer closed the QUIC connection with a transport error",
+            )),
+        }
+    }
+}
+
 /// One QUIC connection of version 1, client or server, with no I/O.
 pub struct Connection {
     end: End,
@@ -480,6 +517,7 @@ pub struct Connection {
     /// A PING frame waits for the next 1-RTT packet.
     ping: bool,
     close: Option<Close>,
+    peer_close: Option<PeerClose>,
     outcome: Option<Result<(), Error>>,
     /// The packets of the peer that failed authentication, across each key.
     failures: u64,
@@ -790,6 +828,7 @@ impl Connection {
             handshake_done: false,
             ping: false,
             close: None,
+            peer_close: None,
             outcome: None,
             failures: 0,
             wait: None,
@@ -841,6 +880,11 @@ impl Connection {
     /// What the handshake negotiated, or `None` before it completed.
     pub fn negotiated(&self) -> Option<Negotiated<'_>> {
         self.facts.as_ref().map(Facts::negotiated)
+    }
+
+    /// The code the peer sent to close the connection, if its CONNECTION_CLOSE frame arrived.
+    pub const fn peer_close(&self) -> Option<PeerClose> {
+        self.peer_close
     }
 
     /// Whether the handshake is confirmed: a server completed it, or a client received
@@ -1434,7 +1478,15 @@ impl Connection {
                     return Err(Failure::transport(ErrorCode::PROTOCOL_VIOLATION, 0x1d, VIOLATION));
                 }
                 Frame::ConnectionClose { code, frame_type, .. } => {
-                    self.outcome = Some(closed(code, frame_type));
+                    let close = match frame_type {
+                        Some(frame_type) => PeerClose::Transport {
+                            code: ErrorCode(code),
+                            frame_type,
+                        },
+                        None => PeerClose::Application(code),
+                    };
+                    self.peer_close = Some(close);
+                    self.outcome = Some(close.outcome());
                     return Ok(None);
                 }
                 Frame::HandshakeDone if !server && !handshake_level => {
@@ -2195,22 +2247,6 @@ impl Failure {
 impl From<Error> for Failure {
     fn from(error: Error) -> Self {
         Self::local(error)
-    }
-}
-
-/// The outcome of a CONNECTION_CLOSE frame of the peer with `code`.
-fn closed(code: u64, frame_type: Option<u64>) -> Result<(), Error> {
-    match (code, frame_type) {
-        // A close of the application, or of the transport with no error.
-        (_, None) | (0, Some(_)) => Ok(()),
-        (CRYPTO_ERROR..=0x1ff, Some(_)) => {
-            let alert = AlertDescription(u8::try_from(code - CRYPTO_ERROR).unwrap_or(u8::MAX));
-            Err(tls::refused(&rustls::Error::AlertReceived(alert)))
-        }
-        _ => Err(Error::new(
-            Kind::Malformed,
-            "the peer closed the QUIC connection with a transport error",
-        )),
     }
 }
 

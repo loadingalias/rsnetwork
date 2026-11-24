@@ -5,7 +5,8 @@
 //!   configurations of [`tls`](crate::tls): the packet number spaces and their keys, the CRYPTO
 //!   streams under [`CRYPTO_BUFFER_BYTES_MAX`], key updates, and the idle and handshake timeouts
 //!   of [`Limits`]. 0-RTT is off. Each byte that the engine and rustls keep is charged to the
-//!   budget of the connection.
+//!   budget of the connection. After a peer closes the connection, [`Connection::peer_close`]
+//!   gives its application code or its transport code and frame type.
 //! - **Streams.** After the handshake, each end opens streams, gives them regions to send, and
 //!   takes an [`Event`] for each call of [`Connection::receive`] and [`Connection::drive`]. Stream
 //!   data in order goes up as views of the received regions, with no copy. The flow control of
@@ -46,7 +47,7 @@ mod reassembly;
 mod recovery;
 mod stream;
 
-pub use connection::{Connection, Limits};
+pub use connection::{Connection, Limits, PeerClose};
 pub use crypto::CRYPTO_BUFFER_BYTES_MAX;
 pub use recovery::RecoveryStats;
 pub use stream::{Event, Priority, STREAM_REGIONS_MAX, StreamId};
