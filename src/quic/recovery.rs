@@ -752,16 +752,19 @@ impl Paths {
             .map_or(0, |(_, credit)| credit)
     }
 
-    /// Takes the bytes of one datagram to `path`, which has no validation and does not carry the
-    /// connection, from its credit: at most 1,200. A path with no credit gets no datagram.
-    pub(super) fn take_room(&mut self, path: Path) -> usize {
-        match &mut self.off_path {
-            Some((known, credit)) if *known == path => {
-                let room = DATAGRAM_MIN.min(usize::try_from(*credit).unwrap_or(usize::MAX));
-                *credit -= room as u64;
-                room
-            }
-            _ => 0,
+    /// The bytes of one datagram that the credit of `path` allows: at most 1,200. `path` has no
+    /// validation, and does not carry the connection. A path with no credit gets no datagram.
+    pub(super) fn off_path_room(&self, path: Path) -> usize {
+        let credit = self.off_path.filter(|(known, _)| *known == path);
+        credit.map_or(0, |(_, credit)| {
+            DATAGRAM_MIN.min(usize::try_from(credit).unwrap_or(usize::MAX))
+        })
+    }
+
+    /// Takes the `bytes` of a datagram that went to `path` from the credit of `path`.
+    pub(super) fn off_path_sent(&mut self, path: Path, bytes: u64) {
+        if let Some((_, credit)) = self.off_path.as_mut().filter(|(known, _)| *known == path) {
+            *credit = credit.saturating_sub(bytes);
         }
     }
 
@@ -774,6 +777,16 @@ impl Paths {
             .filter(|fallback| fallback.id == sender)
             .unwrap_or(&self.active)
             .loss_delay()
+    }
+
+    /// The path with the tag `sender`, while the connection has it: the active path, or the
+    /// fallback path.
+    fn owner(&mut self, sender: u32) -> Option<&mut PathState> {
+        if self.active.id == sender {
+            return Some(&mut self.active);
+        }
+        let fallback = self.validation.as_mut().map(|validation| &mut validation.fallback);
+        fallback.filter(|fallback| fallback.id == sender)
     }
 }
 
@@ -1020,7 +1033,8 @@ impl History {
                 }
                 let previous = slot.previous;
                 if packet.number <= *range.end() {
-                    let (sent_round, current) = (slot.round, slot.path == paths.active.id);
+                    let (sent_round, sender) = (slot.round, slot.path);
+                    let current = sender == paths.active.id;
                     let packet = self.remove(paths, at, Settlement::Delivered);
                     let path = &mut paths.active;
                     if current {
@@ -1041,8 +1055,14 @@ impl History {
                     }
                     for record in packet.records.iter() {
                         match record {
-                            Record::Mtu(size) if current => path.mtu.probe_acknowledged(size),
-                            Record::Mtu(_) | Record::Challenge => {}
+                            // A probe settles on the path that sent it, also after the connection
+                            // left that path, so the search of that path can go on.
+                            Record::Mtu(size) => {
+                                if let Some(owner) = paths.owner(sender) {
+                                    owner.mtu.probe_acknowledged(size);
+                                }
+                            }
+                            Record::Challenge => {}
                             record => delivered(record),
                         }
                     }
@@ -1127,13 +1147,17 @@ impl History {
             at = next;
             for record in packet.records.iter() {
                 match record {
-                    Record::Mtu(size) if current => paths.active.mtu.probe_lost(size),
+                    Record::Mtu(size) => {
+                        if let Some(owner) = paths.owner(sender) {
+                            owner.mtu.probe_lost(size);
+                        }
+                    }
                     Record::Challenge if current => {
                         if let Some(validation) = &mut paths.validation {
                             validation.send = true;
                         }
                     }
-                    Record::Mtu(_) | Record::Challenge => {}
+                    Record::Challenge => {}
                     record => lost(record)?,
                 }
             }

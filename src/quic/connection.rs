@@ -72,8 +72,9 @@ pub struct Limits {
     /// The largest datagram that this end sends: 1,200 to 65,527 bytes. Each path starts at 1,200
     /// bytes. Above 1,200, the connection searches each validated path for the largest size that
     /// the path carries, up to this limit and the limit of the peer (RFC 8899). The search sends at
-    /// most three probes of each size, and the loss of a probe is no sign of congestion. After three
-    /// probe timeouts in a row that lose only datagrams above 1,200 bytes, the path returns to 1,200
+    /// most three probes of each size, and the loss of a probe is no sign of congestion. A probe
+    /// has at most two times the bytes that the path carried before it. After three probe
+    /// timeouts in a row that lose only datagrams above 1,200 bytes, the path returns to 1,200
     /// bytes. Set a limit above 1,200 only on a host that forbids the fragmentation of its
     /// datagrams. A datagram that carries an ack-eliciting Initial packet or a client Initial has
     /// at least 1,200 bytes (RFC 9000, section 14.1).
@@ -518,8 +519,6 @@ struct Ending {
 struct Answer {
     path: Path,
     data: [u8; 8],
-    /// The connection ID of the peer for that path, when the challenge came.
-    dcid: ConnectionId,
     /// The address of the peer on that path had its validation when the challenge came, and an
     /// address keeps it. Else the credit of the path pays for the datagram of the answer when it
     /// goes out.
@@ -673,6 +672,9 @@ pub struct Connection {
     handshake_deadline: Option<Instant>,
     /// A packet of the peer opened after the last ack-eliciting packet of this end.
     received: bool,
+    /// The largest number of a 1-RTT packet of the peer that was not a probe. Only a packet above
+    /// it shows that the peer moved (RFC 9000, section 9.3).
+    non_probing: Option<u64>,
     /// The handshake is confirmed (RFC 9001, section 4.1.2).
     confirmed: bool,
     /// A server owes a HANDSHAKE_DONE frame.
@@ -731,6 +733,10 @@ pub(super) const CLOCK: Error = Error::new(
     "the time of the call is not on the clock of the QUIC connection",
 );
 const IDLE: Error = Error::new(Kind::Deadline, "the QUIC connection was idle past its timeout");
+const NO_PATH: Error = Error::new(
+    Kind::Deadline,
+    "the QUIC path gave no answer, and the peer gave no connection ID for the path before it",
+);
 const HANDSHAKE_LATE: Error = Error::new(
     Kind::Deadline,
     "the QUIC handshake did not complete before its deadline",
@@ -817,6 +823,17 @@ fn encode(parameters: &Parameters, credit: &mut Credit) -> Result<Vec<u8>, Error
     let written = parameters.write(&mut bytes);
     assert_eq!(written, Some(len), "the parameters write the bytes of their length");
     Ok(bytes)
+}
+
+/// The data of a PATH_CHALLENGE frame, from the source of a connection. Each frame has its own
+/// data (RFC 9000, section 8.2.1).
+fn challenge(
+    stream: Option<&rscrypto_rustls::replay::Stream>,
+    random: &dyn rustls::crypto::SecureRandom,
+) -> Result<[u8; 8], Error> {
+    let mut data = [0; 8];
+    tls::scoped(stream, || random.fill(&mut data)).map_err(|_| endpoint::RANDOM)?;
+    Ok(data)
 }
 
 impl Connection {
@@ -1049,6 +1066,7 @@ impl Connection {
             last_activity: now,
             handshake_deadline: Some(after(now, limits.handshake_timeout)?),
             received: false,
+            non_probing: None,
             confirmed: false,
             handshake_done: false,
             ping: false,
@@ -1152,7 +1170,7 @@ impl Connection {
     pub fn rotate_peer_id(&mut self) -> Result<bool, Error> {
         self.live()?;
         let current = self.paths.active.remote_cid;
-        let Some(spare) = self.ids.spare(current).filter(|_| self.paths.validation.is_none()) else {
+        let Some(spare) = self.spare().filter(|_| self.paths.validation.is_none()) else {
             return Ok(false);
         };
         let old = self.ids.peer(current).expect("a spare accompanies a current ID");
@@ -1161,11 +1179,42 @@ impl Connection {
         Ok(true)
     }
 
+    /// A connection ID of the peer that no path uses: not the active path, and not the path that
+    /// the connection left.
+    fn spare(&self) -> Option<Id> {
+        let active = self.paths.active.remote_cid;
+        let fallback = self.paths.validation.as_ref();
+        self.ids
+            .spare([active, fallback.map_or(active, |left| left.fallback.remote_cid)])
+    }
+
+    /// The connection ID of the peer for a datagram to `path`, which is not the active path. An
+    /// ID goes out from one local address only (RFC 9000, section 9.5). The path that the
+    /// connection left keeps its ID while the peer did not retire it. Else, and for each other
+    /// path, the ID is one that no path uses. With none, a path with the local address of the
+    /// active path takes the ID of the active path: the peer changed its address. Else the peer
+    /// gave no ID for `path`, and no datagram goes there.
+    fn cid_for(&self, path: Path) -> Option<ConnectionId> {
+        let active = &self.paths.active;
+        // A peer with a connection ID of no bytes has no other one.
+        if active.remote_cid.as_bytes().is_empty() {
+            return Some(active.remote_cid);
+        }
+        let one_local = path.local == active.addresses.local;
+        let fallback = self.paths.validation.as_ref().map(|left| &left.fallback);
+        let own = fallback
+            .filter(|fallback| fallback.addresses == path)
+            .map(|own| own.remote_cid);
+        own.filter(|own| self.ids.peer(*own).is_some() && (*own != active.remote_cid || one_local))
+            .or_else(|| self.spare().map(|spare| spare.id))
+            .or_else(|| one_local.then_some(active.remote_cid))
+    }
+
     /// Moves a client to `path`, a new local address with the same address of the server (RFC
     /// 9000, section 9.2). The next packets leave on `path` with a spare connection ID of the
     /// server, and the client validates the path. If the path gives no answer in three probe
-    /// timeouts, the client returns to the path that it left. Returns false when no spare
-    /// connection ID has arrived: the client then stays on its path.
+    /// timeouts, the client returns to the path that it left. Returns false when the server gave
+    /// no connection ID that the client can use on `path`: the client then stays on its path.
     ///
     /// Refuses with [`Kind::Misuse`] on a server, before the handshake is confirmed, and for
     /// another address of the server. Refuses with [`Kind::Unsupported`] when the server
@@ -1186,16 +1235,9 @@ impl Connection {
         if self.peer.is_some_and(|peer| peer.migration == Migration::Disabled) {
             return Err(Error::new(Kind::Unsupported, "the QUIC server disabled migration"));
         }
-        // A connection ID goes out from one local address only (RFC 9000, section 9.5).
-        let returns = self
-            .paths
-            .validation
-            .as_ref()
-            .is_some_and(|validation| validation.fallback.addresses == path);
-        if !returns && !active.remote_cid.as_bytes().is_empty() && self.ids.spare(active.remote_cid).is_none() {
+        if !self.moved(path, now)? {
             return Ok(false);
         }
-        self.moved(path, now)?;
         // A packet that is not a probe shows the server the new path (RFC 9000, section 9.2).
         self.ping = true;
         Ok(true)
@@ -1204,88 +1246,72 @@ impl Connection {
     /// Makes `path` the active path: the path of the newest packet of a peer that moved, or the
     /// path that a client selected (RFC 9000, section 9.3). A server sends at most three times the
     /// bytes that came from an address with no validation. Thus the path starts with the credit
-    /// that its datagrams left.
-    fn moved(&mut self, path: Path, now: Instant) -> Result<(), Error> {
+    /// that its datagrams left. Gives false when the peer gave no connection ID for `path`: the
+    /// connection then stays on its path.
+    fn moved(&mut self, path: Path, now: Instant) -> Result<bool, Error> {
+        let Some(remote_cid) = self.cid_for(path) else {
+            return Ok(false);
+        };
         // A return to the last validated path ends the validation of the path that the connection
         // leaves, and restores the delivery state of the path (RFC 9000, section 9.3.2).
-        if let Some(validation) = self
+        if let Some(mut validation) = self
             .paths
             .validation
             .take_if(|validation| validation.fallback.addresses == path)
         {
+            validation.fallback.remote_cid = remote_cid;
             self.paths.activate(validation.fallback);
-            return Ok(());
+            return Ok(true);
         }
         let server = matches!(self.end, End::Server { .. });
         let old = &self.paths.active;
-        // A new path takes a connection ID that no other path used, when the peer gave one, and
-        // never waits for one (RFC 9000, section 9.5).
-        let remote_cid = self.ids.spare(old.remote_cid).map_or(old.remote_cid, |spare| spare.id);
         let mut next = old.next(path, remote_cid, self.datagram_top(), self.limits.congestion_control);
         next.amplification_credit = server.then(|| self.paths.take_credit(path));
-        // The new path can have a longer round trip than the old one (RFC 9000, section 8.2.4).
-        let until = after(now, 3 * self.pto().max(next.pto(self.ack_delay_max())))?;
-        let data = self.challenge()?;
-        // A server also asks the path that the peer left, so a peer that did not move answers
-        // there and brings the connection back (RFC 9000, section 9.3.3).
-        let left = if server { Some(self.challenge()?) } else { None };
+        let until = self.validation_end(now)?;
         let old = self.paths.switch(next);
         match &mut self.paths.validation {
             // The path that the connection leaves had no validation: the fallback path stays.
-            Some(validation) => {
-                validation.data = data;
-                validation.send = true;
-                validation.padded = None;
-                validation.until = until;
-            }
-            None => {
-                self.paths.validation = Some(Validation {
-                    fallback: old,
-                    data,
-                    send: true,
-                    padded: None,
-                    until,
-                    left,
-                });
-            }
+            Some(validation) => validation.restart(until),
+            // A server also asks the path that the peer left, so a peer that did not move answers
+            // there and brings the connection back (RFC 9000, section 9.3.3).
+            None => self.paths.validation = Some(Validation::new(old, until, server)),
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// The data of a PATH_CHALLENGE frame, from the source of the connection.
-    fn challenge(&self) -> Result<[u8; 8], Error> {
-        let mut data = [0; 8];
-        tls::scoped(self.stream.as_ref(), || self.random.fill(&mut data)).map_err(|_| endpoint::RANDOM)?;
-        Ok(data)
+    /// The end of a validation that starts at `now`: three probe timeouts later (RFC 9000,
+    /// section 8.2.4). The probe timeout is the larger one of the path that the connection came
+    /// from, and of a path with no round-trip sample. The estimate of the new path is no measure.
+    /// The new path can have a longer round trip, and its estimate can come from the path before it.
+    fn validation_end(&self, now: Instant) -> Result<Instant, Error> {
+        let validation = self.paths.validation.as_ref();
+        let from = validation.map_or(&self.paths.active, |validation| &validation.fallback);
+        let ack_delay = self.ack_delay_max();
+        after(now, 3 * from.pto(ack_delay).max(PTO_INITIAL + ack_delay))
     }
 
-    /// Takes a PATH_RESPONSE frame. The data of the challenge of the active path shows that the
-    /// peer is at its address. When each copy of the challenge had 1,200 bytes, it also shows that
-    /// the path carries QUIC, and the validation is complete. Else a challenge of 1,200 bytes
-    /// follows (RFC 9000, section 8.2.1).
+    /// Takes a PATH_RESPONSE frame. The data of a challenge of the active path shows that the
+    /// peer is at its address. When the datagram of that challenge had 1,200 bytes, it also shows
+    /// that the path carries QUIC, and the validation is complete. Else a challenge of 1,200 bytes
+    /// follows, with its own period (RFC 9000, section 8.2.1).
     fn responded(&mut self, data: [u8; 8], now: Instant) -> Result<(), Failure> {
-        let Some(validation) = self
-            .paths
-            .validation
-            .take_if(|validation| validation.data == data && validation.padded.is_some())
-        else {
+        let validation = self.paths.validation.as_ref();
+        let Some(padded) = validation.and_then(|validation| validation.answered(data)) else {
             return Ok(());
         };
         let active = &mut self.paths.active;
         active.amplification_credit = None;
         active.amplification_blocked = false;
-        if validation.padded != Some(true) {
-            self.paths.validation = Some(Validation {
-                data: self.challenge()?,
-                send: true,
-                padded: None,
-                until: after(now, 3 * self.pto())?,
-                ..validation
-            });
+        if !padded {
+            let until = self.validation_end(now)?;
+            if let Some(validation) = &mut self.paths.validation {
+                validation.restart(until);
+            }
             return Ok(());
         }
         // The connection ID of the path that the connection left is not used again.
-        if validation.fallback.remote_cid != active.remote_cid
+        if let Some(validation) = self.paths.validation.take()
+            && validation.fallback.remote_cid != self.paths.active.remote_cid
             && let Some(old) = self.ids.peer(validation.fallback.remote_cid)
         {
             self.ids
@@ -1890,7 +1916,8 @@ impl Connection {
 
     /// Ends the connection at its idle or handshake deadline, with no packet (RFC 9000, section
     /// 10.1), and at the end of its closing or draining period. Drops the old key of the peer at
-    /// its deadline, and leaves a path that gave no answer in the time of its validation.
+    /// its deadline, and leaves a path that gave no answer in the time of its validation. When the
+    /// peer gave no connection ID for the path before that one, the connection ends there.
     fn timers(&mut self, now: Instant) -> Result<(), Error> {
         if self.outcome.is_some() {
             return Ok(());
@@ -1919,13 +1946,13 @@ impl Connection {
             keys.previous = None;
         }
         // The connection returns to its last validated path, with the delivery state of that path
-        // (RFC 9000, sections 8.2.4 and 9.3.2).
-        if let Some(validation) = self
-            .paths
-            .validation
-            .take_if(|validation| validation.until.as_nanos() <= now.as_nanos())
+        // (RFC 9000, sections 8.2.4 and 9.3.2). A connection that cannot return has no path.
+        let validation = self.paths.validation.as_ref();
+        let ended = validation.filter(|validation| validation.until.as_nanos() <= now.as_nanos());
+        if let Some(fallback) = ended.map(|validation| validation.fallback.addresses)
+            && !self.moved(fallback, now)?
         {
-            self.paths.activate(validation.fallback);
+            return Err(NO_PATH);
         }
         if let Some((at, alarm)) = self.recovery_timer()
             && reached(Some(at), now)?
@@ -2262,14 +2289,16 @@ impl Connection {
                 if !reading.accepted && !self.spaces[level as usize].discarded {
                     let ranges = &mut self.spaces[level as usize].ranges;
                     ranges.accept(reading.number, reading.received_at, reading.eliciting, reading.ecn)?;
-                    // The peer moved: its newest packet came on another path, and the packet is
-                    // not a probe (RFC 9000, section 9.3).
-                    if server
-                        && reading.path != self.paths.active.addresses
+                    // The peer moved: its newest packet that is not a probe came on another path.
+                    // A probe with a higher number can arrive before it (RFC 9000, section 9.3).
+                    if level == Level::Data
                         && !reading.probing
-                        && ranges.largest() == Some(reading.number)
+                        && self.non_probing.is_none_or(|largest| reading.number > largest)
                     {
-                        self.moved(reading.path, reading.received_at)?;
+                        self.non_probing = Some(reading.number);
+                        if server && reading.path != self.paths.active.addresses {
+                            self.moved(reading.path, reading.received_at)?;
+                        }
                     }
                     if let Some(at) = reading.first_datagram {
                         reading.at = at;
@@ -2401,16 +2430,22 @@ impl Connection {
                         id,
                         reset: Some(reset_token),
                     };
-                    let destination = self
+                    let active = self.paths.active.remote_cid;
+                    let kept = self
                         .ids
-                        .receive(id, retire_prior_to, self.paths.active.remote_cid)
+                        .receive(id, retire_prior_to, active)
                         .map_err(|code| Failure::transport(code, 0x18, VIOLATION))?;
-                    self.paths.active.remote_cid = destination;
-                    // The peer also retired the connection ID of the path that the connection left.
-                    if let Some(validation) = &mut self.paths.validation
-                        && self.ids.peer(validation.fallback.remote_cid).is_none()
+                    // A path keeps its connection ID while the peer did not retire it. Else it
+                    // takes one that no path uses, when the peer gave one (RFC 9000, section 9.5).
+                    if kept != active {
+                        self.paths.active.remote_cid = self.spare().map_or(kept, |spare| spare.id);
+                    }
+                    let left = self.paths.validation.as_ref();
+                    let fallback = left.map(|validation| validation.fallback.addresses);
+                    if let Some(cid) = fallback.and_then(|path| self.cid_for(path))
+                        && let Some(validation) = &mut self.paths.validation
                     {
-                        validation.fallback.remote_cid = destination;
+                        validation.fallback.remote_cid = cid;
                     }
                     Ok(None)
                 }
@@ -2434,18 +2469,14 @@ impl Connection {
                     let active = &self.paths.active;
                     let on_active = reading.path == active.addresses;
                     let fallback = self.paths.validation.as_ref().map(|validation| &validation.fallback);
-                    let spare = self.ids.spare(active.remote_cid);
-                    let (dcid, validated) = match fallback.filter(|fallback| fallback.addresses == reading.path) {
-                        _ if on_active => (active.remote_cid, active.amplification_credit.is_none()),
-                        Some(fallback) => (fallback.remote_cid, true),
-                        // A new path takes a connection ID that no other path used, when the peer
-                        // gave one (RFC 9000, section 9.5).
-                        None => (spare.map_or(active.remote_cid, |spare| spare.id), false),
+                    let validated = if on_active {
+                        active.amplification_credit.is_none()
+                    } else {
+                        fallback.is_some_and(|fallback| fallback.addresses == reading.path)
                     };
                     self.answers[usize::from(!on_active)] = Some(Answer {
                         path: reading.path,
                         data,
-                        dcid,
                         validated,
                     });
                     // The answer on the active path goes in a packet that is not a probe, so a
@@ -3161,10 +3192,12 @@ impl Connection {
         Ok(len)
     }
 
-    /// Builds a datagram of `out.len()` bytes with one 1-RTT packet: `frame` and its padding, to
-    /// the address `peer` with the connection ID `dcid`. With `record`, the packet counts on the
-    /// active path, and the record tells its delivery or its loss. Else the packet goes to another
-    /// path, and no delivery state of the active path follows it.
+    /// Builds a datagram with one 1-RTT packet: `frame`, to the address `peer` with the connection
+    /// ID `dcid`. An output of 1,200 bytes or more gives a datagram of its size, with padding. A
+    /// smaller output gives a datagram with no padding. A datagram with a frame of the paths has
+    /// 1,200 bytes or no expansion (RFC 9000, sections 8.2.1 and 8.2.2). With `record`, the packet
+    /// counts on the active path, and the record tells its delivery or its loss. Else the packet
+    /// goes to another path, and no delivery state of the active path follows it.
     fn single(
         &mut self,
         out: &mut [u8],
@@ -3180,7 +3213,7 @@ impl Connection {
             spin: false,
             key_phase: self.one_rtt.as_ref().is_some_and(|keys| keys.phase),
         };
-        let size = out.len();
+        let size = if out.len() < DATAGRAM_MIN { 0 } else { out.len() };
         let Ok(builder) = Builder::new(out, header, number, number_len) else {
             return Ok(None);
         };
@@ -3219,8 +3252,9 @@ impl Connection {
 
     /// Builds a datagram for a path that does not carry the connection: the PATH_RESPONSE for a
     /// path that the peer probes, or the PATH_CHALLENGE for the path that the peer left (RFC
-    /// 9000, sections 8.2.2 and 9.3.3). The datagram has 1,200 bytes, or the bytes that the
-    /// credit of a path with no validation allows, and it takes them from that credit.
+    /// 9000, sections 8.2.2 and 9.3.3). The datagram has 1,200 bytes. When the credit of a path
+    /// with no validation does not allow them, the answer has no padding. The answer takes its
+    /// bytes from that credit. A path that the peer gave no connection ID for gets no datagram.
     fn off_path(&mut self, out: &mut [u8], send: SendAt) -> Result<Option<(usize, Path)>, Failure> {
         let active = self.paths.active.addresses;
         if let Some(slot) = self
@@ -3229,21 +3263,30 @@ impl Connection {
             .find(|slot| slot.is_some_and(|answer| answer.path != active))
             && let Some(answer) = slot.take()
         {
+            let Some(dcid) = self.cid_for(answer.path) else {
+                return Ok(None);
+            };
             let frame = Frame::PathResponse { data: answer.data };
             let room = if answer.validated {
                 DATAGRAM_MIN
             } else {
-                self.paths.take_room(answer.path)
+                self.paths.off_path_room(answer.path)
             };
-            let to = (answer.path.peer, answer.dcid);
-            let sent = self.single(&mut out[..room], to, &frame, None, send)?;
+            let sent = self.single(&mut out[..room], (answer.path.peer, dcid), &frame, None, send)?;
+            if let Some(len) = sent.filter(|_| !answer.validated) {
+                self.paths.off_path_sent(answer.path, len as u64);
+            }
             return Ok(sent.map(|len| (len, answer.path)));
         }
-        if let Some(validation) = &mut self.paths.validation
-            && let Some(data) = validation.left.take()
+        let left = self.paths.validation.as_ref().filter(|validation| validation.left);
+        if let Some(path) = left.map(|validation| validation.fallback.addresses)
+            && let Some(dcid) = self.cid_for(path)
+            && let Some(validation) = &mut self.paths.validation
         {
-            let (dcid, path) = (validation.fallback.remote_cid, validation.fallback.addresses);
-            let frame = Frame::PathChallenge { data };
+            validation.left = false;
+            let frame = Frame::PathChallenge {
+                data: challenge(self.stream.as_ref(), self.random)?,
+            };
             let sent = self.single(&mut out[..DATAGRAM_MIN], (path.peer, dcid), &frame, None, send)?;
             return Ok(sent.map(|len| (len, path)));
         }
@@ -3343,14 +3386,12 @@ impl Connection {
                         *slot = None;
                         pad = pad.or(full_pad);
                     }
-                    if let Some(validation) = self.paths.validation.as_mut().filter(|validation| validation.send)
-                        && output
-                            .track(&Frame::PathChallenge { data: validation.data }, Record::Challenge)
-                            .is_ok()
-                    {
-                        validation.send = false;
-                        validation.padded = Some(validation.padded.unwrap_or(true) && full);
-                        pad = pad.or(full_pad);
+                    if let Some(validation) = self.paths.validation.as_mut().filter(|validation| validation.send) {
+                        let data = challenge(self.stream.as_ref(), self.random)?;
+                        if output.track(&Frame::PathChallenge { data }, Record::Challenge).is_ok() {
+                            validation.sent(data, full);
+                            pad = pad.or(full_pad);
+                        }
                     }
                 }
                 if level == Level::Data

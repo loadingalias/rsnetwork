@@ -91,16 +91,14 @@ fn sent_at(connection: &mut Connection, at: Instant) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Each datagram that `connection` sends at `at`, with its path.
+/// Each datagram that `connection` sends at `at`, with its path. The output has room for the
+/// largest datagram limit of a test.
 fn routed_at(connection: &mut Connection, at: Instant) -> Vec<(Path, Vec<u8>)> {
     let mut datagrams = Vec::new();
+    let mut out = vec![0; 16_384];
     for _ in 0..8192 {
-        let mut out = vec![0; 1500];
         match connection.transmit(&mut out, at).unwrap() {
-            Some(sent) => {
-                out.truncate(sent.len);
-                datagrams.push((sent.path, out));
-            }
+            Some(sent) => datagrams.push((sent.path, out[..sent.len].to_vec())),
             None => return datagrams,
         }
     }
@@ -1681,4 +1679,27 @@ fn a_key_that_cannot_update_seals_its_close_inside_its_limit_and_no_packet_after
         pair.server.peer_close(),
         Some(PeerClose::Transport { code, .. }) if code == rsnetwork::quic::ErrorCode::AEAD_LIMIT_REACHED
     );
+}
+
+#[test]
+fn the_search_starts_on_an_idle_path_whose_limit_is_above_the_window() {
+    // The limit of the client is above the first window of ten datagrams of 1,200 bytes, and the
+    // path carries each size.
+    let limits = Limits {
+        datagram_bytes_max: 13_000,
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(limits, Limits::DEFAULT);
+    let mut at = now();
+    for _ in 0..512 {
+        pair.run_at(at, |_| true);
+        let next = pair.client.drive(at).1.deadline.expect("the idle deadline").instant();
+        if next.as_nanos() >= ms(20_000).as_nanos() {
+            break;
+        }
+        at = next;
+    }
+    // Each probe has at most two datagrams of the size before it, which each window holds. Thus
+    // the search reaches the limit, and loses no probe.
+    assert_eq!((pair.largest, pair.dropped), (13_000, 0));
 }

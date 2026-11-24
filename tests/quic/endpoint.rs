@@ -446,9 +446,11 @@ fn a_client_moves_to_a_new_local_address_with_new_connection_ids_and_the_listene
         down.iter()
             .all(|(route, id)| (*route == mirror(home)) == (*id == old_down))
     );
-    // The server asked the path that the client left, one time, and the client answered there.
+    // The server asked the path that the client left, one time. The validation of the new path
+    // came with it, and the client retired the connection ID of the old path. Thus the client
+    // has no connection ID for an answer there (RFC 9000, section 9.5).
     assert_eq!(down.iter().filter(|(route, _)| *route == mirror(home)).count(), 1);
-    assert_eq!(up.iter().filter(|(route, _)| *route == home).count(), 1);
+    assert_eq!(up.iter().filter(|(route, _)| *route == home).count(), 0);
     // After its validation, the client retired the connection ID of the old path, and the
     // listener routes that ID no more.
     let ids = endpoint.with_connection(handle, |c| c.local_ids()).unwrap();

@@ -9,8 +9,8 @@ use rstypes::time::{ClockDomain, Instant, Suspend};
 use core::net::{Ipv4Addr, SocketAddr};
 
 use super::{
-    Ack, CongestionControl, ConnectionId, Controller, Duration, Ecn, Frame, History, Path, PathState, Paths, Records,
-    Sent, Settlement, Validation,
+    Ack, CongestionControl, ConnectionId, Controller, Duration, Ecn, Frame, History, Mtu, Path, PathState, Paths,
+    Record, Records, Sent, Settlement, Validation,
 };
 
 fn at(ms: u64) -> Instant {
@@ -43,14 +43,7 @@ fn migrate(paths: &mut Paths, rtt: Duration) {
         .next(route(2), ConnectionId::EMPTY, 1200, CongestionControl::Cubic);
     next.sample(rtt, Duration::ZERO, at(0));
     let fallback = paths.switch(next);
-    paths.validation = Some(Validation {
-        fallback,
-        data: [0; 8],
-        send: false,
-        padded: None,
-        until: at(60_000),
-        left: None,
-    });
+    paths.validation = Some(Validation::new(fallback, at(60_000), false));
 }
 
 /// An ack-eliciting packet of 1,200 bytes with the mark `mark`.
@@ -269,4 +262,50 @@ fn hystart_slows_growth_on_sustained_delay_and_resumes_on_a_transient_spike() {
             assert_eq!(controller.window, 12_417);
         }
     }
+}
+
+#[test]
+fn a_probe_of_the_datagram_size_settles_on_its_path_after_the_connection_left_that_path() {
+    for delivered in [true, false] {
+        let budget = Budget::new(NonZeroU64::new(1 << 16).unwrap());
+        let rtt = Duration::from_millis(10);
+        let mut paths = connection(&budget, rtt);
+        let mut history = History::new();
+        // The first path searches up to 1,452 bytes, and its first probe is out.
+        paths.active.mtu = Mtu::new(1452);
+        let size = paths.active.mtu.next().expect("the first probe");
+        paths.active.mtu.sent(size);
+        let mut records = Records::default();
+        records.push(Record::Mtu(size), &budget).unwrap();
+        let probe = Sent {
+            records,
+            ..packet(0, at(1), Ecn::NotEct)
+        };
+        history.insert(&mut paths, probe).unwrap();
+        // The connection moves, and the probe settles while its path is the fallback path.
+        migrate(&mut paths, rtt);
+        let acked: &[u8] = if delivered { &[2, 0, 0, 0, 0] } else { &[2, 5, 0, 0, 0] };
+        history
+            .ack(&ack(acked), &mut paths, at(5), Duration::ZERO, |_| {})
+            .unwrap();
+        history.detect(&mut paths, at(1000), |_| Ok(())).unwrap();
+        // The search of that path goes on when the connection returns: no probe waits with no end.
+        let mtu = paths.validation.as_ref().unwrap().fallback.mtu;
+        if delivered {
+            assert_eq!(mtu.size(), 1452);
+        } else {
+            assert_eq!((mtu.size(), mtu.next()), (1200, Some(1452)));
+        }
+    }
+}
+
+#[test]
+fn the_window_holds_two_datagrams_when_the_datagram_size_of_the_path_grows() {
+    // Persistent congestion leaves the smallest window: two datagrams (RFC 9002, sections 7.2
+    // and 7.6). Then the search finds that the path carries datagrams of twice the size.
+    let mut controller = Controller::new(1200, CongestionControl::NewReno);
+    controller.persistent();
+    assert_eq!(controller.window, 2400);
+    controller.datagram_limit(2400);
+    assert_eq!(controller.window, 4800);
 }

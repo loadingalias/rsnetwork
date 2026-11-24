@@ -66,13 +66,9 @@ impl Ids {
         self.remote.iter().flatten().find(|p| p.id == cid).copied()
     }
 
-    pub(super) fn spare(&self, current: ConnectionId) -> Option<Id> {
-        let current = self.peer(current)?;
-        self.remote
-            .iter()
-            .flatten()
-            .find(|p| p.sequence > current.sequence)
-            .copied()
+    /// A connection ID of the peer that no path uses. `used` has the ID of each path.
+    pub(super) fn spare(&self, used: [ConnectionId; 2]) -> Option<Id> {
+        self.remote.iter().flatten().find(|p| !used.contains(&p.id)).copied()
     }
 
     pub(super) fn rotate(&mut self, old: u64) -> Result<(), ErrorCode> {

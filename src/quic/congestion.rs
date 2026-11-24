@@ -45,7 +45,8 @@ impl Controller {
 
     /// Follows the datagram size of the path. A smaller size keeps the number of datagrams in the
     /// window: the peer can take a smaller datagram, or the path now drops the larger ones. A
-    /// larger size keeps the bytes of the window.
+    /// larger size keeps the bytes of the window, and at least two datagrams (RFC 9002, section
+    /// 7.2).
     pub(super) fn datagram_limit(&mut self, bytes: u64) {
         if bytes < self.datagram {
             let scale = |n| {
@@ -64,6 +65,8 @@ impl Controller {
                     cubic.epoch = None;
                 }
             }
+        } else {
+            self.window = self.window.max(2 * bytes);
         }
         self.datagram = bytes;
     }

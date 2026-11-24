@@ -86,6 +86,8 @@ struct Rogue {
     closes: Vec<(u64, Option<u64>)>,
     /// The data of each PATH_RESPONSE frame of the server.
     answers: Vec<[u8; 8]>,
+    /// The data of each PATH_CHALLENGE frame of the server.
+    challenges: Vec<[u8; 8]>,
 }
 
 impl Rogue {
@@ -130,6 +132,7 @@ impl Rogue {
             complete: false,
             closes: Vec::new(),
             answers: Vec::new(),
+            challenges: Vec::new(),
         };
         rogue.take_events();
         rogue
@@ -243,6 +246,7 @@ impl Rogue {
                     }
                     Frame::ConnectionClose { code, frame_type, .. } => self.closes.push((code, frame_type)),
                     Frame::PathResponse { data } => self.answers.push(data),
+                    Frame::PathChallenge { data } => self.challenges.push(data),
                     _ => {}
                 }
             }
@@ -314,11 +318,16 @@ fn give(connection: &mut Connection, datagram: &[u8]) -> Vec<Event> {
 
 /// Gives `datagram` to `connection` as a datagram that arrived on `path`.
 fn give_on(connection: &mut Connection, path: Path, datagram: &[u8]) -> Vec<Event> {
+    give_at(connection, path, datagram, now())
+}
+
+/// Gives `datagram` to `connection` as a datagram that arrived on `path` at the time `at`.
+fn give_at(connection: &mut Connection, path: Path, datagram: &[u8], at: Instant) -> Vec<Event> {
     let len = connection.local_cid().as_bytes().len();
     let mut datagrams = Datagrams::new(Backing::from(datagram.to_vec()), None, len);
     let mut events = Vec::new();
     for _ in 0..64 {
-        match connection.receive(&mut datagrams, path, now()) {
+        match connection.receive(&mut datagrams, path, at) {
             (Some(event), _) => events.push(event),
             (None, turn) if turn.progress == Progress::Pending => {}
             (None, _) => return events,
@@ -686,7 +695,11 @@ fn a_datagram_from_a_new_address_pays_for_three_times_its_bytes_one_time() {
     }
     assert_eq!(server.path(), moved);
     assert!(!server.address_validated());
-    let to_new = answer + bytes(answers_to(&mut server, moved));
+    // The answer had no padding, because 1,200 bytes are past the limit (RFC 9000, section
+    // 8.2.2). Thus the credit still pays for the challenge of the server.
+    let challenge = bytes(answers_to(&mut server, moved));
+    assert!(challenge > 0, "the answer of {answer} bytes left no credit");
+    let to_new = answer + challenge;
     assert!(
         to_new <= 3 * datagram.len(),
         "{to_new} bytes after {} bytes",
@@ -780,4 +793,231 @@ fn a_stateless_reset_routes_from_each_address_that_the_connection_sent_to_with_i
             Route::Reset(handle)
         );
     }
+}
+
+/// The destination connection ID of each datagram of `datagrams`. The IDs of the client have 8 bytes.
+fn destinations(datagrams: &[Vec<u8>]) -> Vec<ConnectionId> {
+    let destination = |datagram: &Vec<u8>| match Header::parse(datagram, 8) {
+        Ok(Header::Protected { dcid, .. }) => dcid,
+        _ => panic!("a 1-RTT packet"),
+    };
+    datagrams.iter().map(destination).collect()
+}
+
+/// The connection ID of the client with each byte `byte`.
+fn id(byte: u8) -> ConnectionId {
+    ConnectionId::new(&[byte; 8]).unwrap()
+}
+
+/// The NEW_CONNECTION_ID frame of the client for the ID `id(byte)`.
+fn issue(sequence: u64, retire_prior_to: u64, byte: u8) -> Frame<'static> {
+    Frame::NewConnectionId {
+        sequence,
+        retire_prior_to,
+        id: id(byte),
+        reset_token: [byte; 16],
+    }
+}
+
+/// A path to another address of the server, so that each path has its own local address.
+fn away() -> Path {
+    Path {
+        local: SocketAddr::from((Ipv4Addr::LOCALHOST, 8443)),
+        peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 4400)),
+    }
+}
+
+#[test]
+fn a_path_whose_connection_id_the_peer_retires_takes_one_that_no_path_uses() {
+    let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
+    let (home, away) = (server.path(), away());
+    let datagram = rogue.data(&[issue(1, 0, 0x6b)]);
+    assert!(give(&mut server, &datagram).is_empty());
+    let datagram = rogue.data(&[Frame::Ping, Frame::Padding { len: 1200 }]);
+    assert!(give_on(&mut server, away, &datagram).is_empty());
+    assert_eq!(server.path(), away);
+    let sent = answers_to(&mut server, away);
+    assert!(!sent.is_empty() && destinations(&sent).iter().all(|used| *used == id(0x6b)));
+
+    // The client probes the path that the connection left. Before the answer goes out, it
+    // retires the connection ID of that path, and gives a new one.
+    let probe = rogue.data(&[Frame::PathChallenge { data: [9; 8] }, Frame::Padding { len: 1200 }]);
+    assert!(give_on(&mut server, home, &probe).is_empty());
+    let datagram = rogue.data(&[issue(2, 1, 0x7c)]);
+    assert!(give_on(&mut server, away, &datagram).is_empty());
+    // The answer has the new ID: not the retired one, and not the one of the other local address
+    // (RFC 9000, section 9.5).
+    let answers = answers_to(&mut server, home);
+    assert_eq!(destinations(&answers), [id(0x7c)]);
+
+    // The client returns to the first path. The server sends there with the new ID.
+    let datagram = rogue.data(&[Frame::Ping]);
+    assert!(give_on(&mut server, home, &datagram).is_empty());
+    assert_eq!(server.path(), home);
+    let sent = answers_to(&mut server, home);
+    assert!(!sent.is_empty() && destinations(&sent).iter().all(|used| *used == id(0x7c)));
+}
+
+/// A server that followed the client to another of its addresses, and the client. The client
+/// then retired the connection ID of each path, and gave one new ID, which the active path took.
+/// The path that the connection left has another local address, so it has no ID (RFC 9000,
+/// section 9.5).
+fn stranded() -> (Connection, Rogue) {
+    let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
+    let away = away();
+    let datagram = rogue.data(&[issue(1, 0, 0x6b)]);
+    assert!(give(&mut server, &datagram).is_empty());
+    let datagram = rogue.data(&[Frame::Ping, Frame::Padding { len: 1200 }]);
+    assert!(give_on(&mut server, away, &datagram).is_empty());
+    assert_eq!(server.path(), away);
+    routed(&mut server);
+    let datagram = rogue.data(&[issue(2, 2, 0x7c)]);
+    assert!(give_on(&mut server, away, &datagram).is_empty());
+    (server, rogue)
+}
+
+#[test]
+fn a_path_with_no_connection_id_gets_no_datagram_until_the_peer_gives_one() {
+    let (mut server, mut rogue) = stranded();
+    let (home, away) = (path(4301), away());
+    // The client sends from the first path again. The server cannot answer there, and stays.
+    let datagram = rogue.data(&[Frame::Ping]);
+    assert!(give_on(&mut server, home, &datagram).is_empty());
+    assert_eq!(server.path(), away);
+    let sent = routed(&mut server);
+    assert!(!sent.is_empty() && sent.iter().all(|(to, _)| *to == away));
+    let to_away: Vec<Vec<u8>> = sent.into_iter().map(|(_, datagram)| datagram).collect();
+    assert!(destinations(&to_away).iter().all(|used| *used == id(0x7c)));
+
+    // The next ID is for the first path, and the server follows the client back with it.
+    let datagram = rogue.data(&[issue(3, 2, 0x8d)]);
+    assert!(give_on(&mut server, away, &datagram).is_empty());
+    let datagram = rogue.data(&[Frame::Ping]);
+    assert!(give_on(&mut server, home, &datagram).is_empty());
+    assert_eq!(server.path(), home);
+    let sent = answers_to(&mut server, home);
+    assert!(!sent.is_empty() && destinations(&sent).iter().all(|used| *used == id(0x8d)));
+}
+
+#[test]
+fn a_validation_that_ends_with_no_connection_id_for_the_path_before_it_ends_the_connection() {
+    let (mut server, _rogue) = stranded();
+    // The new path gives no answer. At the end of the validation the server cannot return, and
+    // it does not send the ID of one local address from another one. Three probe timeouts of a
+    // path with no round-trip sample are 3,072 ms.
+    assert_eq!(server.drive(ms(3071)).1.progress, Progress::Blocked(Blocked::Input));
+    assert_matches!(
+        server.drive(ms(3072)).1.progress,
+        Progress::Terminal(Err(error)) if error.kind() == Kind::Deadline
+    );
+}
+
+#[test]
+fn the_newest_packet_that_is_no_probe_moves_the_connection_also_after_a_probe_with_a_higher_number() {
+    let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
+    let (home, moved) = (server.path(), path(4400));
+    let late = rogue.data(&[Frame::Ping]);
+    let data = rogue.data(&[Frame::Ping]);
+    let probe = rogue.data(&[Frame::PathChallenge { data: [7; 8] }, Frame::Padding { len: 1200 }]);
+    // The probe has the highest number, and arrives first. A probe is no move.
+    assert!(give_on(&mut server, moved, &probe).is_empty());
+    assert_eq!(server.path(), home);
+    // The packet before it is the newest one that is no probe: the client moved (RFC 9000,
+    // section 9.3).
+    assert!(give_on(&mut server, moved, &data).is_empty());
+    assert_eq!(server.path(), moved);
+    // An older packet from the old address arrives late, and brings no connection back.
+    assert!(give_on(&mut server, home, &late).is_empty());
+    assert_eq!(server.path(), moved);
+}
+
+fn ms(value: u64) -> Instant {
+    now().checked_add(Duration::from_millis(value)).unwrap()
+}
+
+/// Each datagram that `server` sends at `at` to the path `to`.
+fn sent_to_at(server: &mut Connection, to: Path, at: Instant) -> Vec<Vec<u8>> {
+    let mut datagrams = Vec::new();
+    let mut out = vec![0; 1500];
+    for _ in 0..64 {
+        match server.transmit(&mut out, at).unwrap() {
+            Some(sent) if sent.path == to => datagrams.push(out[..sent.len].to_vec()),
+            Some(_) => {}
+            None => return datagrams,
+        }
+    }
+    panic!("a server sends at most 64 datagrams at once");
+}
+
+#[test]
+fn a_validation_lasts_three_probe_timeouts_of_a_path_with_no_sample_also_for_a_new_port() {
+    // Three probe timeouts of a path with no round-trip sample (RFC 9000, section 8.2.4). One
+    // has 333 ms, four times the half of them, and the 25 ms that the peer can delay an
+    // acknowledgement (RFC 9002, section 6.2).
+    const PERIOD_MS: u64 = 3 * (999 + 25);
+    for padded in [true, false] {
+        let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
+        let (home, moved) = (server.path(), path(4400));
+        // The first path has a round trip of 10 ms: the client acknowledges each packet of the
+        // server.
+        let start = ms(10);
+        let largest = u8::try_from(rogue.expected[DATA] - 1).unwrap();
+        let bytes = [2, largest, 0, 0, largest];
+        let (ack, _) = Frame::parse(&bytes).unwrap();
+        let datagram = rogue.data(&[ack]);
+        assert!(give_at(&mut server, home, &datagram, start).is_empty());
+        // Only the port of the client changes, so the new path starts with that short estimate.
+        let frames = [Frame::Ping, Frame::Padding { len: 1200 }];
+        let datagram = rogue.data(&frames[..if padded { 2 } else { 1 }]);
+        assert!(give_at(&mut server, moved, &datagram, start).is_empty());
+        for datagram in sent_to_at(&mut server, moved, start) {
+            rogue.receive(&datagram);
+        }
+        assert_eq!(rogue.challenges.len(), 1);
+        if !padded {
+            // The datagram of the challenge was small. Its answer shows the address, and a
+            // challenge of 1,200 bytes follows, with its own period (RFC 9000, section 8.2.1).
+            let answer = rogue.data(&[Frame::PathResponse {
+                data: rogue.challenges[0],
+            }]);
+            assert!(give_at(&mut server, moved, &answer, start).is_empty());
+            assert!(server.address_validated());
+        }
+        // No answer comes. The server stays for the full period, and then returns.
+        server.drive(ms(10 + PERIOD_MS - 1));
+        assert_eq!(server.path(), moved, "padded: {padded}");
+        server.drive(ms(10 + PERIOD_MS));
+        assert_eq!(server.path(), home, "padded: {padded}");
+    }
+}
+
+#[test]
+fn each_challenge_has_new_data_and_the_answer_to_an_earlier_one_validates_the_path() {
+    let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
+    let moved = path(4400);
+    let datagram = rogue.data(&[Frame::Ping, Frame::Padding { len: 1200 }]);
+    assert!(give_on(&mut server, moved, &datagram).is_empty());
+    // The server sends its challenge again at each probe timeout.
+    let mut at = now();
+    for _ in 0..8 {
+        for datagram in sent_to_at(&mut server, moved, at) {
+            rogue.receive(&datagram);
+        }
+        if rogue.challenges.len() >= 2 {
+            break;
+        }
+        at = server.drive(at).1.deadline.expect("a probe timeout").instant();
+        server.drive(at);
+    }
+    let [first, second] = rogue.challenges[..] else {
+        panic!("two challenges, not {}", rogue.challenges.len())
+    };
+    assert_ne!(first, second, "each PATH_CHALLENGE frame has its own data");
+    // The path is slow: the answer to the first challenge comes after the second one went out.
+    let answer = rogue.data(&[Frame::PathResponse { data: first }]);
+    let len = server.local_cid().as_bytes().len();
+    let mut datagrams = Datagrams::new(Backing::from(answer), None, len);
+    assert!(server.receive(&mut datagrams, moved, at).0.is_none());
+    assert!(server.address_validated());
+    assert_eq!(server.path(), moved);
 }

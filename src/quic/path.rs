@@ -21,23 +21,64 @@ pub struct Path {
     pub peer: SocketAddr,
 }
 
+/// The PATH_CHALLENGE frames of one validation whose answer the connection still takes. A
+/// validation sends about seven of them before its period ends, each at a probe timeout.
+const CHALLENGES_MAX: usize = 8;
+
 /// The validation of the active path (RFC 9000, section 8.2), and the path that the connection
 /// returns to when the validation fails.
 pub(super) struct Validation {
     /// The last validated path, with its delivery state.
     pub(super) fallback: PathState,
-    /// The data of the PATH_CHALLENGE frames of the active path.
-    pub(super) data: [u8; 8],
+    /// The PATH_CHALLENGE frames of the active path that wait for their answer, the newest
+    /// first. Each frame has its own data (RFC 9000, section 8.2.1). The flag tells whether the
+    /// datagram of the frame had at least 1,200 bytes. The answer to such a frame also shows that
+    /// the path carries them.
+    challenges: [Option<([u8; 8], bool)>; CHALLENGES_MAX],
     /// A PATH_CHALLENGE frame waits to go out.
     pub(super) send: bool,
-    /// Whether each copy of `data` went out in a datagram of at least 1,200 bytes, so that its
-    /// answer also shows that the path carries them. `None` before the first copy.
-    pub(super) padded: Option<bool>,
     /// The validation fails at this time.
     pub(super) until: Instant,
-    /// The data of one PATH_CHALLENGE frame that waits to go out on the fallback path, after
-    /// the peer moved (RFC 9000, section 9.3.3).
-    pub(super) left: Option<[u8; 8]>,
+    /// One PATH_CHALLENGE frame waits to go out on the fallback path, after the peer moved
+    /// (RFC 9000, section 9.3.3).
+    pub(super) left: bool,
+}
+
+impl Validation {
+    /// The validation of a path that the connection moved to from `fallback`, which ends at
+    /// `until`. With `left`, the connection also asks the fallback path one time.
+    pub(super) fn new(fallback: PathState, until: Instant, left: bool) -> Self {
+        Self {
+            fallback,
+            challenges: [None; CHALLENGES_MAX],
+            send: true,
+            until,
+            left,
+        }
+    }
+
+    /// Starts the validation again, with a period to `until`: for another path, or for a
+    /// challenge of 1,200 bytes. No answer to an earlier challenge counts.
+    pub(super) fn restart(&mut self, until: Instant) {
+        self.challenges = [None; CHALLENGES_MAX];
+        self.send = true;
+        self.until = until;
+    }
+
+    /// A PATH_CHALLENGE frame with `data` went out. `padded` tells whether its datagram had at
+    /// least 1,200 bytes. The oldest frame leaves when the list is full.
+    pub(super) fn sent(&mut self, data: [u8; 8], padded: bool) {
+        self.challenges.rotate_right(1);
+        self.challenges[0] = Some((data, padded));
+        self.send = false;
+    }
+
+    /// Whether the datagram of the challenge with `data` had at least 1,200 bytes, or `None` for
+    /// data of no challenge that waits.
+    pub(super) fn answered(&self, data: [u8; 8]) -> Option<bool> {
+        let challenge = self.challenges.iter().flatten().find(|(sent, _)| *sent == data);
+        challenge.map(|(_, padded)| *padded)
+    }
 }
 
 /// The probes of one size that the search loses before it takes the size as too large
@@ -51,6 +92,8 @@ const BLACK_HOLE_TIMEOUTS: u8 = 3;
 
 /// The datagram size of one path, and the search above it (RFC 8899). A path starts at 1,200
 /// bytes. One search runs for each path: it sends at most [`PROBES_MAX`] probes for each size.
+/// The search doubles the size while its probes arrive. After a size failed, it takes the middle
+/// of the sizes that remain.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Mtu {
     /// The largest datagram that the path carried.
@@ -103,8 +146,10 @@ impl Mtu {
         self.top = self.top.min(usize::try_from(top).unwrap_or(usize::MAX)).max(self.size);
     }
 
-    /// The size of the next probe: the top first, and then the middle of the sizes that remain.
-    /// `None` while a probe is out, and when the search is complete.
+    /// The size of the next probe: the top, or two datagrams of the size that the path carries
+    /// when the top is above them. A congestion window always holds two datagrams (RFC 9002,
+    /// section 7.2), so it holds each probe. After a size failed, the middle of the sizes that
+    /// remain. `None` while a probe is out, and when the search is complete.
     pub(super) fn next(&self) -> Option<usize> {
         let range = self.top - self.size;
         if self.probe.is_some() || range < STEP {
@@ -113,7 +158,7 @@ impl Mtu {
         Some(if self.halving {
             self.size + range.div_ceil(2)
         } else {
-            self.top
+            self.top.min(2 * self.size)
         })
     }
 
