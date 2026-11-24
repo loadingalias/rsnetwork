@@ -469,8 +469,7 @@ fn a_delivery_needs_each_byte_and_a_reset_after_the_finish_makes_it_partial() {
 #[test]
 fn a_close_of_the_server_drains_accepted_streams_refuses_new_ones_and_joins_each_handler_task() {
     on_each_runtime(|| async {
-        let metrics = tokio::runtime::Handle::current().metrics();
-        let before = metrics.num_alive_tasks();
+        let before = tokio::runtime::Handle::current().metrics().num_alive_tasks();
         let (listener, address) = support::listener().await;
         let (started, mut starts) = mpsc::unbounded_channel();
         let proceed = Arc::new(Notify::new());
@@ -537,7 +536,7 @@ fn a_close_of_the_server_drains_accepted_streams_refuses_new_ones_and_joins_each
         );
         drop(client);
         // The close joined each task that the server spawned, also each handler task.
-        assert_eq!(metrics.num_alive_tasks(), before);
+        support::joined(before).await;
     });
 }
 

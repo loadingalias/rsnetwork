@@ -127,8 +127,7 @@ enum Event {
 #[test]
 fn a_close_drains_the_request_in_flight_refuses_the_one_that_the_handler_did_not_see_and_joins_each_task() {
     on_each_runtime(|| async {
-        let metrics = tokio::runtime::Handle::current().metrics();
-        let before = metrics.num_alive_tasks();
+        let before = tokio::runtime::Handle::current().metrics().num_alive_tasks();
         let (listener, address) = support::listener().await;
         let (events, mut seen) = channel::unbounded_channel();
         let proceed = Arc::new(Notify::new());
@@ -191,7 +190,7 @@ fn a_close_drains_the_request_in_flight_refuses_the_one_that_the_handler_did_not
             }
         );
         // The close joined each task that the server spawned.
-        assert_eq!(metrics.num_alive_tasks(), before);
+        support::joined(before).await;
         let bytes = pipelined.join().unwrap();
         let ok_end = bytes
             .windows(2)

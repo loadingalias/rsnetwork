@@ -24,7 +24,7 @@ use rsnetwork::tls::{
 };
 use rsnetwork::value::{Authority, Method, Status, Target};
 use rsnetwork_tokio::Clock;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::{Builder, Handle, Runtime, RuntimeFlavor};
 
 const CA: &[u8] = include_bytes!("../../../tests/tls/ca.der");
 const SERVER: (&[u8], &[u8]) = (
@@ -294,6 +294,28 @@ pub(crate) fn on_each_runtime<F: Future<Output = ()>>(test: impl Fn() -> F) {
     for runtime in runtimes {
         runtime.block_on(test());
     }
+}
+
+/// Checks that the runtime has `tasks` alive tasks again, after a close that joined each task of
+/// a server. A current-thread runtime releases a task before the task that joined it runs, so
+/// its count is exact. A multi-thread runtime wakes the join handle of a task before it releases
+/// the task, as the `rt_metrics` test of Tokio states, so its count can still hold a joined task
+/// for a moment. There, a task that does not end keeps the count, and the wait ends in a failure.
+pub(crate) async fn joined(tasks: usize) {
+    let runtime = Handle::current();
+    let metrics = runtime.metrics();
+    if runtime.runtime_flavor() == RuntimeFlavor::CurrentThread {
+        assert_eq!(metrics.num_alive_tasks(), tasks);
+        return;
+    }
+    let released = async {
+        while metrics.num_alive_tasks() != tasks {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(PATIENCE, released)
+        .await
+        .expect("the runtime releases each joined task");
 }
 
 /// What a [`Proxy`] does with the last record that the server sends before the end of its stream.
