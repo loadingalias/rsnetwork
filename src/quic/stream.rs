@@ -27,9 +27,10 @@ use rstypes::buffer::{Buffer as _, Lease};
 use rstypes::capacity::{Budget, Credit};
 
 use super::frame::{Direction, Frame, STREAMS_MAX};
-use super::packet::{Builder, Side};
+use super::packet::Side;
 use super::params::Parameters;
 use super::reassembly::{Reassembly, Refused, Reorder, grow};
+use super::recovery::{DataRange, Output, Record};
 use super::{ErrorCode, VARINT_MAX, varint_len};
 use crate::drive::{Error, Kind};
 
@@ -151,6 +152,15 @@ pub enum Event {
         /// The stream.
         stream: StreamId,
     },
+    /// The peer acknowledged the stream prefix through `offset` and its end when `end` is set.
+    Acknowledged {
+        /// The stream.
+        stream: StreamId,
+        /// The first byte after the acknowledged regions.
+        offset: u64,
+        /// The peer acknowledged all bytes and the FIN.
+        end: bool,
+    },
     /// The peer raised its stream limit after [`Connection::open`](super::Connection::open) gave
     /// no stream of this direction.
     Openable(Direction),
@@ -179,6 +189,12 @@ impl fmt::Debug for Event {
                 .field("code", code)
                 .finish(),
             Self::Sent { stream } => f.debug_struct("Sent").field("stream", stream).finish(),
+            Self::Acknowledged { stream, offset, end } => f
+                .debug_struct("Acknowledged")
+                .field("stream", stream)
+                .field("offset", offset)
+                .field("end", end)
+                .finish(),
             Self::Openable(direction) => f.debug_tuple("Openable").field(direction).finish(),
             Self::Unreliable(data) => f.debug_tuple("Unreliable").field(&data.initialized()).finish(),
         }
@@ -210,6 +226,7 @@ pub(super) struct Config {
     /// The streams that the peer has open at one time: bidirectional, and unidirectional.
     pub(super) streams: [u64; 2],
     pub(super) reassembly_bytes: u64,
+    pub(super) send_bytes: u64,
     /// The bytes of unreliable datagrams that wait to go out, or `None` when they are off.
     pub(super) unreliable_bytes: Option<u64>,
 }
@@ -271,6 +288,7 @@ mod notify {
     pub(super) const RESET: u8 = 2;
     pub(super) const STOPPED: u8 = 4;
     pub(super) const SENT: u8 = 8;
+    pub(super) const ACKNOWLEDGED: u8 = 16;
 }
 
 /// The lists that a stream is in.
@@ -300,13 +318,15 @@ enum Sending {
     /// The application gave the end, and it is not in a packet yet.
     Finishing,
     /// The end is in a packet.
+    FinSent,
+    /// The peer acknowledged the end.
     Finished,
     /// The direction was reset with `code`: by the application, or for a STOP_SENDING frame of
-    /// the peer. `sent` when the RESET_STREAM frame is in a packet.
+    /// the peer. The peer acknowledges the reset before the stream leaves the table.
     Reset {
         code: u64,
         stopped: bool,
-        sent: bool,
+        acknowledged: bool,
     },
 }
 
@@ -335,6 +355,8 @@ struct Send {
     /// The first and the last region that wait, and the bytes of the first that are in packets.
     head: u32,
     tail: u32,
+    /// The first region whose bytes still need an ACK.
+    held: u32,
     head_at: usize,
     regions: usize,
     state: Sending,
@@ -367,6 +389,9 @@ struct Stream {
 #[derive(Debug)]
 struct Region {
     lease: Option<Lease>,
+    offset: u64,
+    remaining: u64,
+    previous: u32,
     next: u32,
 }
 
@@ -434,6 +459,7 @@ pub(super) struct Streams {
     openable: [bool; 2],
     regions: Vec<Region>,
     region_free: u32,
+    retained_bytes: u64,
     /// The urgencies that had a stream, sorted.
     levels: Vec<Level>,
     /// The first and the last stream of the control list and of the notify list.
@@ -462,7 +488,7 @@ const fn link_of(slot: usize) -> u32 {
 
 /// The most bytes of a STREAM or DATAGRAM frame that fit in `space` bytes with their length
 /// field, at most `want`.
-fn fit(space: usize, want: usize) -> usize {
+pub(super) fn fit(space: usize, want: usize) -> usize {
     [1, 2, 4, 8]
         .into_iter()
         .map(|field| (field, want.min(space.saturating_sub(field))))
@@ -502,6 +528,7 @@ impl Streams {
             openable: [false; 2],
             regions: Vec::new(),
             region_free: NONE,
+            retained_bytes: 0,
             levels: Vec::new(),
             fifo: [[NONE; 2]; 2],
             unreliable: VecDeque::new(),
@@ -582,6 +609,7 @@ impl Streams {
             blocked_at: None,
             head: NONE,
             tail: NONE,
+            held: NONE,
             head_at: 0,
             regions: 0,
             state: Sending::Open,
@@ -814,10 +842,11 @@ impl Streams {
         let Some(send) = &mut self.slots[slot].send else {
             return;
         };
-        let mut region = core::mem::replace(&mut send.head, NONE);
+        let mut region = core::mem::replace(&mut send.held, NONE);
+        send.head = NONE;
         (send.tail, send.head_at, send.regions, send.queued) = (NONE, 0, 0, 0);
         while let Some(entry) = self.regions.get_mut(region as usize) {
-            entry.lease = None;
+            self.retained_bytes -= entry.lease.take().map_or(0, |lease| lease.initialized() as u64);
             let next = core::mem::replace(&mut entry.next, self.region_free);
             self.region_free = region;
             region = next;
@@ -834,10 +863,13 @@ impl Streams {
             Receiving::Stopped(_) => recv.final_size.is_some(),
             Receiving::Ended | Receiving::Reset(_) => true,
         });
-        let sent = stream
-            .send
-            .as_ref()
-            .is_none_or(|send| matches!(send.state, Sending::Finished | Sending::Reset { sent: true, .. }));
+        let sent = stream.send.as_ref().is_none_or(|send| {
+            send.held == NONE
+                && matches!(
+                    send.state,
+                    Sending::Finished | Sending::Reset { acknowledged: true, .. }
+                )
+        });
         if !(stream.live && stream.closed && received && sent && stream.linked == 0 && stream.control == 0) {
             return;
         }
@@ -1033,12 +1065,12 @@ impl Streams {
         send.state = Sending::Reset {
             code,
             stopped,
-            sent: false,
+            acknowledged: false,
         };
         self.drop_regions(slot);
         let stream = &mut self.slots[slot];
         stream.control &= !(control::FIN | control::BLOCKED);
-        stream.notify &= !notify::SENT;
+        stream.notify &= !(notify::SENT | notify::ACKNOWLEDGED);
         self.owe(slot, control::RESET);
         true
     }
@@ -1150,6 +1182,17 @@ impl Streams {
                 stream.notify &= !notify::SENT;
                 return Some(Event::Sent { stream: id });
             }
+            if stream.notify & notify::ACKNOWLEDGED != 0
+                && let Some(send) = &stream.send
+            {
+                stream.notify &= !notify::ACKNOWLEDGED;
+                let offset = self.regions.get(send.held as usize).map_or(send.offset, |r| r.offset);
+                return Some(Event::Acknowledged {
+                    stream: id,
+                    offset,
+                    end: send.held == NONE && send.state == Sending::Finished,
+                });
+            }
             stream.notify = 0;
             self.pop(list::NOTIFY);
             self.settle(slot);
@@ -1202,6 +1245,14 @@ impl Streams {
         if (send.offset + send.queued).saturating_add(len as u64) > VARINT_MAX {
             return Err(Error::new(Kind::Misuse, "a QUIC stream carries at most 2^62 - 1 bytes"));
         }
+        if len as u64 > self.config.send_bytes - self.retained_bytes {
+            return Err(Error::new(
+                Kind::Overload,
+                "the QUIC stream regions reached the send byte limit",
+            ));
+        }
+        let offset = send.offset + send.queued;
+        let previous = send.tail;
         let urgency = send.priority.urgency;
         if len > 0 {
             self.level(urgency).map_err(|_| NO_ROOM)?;
@@ -1216,6 +1267,9 @@ impl Streams {
             }
             let region = Region {
                 lease: Some(data),
+                offset,
+                remaining: len as u64,
+                previous,
                 next: NONE,
             };
             let at = if let Some(free) = self.regions.get_mut(self.region_free as usize) {
@@ -1235,6 +1289,10 @@ impl Streams {
                 if send.head == NONE {
                     send.head = at;
                 }
+                if send.held == NONE {
+                    send.held = at;
+                }
+                self.retained_bytes += len as u64;
                 send.tail = at;
                 send.regions += 1;
                 send.queued += len as u64;
@@ -1404,6 +1462,87 @@ impl Streams {
         Ok(())
     }
 
+    /// The original bytes of a lost STREAM frame. A reset releases its regions and cancels the resend.
+    pub(super) fn retained(&self, id: StreamId, region: u32, offset: u64, len: usize) -> Option<&[u8]> {
+        let send = self.slots[self.find(id)? as usize].send.as_ref()?;
+        if matches!(send.state, Sending::Reset { .. }) {
+            return None;
+        }
+        let entry = self.regions.get(region as usize)?;
+        let start = usize::try_from(offset.checked_sub(entry.offset)?).ok()?;
+        entry.lease.as_ref()?.bytes().get(start..start.checked_add(len)?)
+    }
+
+    /// Gives back a region as soon as its last outstanding byte receives an ACK.
+    pub(super) fn acknowledged(&mut self, record: Record) {
+        let (id, region, len, fin) = match record {
+            Record::Range(DataRange::Stream {
+                id, region, len, fin, ..
+            }) => (id, region, len, fin),
+            Record::Control(id, control::FIN) => (id, NONE, 0, true),
+            Record::Control(id, control::RESET) => {
+                if let Some(slot) = self.find(id) {
+                    let stream = &mut self.slots[slot as usize];
+                    if let Some(Sending::Reset { acknowledged, .. }) = stream.send.as_mut().map(|s| &mut s.state) {
+                        *acknowledged = true;
+                    }
+                    self.settle(slot as usize);
+                }
+                return;
+            }
+            _ => return,
+        };
+        let Some(slot) = self.find(id).map(|slot| slot as usize) else {
+            return;
+        };
+        let stream = &mut self.slots[slot];
+        let Some(send) = &mut stream.send else { return };
+        if matches!(send.state, Sending::Reset { .. }) {
+            return;
+        }
+        if fin {
+            send.state = Sending::Finished;
+        }
+        let mut progress = false;
+        if let Some(entry) = self.regions.get_mut(region as usize) {
+            entry.remaining -= len as u64;
+            if entry.remaining == 0 {
+                self.retained_bytes -= entry.lease.take().expect("a live region owns its bytes").initialized() as u64;
+                let previous = entry.previous;
+                let next = core::mem::replace(&mut entry.next, self.region_free);
+                self.region_free = region;
+                if let Some(before) = self.regions.get_mut(previous as usize) {
+                    before.next = next;
+                } else {
+                    send.held = next;
+                    progress = true;
+                }
+                if let Some(after) = self.regions.get_mut(next as usize) {
+                    after.previous = previous;
+                } else {
+                    send.tail = previous;
+                }
+            }
+        }
+        if !stream.closed && (progress || (fin && send.held == NONE)) {
+            self.tell(slot, notify::ACKNOWLEDGED);
+        }
+        self.settle(slot);
+    }
+
+    /// Rebuilds a lost control frame from the current limits and stream state.
+    pub(super) fn lost_control(&mut self, record: Record) {
+        match record {
+            Record::Limit(bit) => self.owed |= bit,
+            Record::Control(id, bit) => {
+                if let Some(slot) = self.find(id) {
+                    self.owe(slot as usize, bit);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Whether a frame of the layer waits to go out.
     pub(super) fn pending(&self) -> bool {
         self.owed != 0
@@ -1415,11 +1554,11 @@ impl Streams {
     /// Writes the frames that wait into the packet of `builder`, as many as fit: the limits of
     /// the connection, the frames of each stream, the unreliable datagrams, and then the data of
     /// the streams in the order of the scheduler. Gives whether it wrote a frame.
-    pub(super) fn write(&mut self, builder: &mut Builder<'_>) -> bool {
+    pub(super) fn write(&mut self, builder: &mut Output<'_, '_>) -> bool {
         let before = builder.room();
         if self.write_limits(builder) && self.write_control(builder) {
             while let Some(data) = self.unreliable.front() {
-                if builder.frame(&Frame::Datagram { data: data.bytes() }).is_err() {
+                if builder.builder.frame(&Frame::Datagram { data: data.bytes() }).is_err() {
                     break;
                 }
                 self.unreliable_bytes -= data.initialized() as u64;
@@ -1431,17 +1570,26 @@ impl Streams {
     }
 
     /// Writes the frames of the connection that wait. Gives `false` when the packet is full.
-    fn write_limits(&mut self, builder: &mut Builder<'_>) -> bool {
+    fn write_limits(&mut self, builder: &mut Output<'_, '_>) -> bool {
         if self.owed & owed::MAX_DATA != 0 {
             let max = self.window.due(self.config.data_bytes).unwrap_or(self.window.max);
-            if builder.frame(&Frame::MaxData { max }).is_err() {
+            if builder
+                .track(&Frame::MaxData { max }, Record::Limit(owed::MAX_DATA))
+                .is_err()
+            {
                 return false;
             }
             self.window.max = max;
             self.owed &= !owed::MAX_DATA;
         }
         if self.owed & owed::DATA_BLOCKED != 0 {
-            if builder.frame(&Frame::DataBlocked { limit: self.send_max }).is_err() {
+            if builder
+                .track(
+                    &Frame::DataBlocked { limit: self.send_max },
+                    Record::Limit(owed::DATA_BLOCKED),
+                )
+                .is_err()
+            {
                 return false;
             }
             self.owed &= !owed::DATA_BLOCKED;
@@ -1453,7 +1601,13 @@ impl Streams {
             if self.owed & (owed::MAX_STREAMS << at) != 0 {
                 let remote = &mut self.remote[at];
                 let max = remote.closed.saturating_add(self.config.streams[at]).min(STREAMS_MAX);
-                if builder.frame(&Frame::MaxStreams { direction, max }).is_err() {
+                if builder
+                    .track(
+                        &Frame::MaxStreams { direction, max },
+                        Record::Limit(owed::MAX_STREAMS << at),
+                    )
+                    .is_err()
+                {
                     return false;
                 }
                 remote.limit = max;
@@ -1461,7 +1615,13 @@ impl Streams {
             }
             if self.owed & (owed::STREAMS_BLOCKED << at) != 0 {
                 let limit = self.local[at].limit;
-                if builder.frame(&Frame::StreamsBlocked { direction, limit }).is_err() {
+                if builder
+                    .track(
+                        &Frame::StreamsBlocked { direction, limit },
+                        Record::Limit(owed::STREAMS_BLOCKED << at),
+                    )
+                    .is_err()
+                {
                     return false;
                 }
                 self.owed &= !(owed::STREAMS_BLOCKED << at);
@@ -1472,7 +1632,7 @@ impl Streams {
 
     /// Writes the frames of each stream of the control list. Gives `false` when the packet is
     /// full.
-    fn write_control(&mut self, builder: &mut Builder<'_>) -> bool {
+    fn write_control(&mut self, builder: &mut Output<'_, '_>) -> bool {
         loop {
             let slot = self.fifo[list::CONTROL][0] as usize;
             let capacity = self.config.stream_bytes;
@@ -1482,22 +1642,33 @@ impl Streams {
             let id = stream.id.0;
             if stream.control & control::RESET != 0
                 && let Some(send) = &mut stream.send
-                && let Sending::Reset { code, sent, .. } = &mut send.state
+                && let Sending::Reset {
+                    code,
+                    acknowledged: false,
+                    ..
+                } = &mut send.state
             {
                 let frame = Frame::ResetStream {
                     stream: id,
                     code: *code,
                     final_size: send.offset,
                 };
-                if builder.frame(&frame).is_err() {
+                if builder
+                    .track(&frame, Record::Control(stream.id, control::RESET))
+                    .is_err()
+                {
                     return false;
                 }
-                *sent = true;
             }
             stream.control &= !control::RESET;
             if stream.control & control::STOP != 0
                 && let Some(Receiving::Stopped(code)) = stream.recv.as_ref().map(|recv| recv.state)
-                && builder.frame(&Frame::StopSending { stream: id, code }).is_err()
+                && builder
+                    .track(
+                        &Frame::StopSending { stream: id, code },
+                        Record::Control(stream.id, control::STOP),
+                    )
+                    .is_err()
             {
                 return false;
             }
@@ -1506,9 +1677,15 @@ impl Streams {
                 && let Some(recv) = &mut stream.recv
                 && recv.state == Receiving::Open
                 && recv.final_size.is_none()
-                && let Some(max) = recv.window.due(capacity)
             {
-                if builder.frame(&Frame::MaxStreamData { stream: id, max }).is_err() {
+                let max = recv.window.due(capacity).unwrap_or(recv.window.max);
+                if builder
+                    .track(
+                        &Frame::MaxStreamData { stream: id, max },
+                        Record::Control(stream.id, control::MAX_STREAM_DATA),
+                    )
+                    .is_err()
+                {
                     return false;
                 }
                 recv.window.max = max;
@@ -1518,10 +1695,13 @@ impl Streams {
                 && let Some(send) = &stream.send
                 && matches!(send.state, Sending::Open | Sending::Finishing)
                 && builder
-                    .frame(&Frame::StreamDataBlocked {
-                        stream: id,
-                        limit: send.max,
-                    })
+                    .track(
+                        &Frame::StreamDataBlocked {
+                            stream: id,
+                            limit: send.max,
+                        },
+                        Record::Control(stream.id, control::BLOCKED),
+                    )
                     .is_err()
             {
                 return false;
@@ -1530,7 +1710,7 @@ impl Streams {
             let mut sent = false;
             if stream.control & control::FIN != 0
                 && let Some(send) = &mut stream.send
-                && send.state == Sending::Finishing
+                && matches!(send.state, Sending::Finishing | Sending::FinSent)
                 && send.queued == 0
             {
                 let frame = Frame::Stream {
@@ -1539,11 +1719,11 @@ impl Streams {
                     data: &[],
                     fin: true,
                 };
-                if builder.frame(&frame).is_err() {
+                if builder.track(&frame, Record::Control(stream.id, control::FIN)).is_err() {
                     return false;
                 }
-                send.state = Sending::Finished;
-                sent = true;
+                sent = send.state == Sending::Finishing;
+                send.state = Sending::FinSent;
             }
             stream.control &= !control::FIN;
             self.pop(list::CONTROL);
@@ -1556,7 +1736,7 @@ impl Streams {
 
     /// Writes STREAM frames in the order of the scheduler, while the connection has send credit
     /// and the packet has room.
-    fn write_data(&mut self, builder: &mut Builder<'_>) {
+    fn write_data(&mut self, builder: &mut Output<'_, '_>) {
         while self.send_used < self.send_max
             && let Some(slot) = self.first()
         {
@@ -1581,7 +1761,7 @@ impl Streams {
 
     /// Writes STREAM frames of stream `slot`, which is in the scheduler, until its regions or its
     /// credit end. Gives `true` when the packet has no room for its next byte.
-    fn write_stream(&mut self, slot: usize, builder: &mut Builder<'_>) -> bool {
+    fn write_stream(&mut self, slot: usize, builder: &mut Output<'_, '_>) -> bool {
         loop {
             let stream = &mut self.slots[slot];
             let id = stream.id.0;
@@ -1609,7 +1789,14 @@ impl Streams {
                 data: &bytes[..len],
                 fin,
             };
-            if len == 0 || builder.frame(&frame).is_err() {
+            let record = Record::Range(DataRange::Stream {
+                id: stream.id,
+                region: send.head,
+                offset: send.offset,
+                len,
+                fin,
+            });
+            if len == 0 || builder.track(&frame, record).is_err() {
                 return true;
             }
             send.offset += len as u64;
@@ -1617,18 +1804,12 @@ impl Streams {
             send.head_at += len;
             self.send_used += len as u64;
             if fin {
-                send.state = Sending::Finished;
+                send.state = Sending::FinSent;
             }
             if len == bytes.len() {
-                // The region is in packets, so it goes: N306 keeps it until its acknowledgement.
-                region.lease = None;
-                let next = core::mem::replace(&mut region.next, self.region_free);
-                self.region_free = core::mem::replace(&mut send.head, next);
+                send.head = region.next;
                 send.head_at = 0;
                 send.regions -= 1;
-                if next == NONE {
-                    send.tail = NONE;
-                }
             }
             let (sent, blocked) = (send.queued == 0, send.offset == send.max);
             if sent || blocked {

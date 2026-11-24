@@ -45,6 +45,10 @@ fn now() -> Instant {
     Instant::new(ClockDomain::new(1, Suspend::Pauses), 0)
 }
 
+fn ms(value: u64) -> Instant {
+    now().checked_add(Duration::from_millis(value)).unwrap()
+}
+
 /// The byte at `offset` of the data of each test stream, so a byte at a wrong place shows.
 fn byte(offset: usize) -> u8 {
     u8::try_from(offset % 251).unwrap()
@@ -57,10 +61,14 @@ fn region(offset: usize, len: usize) -> Lease {
 
 /// Each datagram that `connection` sends now.
 fn sent(connection: &mut Connection) -> Vec<Vec<u8>> {
+    sent_at(connection, now())
+}
+
+fn sent_at(connection: &mut Connection, at: Instant) -> Vec<Vec<u8>> {
     let mut datagrams = Vec::new();
     for _ in 0..8192 {
         let mut out = vec![0; 1500];
-        match connection.transmit(&mut out, now()).unwrap() {
+        match connection.transmit(&mut out, at).unwrap() {
             Some(len) => {
                 out.truncate(len);
                 datagrams.push(out);
@@ -73,11 +81,15 @@ fn sent(connection: &mut Connection) -> Vec<Vec<u8>> {
 
 /// Gives `datagram` to `connection` in a region of its own, and gives the events of the call.
 fn give(connection: &mut Connection, datagram: &[u8]) -> Vec<Event> {
+    give_at(connection, datagram, now())
+}
+
+fn give_at(connection: &mut Connection, datagram: &[u8], at: Instant) -> Vec<Event> {
     let len = connection.local_cid().as_bytes().len();
     let mut datagrams = Datagrams::new(Backing::from(datagram.to_vec()), None, len);
     let mut events = Vec::new();
     for _ in 0..8192 {
-        match connection.receive(&mut datagrams, now()) {
+        match connection.receive(&mut datagrams, at) {
             (Some(event), _) => events.push(event),
             (None, turn) if turn.progress == Progress::Pending => {}
             (None, _) => return events,
@@ -87,10 +99,10 @@ fn give(connection: &mut Connection, datagram: &[u8]) -> Vec<Event> {
 }
 
 /// The events that wait in `connection` after its last datagram went out.
-fn driven(connection: &mut Connection) -> Vec<Event> {
+fn driven_at(connection: &mut Connection, at: Instant) -> Vec<Event> {
     let mut events = Vec::new();
     for _ in 0..8192 {
-        match connection.drive(now()) {
+        match connection.drive(at) {
             (Some(event), _) => events.push(event),
             (None, turn) if turn.progress == Progress::Pending => {}
             (None, _) => return events,
@@ -198,21 +210,25 @@ impl Pair {
     /// Moves the datagrams of both ends until no datagram and no event moves. Each end releases
     /// the bytes of each stream for which `releases` gives `true`.
     fn run(&mut self, releases: impl Fn(StreamId) -> bool) {
+        self.run_at(now(), releases);
+    }
+
+    fn run_at(&mut self, at: Instant, releases: impl Fn(StreamId) -> bool) {
         for _ in 0..4096 {
-            let to_server = sent(&mut self.client);
-            let events = driven(&mut self.client);
+            let events = driven_at(&mut self.client, at);
+            let to_server = sent_at(&mut self.client, at);
             let mut quiet = to_server.is_empty() && events.is_empty();
             self.at_client.take(&mut self.client, events, &releases);
             for datagram in &to_server {
-                let events = give(&mut self.server, datagram);
+                let events = give_at(&mut self.server, datagram, at);
                 self.at_server.take(&mut self.server, events, &releases);
             }
-            let to_client = sent(&mut self.server);
-            let events = driven(&mut self.server);
+            let events = driven_at(&mut self.server, at);
+            let to_client = sent_at(&mut self.server, at);
             quiet &= to_client.is_empty() && events.is_empty();
             self.at_server.take(&mut self.server, events, &releases);
             for datagram in &to_client {
-                let events = give(&mut self.client, datagram);
+                let events = give_at(&mut self.client, datagram, at);
                 self.at_client.take(&mut self.client, events, &releases);
             }
             if quiet {
@@ -328,18 +344,15 @@ fn a_stream_window_as_large_as_the_connection_window_lets_a_slow_consumer_hold_e
 
 /// The datagrams of a transfer of `len` bytes on one new stream of the client, not delivered.
 fn flight(pair: &mut Pair, len: usize) -> (StreamId, Vec<Vec<u8>>) {
+    // An earlier transfer grows the congestion window enough to put this flight on the path.
+    let warm = pair.open(Direction::Unidirectional);
+    pair.client.send(warm, region(0, 3 * len), true).unwrap();
+    pair.run(|_| true);
+    assert!(pair.at_server.complete(warm, 3 * len));
     let stream = pair.open(Direction::Unidirectional);
-    let mut datagrams = Vec::new();
-    let mut offset = 0;
-    while offset < len {
-        offset = feed(&mut pair.client, stream, offset, len, 16 * 1024);
-        datagrams.extend(sent(&mut pair.client));
-        assert!(
-            driven(&mut pair.client)
-                .iter()
-                .all(|event| matches!(event, Event::Sent { .. }))
-        );
-    }
+    pair.client.send(stream, region(0, len), true).unwrap();
+    let datagrams = sent(&mut pair.client);
+    assert_matches!(driven_at(&mut pair.client, now())[..], [Event::Sent { stream: id }] if id == stream);
     (stream, datagrams)
 }
 
@@ -372,7 +385,8 @@ fn data_out_of_order_past_its_bound_is_refused_and_counted_and_the_stream_comple
     assert!((12 * 1024..20 * 1024).contains(&held), "{held} bytes: about 4 pages");
     // The packets that the server did not take got no acknowledgement, so the client sends their
     // data again: now it is in order, and needs no page.
-    deliver(&mut pair, &datagrams[1..]);
+    pair.run(|_| true);
+    pair.run_at(now().checked_add(Duration::from_millis(26)).unwrap(), |_| true);
     assert!(pair.at_server.complete(stream, LEN));
     assert_eq!(pair.server.reassembly_refused(), refused);
 }
@@ -380,21 +394,15 @@ fn data_out_of_order_past_its_bound_is_refused_and_counted_and_the_stream_comple
 #[test]
 fn a_transfer_with_many_gaps_completes_and_pieces_with_no_neighbor_reach_the_bound_first() {
     const LEN: usize = 200 * 1024;
-    // Many small gaps inside the bound. A packet number of one byte decodes only within 128
-    // packets of the newest one (RFC 9000, appendix A.3), so the order changes inside groups of
-    // 32 datagrams: first each second datagram of a group is late, and then each group arrives
-    // from its last datagram.
+    // Each second datagram arrives late. A second flight arrives in reverse order.
     let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
     let (stream, datagrams) = flight(&mut pair, LEN);
-    for group in datagrams.chunks(32) {
-        deliver(&mut pair, group.iter().skip(1).step_by(2));
-        deliver(&mut pair, group.iter().step_by(2));
-    }
+    deliver(&mut pair, datagrams.iter().skip(1).step_by(2));
+    deliver(&mut pair, datagrams.iter().step_by(2));
+    pair.run(|_| true);
     assert!(pair.at_server.complete(stream, LEN));
     let (stream, datagrams) = flight(&mut pair, LEN);
-    for group in datagrams.chunks(32) {
-        deliver(&mut pair, group.iter().rev());
-    }
+    deliver(&mut pair, datagrams.iter().rev());
     assert!(pair.at_server.complete(stream, LEN));
     assert_eq!(pair.server.reassembly_refused(), 0);
 
@@ -613,7 +621,7 @@ fn a_stream_takes_its_regions_up_to_its_bound_and_refuses_what_its_state_forbids
     );
     // The regions are in a packet: the stream takes the next one, and then its end with no byte.
     pair.run(|_| true);
-    assert_matches!(pair.at_client.other[..], [Event::Sent { stream: sent }] if sent == stream);
+    assert_matches!(pair.at_client.other[..], [Event::Sent { stream: sent }, Event::Acknowledged { stream: acked, offset: 40, end: false }] if sent == stream && acked == stream);
     pair.client.send(stream, region(40, 10), false).unwrap();
     pair.run(|_| true);
     pair.client.send(stream, region(50, 0), true).unwrap();
@@ -642,5 +650,275 @@ fn a_stream_takes_its_regions_up_to_its_bound_and_refuses_what_its_state_forbids
     assert_matches!(
         pair.client.close_stream(stream).map_err(|error| error.kind()),
         Err(Kind::Misuse)
+    );
+}
+
+#[test]
+fn newreno_grows_on_delivery_and_halves_once_for_packet_and_time_threshold_losses() {
+    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    let stream = pair.open(Direction::Unidirectional);
+    pair.client.send(stream, region(0, 128 * 1024), true).unwrap();
+    assert_eq!(pair.client.recovery().congestion_window, 12_000);
+    let first = sent_at(&mut pair.client, ms(10));
+    assert_eq!(first.iter().map(Vec::len).collect::<Vec<_>>(), [1200; 10]);
+    for packet in first {
+        give_at(&mut pair.server, &packet, ms(14));
+    }
+    for ack in sent_at(&mut pair.server, ms(16)) {
+        give_at(&mut pair.client, &ack, ms(20));
+    }
+    let path = pair.client.recovery();
+    assert_eq!((path.congestion_window, path.bytes_in_flight), (24_000, 0));
+    assert_eq!(path.latest_rtt, Some(Duration::from_millis(10)));
+    // The handshake took zero ticks. The first data sample is 10 ms less 2 ms of ACK delay.
+    assert_eq!(path.smoothed_rtt, Some(Duration::from_millis(1)));
+
+    let second = sent_at(&mut pair.client, ms(30));
+    assert_eq!(second.len(), 20);
+    give_at(&mut pair.server, &second[3], ms(34));
+    for ack in sent_at(&mut pair.server, ms(35)) {
+        give_at(&mut pair.client, &ack, ms(40));
+    }
+    let path = pair.client.recovery();
+    assert_eq!(
+        (path.packets_lost, path.congestion_window, path.bytes_in_flight),
+        (1, 12_000, 21_600)
+    );
+    let threshold = now().checked_add(Duration::from_micros(41_250)).unwrap();
+    let turn = pair.client.drive(ms(41)).1;
+    assert_eq!(turn.deadline.map(|d| d.instant()), Some(threshold));
+    assert_eq!(pair.client.recovery().packets_lost, 1);
+    pair.client.drive(threshold);
+    let path = pair.client.recovery();
+    assert_eq!(
+        (path.packets_lost, path.congestion_window, path.bytes_in_flight),
+        (3, 12_000, 19_200)
+    );
+
+    for packet in &second[4..] {
+        give_at(&mut pair.server, packet, ms(42));
+    }
+    for ack in sent_at(&mut pair.server, ms(42)) {
+        give_at(&mut pair.client, &ack, ms(45));
+    }
+    assert_eq!(pair.client.recovery().congestion_window, 12_000);
+    let third = sent_at(&mut pair.client, ms(46));
+    assert_eq!(third.iter().map(Vec::len).sum::<usize>(), 12_000);
+    for packet in third {
+        give_at(&mut pair.server, &packet, ms(50));
+    }
+    for ack in sent_at(&mut pair.server, ms(50)) {
+        give_at(&mut pair.client, &ack, ms(55));
+    }
+    assert_eq!(
+        pair.client.recovery().congestion_window,
+        13_200,
+        "one datagram per acknowledged window"
+    );
+}
+
+#[test]
+fn a_probe_backs_off_without_declaring_loss_and_an_ack_releases_the_retained_region() {
+    let limits = Limits {
+        send_bytes_max: 4000,
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(limits, Limits::DEFAULT);
+    let stream = pair.open(Direction::Unidirectional);
+    let owner: Arc<[u8]> = (0..4000).map(byte).collect();
+    let backing = Arc::downgrade(&owner);
+    pair.client.send(stream, Lease::from_owner(owner, 4000), false).unwrap();
+    let lost = sent_at(&mut pair.client, ms(1));
+    let in_flight = lost.iter().map(|d| d.len() as u64).sum::<u64>();
+    assert!(lost.len() > 1);
+    assert_matches!(driven_at(&mut pair.client, ms(1))[..], [Event::Sent { stream: id }] if id == stream);
+    assert!(backing.upgrade().is_some(), "the packet needs the region for recovery");
+    assert_eq!(
+        pair.client.send(stream, region(4000, 1), true).unwrap_err().kind(),
+        Kind::Overload
+    );
+    let deadline = |connection: &mut Connection, time| connection.drive(time).1.deadline.map(|d| d.instant());
+    assert_eq!(deadline(&mut pair.client, ms(26)), Some(ms(27)));
+    pair.client.drive(ms(27));
+    let first_probe = sent_at(&mut pair.client, ms(27));
+    assert_eq!(first_probe.len(), 1);
+    let path = pair.client.recovery();
+    assert_eq!(
+        (path.packets_lost, path.probes_sent, path.congestion_window),
+        (0, 1, 12_000)
+    );
+    assert_eq!(path.bytes_in_flight, in_flight + first_probe[0].len() as u64);
+    assert_eq!(deadline(&mut pair.client, ms(78)), Some(ms(79)));
+    pair.client.drive(ms(79));
+    let probe = sent_at(&mut pair.client, ms(79));
+    assert_eq!(probe.len(), 1);
+    give_at(&mut pair.server, &probe[0], ms(80));
+    for ack in sent_at(&mut pair.server, ms(80)) {
+        give_at(&mut pair.client, &ack, ms(81));
+    }
+    assert_eq!(pair.client.recovery().packets_lost, lost.len() as u64 + 1);
+    pair.run_at(ms(82), |_| true);
+    assert_eq!(pair.at_server.bytes(stream), 4000);
+    assert!(
+        backing.upgrade().is_none(),
+        "the transport released its acknowledged region"
+    );
+    assert_matches!(pair.at_client.other[..], [Event::Acknowledged { stream: id, offset: 4000, end: false }] if id == stream);
+    pair.client.send(stream, region(4000, 1), true).unwrap();
+    pair.run_at(ms(83), |_| true);
+    assert!(pair.at_server.complete(stream, 4001));
+}
+
+#[test]
+fn a_full_congestion_window_admits_one_probe_and_counts_its_bytes() {
+    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    let stream = pair.open(Direction::Unidirectional);
+    pair.client.send(stream, region(0, 24_000), true).unwrap();
+    assert_eq!(sent_at(&mut pair.client, ms(1)).len(), 10);
+    let time = pair.client.drive(ms(1)).1.deadline.unwrap().instant();
+    pair.client.drive(time);
+    let probe = sent_at(&mut pair.client, time);
+    assert_eq!(probe.iter().map(Vec::len).collect::<Vec<_>>(), [1200]);
+    let path = pair.client.recovery();
+    assert_eq!(
+        (path.bytes_in_flight, path.congestion_window, path.packets_lost),
+        (13_200, 12_000, 0)
+    );
+}
+
+#[test]
+fn an_ack_covering_a_ping_and_a_later_bare_ack_samples_the_later_send_time() {
+    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    pair.client.ping();
+    let ping = sent_at(&mut pair.client, ms(10));
+    pair.server.ping();
+    for packet in sent_at(&mut pair.server, ms(12)) {
+        give_at(&mut pair.client, &packet, ms(13));
+    }
+    let bare = sent_at(&mut pair.client, ms(15));
+    assert_eq!((ping.len(), bare.len()), (1, 1));
+    give_at(&mut pair.server, &ping[0], ms(16));
+    give_at(&mut pair.server, &bare[0], ms(20));
+    for ack in sent_at(&mut pair.server, ms(22)) {
+        give_at(&mut pair.client, &ack, ms(25));
+    }
+    assert_eq!(pair.client.recovery().latest_rtt, Some(Duration::from_millis(10)));
+    assert_eq!(pair.client.recovery().bytes_in_flight, 0);
+}
+
+#[test]
+fn lost_stream_credit_and_a_lost_reset_after_close_reach_the_peer() {
+    let limits = Limits {
+        stream_bytes_max: 4,
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(Limits::DEFAULT, limits);
+    let stream = pair.open(Direction::Unidirectional);
+    pair.client.send(stream, region(0, 8), true).unwrap();
+    let packets = sent_at(&mut pair.client, ms(10));
+    for packet in packets {
+        let events = give_at(&mut pair.server, &packet, ms(11));
+        pair.at_server.take(&mut pair.server, events, |_| true);
+    }
+    assert_eq!(pair.at_server.bytes(stream), 4);
+    assert!(
+        !sent_at(&mut pair.server, ms(11)).is_empty(),
+        "the first credit update is lost"
+    );
+    pair.server.ping();
+    for ping in sent_at(&mut pair.server, ms(12)) {
+        give_at(&mut pair.client, &ping, ms(13));
+    }
+    for ack in sent_at(&mut pair.client, ms(14)) {
+        give_at(&mut pair.server, &ack, ms(16));
+    }
+    pair.run_at(ms(17), |_| true);
+    assert!(pair.at_server.complete(stream, 8), "the current credit goes out again");
+
+    let reset = pair.open(Direction::Unidirectional);
+    pair.client.reset(reset, 7).unwrap();
+    pair.client.close_stream(reset).unwrap();
+    assert_eq!(sent_at(&mut pair.client, ms(20)).len(), 1);
+    let timeout = pair.client.drive(ms(20)).1.deadline.unwrap().instant();
+    pair.run_at(timeout, |_| true);
+    assert!(
+        pair.at_server
+            .other
+            .iter()
+            .any(|e| matches!(e, Event::Reset { stream, code: 7 } if *stream == reset))
+    );
+}
+
+#[test]
+fn the_declared_reordering_interval_preserves_goodput_and_delivers_each_datagram_once() {
+    use std::collections::VecDeque;
+
+    // At 100,000 packets/s, each tick is 10 us. Delay 20 of every 100 packets by exactly 100 ms.
+    // Count payload bytes in the second 100 ms, after the path fills.
+    const INTERVAL: usize = 10_000;
+    let measure = |limits: Limits, reorder: bool| {
+        let mut pair = Pair::new(limits, limits);
+        let mut late = VecDeque::new();
+        let mut seen = vec![false; 2 * INTERVAL];
+        let mut delivered = 0;
+        let mut out = [0; 1200];
+        for tick in 0..2 * INTERVAL {
+            let at = now().checked_add(Duration::from_micros(tick as u64 * 10)).unwrap();
+            pair.client
+                .send_unreliable(Lease::from(u32::try_from(tick).unwrap().to_be_bytes().to_vec()))
+                .unwrap();
+            let len = pair
+                .client
+                .transmit(&mut out, at)
+                .unwrap()
+                .expect("the offered packet fits the path");
+            let mut arrive = |packet: &[u8]| {
+                for event in give_at(&mut pair.server, packet, at) {
+                    let Event::Unreliable(data) = event else {
+                        panic!("an unreliable datagram")
+                    };
+                    let id = u32::from_be_bytes(data.bytes().try_into().unwrap()) as usize;
+                    assert!(!core::mem::replace(&mut seen[id], true), "one delivery per packet");
+                    if tick >= INTERVAL {
+                        delivered += data.initialized();
+                    }
+                }
+            };
+            if reorder && tick % 100 < 20 {
+                late.push_back(out[..len].to_vec());
+                if tick >= INTERVAL {
+                    arrive(&late.pop_front().unwrap());
+                }
+            } else {
+                arrive(&out[..len]);
+                if tick % 100 == 50 {
+                    arrive(&out[..len]);
+                }
+            }
+            for ack in sent_at(&mut pair.server, at) {
+                give_at(&mut pair.client, &ack, at);
+            }
+        }
+        delivered
+    };
+    let limits = Limits {
+        unreliable_bytes_max: Some(1200),
+        ..Limits::DEFAULT
+    };
+    let clean = measure(limits, false);
+    assert_eq!(clean, 40_000);
+    assert_eq!(
+        measure(limits, true),
+        clean,
+        "zero tolerated loss of goodput inside the declared interval"
+    );
+    let short = Limits {
+        reordering_time: Duration::from_millis(10),
+        ..limits
+    };
+    assert_eq!(
+        measure(short, true),
+        32_000,
+        "the late fifth is outside a 10 ms interval"
     );
 }

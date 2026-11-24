@@ -294,12 +294,19 @@ fn run(profile: &Profile) -> ([u64; 2], Vec<Option<Handshake>>, [u64; 2]) {
             // The data of the application is its own memory.
             let data = Lease::from(vec![7; profile.stream_bytes]);
             owned(CLIENT_END, || client.send(stream, data, true)).unwrap();
-            let datagrams = send(CLIENT_END, &mut client);
-            let received: usize = datagrams
-                .chunks(32)
-                .flat_map(|group| group.iter().rev())
-                .map(|datagram| give(SERVER_END, server, datagram.clone()))
-                .sum();
+            let mut received = 0;
+            for _ in 0..512 {
+                let datagrams = send(CLIENT_END, &mut client);
+                if datagrams.is_empty() {
+                    break;
+                }
+                for datagram in datagrams.into_iter().rev() {
+                    received += give(SERVER_END, server, datagram);
+                }
+                for ack in send(SERVER_END, server) {
+                    give(CLIENT_END, &mut client, ack);
+                }
+            }
             assert_eq!(received, profile.stream_bytes, "{}: the stream arrived", profile.name);
         }
         let heap = counting::LIVE.get();

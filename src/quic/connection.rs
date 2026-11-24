@@ -11,15 +11,14 @@
 //! while they give one. Also call `drive` after the last `transmit`: it gives the events of the
 //! packets that went out, and the next deadline.
 //!
-//! This engine has the handshake, streams, flow control, and unreliable datagrams.
-//! Acknowledgements and loss recovery come with N306, address validation and connection IDs with
-//! N304, and the close periods with N307. Until then a lost packet is not sent again, the engine
-//! ignores the frames of those parts, and a close ends the connection at once.
+//! Each packet number space keeps its received ranges and outstanding packets. The spaces share
+//! the round-trip estimate and the NewReno congestion window of the path.
 
 use core::cmp::Ordering;
 use core::fmt;
 use core::mem::size_of;
 use core::time::Duration;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use rstypes::buffer::{Buffer as _, Lease};
@@ -34,9 +33,10 @@ use rustls::quic::{
 use rustls::{ClientSide, ServerSide};
 
 use super::crypto::{self, Refused};
-use super::frame::{Direction, Frame, STREAMS_MAX};
+use super::frame::{Ack, Direction, Frame, STREAMS_MAX};
 use super::packet::{self, Builder, Datagrams, Header, Kind as PacketKind, OpenError, Outgoing, Side};
 use super::params::{Parameters, Sender};
+use super::recovery::{self, DataRange, History, Output, Path, Received, Record, RecoveryStats, Sent};
 use super::stream::{self, Event, Priority, Stop, StreamId, Streams};
 use super::{ConnectionId, ErrorCode, VARINT_MAX};
 use crate::drive::{Blocked, Error, Kind, Progress, Turn, TurnLimits, Work};
@@ -55,7 +55,7 @@ pub struct Limits {
     /// connection ends with [`Kind::Deadline`].
     pub handshake_timeout: Duration,
     /// The largest datagram that this end sends: 1,200 to 65,527 bytes. A datagram that carries an
-    /// Initial packet has at least 1,200 bytes (RFC 9000, section 14.1).
+    /// ack-eliciting Initial packet or a client Initial has at least 1,200 bytes (RFC 9000, section 14.1).
     pub datagram_bytes_max: usize,
     /// The bytes of the connection ID that this end chooses for itself: 0 to 20.
     pub cid_bytes: usize,
@@ -86,6 +86,13 @@ pub struct Limits {
     /// The bytes of unreliable datagrams (RFC 9221) that wait to go out at one time, or `None`
     /// for a connection that sends and takes none.
     pub unreliable_bytes_max: Option<u32>,
+    /// The sum of the lengths of stream regions this end can retain for sending and retransmission.
+    /// An ACK of the whole region or a stream reset returns its allowance.
+    pub send_bytes_max: u64,
+    /// The packet rate used to size duplicate detection, in packets per second.
+    pub packets_per_second: u32,
+    /// The time a packet can arrive out of order at that rate.
+    pub reordering_time: Duration,
     /// The work of one call: the received bytes and the frames that it reads, and the rustls
     /// calls that it makes, each counted as a frame.
     pub turn: TurnLimits,
@@ -96,7 +103,7 @@ impl Limits {
     /// connection IDs of 8 bytes, the key limit of the suite, and 1 MiB and 4,096 frames for each
     /// call. A window of 4 MiB for the connection and of 1 MiB for each stream, 100 streams of the
     /// peer in each direction, 6 MiB for data out of order, which the windows never reach, and no
-    /// unreliable datagrams.
+    /// unreliable datagrams. Send regions share 4 MiB. Duplicate detection covers 100,000 packets/s for 100 ms.
     pub const DEFAULT: Self = Self {
         idle_timeout: Some(Duration::from_secs(30)),
         handshake_timeout: Duration::from_secs(10),
@@ -108,6 +115,9 @@ impl Limits {
         streams_bidi_max: 100,
         streams_uni_max: 100,
         reassembly_bytes_max: 6 << 20,
+        send_bytes_max: 4 << 20,
+        packets_per_second: 100_000,
+        reordering_time: Duration::from_millis(100),
         unreliable_bytes_max: None,
         turn: TurnLimits {
             bytes: 1 << 20,
@@ -135,8 +145,10 @@ const PTO_INITIAL: Duration = Duration::from_millis(999);
 /// The code of the CRYPTO_ERROR range: the TLS alert follows it (RFC 9001, section 4.8).
 const CRYPTO_ERROR: u64 = 0x100;
 /// The bytes of a CRYPTO frame besides its data: its type, an offset of up to 8 bytes, and a
-/// length of up to 2 bytes for the data of one packet.
-const CRYPTO_FRAME_HEAD: usize = 1 + 8 + 2;
+/// length of up to 4 bytes for the data of one packet.
+const CRYPTO_FRAME_HEAD: usize = 1 + 8 + 4;
+/// A Handshake header with two maximum-length IDs, the tag, and a transport close with an empty reason.
+const COALESCED_ROOM: usize = 1 + 4 + 2 * (1 + ConnectionId::MAX) + 4 + 4 + packet::TAG + 1 + 8 + 8 + 1;
 /// The memory of the keys of one level: two packet keys and two header keys of the provider.
 const KEYS_BYTES: u64 = 2 * memory::RECORD_KEY + 2 * memory::HEADER_KEY;
 /// The events of one rustls call that the engine keeps room for: a flight of the server, its key
@@ -175,22 +187,28 @@ struct Space {
     received: u64,
     /// The number of the next packet that this end sends.
     next: u64,
-    /// The largest number of a packet of the peer that opened.
-    largest: Option<u64>,
+    ranges: Received,
+    history: History,
+    /// Lost stream and CRYPTO ranges that still need a packet.
+    retry: VecDeque<DataRange>,
+    probe: bool,
     /// The keys are gone: each later packet of the space drops.
     discarded: bool,
     credit: Credit,
 }
 
 impl Space {
-    fn new(budget: &Budget) -> Self {
+    fn new(budget: &Budget, window: u64) -> Self {
         Self {
             keys: None,
             receive: crypto::Receive::new(budget),
             send: crypto::Send::new(budget),
             received: 0,
             next: 0,
-            largest: None,
+            ranges: Received::new(window, budget),
+            history: History::new(budget),
+            retry: VecDeque::new(),
+            probe: false,
             discarded: false,
             credit: budget.credit(0),
         }
@@ -204,13 +222,100 @@ impl Space {
     }
 
     /// Drops the keys and the CRYPTO streams of the space (RFC 9001, section 4.9).
-    fn discard(&mut self, budget: &Budget) {
+    fn discard(&mut self, budget: &Budget, window: u64) {
         *self = Self {
             discarded: true,
             next: self.next,
-            largest: self.largest,
-            ..Self::new(budget)
+            ..Self::new(budget, window)
         };
+    }
+
+    /// Repackages lost ranges. A shorter packet can carry a prefix and leave the rest queued.
+    fn resend(&mut self, streams: &Streams, out: &mut Output<'_, '_>) {
+        while let Some(record) = self.retry.front_mut() {
+            let (offset, remaining, count) = match *record {
+                DataRange::Crypto { offset, len } => {
+                    let room = stream::fit(
+                        out.room().saturating_sub(1 + super::varint_len(offset).unwrap_or(8)),
+                        len,
+                    );
+                    if room == 0 {
+                        break;
+                    }
+                    let data = self
+                        .send
+                        .retained(offset, room)
+                        .expect("an outstanding CRYPTO range owns its message");
+                    if out
+                        .track(
+                            &Frame::Crypto { offset, data },
+                            Record::Range(DataRange::Crypto {
+                                offset,
+                                len: data.len(),
+                            }),
+                        )
+                        .is_err()
+                    {
+                        break;
+                    }
+                    (offset, len, data.len())
+                }
+                DataRange::Stream {
+                    id,
+                    region,
+                    offset,
+                    len,
+                    fin,
+                } => {
+                    let Some(bytes) = streams.retained(id, region, offset, len) else {
+                        self.retry.pop_front();
+                        continue;
+                    };
+                    let header = 1
+                        + super::varint_len(id.get()).unwrap_or(8)
+                        + if offset == 0 {
+                            0
+                        } else {
+                            super::varint_len(offset).unwrap_or(8)
+                        };
+                    let count = stream::fit(out.room().saturating_sub(header), len);
+                    if count == 0 {
+                        break;
+                    }
+                    let fin = fin && count == len;
+                    let frame = Frame::Stream {
+                        stream: id.get(),
+                        offset,
+                        data: &bytes[..count],
+                        fin,
+                    };
+                    if out
+                        .track(
+                            &frame,
+                            Record::Range(DataRange::Stream {
+                                id,
+                                region,
+                                offset,
+                                len: count,
+                                fin,
+                            }),
+                        )
+                        .is_err()
+                    {
+                        break;
+                    }
+                    (offset, len, count)
+                }
+            };
+            if count == remaining {
+                self.retry.pop_front();
+            } else {
+                let (DataRange::Stream { offset: start, len, .. } | DataRange::Crypto { offset: start, len }) = record;
+                *start = offset + count as u64;
+                *len -= count;
+                break;
+            }
+        }
     }
 }
 
@@ -341,6 +446,10 @@ pub struct Connection {
     parameters_kept: bool,
     events: Vec<QuicEvent>,
     spaces: [Space; 3],
+    path: Path,
+    window: u64,
+    /// Start of the client probe timer when address validation still needs a packet.
+    validation_at: Instant,
     one_rtt: Option<OneRtt>,
     /// The level of the next messages of rustls.
     write: Level,
@@ -360,7 +469,7 @@ pub struct Connection {
     budget: Budget,
     /// The idle timeout of the connection, or `None` for none.
     idle: Option<Duration>,
-    idle_deadline: Option<Instant>,
+    last_activity: Instant,
     handshake_deadline: Option<Instant>,
     /// A packet of the peer opened after the last ack-eliciting packet of this end.
     received: bool,
@@ -390,6 +499,11 @@ struct Reading {
     level: Level,
     payload: Lease,
     at: usize,
+    number: u64,
+    received_at: Instant,
+    eliciting: bool,
+    first_datagram: Option<usize>,
+    accepted: bool,
 }
 
 impl fmt::Debug for Connection {
@@ -405,7 +519,7 @@ impl fmt::Debug for Connection {
 
 const KEYS_REFUSED: Error = Error::new(Kind::Overload, "the budget refused the keys of a QUIC level");
 const OUTPUT_REFUSED: Error = Error::new(Kind::Overload, "the budget refused the QUIC handshake output");
-const CLOCK: Error = Error::new(
+pub(super) const CLOCK: Error = Error::new(
     Kind::Misuse,
     "the time of the call is not on the clock of the QUIC connection",
 );
@@ -443,12 +557,27 @@ fn earlier(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
     }
 }
 
+/// A packet can be as late as the declared rate times the reordering time. Include the newest packet.
+fn receive_window(limits: &Limits) -> Result<u64, Error> {
+    let packets = (u128::from(limits.packets_per_second) * limits.reordering_time.as_nanos()).div_ceil(1_000_000_000);
+    u64::try_from(packets)
+        .ok()
+        .filter(|n| (1..(1 << 31) - 1).contains(n))
+        .map(|n| n + 1)
+        .ok_or(Error::new(
+            Kind::Misuse,
+            "the QUIC reordering interval must fit a packet number of four bytes",
+        ))
+}
+
 /// Checks the limits that the caller set.
 fn check(limits: &Limits) -> Result<(), Error> {
     if !(DATAGRAM_MIN..=DATAGRAM_MAX).contains(&limits.datagram_bytes_max)
         || limits.cid_bytes > ConnectionId::MAX
         || limits.key_packets_max < 2
         || limits.handshake_timeout.is_zero()
+        || limits.turn.bytes == 0
+        || limits.turn.frames == 0
         || limits.idle_timeout.is_some_and(|timeout| timeout.is_zero())
         || limits.data_bytes_max.max(limits.stream_bytes_max) > VARINT_MAX
         || limits.streams_bidi_max.max(limits.streams_uni_max) > STREAMS_MAX
@@ -611,13 +740,17 @@ impl Connection {
         budget: &Budget,
         now: Instant,
     ) -> Result<Self, Error> {
+        let window = receive_window(&limits)?;
         let mut output = budget.credit(0);
         output
             .charge((EVENTS * size_of::<QuicEvent>()) as u64)
             .map_err(|_| OUTPUT_REFUSED)?;
         let mut events = Vec::new();
         events.try_reserve_exact(EVENTS).map_err(|_| OUTPUT_REFUSED)?;
-        let idle = limits.idle_timeout.map(|timeout| timeout.max(3 * PTO_INITIAL));
+        let idle = limits.idle_timeout;
+        if let Some(timeout) = idle {
+            after(now, timeout.max(3 * PTO_INITIAL))?;
+        }
         let side = if matches!(end, End::Client { .. }) {
             Side::Client
         } else {
@@ -634,7 +767,10 @@ impl Connection {
             kept: budget.credit(0),
             parameters_kept: false,
             events,
-            spaces: [Space::new(budget), Space::new(budget), Space::new(budget)],
+            spaces: core::array::from_fn(|_| Space::new(budget, window)),
+            path: Path::new(limits.datagram_bytes_max),
+            window,
+            validation_at: now,
             one_rtt: None,
             write: Level::Initial,
             read: Level::Initial,
@@ -647,7 +783,7 @@ impl Connection {
             limits,
             budget: budget.clone(),
             idle,
-            idle_deadline: idle.map(|idle| after(now, idle)).transpose()?,
+            last_activity: now,
             handshake_deadline: Some(after(now, limits.handshake_timeout)?),
             received: false,
             confirmed: false,
@@ -665,6 +801,7 @@ impl Connection {
                     stream_bytes: limits.stream_bytes_max,
                     streams: [limits.streams_bidi_max, limits.streams_uni_max],
                     reassembly_bytes: limits.reassembly_bytes_max,
+                    send_bytes: limits.send_bytes_max,
                     unreliable_bytes: limits.unreliable_bytes_max.map(u64::from),
                 },
                 budget,
@@ -712,6 +849,11 @@ impl Connection {
         self.confirmed
     }
 
+    /// The round-trip estimate, congestion window, and recovery counters of the current path.
+    pub fn recovery(&self) -> RecoveryStats {
+        self.path.stats()
+    }
+
     /// The transport parameters of the peer, after the handshake completed.
     pub const fn peer_parameters(&self) -> Option<&Parameters> {
         self.peer.as_ref()
@@ -748,16 +890,15 @@ impl Connection {
         self.streams.open(direction)
     }
 
-    /// Gives `data` to `stream` as its next bytes, with no copy: the stream sends views of the
-    /// region, and holds it until each of its bytes is in a packet. With `end`, the bytes are the
-    /// last of the stream, and `data` can be empty. A stream holds at most
-    /// [`STREAM_REGIONS_MAX`](super::STREAM_REGIONS_MAX) regions: give the next ones after
-    /// [`Event::Sent`].
+    /// Queues `data` without a copy. With `end`, the region ends the stream and can be empty.
+    /// Each stream accepts up to [`STREAM_REGIONS_MAX`](super::STREAM_REGIONS_MAX) unsent regions.
+    /// [`Event::Sent`] permits the next batch. The engine retains each region until the peer
+    /// acknowledges its bytes or the stream resets. [`Event::Acknowledged`] reports the acknowledged prefix.
     ///
     /// Refuses with [`Kind::Misuse`] when the stream is not open, only receives, sent its end, or
     /// holds its most regions, and when `data` is empty with no `end`. Refuses with
     /// [`Kind::Cancelled`] after the peer stopped the stream, and with [`Kind::Overload`] when
-    /// the budget cannot pay.
+    /// the budget or [`Limits::send_bytes_max`] cannot admit the region.
     pub fn send(&mut self, stream: StreamId, data: Lease, end: bool) -> Result<(), Error> {
         self.live()?;
         self.streams.send(stream, data, end)
@@ -929,30 +1070,91 @@ impl Connection {
     }
 
     /// The result of a call.
-    fn turn(&self) -> Turn {
+    fn turn(&mut self) -> Turn {
+        let deadline = match self.deadline() {
+            Ok(at) => at.map(Deadline::at),
+            Err(error) => {
+                self.outcome = Some(Err(error));
+                None
+            }
+        };
         let progress = match (self.outcome, self.wait) {
             (Some(outcome), _) => Progress::Terminal(outcome),
             (None, Some(units)) => Progress::Blocked(Blocked::Capacity(units)),
             (None, None) if self.more => Progress::Pending,
             (None, None) => Progress::Blocked(Blocked::Input),
         };
-        Turn {
-            progress,
-            deadline: self.deadline().map(Deadline::at),
-        }
+        Turn { progress, deadline }
     }
 
     /// The earliest timer of the connection.
-    fn deadline(&self) -> Option<Instant> {
+    fn deadline(&self) -> Result<Option<Instant>, Error> {
         if self.outcome.is_some() {
-            return None;
+            return Ok(None);
         }
         let previous = self
             .one_rtt
             .as_ref()
             .and_then(|keys| keys.previous.as_ref().map(|(_, until)| *until));
         let handshake = if self.confirmed { None } else { self.handshake_deadline };
-        earlier(earlier(self.idle_deadline, handshake), previous)
+        Ok(earlier(
+            earlier(self.idle_deadline()?, handshake),
+            earlier(previous, self.recovery_timer().map(|(at, _)| at)),
+        ))
+    }
+
+    fn idle_deadline(&self) -> Result<Option<Instant>, Error> {
+        self.idle
+            .map(|idle| after(self.last_activity, idle.max(3 * self.pto())))
+            .transpose()
+    }
+
+    /// The loss timer takes priority over a probe in any space (RFC 9002, section 6).
+    fn recovery_timer(&self) -> Option<(Instant, Level)> {
+        let earliest =
+            |times: [Option<(Instant, Level)>; 3]| times.into_iter().flatten().min_by_key(|(at, _)| at.as_nanos());
+        let loss =
+            earliest(Level::ALL.map(|level| self.spaces[level as usize].history.loss_time.map(|at| (at, level))));
+        if loss.is_some() || self.spaces.iter().any(|space| space.probe) {
+            return loss;
+        }
+        let delay = |base: Instant, level| {
+            let pto = if level == Level::Data {
+                self.pto()
+            } else {
+                self.path.pto(Duration::ZERO)
+            };
+            let nanos = pto
+                .as_nanos()
+                .checked_mul(1u128.checked_shl(self.path.backoff)?)?
+                .try_into()
+                .ok()?;
+            base.checked_add(Duration::from_nanos(nanos)).ok().map(|at| (at, level))
+        };
+        earliest(Level::ALL.map(|level| {
+            self.spaces[level as usize]
+                .history
+                .pto_start()
+                .filter(|_| level != Level::Data || self.confirmed)
+                .and_then(|base| delay(base, level))
+        }))
+        .or_else(|| {
+            if self.validated() {
+                return None;
+            }
+            let level = if self.spaces[Level::Handshake as usize].keys.is_some() {
+                Level::Handshake
+            } else {
+                Level::Initial
+            };
+            delay(self.validation_at, level)
+        })
+    }
+
+    fn validated(&self) -> bool {
+        self.confirmed
+            || matches!(self.end, End::Server { .. })
+            || self.spaces[Level::Handshake as usize].history.largest.is_some()
     }
 
     /// Ends the connection at its idle or handshake deadline, with no packet (RFC 9000, section
@@ -961,7 +1163,7 @@ impl Connection {
         if self.outcome.is_some() {
             return Ok(());
         }
-        if reached(self.idle_deadline, now)? {
+        if reached(self.idle_deadline()?, now)? {
             return Err(IDLE);
         }
         if !self.confirmed && reached(self.handshake_deadline, now)? {
@@ -972,7 +1174,83 @@ impl Connection {
         {
             keys.previous = None;
         }
+        if let Some((at, level)) = self.recovery_timer()
+            && reached(Some(at), now)?
+        {
+            if self.spaces[level as usize].history.loss_time.is_some() {
+                self.detect_loss(level, now)?;
+            } else {
+                self.spaces[level as usize].probe = true;
+                self.path.backoff = self.path.backoff.saturating_add(1);
+            }
+        }
         Ok(())
+    }
+
+    fn acknowledge(&mut self, level: Level, ack: &Ack<'_>, now: Instant) -> Result<(), Failure> {
+        let space = &self.spaces[level as usize];
+        if ack.largest >= space.next {
+            return Err(Failure::transport(
+                ErrorCode::PROTOCOL_VIOLATION,
+                if ack.ecn.is_some() { 3 } else { 2 },
+                VIOLATION,
+            ));
+        }
+        let mut delay = Duration::ZERO;
+        if level == Level::Data {
+            if let Some(keys) = &mut self.one_rtt
+                && keys.first_sent.is_some_and(|first| ack.largest >= first)
+            {
+                keys.acknowledged = true;
+            }
+            if let Some(peer) = self.peer {
+                delay = Duration::from_micros(ack.delay.saturating_mul(1 << peer.ack_delay_exponent));
+                if self.confirmed {
+                    delay = delay.min(peer.ack_delay_max);
+                }
+            }
+        }
+        let limited =
+            self.path.room() < self.datagram_bytes() as u64 || Level::ALL.into_iter().any(|l| self.has_data(l));
+        let space = &mut self.spaces[level as usize];
+        let (eliciting, bytes) = space
+            .history
+            .ack(ack, &mut self.path, now, delay, |record| match record {
+                Record::Range(DataRange::Crypto { offset, len }) => space.send.acknowledged(offset, len),
+                other => self.streams.acknowledged(other),
+            })?;
+        if eliciting {
+            space.probe = false;
+            self.validation_at = now;
+            if self.validated() {
+                self.path.backoff = 0;
+            }
+        }
+        if !self.detect_loss(level, now)? && limited && bytes > 0 {
+            self.path.acknowledged(bytes);
+        }
+        Ok(())
+    }
+
+    fn detect_loss(&mut self, level: Level, now: Instant) -> Result<bool, Error> {
+        let space = &mut self.spaces[level as usize];
+        space.history.detect(&mut self.path, now, |record| {
+            match record {
+                Record::HandshakeDone => self.handshake_done = true,
+                Record::Limit(_) | Record::Control(_, _) => self.streams.lost_control(record),
+                Record::Range(range) => {
+                    let retry = &mut space.retry;
+                    super::reassembly::grow(
+                        (retry.len(), retry.capacity(), size_of::<DataRange>()),
+                        &mut space.credit,
+                        |n| retry.try_reserve_exact(n).is_ok(),
+                    )
+                    .map_err(|_| recovery::NO_ROOM)?;
+                    retry.push_back(range);
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Opens one packet and reads its frames.
@@ -994,7 +1272,7 @@ impl Connection {
             return Ok(());
         }
         let space = &self.spaces[level as usize];
-        let expected = space.largest.map_or(0, |largest| largest + 1);
+        let expected = space.ranges.largest().map_or(0, |largest| largest + 1);
         let opened = match level {
             Level::Data => {
                 // No 1-RTT packet is read before the handshake completes (RFC 9001, section
@@ -1034,6 +1312,9 @@ impl Connection {
             Err(OpenError::Violation) => return Err(Failure::transport(ErrorCode::PROTOCOL_VIOLATION, 0, VIOLATION)),
         };
         let number = packet.number();
+        if self.spaces[level as usize].ranges.seen(number) {
+            return Ok(());
+        }
         if updated {
             // The peer updated its keys: this end follows in its next packet (RFC 9001, section
             // 6.2).
@@ -1044,11 +1325,10 @@ impl Connection {
         }
         if level == Level::Data
             && let Some(keys) = &mut self.one_rtt
+            && keys.phase == packet.key_phase()
         {
-            keys.first_received.get_or_insert(number);
+            keys.first_received = Some(keys.first_received.map_or(number, |first| first.min(number)));
         }
-        let space = &mut self.spaces[level as usize];
-        space.largest = Some(space.largest.map_or(number, |largest| largest.max(number)));
         if !server && level == Level::Initial && !self.remote_known {
             self.remote_cid = scid;
             self.remote_known = true;
@@ -1056,14 +1336,19 @@ impl Connection {
         // A server drops the Initial keys when a Handshake packet of the client opens (RFC 9001,
         // section 4.9.1).
         if server && level == Level::Handshake && !self.spaces[0].discarded {
-            self.spaces[0].discard(&self.budget);
+            self.discard(Level::Initial);
         }
         self.received = true;
-        self.idle_deadline = self.idle.map(|idle| after(now, idle)).transpose()?;
+        self.last_activity = now;
         self.reading = Some(Reading {
             level,
             payload: packet.payload(),
             at: 0,
+            number,
+            received_at: now,
+            eliciting: false,
+            first_datagram: None,
+            accepted: false,
         });
         Ok(())
     }
@@ -1101,27 +1386,43 @@ impl Connection {
         loop {
             let bytes = reading.payload.bytes().get(reading.at..).unwrap_or_default();
             if bytes.is_empty() {
+                if !reading.accepted && !self.spaces[level as usize].discarded {
+                    self.spaces[level as usize].ranges.accept(
+                        reading.number,
+                        reading.received_at,
+                        reading.eliciting,
+                    )?;
+                    if let Some(at) = reading.first_datagram {
+                        reading.at = at;
+                        reading.accepted = true;
+                        continue;
+                    }
+                }
                 return Ok(None);
             }
+            if work.reached(&self.limits.turn) {
+                self.more = true;
+                self.reading = Some(reading);
+                return Ok(None);
+            }
+            let start = reading.at;
             let (frame, len) =
                 Frame::parse(bytes).map_err(|error| Failure::transport(error.code, error.frame_type, VIOLATION))?;
             reading.at += len;
             work.add(0, 1);
             // The data of a STREAM or DATAGRAM frame is the end of its frame.
             let data = |data: &[u8]| reading.at - data.len()..reading.at;
+            if reading.accepted && !matches!(frame, Frame::Datagram { .. }) {
+                continue;
+            }
+            reading.eliciting |= !matches!(
+                frame,
+                Frame::Padding { .. } | Frame::Ack(_) | Frame::ConnectionClose { .. }
+            );
             let taken = match frame {
                 Frame::Padding { .. } | Frame::Ping => Ok(None),
                 Frame::Ack(ack) => {
-                    let space = &self.spaces[level as usize];
-                    if ack.largest >= space.next {
-                        return Err(Failure::transport(ErrorCode::PROTOCOL_VIOLATION, 0x02, VIOLATION));
-                    }
-                    if level == Level::Data
-                        && let Some(keys) = &mut self.one_rtt
-                        && keys.first_sent.is_some_and(|first| ack.largest >= first)
-                    {
-                        keys.acknowledged = true;
-                    }
+                    self.acknowledge(level, &ack, reading.received_at)?;
                     Ok(None)
                 }
                 Frame::Crypto { offset, data } => {
@@ -1172,7 +1473,18 @@ impl Connection {
                     Ok(None)
                 }
                 Frame::StreamDataBlocked { stream, .. } => self.streams.blocked_in(stream).map(|()| None),
-                Frame::Datagram { data: bytes } => self.streams.unreliable_in(len, data(bytes), &reading.payload),
+                Frame::Datagram { data: bytes } => {
+                    self.streams
+                        .unreliable_in(len, data(bytes), &reading.payload)
+                        .map(|event| {
+                            if reading.accepted {
+                                event
+                            } else {
+                                reading.first_datagram.get_or_insert(start);
+                                None
+                            }
+                        })
+                }
                 // The frames of paths and connection IDs come with N304 and N307. The other
                 // BLOCKED frames and a NEW_TOKEN frame change nothing.
                 _ => Ok(None),
@@ -1225,12 +1537,22 @@ impl Connection {
         }
         self.confirmed = true;
         self.handshake_deadline = None;
-        self.spaces[Level::Handshake as usize].discard(&self.budget);
+        self.discard(Level::Handshake);
     }
 
-    /// The probe timeout before a round-trip sample, with the ACK delay of the peer.
+    fn discard(&mut self, level: Level) {
+        let space = &mut self.spaces[level as usize];
+        self.path.discard(space.history.bytes);
+        space.discard(&self.budget, self.window);
+    }
+
+    /// The probe timeout of the data space, including the peer's maximum ACK delay.
     fn pto(&self) -> Duration {
-        PTO_INITIAL + self.peer.map_or(Duration::ZERO, |peer| peer.ack_delay_max)
+        self.path.pto(
+            self.peer
+                .filter(|_| self.confirmed)
+                .map_or(Duration::ZERO, |peer| peer.ack_delay_max),
+        )
     }
 
     /// Runs rustls on the CRYPTO data in order, one level at a time, until it needs more, a limit
@@ -1479,11 +1801,11 @@ impl Connection {
         self.validate(&parameters)?;
         self.peer = Some(parameters);
         self.streams.peer(&parameters);
+        self.path.datagram_limit(self.datagram_bytes());
         self.idle = match (self.limits.idle_timeout, parameters.idle_timeout) {
             (Some(local), Some(remote)) => Some(local.min(remote)),
             (local, remote) => local.or(remote),
-        }
-        .map(|idle| idle.max(3 * self.pto()));
+        };
         self.read = Level::Data;
         if sender == Sender::Client {
             self.handshake_done = true;
@@ -1529,7 +1851,7 @@ impl Connection {
 
     /// Builds the next datagram at the start of `out`, and gives its length, or `None` when this
     /// end has nothing to send. Call it until it gives `None`. The datagram has at most
-    /// [`Limits::datagram_bytes_max`] bytes, and at least 1,200 when it carries an Initial packet.
+    /// [`Limits::datagram_bytes_max`] bytes. A client Initial or an ack-eliciting server Initial needs at least 1,200.
     ///
     /// Refuses with [`Kind::Misuse`] when `out` has fewer bytes than
     /// [`Limits::datagram_bytes_max`].
@@ -1567,16 +1889,25 @@ impl Connection {
         self.limits.datagram_bytes_max.min(peer)
     }
 
-    /// Whether this end has something to send at `level`.
+    /// Whether an ack-eliciting frame waits at this level.
+    fn has_data(&self, level: Level) -> bool {
+        let space = &self.spaces[level as usize];
+        space.send.pending()
+            || !space.retry.is_empty()
+            || (level == Level::Data && (self.handshake_done || self.ping || self.streams.pending()))
+    }
+
     fn wants(&self, level: Level) -> bool {
         let space = &self.spaces[level as usize];
-        match level {
-            Level::Data => {
-                self.one_rtt.is_some()
-                    && (space.send.pending() || self.handshake_done || self.ping || self.streams.pending())
-            }
-            _ => space.keys.is_some() && space.send.pending(),
-        }
+        let keyed = if level == Level::Data {
+            self.one_rtt.is_some()
+        } else {
+            space.keys.is_some()
+        };
+        keyed
+            && (space.ranges.due
+                || space.probe
+                || (self.has_data(level) && self.path.room() >= self.datagram_bytes() as u64))
     }
 
     /// Builds a datagram of the packets that wait, at most one for each level.
@@ -1585,14 +1916,15 @@ impl Connection {
         let Some(last) = wanted.iter().rposition(|&wanted| wanted) else {
             return Ok(None);
         };
-        let initial = wanted[0];
+        let initial = wanted[0]
+            && (matches!(self.end, End::Client { .. }) || self.has_data(Level::Initial) || self.spaces[0].probe);
         let mut at = 0;
         let mut handshake_sent = false;
         for level in Level::ALL {
             if !wanted[level as usize] {
                 continue;
             }
-            let pad = (initial && level as usize == last).then_some(DATAGRAM_MIN.saturating_sub(at));
+            let pad = initial.then_some((DATAGRAM_MIN.saturating_sub(at), Level::ALL[last]));
             let Some(len) = self.packet_out(level, &mut out[at..], pad, (None, now))? else {
                 break;
             };
@@ -1605,13 +1937,7 @@ impl Connection {
         // A client drops its Initial keys when it first sends a Handshake packet (RFC 9001,
         // section 4.9.1).
         if handshake_sent && matches!(self.end, End::Client { .. }) && !self.spaces[0].discarded {
-            self.spaces[0].discard(&self.budget);
-        }
-        // The first ack-eliciting packet after a received one restarts the idle timer (RFC 9000,
-        // section 10.1).
-        if self.received {
-            self.received = false;
-            self.idle_deadline = self.idle.map(|idle| after(now, idle)).transpose()?;
+            self.discard(Level::Initial);
         }
         Ok(Some(at))
     }
@@ -1629,7 +1955,9 @@ impl Connection {
             if !keyed[level as usize] {
                 continue;
             }
-            let pad = (keyed[0] && Some(level as usize) == last).then_some(DATAGRAM_MIN.saturating_sub(at));
+            let pad = last
+                .filter(|_| keyed[0])
+                .map(|i| (DATAGRAM_MIN.saturating_sub(at), Level::ALL[i]));
             match self.packet_out(level, &mut out[at..], pad, (Some(close), now)) {
                 Ok(Some(len)) => at += len,
                 _ => break,
@@ -1648,15 +1976,23 @@ impl Connection {
         &mut self,
         level: Level,
         out: &mut [u8],
-        pad: Option<usize>,
+        pad: Option<(usize, Level)>,
         (close, now): (Option<Close>, Instant),
     ) -> Result<Option<usize>, Failure> {
         let space = &self.spaces[level as usize];
         let number = space.next;
-        let number_len = packet::number_len(number, None).ok_or(Failure::local(Error::new(
-            Kind::Overload,
-            "the packet numbers of a QUIC space passed their limit",
-        )))?;
+        let number_len = packet::number_len(number, space.history.largest)
+            .filter(|_| number <= VARINT_MAX)
+            .ok_or(Failure::local(Error::new(
+                Kind::Overload,
+                "the packet numbers of a QUIC space passed their limit",
+            )))?;
+        let number_len = if level == Level::Data {
+            number_len.max(packet::number_len(self.window - 1, None).unwrap_or(4))
+        } else {
+            number_len
+        };
+        let admitted = space.probe || self.path.room() >= out.len() as u64;
         if level == Level::Data && close.is_none() {
             self.key_limit(now)?;
         }
@@ -1677,55 +2013,76 @@ impl Connection {
                 key_phase: self.one_rtt.as_ref().is_some_and(|keys| keys.phase),
             },
         };
-        let Ok(mut builder) = Builder::new(out, header, number, number_len) else {
+        let Ok(builder) = Builder::new(out, header, number, number_len) else {
             return Ok(None);
         };
         let full = |_: packet::BuildError| {
             Failure::local(Error::new(Kind::Unsupported, "a QUIC frame did not fit its packet"))
         };
-        let room = builder.room();
-        // A packet with no room for a frame waits for the next datagram.
-        let control = level == Level::Data && (self.handshake_done || self.ping);
-        if close.is_none() && !control && builder.room() <= CRYPTO_FRAME_HEAD {
-            return Ok(None);
-        }
+        let mut output = Output::new(builder, &self.budget);
+        let room = output.room();
+        let mut eliciting = false;
         if let Some(close) = close {
             let frame = Frame::ConnectionClose {
                 code: close.code,
                 frame_type: Some(close.frame_type),
                 reason: &[],
             };
-            if builder.frame(&frame).is_err() {
+            if output.builder.frame(&frame).is_err() {
                 return Ok(None);
             }
         } else {
-            if level == Level::Data && self.handshake_done {
-                builder.frame(&Frame::HandshakeDone).map_err(full)?;
-                self.handshake_done = false;
+            let space = &mut self.spaces[level as usize];
+            space.ranges.write(&mut output.builder, now)?;
+            let after_ack = output.room();
+            if admitted {
+                if level == Level::Data
+                    && self.handshake_done
+                    && output.track(&Frame::HandshakeDone, Record::HandshakeDone).is_ok()
+                {
+                    self.handshake_done = false;
+                }
+                if level == Level::Data && self.ping && output.builder.frame(&Frame::Ping).is_ok() {
+                    self.ping = false;
+                }
+                space.resend(&self.streams, &mut output);
+                let send = &mut space.send;
+                while output.room() > CRYPTO_FRAME_HEAD
+                    && let Some((offset, data)) = send.next(output.room() - CRYPTO_FRAME_HEAD)
+                {
+                    let len = data.len();
+                    output
+                        .track(
+                            &Frame::Crypto { offset, data },
+                            Record::Range(DataRange::Crypto { offset, len }),
+                        )
+                        .map_err(full)?;
+                    send.sent(len);
+                }
+                if level == Level::Data {
+                    self.streams.write(&mut output);
+                }
+                if space.probe && output.room() == after_ack {
+                    let _fits = output.builder.frame(&Frame::Ping);
+                }
             }
-            if level == Level::Data && self.ping {
-                builder.frame(&Frame::Ping).map_err(full)?;
-                self.ping = false;
-            }
-            let send = &mut self.spaces[level as usize].send;
-            while builder.room() > CRYPTO_FRAME_HEAD
-                && let Some((offset, data)) = send.next(builder.room() - CRYPTO_FRAME_HEAD)
-            {
-                let len = data.len();
-                builder.frame(&Frame::Crypto { offset, data }).map_err(full)?;
-                send.sent(len);
-            }
-            if level == Level::Data {
-                self.streams.write(&mut builder);
+            eliciting = after_ack != output.room();
+            if output.refused {
+                return Err(Failure::local(recovery::NO_ROOM));
             }
             // A packet that took no frame, because none fits, waits for the next datagram.
-            if builder.room() == room && pad.is_none() {
+            if output.room() == room && pad.is_none_or(|(min, last)| min == 0 || level != last) {
                 return Ok(None);
             }
         }
-        if let Some(pad) = pad {
-            builder.pad_to(pad).map_err(full)?;
+        let mut builder = output.builder;
+        let before_pad = builder.room();
+        if let Some((minimum, last)) = pad
+            && (level == last || before_pad < COALESCED_ROOM)
+        {
+            builder.pad_to(minimum).map_err(full)?;
         }
+        let in_flight = eliciting || builder.room() < before_pad;
         let keys = match level {
             Level::Data => self.one_rtt.as_ref().map(|keys| &keys.local),
             _ => self.spaces[level as usize].keys.as_ref().map(|keys| &keys.local),
@@ -1741,6 +2098,27 @@ impl Connection {
             ))
         })?;
         self.spaces[level as usize].next = number + 1;
+        // A later bare ACK can be the largest number in an ACK that also covers a live elicitor.
+        if close.is_none() && (in_flight || self.spaces[level as usize].history.pto_start().is_some()) {
+            let bytes = if in_flight { len as u64 } else { 0 };
+            let space = &mut self.spaces[level as usize];
+            space.history.insert(Sent {
+                number,
+                time: now,
+                bytes,
+                eliciting,
+                records: output.records,
+            })?;
+            self.path.sent(bytes);
+            if eliciting {
+                if core::mem::take(&mut space.probe) {
+                    self.path.probes = self.path.probes.saturating_add(1);
+                }
+                if core::mem::take(&mut self.received) {
+                    self.last_activity = now;
+                }
+            }
+        }
         if level == Level::Data
             && let Some(keys) = &mut self.one_rtt
         {
@@ -1755,15 +2133,15 @@ impl Connection {
     /// first one an acknowledgement of a packet of the current phase: without them the connection
     /// ends with AEAD_LIMIT_REACHED.
     fn key_limit(&mut self, now: Instant) -> Result<(), Failure> {
-        let (confirmed, until) = (self.confirmed, after(now, 3 * self.pto())?);
-        let Some(keys) = &mut self.one_rtt else {
+        let Some(keys) = &self.one_rtt else {
             return Ok(());
         };
         if keys.sealed < keys.limit {
             return Ok(());
         }
-        if confirmed && (!keys.updated || keys.acknowledged) {
-            keys.update(until);
+        if self.confirmed && (!keys.updated || keys.acknowledged) {
+            let until = after(now, 3 * self.pto())?;
+            self.one_rtt.as_mut().expect("this space has 1-RTT keys").update(until);
             return Ok(());
         }
         Err(Failure::transport(

@@ -693,6 +693,16 @@ impl<'a> Builder<'a> {
         self.out.len() - TAG - self.end
     }
 
+    /// Writes an ACK directly into the room for frames. Only a complete frame advances the packet.
+    pub(super) fn write_ack(&mut self, write: impl FnOnce(&mut [u8]) -> Option<usize>) -> bool {
+        let stop = self.out.len() - TAG;
+        if let Some(len) = write(&mut self.out[self.end..stop]) {
+            self.end += len;
+            return true;
+        }
+        false
+    }
+
     /// Writes `frame` after the frames so far. Refuses, and writes nothing, when it does not fit.
     pub fn frame(&mut self, frame: &Frame<'_>) -> Result<(), BuildError> {
         let room = self.out.len() - TAG;

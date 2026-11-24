@@ -186,11 +186,17 @@ impl TlsInputBuffer for Receive {
     }
 }
 
-/// The CRYPTO bytes of one level that this end sends: the messages of rustls, in order, kept until
-/// the level ends.
+#[derive(Debug)]
+struct Message {
+    start: u64,
+    bytes: Vec<u8>,
+    remaining: usize,
+}
+
+/// The CRYPTO messages of one level until their acknowledgement or the discard of its keys.
 #[derive(Debug)]
 pub(super) struct Send {
-    messages: VecDeque<Vec<u8>>,
+    messages: VecDeque<Message>,
     /// The stream offset of the next byte to send.
     next: u64,
     /// The stream offset after the last message.
@@ -211,20 +217,31 @@ impl Send {
     /// Queues `message` after the others, and charges its memory. Refuses when the budget cannot
     /// pay: the message then drops.
     pub(super) fn push(&mut self, message: Vec<u8>) -> Result<(), Refused> {
-        let place = if self.messages.len() == self.messages.capacity() {
-            self.messages.capacity().max(2) * size_of::<Vec<u8>>()
-        } else {
-            0
-        };
-        let bytes = (message.capacity() + place) as u64;
-        self.credit.charge(bytes).map_err(|_| Refused::Budget)?;
-        if place > 0 && self.messages.try_reserve(self.messages.capacity().max(2)).is_err() {
-            let refunded = self.credit.refund(bytes);
-            assert!(refunded.is_ok(), "a credit refunds what it charged");
-            return Err(Refused::Budget);
+        if message.is_empty() {
+            return Ok(());
         }
-        self.end += message.len() as u64;
-        self.messages.push_back(message);
+        let start = self.end;
+        let remaining = message.len();
+        let end = start
+            .checked_add(remaining as u64)
+            .filter(|end| *end <= super::VARINT_MAX)
+            .ok_or(Refused::Bound)?;
+        let messages = &mut self.messages;
+        super::reassembly::grow(
+            (messages.len(), messages.capacity(), size_of::<Message>()),
+            &mut self.credit,
+            |n| messages.try_reserve_exact(n).is_ok(),
+        )
+        .map_err(|_| Refused::Budget)?;
+        self.credit
+            .charge(message.capacity() as u64)
+            .map_err(|_| Refused::Budget)?;
+        messages.push_back(Message {
+            start,
+            bytes: message,
+            remaining,
+        });
+        self.end = end;
         Ok(())
     }
 
@@ -236,19 +253,34 @@ impl Send {
     /// The next bytes to send, at most `room` of them and inside one message, with their stream
     /// offset.
     pub(super) fn next(&self, room: usize) -> Option<(u64, &[u8])> {
-        if !self.pending() || room == 0 {
-            return None;
-        }
-        let mut start = self.end;
-        for message in self.messages.iter().rev() {
-            start -= message.len() as u64;
-            if start <= self.next {
-                let at = usize::try_from(self.next - start).expect("the next byte is in its message");
-                let len = (message.len() - at).min(room);
-                return Some((self.next, &message[at..at + len]));
+        self.retained(self.next, room).map(|bytes| (self.next, bytes))
+    }
+
+    pub(super) fn retained(&self, offset: u64, room: usize) -> Option<&[u8]> {
+        let at = self
+            .messages
+            .partition_point(|message| message.start <= offset)
+            .checked_sub(1)?;
+        let message = &self.messages[at];
+        let bytes = message.bytes.get(usize::try_from(offset - message.start).ok()?..)?;
+        let len = room.min(bytes.len());
+        (len > 0).then(|| &bytes[..len])
+    }
+
+    pub(super) fn acknowledged(&mut self, offset: u64, len: usize) {
+        let at = self.messages.partition_point(|message| message.start <= offset) - 1;
+        let message = &mut self.messages[at];
+        message.remaining -= len;
+        if message.remaining == 0 {
+            let bytes = message.bytes.capacity();
+            message.bytes = Vec::new();
+            self.credit
+                .refund(bytes as u64)
+                .expect("a CRYPTO message owns its charge");
+            while self.messages.front().is_some_and(|m| m.remaining == 0) {
+                self.messages.pop_front();
             }
         }
-        None
     }
 
     /// Marks `len` more bytes as sent.

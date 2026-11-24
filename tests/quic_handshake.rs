@@ -9,6 +9,7 @@ use std::sync::Arc;
 use rsnetwork::buffer::Backing;
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Error, Kind, Progress};
+use rsnetwork::quic::frame::Frame;
 use rsnetwork::quic::packet::{self, Builder, Datagrams, Header, Kind as PacketKind, Outgoing, Side};
 use rsnetwork::quic::params::{Migration, ParameterError, Parameters, PreferredAddress, Sender};
 use rsnetwork::quic::{CRYPTO_BUFFER_BYTES_MAX, Connection, ConnectionId, Limits};
@@ -132,12 +133,11 @@ impl Pair {
     /// The datagrams that `connection` sends now.
     fn send(connection: &mut Connection, now: Instant) -> Vec<Vec<u8>> {
         let mut datagrams = Vec::new();
+        let mut out = vec![0; 65_527];
         for _ in 0..512 {
-            let mut out = vec![0; 1500];
             match connection.transmit(&mut out, now).unwrap() {
                 Some(len) => {
-                    out.truncate(len);
-                    datagrams.push(out);
+                    datagrams.push(out[..len].to_vec());
                 }
                 None => return datagrams,
             }
@@ -284,12 +284,34 @@ fn a_handshake_message_in_two_datagrams_waits_for_its_rest_with_no_work() {
     let flight = Pair::send(&mut pair.client, at(0));
     assert!(flight.len() >= 2, "the ClientHello spans {} datagrams", flight.len());
     let mut flight = flight.into_iter();
-    let first = pair.deliver(flight.next().unwrap(), at(0));
+    let first_packet = flight.next().unwrap();
+    let Header::Protected { dcid, .. } = Header::parse(&first_packet, 0).unwrap() else {
+        panic!("an Initial packet")
+    };
+    let first = pair.deliver(first_packet, at(0));
     assert_eq!(first, Progress::Blocked(rsnetwork::drive::Blocked::Input));
-    assert_eq!(
-        Pair::send(pair.server(), at(0)),
-        Vec::<Vec<u8>>::new(),
-        "the server waits"
+    let acks = Pair::send(pair.server(), at(0));
+    assert_eq!(acks.len(), 1, "the server acknowledges the first packet");
+    let keys = packet::initial_keys(&dcid, Side::Client);
+    let mut region = Datagrams::new(Backing::from(acks.into_iter().next().unwrap()), None, 0);
+    let opened = region
+        .next_packet()
+        .unwrap()
+        .unwrap()
+        .unmask(&*keys.remote.header, 0)
+        .unwrap()
+        .open(&*keys.remote.packet)
+        .unwrap()
+        .payload();
+    let mut frames = opened.as_ref();
+    let (Frame::Ack(ack), used) = Frame::parse(frames).unwrap() else {
+        panic!("the Initial packet starts with an ACK")
+    };
+    assert!(ack.ranges().eq(core::iter::once(0..=0)));
+    frames = &frames[used..];
+    assert!(
+        frames.iter().all(|byte| *byte == 0),
+        "TLS waits for the rest of the ClientHello"
     );
     for datagram in flight {
         pair.deliver(datagram, at(0));
@@ -315,10 +337,15 @@ fn a_chain_inside_the_crypto_bound_completes_out_of_order_and_one_past_it_refuse
 
     let past = [MLDSA_INTERMEDIATE; 13];
     assert!(past.len() * MLDSA_INTERMEDIATE.len() > CRYPTO_BUFFER_BYTES_MAX);
+    // A two-datagram initial window holds the chain. Its last offset arrives before TLS reads its length.
+    let large = Limits {
+        datagram_bytes_max: 48 * 1024,
+        ..Limits::DEFAULT
+    };
     let mut pair = Pair::new(
         &client_config(MLDSA_CA, Resumption::Off),
         server_config(MLDSA65, &past, Resumption::Off),
-        (Limits::DEFAULT, Limits::DEFAULT),
+        (Limits::DEFAULT, large),
     );
     pair.run(at(0), Order::HandshakeReversed);
     let outcome = terminal(pair.client_outcome(at(0))).expect("the client ended");
@@ -424,6 +451,68 @@ fn a_handshake_that_does_not_confirm_by_its_deadline_ends() {
 }
 
 #[test]
+fn loss_of_the_client_initial_or_handshake_done_recovers_on_the_reported_deadline() {
+    for drop_initial in [true, false] {
+        let mut pair = Pair::new(
+            &client_config(CA, Resumption::Off),
+            server_config(SERVER, &[], Resumption::Off),
+            (Limits::DEFAULT, Limits::DEFAULT),
+        );
+        let mut time = at(0);
+        let mut dropped = false;
+        for _ in 0..64 {
+            let outgoing = Pair::send(&mut pair.client, time);
+            let drop_flight = drop_initial && !dropped && !outgoing.is_empty();
+            for datagram in outgoing {
+                if drop_flight {
+                    dropped = true;
+                } else {
+                    pair.deliver(datagram, time);
+                }
+            }
+            if let Some(server) = &mut pair.server {
+                let drop_flight = !drop_initial && !dropped && server.is_confirmed();
+                for datagram in Pair::send(server, time) {
+                    if drop_flight {
+                        dropped = true;
+                    } else {
+                        Pair::give(&mut pair.client, datagram, time);
+                    }
+                }
+            }
+            if pair.client.is_confirmed() {
+                break;
+            }
+            if pair.client.recovery().bytes_in_flight == 0 && !dropped {
+                continue;
+            }
+            let client = pair.client.drive(time).1.deadline;
+            let server = pair.server.as_mut().and_then(|server| server.drive(time).1.deadline);
+            // Give the next pending flight its turn before advancing the clock.
+            let to_server = Pair::send(&mut pair.client, time);
+            if !to_server.is_empty() {
+                for datagram in to_server {
+                    pair.deliver(datagram, time);
+                }
+                continue;
+            }
+            time = [client, server]
+                .into_iter()
+                .flatten()
+                .map(|d| d.instant())
+                .min_by_key(|t| t.as_nanos())
+                .unwrap();
+            pair.client.drive(time);
+            if let Some(server) = &mut pair.server {
+                server.drive(time);
+            }
+        }
+        assert!(dropped && pair.client.is_confirmed() && pair.server().is_confirmed());
+        assert!(pair.client.recovery().probes_sent + pair.server().recovery().probes_sent > 0);
+    }
+}
+
+#[test]
 fn a_key_update_keeps_the_connection_and_the_crypto_stream_of_its_data_space() {
     let config = client_config(CA, SESSIONS);
     let server_limits = Limits {
@@ -479,6 +568,13 @@ fn a_key_update_keeps_the_connection_and_the_crypto_stream_of_its_data_space() {
     for datagram in Pair::send(&mut pair.client, at(0)) {
         assert_eq!(terminal(Pair::give(pair.server(), datagram, at(0))), None);
     }
+    // The client acknowledged phase 1. The server can now use the next key with phase bit zero.
+    pair.server().ping();
+    let following = Pair::send(pair.server(), at(0));
+    assert_eq!(following.len(), 1);
+    assert_eq!(pair.server().key_phase(), Some(false));
+    Pair::give(&mut pair.client, following.into_iter().next().unwrap(), at(0));
+    assert_eq!(pair.client.key_phase(), Some(false));
     // The ticket of the late packet resumes the next connection.
     let mut next = Pair::new(&config, pair.config.clone(), (Limits::DEFAULT, Limits::DEFAULT));
     next.run(at(0), Order::Sent);

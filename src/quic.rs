@@ -13,6 +13,10 @@
 //!   releases. Data out of order waits in pages under [`Limits::reassembly_bytes_max`]. The send
 //!   scheduler orders the streams by their [`Priority`]. Unreliable datagrams (RFC 9221) go when
 //!   both ends take them.
+//! - **Recovery.** Each packet number space acknowledges accepted packets and discards duplicates.
+//!   Lost stream and handshake bytes go into new packets. The spaces share the NewReno window
+//!   and round-trip estimate of the path. [`Connection::recovery`] reports both.
+//!   Drive the connection at its deadline to send probes during a loss of traffic.
 //! - **Parameters.** [`params::Parameters`] writes and checks the transport parameters of each end
 //!   (RFC 9000, section 18).
 //! - **Packets.** [`packet::Datagrams`] walks the packets of a received region in place: the
@@ -39,10 +43,12 @@ pub mod frame;
 pub mod packet;
 pub mod params;
 mod reassembly;
+mod recovery;
 mod stream;
 
 pub use connection::{Connection, Limits};
 pub use crypto::CRYPTO_BUFFER_BYTES_MAX;
+pub use recovery::RecoveryStats;
 pub use stream::{Event, Priority, STREAM_REGIONS_MAX, StreamId};
 
 use core::fmt;
