@@ -1354,6 +1354,79 @@ fn a_client_with_no_spare_connection_id_stays_on_its_path_and_only_a_client_move
     assert_eq!(pair.server.migrate(server, now()).unwrap_err().kind(), Kind::Misuse);
 }
 
+#[test]
+fn a_side_datagram_counts_against_the_limit_of_a_path_with_no_validation() {
+    let side = Limits {
+        side_flows_max: 1,
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(Limits::DEFAULT, side);
+    let flow = pair.server.open_side_flow().unwrap();
+    // The client moves, and no datagram of the server reaches it.
+    pair.client.ping();
+    let mut received = 0;
+    for datagram in sent(&mut pair.client) {
+        received += datagram.len();
+        give_on(
+            &mut pair.server,
+            from_server(moved_address()),
+            &datagram,
+            now(),
+            Ecn::NotEct,
+        );
+    }
+    // The connection sends its challenge first, and the side flow has what the limit leaves.
+    let parent: usize = routed_at(&mut pair.server, now())
+        .iter()
+        .filter(|(path, _)| path.peer == moved_address())
+        .map(|(_, datagram)| datagram.len())
+        .sum();
+    let left = 3 * received - parent;
+    assert!(parent > 0 && left > 0, "{parent} bytes of {received} times three");
+    // One byte past the limit waits. A datagram inside it goes, and then the limit is reached.
+    assert_eq!(pair.server.admit_side(flow, left + 1, now()).unwrap(), None);
+    assert!(pair.server.admit_side(flow, left, now()).unwrap().is_some());
+    assert_eq!(pair.server.admit_side(flow, 1, now()).unwrap(), None);
+    // After the validation of the address, the side flow has no such limit.
+    pair.seen = moved_address();
+    let at = pair.run_until(now(), |pair| pair.server.address_validated());
+    assert!(pair.server.admit_side(flow, 1200, at).unwrap().is_some());
+}
+
+#[test]
+fn an_unreliable_datagram_that_waits_drops_with_its_count_when_the_path_returns_to_1200_bytes() {
+    let limits = Limits {
+        datagram_bytes_max: 1452,
+        unreliable_bytes_max: Some(64_000),
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(limits, limits);
+    assert!(pair.client.unreliable_room().is_some_and(|room| room >= 1300));
+    // The path now drops each datagram above 1,200 bytes. The client queues more datagrams of
+    // 1,300 bytes than its window sends, and data of a stream after them.
+    pair.path_bytes = 1200;
+    for _ in 0..30 {
+        pair.client.send_unreliable(region(0, 1300)).unwrap();
+    }
+    let stream = pair.open(Direction::Bidirectional);
+    pair.client.send(stream, region(0, 5000), true).unwrap();
+    pair.run_until(now(), |pair| pair.at_server.complete(stream, 5000));
+    // The datagrams that waited do not fit a path of 1,200 bytes. They dropped, so the stream
+    // went on, and a new one of this size refuses.
+    assert!(pair.client.unreliable_dropped() > 0);
+    assert!(pair.client.unreliable_room().is_some_and(|room| room < 1200));
+    assert_matches!(
+        pair.client
+            .send_unreliable(region(0, 1300))
+            .map_err(|error| error.kind()),
+        Err(Kind::Overload)
+    );
+    assert!(
+        pair.at_server.other.is_empty(),
+        "the path carried no datagram of 1,300 bytes"
+    );
+}
+
 /// A server with a window above the initial one, which an attacker moves: a copy of a datagram
 /// of the client arrives from the address of the attacker, and the datagram itself is lost. Gives
 /// the window before the move, that address, and the bytes of the copy.
