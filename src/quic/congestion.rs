@@ -14,6 +14,7 @@ pub enum CongestionControl {
     NewReno,
 }
 
+#[derive(Clone)]
 pub(super) struct Controller {
     pub(super) datagram: u64,
     pub(super) window: u64,
@@ -22,6 +23,7 @@ pub(super) struct Controller {
     growth: Growth,
 }
 
+#[derive(Clone)]
 enum Growth {
     NewReno { credit: u64 },
     Cubic(Cubic),
@@ -41,24 +43,26 @@ impl Controller {
         }
     }
 
+    /// Follows the datagram size of the path. A smaller size keeps the number of datagrams in the
+    /// window: the peer can take a smaller datagram, or the path now drops the larger ones. A
+    /// larger size keeps the bytes of the window.
     pub(super) fn datagram_limit(&mut self, bytes: u64) {
-        if bytes >= self.datagram {
-            return;
-        }
-        let scale = |n| {
-            u64::try_from(u128::from(n) * u128::from(bytes) / u128::from(self.datagram))
-                .expect("the datagram limit only decreases")
-        };
-        self.window = scale(self.window).max(2 * bytes);
-        if self.threshold != u64::MAX {
-            self.threshold = scale(self.threshold);
-        }
-        match &mut self.growth {
-            Growth::NewReno { credit } => *credit = scale(*credit),
-            Growth::Cubic(cubic) => {
-                cubic.maximum = scale(cubic.maximum);
-                cubic.prior = scale(cubic.prior);
-                cubic.epoch = None;
+        if bytes < self.datagram {
+            let scale = |n| {
+                u64::try_from(u128::from(n) * u128::from(bytes) / u128::from(self.datagram))
+                    .expect("the datagram size decreases")
+            };
+            self.window = scale(self.window).max(2 * bytes);
+            if self.threshold != u64::MAX {
+                self.threshold = scale(self.threshold);
+            }
+            match &mut self.growth {
+                Growth::NewReno { credit } => *credit = scale(*credit),
+                Growth::Cubic(cubic) => {
+                    cubic.maximum = scale(cubic.maximum);
+                    cubic.prior = scale(cubic.prior);
+                    cubic.epoch = None;
+                }
             }
         }
         self.datagram = bytes;
@@ -147,7 +151,7 @@ impl Controller {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Cubic {
     maximum: u64,
     prior: u64,
@@ -156,7 +160,7 @@ struct Cubic {
 }
 
 /// HyStart++ samples one round of sent packets at a time (RFC 9406, section 4).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Startup {
     round: u64,
     previous: Option<Duration>,
@@ -197,6 +201,7 @@ impl Startup {
     }
 }
 
+#[derive(Clone)]
 struct Epoch {
     start: u64,
     idle: Option<u64>,

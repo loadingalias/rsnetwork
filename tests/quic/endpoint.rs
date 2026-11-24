@@ -1,18 +1,23 @@
-//! The server listener processes real packets from the client engine.
+//! The server listener processes real packets from the client engine, also when the client moves
+//! to a new local address.
 
-use core::net::{Ipv4Addr, SocketAddr};
+use core::net::Ipv4Addr;
 use std::sync::Arc;
 
-use super::{CA, Pair, SERVER, at, budget, client_config, server_config};
+use super::{CA, CLIENT_PORT, Pair, SERVER, SERVER_PORT, at, budget, client_config, path, server_config};
+use rsnetwork::buffer::Backing;
 use rsnetwork::drive::Progress;
 use rsnetwork::quic::frame::Frame;
-use rsnetwork::quic::packet::{self, Builder, Header, Outgoing, Side};
+use rsnetwork::quic::packet::{self, Builder, Datagrams, Header, Outgoing, Side};
 use rsnetwork::quic::params::{Parameters, PreferredAddress};
-use rsnetwork::quic::{Connection, Endpoint, EndpointKeys, EndpointLimits, Handle, Limits, PeerClose, Route};
+use rsnetwork::quic::{
+    Connection, ConnectionId, Endpoint, EndpointKeys, EndpointLimits, Handle, Limits, Path, PeerClose, Route,
+};
 use rsnetwork::tls::{ClientConfig, Resumption, ServerConfig};
 
-fn address(port: u16) -> SocketAddr {
-    (Ipv4Addr::LOCALHOST, port).into()
+/// The path of the listener for a client at the port `port` of the loopback address.
+fn address(port: u16) -> Path {
+    path(SERVER_PORT, port)
 }
 
 fn configs() -> (ClientConfig, ServerConfig, Arc<EndpointKeys>) {
@@ -32,7 +37,8 @@ fn listener(config: &ServerConfig, keys: &Arc<EndpointKeys>, retry_at: u16) -> E
 }
 
 fn client(config: &ClientConfig) -> Connection {
-    Connection::client(config, "server.test", Limits::DEFAULT, &budget(), at(0)).unwrap()
+    let route = path(CLIENT_PORT, SERVER_PORT);
+    Connection::client(config, "server.test", route, Limits::DEFAULT, &budget(), at(0)).unwrap()
 }
 
 struct Admission {
@@ -41,42 +47,7 @@ struct Admission {
     retries: usize,
 }
 
-fn handshake(endpoint: &mut Endpoint, client: &mut Connection, addr: SocketAddr) -> Admission {
-    let admission = exchange(endpoint, client, addr, super::Order::Sent);
-    assert!(client.is_confirmed());
-    admission
-}
-
-pub(super) fn validated_reversed_flight(
-    config: &ClientConfig,
-    server: &ServerConfig,
-    limits: Limits,
-) -> (Progress, Progress) {
-    let keys = Arc::new(EndpointKeys::generate(server, 0).unwrap());
-    let admission = EndpointLimits {
-        retry_at: 0,
-        connections_max: 1,
-        handshakes_max: 1,
-        ..EndpointLimits::default()
-    };
-    let mut endpoint = Endpoint::new(server, keys, 0, admission, limits, &budget()).unwrap();
-    let mut client = client(config);
-    let admitted = exchange(
-        &mut endpoint,
-        &mut client,
-        address(443),
-        super::Order::HandshakeReversed,
-    );
-    assert!(admitted.validated);
-    (
-        client.drive(at(0)).1.progress,
-        endpoint
-            .with_connection(admitted.handle, |c| c.drive(at(0)).1.progress)
-            .unwrap(),
-    )
-}
-
-fn exchange(endpoint: &mut Endpoint, client: &mut Connection, addr: SocketAddr, order: super::Order) -> Admission {
+fn handshake(endpoint: &mut Endpoint, client: &mut Connection, addr: Path) -> Admission {
     let mut admission = None;
     let mut retries = 0;
     let mut reply = [0; 1200];
@@ -106,13 +77,14 @@ fn exchange(endpoint: &mut Endpoint, client: &mut Connection, addr: SocketAddr, 
         if let Some((handle, validated)) = admission {
             let flight = endpoint.with_connection(handle, |c| Pair::send(c, at(0))).unwrap();
             if !moved && flight.is_empty() {
+                assert!(client.is_confirmed());
                 return Admission {
                     handle,
                     validated,
                     retries,
                 };
             }
-            for packet in order.flight(flight) {
+            for packet in flight {
                 Pair::give(client, packet, at(0));
             }
         }
@@ -146,9 +118,13 @@ fn retry_validates_the_first_address_and_new_token_validates_a_repeat_connection
     let token = second.take_address_token().unwrap();
     let mut third = client(&config);
     third.use_address_token(token).unwrap();
-    let other_ip = (Ipv4Addr::new(127, 0, 0, 2), 4302).into();
+    let other_ip = Path {
+        peer: (Ipv4Addr::new(127, 0, 0, 2), 4302).into(),
+        ..address(4302)
+    };
     assert!(handshake(&mut endpoint, &mut third, other_ip).retries > 0);
-    let mut other = Connection::client(&config, "other.test", Limits::DEFAULT, &budget(), at(0)).unwrap();
+    let route = path(CLIENT_PORT, SERVER_PORT);
+    let mut other = Connection::client(&config, "other.test", route, Limits::DEFAULT, &budget(), at(0)).unwrap();
     assert_eq!(
         other
             .use_address_token(third.take_address_token().unwrap())
@@ -324,4 +300,125 @@ fn retired_connection_ids_leave_the_route_and_a_stateless_reset_drains_the_peer(
     assert!(Pair::send(&mut client, at(0)).is_empty());
     let end = client.drive(at(0)).1.deadline.unwrap().instant();
     assert!(matches!(client.drive(end).1.progress, Progress::Terminal(Err(_))));
+}
+
+/// The same path, as the other end names it.
+fn mirror(route: Path) -> Path {
+    Path {
+        local: route.peer,
+        peer: route.local,
+    }
+}
+
+/// Each datagram that `connection` sends now, with its path.
+fn routed(connection: &mut Connection) -> Vec<(Path, Vec<u8>)> {
+    let mut datagrams = Vec::new();
+    let mut out = vec![0; 1500];
+    for _ in 0..64 {
+        match connection.transmit(&mut out, at(0)).unwrap() {
+            Some(sent) => datagrams.push((sent.path, out[..sent.len].to_vec())),
+            None => return datagrams,
+        }
+    }
+    panic!("a connection sends at most 64 datagrams at once");
+}
+
+/// Gives `datagram` to `connection` as a datagram that arrived on `route`.
+fn arrive(connection: &mut Connection, route: Path, datagram: Vec<u8>) {
+    let len = connection.local_cid().as_bytes().len();
+    let mut datagrams = Datagrams::new(Backing::from(datagram), None, len);
+    for _ in 0..64 {
+        let (event, turn) = connection.receive(&mut datagrams, route, at(0));
+        if event.is_none() && turn.progress != Progress::Pending {
+            return;
+        }
+    }
+    panic!("a datagram gives at most 64 events");
+}
+
+/// The path of each 1-RTT datagram of one direction, as its sender names it, with the destination
+/// connection ID of the datagram.
+type Sent = Vec<(Path, ConnectionId)>;
+
+/// Moves the datagrams between `client` and its connection in `endpoint` until none moves, each
+/// on the path that its sender names. Gives the datagrams of the client, and of the server.
+fn shuttle(endpoint: &mut Endpoint, handle: Handle, client: &mut Connection) -> (Sent, Sent) {
+    let destination = |datagram: &[u8], len| match Header::parse(datagram, len) {
+        Ok(Header::Protected { dcid, .. }) => dcid,
+        _ => panic!("a 1-RTT packet"),
+    };
+    let (mut up, mut down) = (Vec::new(), Vec::new());
+    let mut reply = [0; 1200];
+    for _ in 0..64 {
+        let to_server = routed(client);
+        let moved = !to_server.is_empty();
+        for (route, datagram) in to_server {
+            let listener = endpoint.route(mirror(route), &datagram, &mut reply, at(0)).unwrap();
+            assert_eq!(listener, Route::Existing(handle));
+            // The connection IDs of the listener have 17 bytes.
+            up.push((route, destination(&datagram, 17)));
+            endpoint
+                .with_connection(handle, |c| arrive(c, mirror(route), datagram))
+                .unwrap();
+        }
+        let to_client = endpoint.with_connection(handle, routed).unwrap();
+        if !moved && to_client.is_empty() {
+            return (up, down);
+        }
+        for (route, datagram) in to_client {
+            down.push((route, destination(&datagram, client.local_cid().as_bytes().len())));
+            arrive(client, mirror(route), datagram);
+        }
+    }
+    panic!("the connection is not quiet after 64 rounds");
+}
+
+#[test]
+fn a_client_moves_to_a_new_local_address_with_new_connection_ids_and_the_listener_follows() {
+    let (config, server, keys) = configs();
+    let mut endpoint = listener(&server, &keys, 2);
+    let mut client = client(&config);
+    let handle = handshake(&mut endpoint, &mut client, address(CLIENT_PORT)).handle;
+    let home = path(CLIENT_PORT, SERVER_PORT);
+    // The connection ID of each direction on the first path.
+    client.ping();
+    let (up, down) = shuttle(&mut endpoint, handle, &mut client);
+    let (old_up, old_down) = (up[0].1, down[0].1);
+    assert!(up.iter().all(|sent| *sent == (home, old_up)));
+    assert!(down.iter().all(|sent| *sent == (mirror(home), old_down)));
+
+    // The client moves to a new local port. The listener keeps the route of the connection.
+    let moved = path(4400, SERVER_PORT);
+    assert_eq!(client.migrate(moved, at(0)), Ok(true));
+    let (up, down) = shuttle(&mut endpoint, handle, &mut client);
+    assert_eq!(client.path(), moved);
+    let followed = endpoint.with_connection(handle, |c| (c.path(), c.address_validated()));
+    assert_eq!(followed, Some((mirror(moved), true)));
+    // Each end uses a connection ID on the new path that the old path did not show, and the old
+    // one only on the old path (RFC 9000, section 9.5).
+    assert!(up.iter().any(|(route, _)| *route == moved));
+    assert!(up.iter().all(|(route, id)| (*route == home) == (*id == old_up)));
+    assert!(
+        down.iter()
+            .all(|(route, id)| (*route == mirror(home)) == (*id == old_down))
+    );
+    // The server asked the path that the client left, one time, and the client answered there.
+    assert_eq!(down.iter().filter(|(route, _)| *route == mirror(home)).count(), 1);
+    assert_eq!(up.iter().filter(|(route, _)| *route == home).count(), 1);
+    // After its validation, the client retired the connection ID of the old path, and the
+    // listener routes that ID no more.
+    let ids = endpoint.with_connection(handle, |c| c.local_ids()).unwrap();
+    assert!(!ids.contains(&Some(old_up)));
+    assert_eq!(ids.into_iter().flatten().count(), 2);
+
+    // The connection goes on, on the new path only.
+    client.ping();
+    let (up, down) = shuttle(&mut endpoint, handle, &mut client);
+    assert!(!up.is_empty() && up.iter().all(|(route, id)| *route == moved && *id != old_up));
+    assert!(
+        !down.is_empty()
+            && down
+                .iter()
+                .all(|(route, id)| *route == mirror(moved) && *id != old_down)
+    );
 }

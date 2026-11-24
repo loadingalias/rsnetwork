@@ -1,4 +1,6 @@
-//! Packet delivery and loss on one QUIC path (RFC 9000, section 13, and RFC 9002).
+//! Packet delivery and loss on the paths of a QUIC connection (RFC 9000, section 13, and
+//! RFC 9002). Each path has its window, pacer, and round-trip estimate. The paths share one store
+//! of sent packets, and each packet counts only for the path that sent it (RFC 9000, section 9.4).
 
 use core::alloc::Layout;
 use core::ops::Range;
@@ -9,11 +11,13 @@ use rstypes::capacity::{Budget, Credit};
 use rstypes::time::Instant;
 
 use super::congestion::{CongestionControl, Controller};
+use super::connection::DATAGRAM_MIN;
 use super::frame::{Ack, EcnCounts, Frame};
 use super::packet::{BuildError, Builder};
+use super::path::{Mtu, Path, Validation};
 use super::reassembly::grow;
 use super::stream::StreamId;
-use super::{VARINT_MAX, Writer, varint_len};
+use super::{ConnectionId, VARINT_MAX, Writer, varint_len};
 use crate::drive::{Ecn, Error, Kind};
 
 pub(super) const NO_ROOM: Error = Error::new(Kind::Overload, "the budget refused QUIC recovery state");
@@ -24,7 +28,8 @@ const PACKET_THRESHOLD: u64 = 3;
 /// The delivery state of the current path. Byte counts include QUIC headers and packet protection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryStats {
-    /// Handshake flights that waited for more receive credit under the server amplification limit.
+    /// Flights that waited for more receive credit under the amplification limit: in the handshake of
+    /// a server, or on a path whose peer address is not validated.
     pub amplification_blocked_round_trips: u64,
     /// The bytes in outstanding packets that elicit an ACK or contain padding.
     pub bytes_in_flight: u64,
@@ -57,13 +62,20 @@ pub enum EcnState {
     Failed,
 }
 
-pub(super) struct Path {
-    /// Remaining send credit before client address validation. A validated path has no cap.
+/// One path of a connection: its addresses and its delivery state.
+pub(super) struct PathState {
+    pub(super) addresses: Path,
+    /// The connection ID of the peer in the packets to this path.
+    pub(super) remote_cid: ConnectionId,
+    /// The datagram size of the path, and the search above it.
+    pub(super) mtu: Mtu,
+    /// The tag of the packets that this path sent.
+    id: u32,
+    /// Remaining send credit before the validation of the peer address. A validated path has no cap.
     pub(super) amplification_credit: Option<u64>,
     pub(super) amplification_blocked: bool,
     pub(super) amplification_rounds: u64,
     pub(super) controller: Controller,
-    store: Store,
     /// The virtual end of the last paced transmission, in clock nanoseconds.
     departure: u64,
     pub(super) pacing_wait: Option<Instant>,
@@ -84,14 +96,18 @@ pub(super) struct Path {
     pub(super) backoff: u32,
 }
 
-impl Path {
-    pub(super) fn new(datagram: usize, algorithm: CongestionControl, budget: &Budget) -> Self {
+impl PathState {
+    /// A path that starts at 1,200 bytes and searches up to `top` bytes.
+    pub(super) fn new(addresses: Path, remote_cid: ConnectionId, top: usize, algorithm: CongestionControl) -> Self {
         Self {
+            addresses,
+            remote_cid,
+            mtu: Mtu::new(top),
+            id: 0,
             amplification_credit: None,
             amplification_blocked: false,
             amplification_rounds: 0,
-            controller: Controller::new(datagram as u64, algorithm),
-            store: Store::new(budget),
+            controller: Controller::new(DATAGRAM_MIN as u64, algorithm),
             departure: 0,
             pacing_wait: None,
             ecn: EcnState::Testing,
@@ -109,6 +125,49 @@ impl Path {
             lost: 0,
             probes: 0,
             backoff: 0,
+        }
+    }
+
+    /// The path that follows this one at `addresses`. A path that differs only in the port of the
+    /// peer keeps the window, the round-trip estimate, and the datagram size. Each other path
+    /// starts from the initial values (RFC 9000, section 9.4).
+    pub(super) fn next(
+        &self,
+        addresses: Path,
+        remote_cid: ConnectionId,
+        top: usize,
+        algorithm: CongestionControl,
+    ) -> Self {
+        let fresh = Self {
+            ack_delay_max: self.ack_delay_max,
+            ..Self::new(addresses, remote_cid, top, algorithm)
+        };
+        if addresses.local != self.addresses.local || addresses.peer.ip() != self.addresses.peer.ip() {
+            return fresh;
+        }
+        Self {
+            mtu: self.mtu.carried(),
+            controller: self.controller.clone(),
+            minimum: self.minimum,
+            latest: self.latest,
+            smoothed: self.smoothed,
+            variation: self.variation,
+            ..fresh
+        }
+    }
+
+    /// Whether `bytes` more bytes can go to the path: before the validation of its peer address,
+    /// at most three times the bytes that came from it (RFC 9000, sections 8.1 and 9.3.1).
+    pub(super) fn allows(&self, bytes: u64) -> bool {
+        self.amplification_credit.is_none_or(|credit| bytes <= credit)
+    }
+
+    /// Counts `bytes` that go to the path. Each sender on the path calls it, so the connection
+    /// and its side flows share one limit.
+    pub(super) fn charge(&mut self, bytes: u64) {
+        if let Some(credit) = &mut self.amplification_credit {
+            *credit = credit.saturating_sub(bytes);
+            self.amplification_blocked = false;
         }
     }
 
@@ -201,15 +260,6 @@ impl Path {
                 self.ecn = EcnState::Unknown;
             }
         }
-    }
-
-    pub(super) fn untracked(&mut self) {
-        self.store.tail = self.store.tail.join(Gap::BARRIER);
-    }
-
-    /// The peer can negotiate a smaller maximum datagram. Preserve the number of packets in the window.
-    pub(super) fn datagram_limit(&mut self, bytes: usize) {
-        self.controller.datagram_limit(bytes as u64);
     }
 
     pub(super) fn acknowledged(&mut self, ack: Acked, now: Instant, grow: bool) {
@@ -407,6 +457,10 @@ pub(super) enum Record {
     Limit(u8),
     Control(StreamId, u8),
     HandshakeDone,
+    /// A probe of the datagram size, which is alone in its packet. The recovery layer takes it.
+    Mtu(usize),
+    /// A PATH_CHALLENGE frame. The recovery layer takes it.
+    Challenge,
 }
 
 /// A packet normally carries one stream range. Only a packet with more records needs a second allocation.
@@ -420,6 +474,12 @@ pub(super) struct Records {
 impl Records {
     pub(super) fn iter(&self) -> impl Iterator<Item = Record> + '_ {
         self.first.into_iter().chain(self.rest.iter().copied())
+    }
+
+    /// Whether the packet is a probe of the datagram size. Its loss is no sign of congestion
+    /// (RFC 9000, section 14.4).
+    fn probe(&self) -> bool {
+        matches!(self.first, Some(Record::Mtu(_)))
     }
 
     fn push(&mut self, record: Record, budget: &Budget) -> Result<(), Error> {
@@ -488,6 +548,8 @@ struct Slot {
     gap: Gap,
     sampled: bool,
     round: u64,
+    /// The tag of the path that sent the packet.
+    path: u32,
 }
 
 const NONE: usize = usize::MAX;
@@ -583,7 +645,8 @@ impl Gap {
     }
 }
 
-/// All number spaces and side flows allocate slots here. Each slot also links its path neighbors.
+/// All number spaces and side flows allocate slots here. Each slot also links its neighbors in
+/// send order.
 struct Store {
     slots: Slots,
     free: usize,
@@ -601,6 +664,43 @@ impl Store {
             tail: Gap::default(),
             credit: budget.credit(0),
         }
+    }
+}
+
+/// The paths of a connection, and the packets that it sent on them.
+pub(super) struct Paths {
+    store: Store,
+    /// The path that carries the connection.
+    pub(super) active: PathState,
+    /// The validation of the active path, with the path that the connection came from.
+    pub(super) validation: Option<Validation>,
+    /// The tag of the next path.
+    next: u32,
+}
+
+impl Paths {
+    pub(super) fn new(active: PathState, budget: &Budget) -> Self {
+        Self {
+            store: Store::new(budget),
+            active,
+            validation: None,
+            next: 1,
+        }
+    }
+
+    /// Makes `next` the active path, and gives the path before it. No packet that went out
+    /// before counts for `next`.
+    pub(super) fn switch(&mut self, mut next: PathState) -> PathState {
+        next.id = self.next;
+        // Only the live packets hold a tag, and the last paths sent them, so a tag that comes
+        // again after 2^32 paths meets no packet of its first use.
+        self.next = self.next.wrapping_add(1);
+        core::mem::replace(&mut self.active, next)
+    }
+
+    /// A packet went out with no delivery state: it stands between its neighbors in send order.
+    pub(super) fn untracked(&mut self) {
+        self.store.tail = self.store.tail.join(Gap::BARRIER);
     }
 }
 
@@ -649,9 +749,9 @@ impl History {
         self.last_sent.filter(|_| self.elicitors > 0)
     }
 
-    pub(super) fn insert(&mut self, path: &mut Path, packet: Sent) -> Result<(), Error> {
+    pub(super) fn insert(&mut self, paths: &mut Paths, packet: Sent) -> Result<(), Error> {
         let (bytes, eliciting, time) = (packet.bytes, packet.eliciting, packet.time);
-        let store = &mut path.store;
+        let (store, path) = (&mut paths.store, &mut paths.active);
         let slot = Slot {
             packet: Some(packet),
             previous: self.last,
@@ -661,6 +761,7 @@ impl History {
             gap: store.tail,
             sampled: path.minimum.is_some(),
             round: path.controller.round(),
+            path: path.id,
         };
         let at = if let Some(free) = store.slots.get_mut(store.free) {
             let at = core::mem::replace(&mut store.free, free.next);
@@ -689,12 +790,19 @@ impl History {
         Ok(())
     }
 
-    fn remove(&mut self, path: &mut Path, at: usize, reason: Settlement) -> Sent {
-        let store = &mut path.store;
+    /// Takes a packet out of the store. Only the path that sent it counts its bytes and its loss.
+    fn remove(&mut self, paths: &mut Paths, at: usize, reason: Settlement) -> Sent {
+        let Paths {
+            store,
+            active: path,
+            validation,
+            ..
+        } = paths;
         let slot = store.slots.get_mut(at).expect("the packet has a slot");
         let packet = slot.packet.take().expect("only a live packet leaves the list");
         let (previous, next) = (slot.previous, core::mem::replace(&mut slot.next, store.free));
         let (left, right, gap, sampled) = (slot.path_previous, slot.path_next, slot.gap, slot.sampled);
+        let sender = slot.path;
         store.free = at;
         if let Some(before) = store.slots.get_mut(previous) {
             before.next = next;
@@ -718,8 +826,8 @@ impl History {
         };
         let mut middle = Gap::BARRIER;
         let mut span = None;
-        if matches!(reason, Settlement::Lost) {
-            let time = (sampled && packet.eliciting).then(|| packet.time.as_nanos());
+        if sender == path.id && matches!(reason, Settlement::Lost) {
+            let time = (sampled && packet.eliciting && !packet.records.probe()).then(|| packet.time.as_nanos());
             middle = Gap {
                 prefix_end: time,
                 suffix_start: time,
@@ -731,8 +839,14 @@ impl History {
         }
         *after = gap.join(middle).join(*after);
         self.bytes -= packet.bytes;
-        path.flight -= packet.bytes;
         self.elicitors -= usize::from(packet.eliciting);
+        if sender == path.id {
+            path.flight -= packet.bytes;
+        } else if let Some(validation) = validation
+            && validation.fallback.id == sender
+        {
+            validation.fallback.flight -= packet.bytes;
+        }
         if let Some((first, last)) = span
             && path.collapsed.is_none_or(|previous| first > previous)
             && u128::from(last.saturating_sub(first)) > 3 * path.pto(path.ack_delay_max).as_nanos()
@@ -744,15 +858,15 @@ impl History {
         packet
     }
 
-    pub(super) fn discard(&mut self, path: &mut Path) {
+    pub(super) fn discard(&mut self, paths: &mut Paths) {
         while self.first != NONE {
-            self.remove(path, self.first, Settlement::Discarded);
+            self.remove(paths, self.first, Settlement::Discarded);
         }
     }
 
     fn validate_ecn(
         &mut self,
-        path: &mut Path,
+        path: &mut PathState,
         counts: Option<EcnCounts>,
         marked: u64,
         sent: Option<Instant>,
@@ -789,17 +903,18 @@ impl History {
     }
 
     /// Walks the ranges and the live packets together, once. A gap in packet numbers costs no work.
+    /// A packet of another path gives the active path no round-trip sample and no growth.
     pub(super) fn ack(
         &mut self,
         ack: &Ack<'_>,
-        path: &mut Path,
+        paths: &mut Paths,
         now: Instant,
         delay: Duration,
         mut delivered: impl FnMut(Record),
     ) -> Result<Acked, Error> {
         let advances = self.largest.is_none_or(|old| ack.largest > old);
         self.largest = Some(self.largest.map_or(ack.largest, |old| old.max(ack.largest)));
-        if path
+        if paths
             .store
             .slots
             .get(self.first)
@@ -815,25 +930,37 @@ impl History {
         let mut sample = None;
         let mut round = None;
         for range in ack.ranges() {
-            while let Some(slot) = path.store.slots.get(at) {
+            while let Some(slot) = paths.store.slots.get(at) {
                 let packet = slot.packet.as_ref().expect("the send list links live packets");
                 if packet.number < *range.start() {
                     break;
                 }
                 let previous = slot.previous;
                 if packet.number <= *range.end() {
-                    let sent_round = slot.round;
-                    let packet = self.remove(path, at, Settlement::Delivered);
-                    marked += u64::from(packet.mark == Ecn::Ect0);
-                    if path.controller.can_grow(packet.time) {
-                        grow_by += packet.bytes;
-                    }
-                    if packet.number == ack.largest {
-                        sample = Some(packet.time);
-                        round = Some(sent_round);
-                    }
+                    let (sent_round, current) = (slot.round, slot.path == paths.active.id);
+                    let packet = self.remove(paths, at, Settlement::Delivered);
+                    let path = &mut paths.active;
                     eliciting |= packet.eliciting;
-                    packet.records.iter().for_each(&mut delivered);
+                    if current {
+                        marked += u64::from(packet.mark == Ecn::Ect0);
+                        if path.controller.can_grow(packet.time) {
+                            grow_by += packet.bytes;
+                        }
+                        if packet.number == ack.largest {
+                            sample = Some(packet.time);
+                            round = Some(sent_round);
+                        }
+                        if packet.bytes > DATAGRAM_MIN as u64 {
+                            path.mtu.large_acknowledged();
+                        }
+                    }
+                    for record in packet.records.iter() {
+                        match record {
+                            Record::Mtu(size) if current => path.mtu.probe_acknowledged(size),
+                            Record::Mtu(_) | Record::Challenge => {}
+                            record => delivered(record),
+                        }
+                    }
                 }
                 at = previous;
             }
@@ -841,6 +968,7 @@ impl History {
                 break;
             }
         }
+        let path = &mut paths.active;
         if eliciting && let Some(sent) = sample {
             path.sample(
                 now.duration_since(sent).map_err(|_| super::connection::CLOCK)?,
@@ -858,21 +986,26 @@ impl History {
         })
     }
 
-    /// Stops at the first packet below both loss thresholds. Each later packet is newer.
+    /// Stops at the first packet below both loss thresholds. Each later packet is newer. Only a
+    /// packet of the active path is a sign of congestion on it.
     pub(super) fn detect(
         &mut self,
-        path: &mut Path,
+        paths: &mut Paths,
         now: Instant,
         mut lost: impl FnMut(Record) -> Result<(), Error>,
     ) -> Result<bool, Error> {
         self.loss_time = None;
-        let delay = path.loss_delay();
-        let previous_collapse = path.collapsed;
+        let delay = paths.active.loss_delay();
+        let previous_collapse = paths.active.collapsed;
         let mut congestion = false;
-        while let Some(packet) = path.store.slots.get(self.first).and_then(|slot| slot.packet.as_ref()) {
+        // Whether each datagram that the active path lost here is above the base size.
+        let mut large = None;
+        while let Some(slot) = paths.store.slots.get(self.first)
+            && let Some(packet) = slot.packet.as_ref()
+        {
             // A bare ACK below no acknowledged number has no remaining RTT or loss evidence.
             if packet.bytes == 0 && self.largest.is_none_or(|largest| largest < packet.number) {
-                self.remove(path, self.first, Settlement::Discarded);
+                self.remove(paths, self.first, Settlement::Discarded);
                 continue;
             }
             let Some(largest) = self.largest.filter(|largest| *largest >= packet.number) else {
@@ -883,14 +1016,30 @@ impl History {
                 self.loss_time = Some(due);
                 break;
             }
-            if packet.bytes > 0 {
-                congestion |= path.controller.congestion(packet.time, now);
-                path.lost = path.lost.saturating_add(1);
+            let current = slot.path == paths.active.id;
+            if current && packet.bytes > 0 && !packet.records.probe() {
+                congestion |= paths.active.controller.congestion(packet.time, now);
+                paths.active.lost = paths.active.lost.saturating_add(1);
+                large = Some(large.unwrap_or(true) && packet.bytes > DATAGRAM_MIN as u64);
             }
-            let packet = self.remove(path, self.first, Settlement::Lost);
-            packet.records.iter().try_for_each(&mut lost)?;
+            let packet = self.remove(paths, self.first, Settlement::Lost);
+            for record in packet.records.iter() {
+                match record {
+                    Record::Mtu(size) if current => paths.active.mtu.probe_lost(size),
+                    Record::Challenge if current => {
+                        if let Some(validation) = &mut paths.validation {
+                            validation.send = true;
+                        }
+                    }
+                    Record::Mtu(_) | Record::Challenge => {}
+                    record => lost(record)?,
+                }
+            }
         }
-        Ok(congestion || previous_collapse != path.collapsed)
+        if let Some(large) = large {
+            paths.active.mtu.lost(large);
+        }
+        Ok(congestion || previous_collapse != paths.active.collapsed)
     }
 }
 

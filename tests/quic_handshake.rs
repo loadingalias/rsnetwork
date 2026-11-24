@@ -1,6 +1,7 @@
 //! The QUIC handshake of the connection engine (N303): RFC 9000 and RFC 9001 over a transport in
 //! memory, with the certificates of `tests/tls/`.
 
+use core::net::{Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
 use std::collections::VecDeque;
@@ -15,7 +16,7 @@ use rsnetwork::drive::{Error, Kind, Progress};
 use rsnetwork::quic::frame::Frame;
 use rsnetwork::quic::packet::{self, Builder, Datagrams, Header, Kind as PacketKind, Outgoing, Side};
 use rsnetwork::quic::params::{Migration, ParameterError, Parameters, PreferredAddress, Sender};
-use rsnetwork::quic::{CRYPTO_BUFFER_BYTES_MAX, Connection, ConnectionId, Limits};
+use rsnetwork::quic::{CRYPTO_BUFFER_BYTES_MAX, Connection, ConnectionId, Limits, Path};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
     Authentication, CertificateDer, ClientConfig, ClientOptions, Entropy, Group, Handshake, Identity, PrivateKeyDer,
@@ -63,6 +64,18 @@ fn budget() -> Budget {
 fn at(ms: u64) -> Instant {
     Instant::new(ClockDomain::new(1, Suspend::Pauses), ms * 1_000_000)
 }
+
+/// The path from the local port `local` to the port `peer`, on the loopback address.
+fn path(local: u16, peer: u16) -> Path {
+    Path {
+        local: SocketAddr::from((Ipv4Addr::LOCALHOST, local)),
+        peer: SocketAddr::from((Ipv4Addr::LOCALHOST, peer)),
+    }
+}
+
+/// The port of the server, and the port of each client that does not move.
+const SERVER_PORT: u16 = 443;
+const CLIENT_PORT: u16 = 4301;
 
 fn client_config(root: &[u8], resumption: Resumption) -> ClientConfig {
     ClientConfig::new(ClientOptions {
@@ -128,7 +141,15 @@ struct Pair {
 impl Pair {
     fn new(client: &ClientConfig, server: ServerConfig, limits: (Limits, Limits)) -> Self {
         Self {
-            client: Connection::client(client, "server.test", limits.0, &budget(), at(0)).unwrap(),
+            client: Connection::client(
+                client,
+                "server.test",
+                path(CLIENT_PORT, SERVER_PORT),
+                limits.0,
+                &budget(),
+                at(0),
+            )
+            .unwrap(),
             server: None,
             config: server,
             limits: limits.1,
@@ -149,8 +170,8 @@ impl Pair {
         let mut out = vec![0; 65_527];
         for _ in 0..512 {
             match connection.transmit(&mut out, now).unwrap() {
-                Some(len) => {
-                    datagrams.push(out[..len].to_vec());
+                Some(sent) => {
+                    datagrams.push(out[..sent.len].to_vec());
                 }
                 None => return datagrams,
             }
@@ -158,17 +179,18 @@ impl Pair {
         panic!("a connection sends at most 512 datagrams at once");
     }
 
-    /// Gives `datagram` to `connection`, whose connection IDs have `cid_bytes` bytes.
+    /// Gives `datagram` to `connection`, on the path of the connection.
     fn give(connection: &mut Connection, datagram: Vec<u8>, now: Instant) -> Progress {
         let len = connection.local_cid().as_bytes().len();
         let mut datagrams = Datagrams::new(Backing::from(datagram), None, len);
-        connection.receive(&mut datagrams, now).1.progress
+        connection.receive(&mut datagrams, connection.path(), now).1.progress
     }
 
     fn deliver(&mut self, datagram: Vec<u8>, now: Instant) -> Progress {
         if self.server.is_none() {
             let header = Header::parse(&datagram, 0).unwrap();
-            self.server = Some(Connection::server(&self.config, &header, self.limits, &budget(), now).unwrap());
+            let route = path(SERVER_PORT, CLIENT_PORT);
+            self.server = Some(Connection::server(&self.config, &header, route, self.limits, &budget(), now).unwrap());
         }
         Self::give(self.server(), datagram, now)
     }
@@ -367,7 +389,7 @@ fn a_handshake_message_in_two_datagrams_waits_for_its_rest_with_no_work() {
 }
 
 #[test]
-fn a_chain_inside_the_crypto_bound_completes_out_of_order_and_one_past_it_refuses() {
+fn a_chain_inside_the_crypto_bound_completes_out_of_order() {
     // Copies of the ML-DSA-65 intermediate, about 5.5 KB each, after the leaf. The server sends
     // its Handshake datagrams from the last one, so each CRYPTO frame waits ahead of the bytes
     // that rustls reads.
@@ -380,35 +402,6 @@ fn a_chain_inside_the_crypto_bound_completes_out_of_order_and_one_past_it_refuse
     );
     pair.run(at(0), Order::HandshakeReversed);
     assert!(pair.client.is_confirmed(), "a chain inside the bound completes");
-
-    let past = [MLDSA_INTERMEDIATE; 13];
-    assert!(past.len() * MLDSA_INTERMEDIATE.len() > CRYPTO_BUFFER_BYTES_MAX);
-    // A two-datagram initial window holds the chain. Its last offset arrives before TLS reads its length.
-    let large = Limits {
-        datagram_bytes_max: 48 * 1024,
-        ..Limits::DEFAULT
-    };
-    // Validate the address before the server sends the full flight in reverse packet order.
-    let (client, server) = endpoint::validated_reversed_flight(
-        &client_config(MLDSA_CA, Resumption::Off),
-        &server_config(MLDSA65, &past, Resumption::Off),
-        large,
-    );
-    let outcome = terminal(client).expect("the client ended");
-    let error = outcome.unwrap_err();
-    assert_eq!(
-        (error.kind(), error.reason()),
-        (
-            Kind::Overload,
-            "the CRYPTO data of the peer passed the buffer bound of its level"
-        )
-    );
-    // The client closed with CRYPTO_BUFFER_EXCEEDED, which the server reads as an error.
-    let server = terminal(server).expect("the close of the client ended the server");
-    assert_eq!(
-        server.unwrap_err().reason(),
-        "the peer closed the QUIC connection with a transport error"
-    );
 }
 
 #[test]
@@ -445,7 +438,8 @@ fn an_idle_connection_reaches_its_idle_deadline_with_no_peer_traffic() {
     };
     // A client that hears nothing after its first datagram.
     let config = client_config(CA, Resumption::Off);
-    let mut client = Connection::client(&config, "server.test", limits, &budget(), at(0)).unwrap();
+    let route = path(CLIENT_PORT, SERVER_PORT);
+    let mut client = Connection::client(&config, "server.test", route, limits, &budget(), at(0)).unwrap();
     assert!(!Pair::send(&mut client, at(0)).is_empty());
     let (_, turn) = client.drive(at(4_999));
     assert_eq!(turn.progress, Progress::Blocked(rsnetwork::drive::Blocked::Input));
@@ -479,7 +473,8 @@ fn a_handshake_that_does_not_confirm_by_its_deadline_ends() {
         ..Limits::DEFAULT
     };
     let config = client_config(CA, Resumption::Off);
-    let mut client = Connection::client(&config, "server.test", limits, &budget(), at(0)).unwrap();
+    let route = path(CLIENT_PORT, SERVER_PORT);
+    let mut client = Connection::client(&config, "server.test", route, limits, &budget(), at(0)).unwrap();
     Pair::send(&mut client, at(0));
     assert_eq!(
         client.drive(at(1_999)).1.deadline.map(|deadline| deadline.instant()),

@@ -5,14 +5,25 @@ use core::num::NonZeroU64;
 use rstypes::capacity::Budget;
 use rstypes::time::{ClockDomain, Instant, Suspend};
 
-use super::{CongestionControl, Controller, Duration, Ecn, History, Path, Records, Sent, Settlement};
+use core::net::{Ipv4Addr, SocketAddr};
+
+use super::{
+    CongestionControl, ConnectionId, Controller, Duration, Ecn, History, Path, PathState, Paths, Records, Sent,
+    Settlement,
+};
 
 #[test]
 fn one_old_packet_and_a_million_number_span_fit_the_live_entry_budget() {
     // This store has at most three live packets. One KiB covers the slots and their directory.
     let budget = Budget::new(NonZeroU64::new(1024).unwrap());
     let mut history = History::new();
-    let mut path = Path::new(1200, CongestionControl::Cubic, &budget);
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 443));
+    let addresses = Path {
+        local: address,
+        peer: address,
+    };
+    let state = PathState::new(addresses, ConnectionId::EMPTY, 1200, CongestionControl::Cubic);
+    let mut path = Paths::new(state, &budget);
     let time = Instant::new(ClockDomain::new(1, Suspend::Pauses), 0);
     let packet = |number| Sent {
         number,

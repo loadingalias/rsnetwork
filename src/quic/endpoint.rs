@@ -17,7 +17,7 @@ use rustls::crypto::SecureRandom;
 use table::Table;
 
 use super::packet::{self, Header, Kind as PacketKind};
-use super::{Connection, ConnectionId, Limits};
+use super::{Connection, ConnectionId, Limits, Path};
 use crate::drive::{Error, Kind};
 use crate::tls;
 
@@ -101,10 +101,12 @@ enum Key {
 
 struct Registered {
     connection: Box<Connection>,
-    peer: SocketAddr,
-    initial: Option<ConnectionId>,
+    /// The route of the first Initial packets, until the handshake is confirmed.
+    initial: Option<Key>,
     ids: [Option<ConnectionId>; 2],
-    reset: Option<[u8; 16]>,
+    /// The route of a stateless reset: the address of the peer, which follows a peer that moves,
+    /// and the token of the connection ID that this end sends to.
+    reset: Option<(SocketAddr, [u8; 16])>,
     _storage: Permit,
 }
 
@@ -114,9 +116,10 @@ struct Slot {
     entry: Option<Registered>,
 }
 
-/// A sans-I/O QUIC server listener for one local address and worker.
+/// A sans-I/O QUIC server listener for one worker.
 ///
-/// Pass each UDP payload and its source address to [`Self::route`].
+/// Pass each UDP payload and its path to [`Self::route`]. A connection keeps its route when its
+/// client moves to a new address: the connection validates that address.
 /// On acceptance or an existing route, call [`Connection::receive`] through [`Self::with_connection`].
 /// Drive the connection at its deadline and drain its transmissions through the same handle.
 /// Call [`Self::remove`] when the connection reaches its terminal outcome.
@@ -190,9 +193,11 @@ impl Endpoint {
         })
     }
 
-    /// Routes one complete UDP payload from `peer`. Pass the same datagram to an accepted or existing connection.
-    /// The caller supplies space for the stateless reply. A 1,200-byte buffer fits every reply.
-    pub fn route(&mut self, peer: SocketAddr, bytes: &[u8], reply: &mut [u8], now: Instant) -> Result<Route, Error> {
+    /// Routes one complete UDP payload that arrived on `path`. Pass the same datagram and path to an
+    /// accepted or existing connection. The caller supplies space for the stateless reply, which
+    /// goes back on `path`. A 1,200-byte buffer fits every reply.
+    pub fn route(&mut self, path: Path, bytes: &[u8], reply: &mut [u8], now: Instant) -> Result<Route, Error> {
+        let peer = path.peer;
         if self.resets != 0
             && let Some(tail) = reset_suffix(bytes)
         {
@@ -228,16 +233,9 @@ impl Endpoint {
         if kind == PacketKind::Initial && bytes.len() < 1200 {
             return Ok(Route::Dropped);
         }
+        // The connection decides what a datagram from a new address means (RFC 9000, section 9).
         if let Some(handle) = self.routes.get(&Key::Local(dcid)) {
-            let owner = self.slots[usize::from(handle.slot)]
-                .entry
-                .as_ref()
-                .expect("a routed ID has an owner");
-            return Ok(if owner.peer == peer {
-                Route::Existing(handle)
-            } else {
-                Route::Dropped
-            });
+            return Ok(Route::Existing(handle));
         }
         if kind != PacketKind::Initial {
             if kind == PacketKind::OneRtt && bytes.len() > 21 && self.keys.worker(&dcid) == Some(self.worker) {
@@ -293,6 +291,7 @@ impl Endpoint {
             &self.config,
             &header,
             Some((issuer, proof)),
+            path,
             self.connection_limits,
             &budget,
             now,
@@ -318,8 +317,7 @@ impl Endpoint {
         self.handshakes += 1;
         slot.entry = Some(Registered {
             connection,
-            peer,
-            initial: Some(dcid),
+            initial: Some(Key::Initial(peer, dcid)),
             ids,
             reset: None,
             _storage: storage,
@@ -349,23 +347,24 @@ impl Endpoint {
             }
             entry.ids = ids;
         }
-        let reset = entry.connection.used_reset();
+        let peer = entry.connection.path().peer;
+        let reset = entry.connection.used_reset().map(|token| (peer, token));
         if reset != entry.reset {
-            if let Some(token) = entry.reset.take() {
-                self.routes.remove(&Key::Reset(entry.peer, token));
+            if let Some((peer, token)) = entry.reset.take() {
+                self.routes.remove(&Key::Reset(peer, token));
                 self.resets -= 1;
             }
-            if let Some(token) = reset
-                && self.routes.insert(Key::Reset(entry.peer, token), h)
+            if let Some((peer, token)) = reset
+                && self.routes.insert(Key::Reset(peer, token), h)
             {
-                entry.reset = Some(token);
+                entry.reset = reset;
                 self.resets += 1;
             }
         }
         if (entry.connection.is_confirmed() || entry.connection.ended())
             && let Some(initial) = entry.initial.take()
         {
-            self.routes.remove(&Key::Initial(entry.peer, initial));
+            self.routes.remove(&initial);
             self.handshakes -= 1;
         }
         Some(result)
@@ -384,12 +383,12 @@ impl Endpoint {
         for cid in entry.ids.into_iter().flatten() {
             self.routes.remove(&Key::Local(cid));
         }
-        if let Some(cid) = entry.initial {
-            self.routes.remove(&Key::Initial(entry.peer, cid));
+        if let Some(initial) = entry.initial {
+            self.routes.remove(&initial);
             self.handshakes -= 1;
         }
-        if let Some(token) = entry.reset {
-            self.routes.remove(&Key::Reset(entry.peer, token));
+        if let Some((peer, token)) = entry.reset {
+            self.routes.remove(&Key::Reset(peer, token));
             self.resets -= 1;
         }
         if let Some(next) = slot.generation.checked_add(1) {

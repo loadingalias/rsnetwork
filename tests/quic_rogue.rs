@@ -1,10 +1,12 @@
 //! A server engine of the core against a client that breaks the rules of the streams: each
 //! frame past a window, a limit, a final size, or the direction of a stream closes the connection
-//! with its code of RFC 9000, section 20.1, and takes no memory (N305).
+//! with its code of RFC 9000, section 20.1, and takes no memory (N305). The same client probes a
+//! path that the connection does not use (N307).
 //!
 //! The client is a harness: rustls runs its handshake, and the packet layer of the core seals and
 //! opens its packets. It sends each frame that a test gives it, on a path with no loss.
 
+use core::net::{Ipv4Addr, SocketAddr};
 use core::num::NonZeroU64;
 use core::time::Duration;
 use std::assert_matches;
@@ -12,11 +14,11 @@ use std::sync::Arc;
 
 use rsnetwork::buffer::{Backing, Buffer as _};
 use rsnetwork::capacity::Budget;
-use rsnetwork::drive::{Kind, Progress};
+use rsnetwork::drive::{Blocked, Kind, Progress};
 use rsnetwork::quic::frame::{Direction, Frame};
 use rsnetwork::quic::packet::{self, Builder, Datagrams, Header, Keys, Kind as PacketKind, Outgoing, Side};
 use rsnetwork::quic::params::Parameters;
-use rsnetwork::quic::{Connection, ConnectionId, ErrorCode, Event, Limits};
+use rsnetwork::quic::{CRYPTO_BUFFER_BYTES_MAX, Connection, ConnectionId, ErrorCode, Event, Limits, Path};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
     CertificateDer, Entropy, Identity, PrivateKeyDer, Resumption, ServerConfig, ServerOptions, TimeProvider, UnixTime,
@@ -47,6 +49,14 @@ fn now() -> Instant {
     Instant::new(ClockDomain::new(1, Suspend::Pauses), 0)
 }
 
+/// The path of the server to a client at the port `port`.
+fn path(port: u16) -> Path {
+    Path {
+        local: SocketAddr::from((Ipv4Addr::LOCALHOST, 443)),
+        peer: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+    }
+}
+
 /// A client that a test drives by hand.
 struct Rogue {
     tls: Option<ClientHandshake>,
@@ -70,6 +80,8 @@ struct Rogue {
     complete: bool,
     /// Each CONNECTION_CLOSE frame of the server: its code and the type of the frame that caused it.
     closes: Vec<(u64, Option<u64>)>,
+    /// The data of each PATH_RESPONSE frame of the server.
+    answers: Vec<[u8; 8]>,
 }
 
 impl Rogue {
@@ -113,6 +125,7 @@ impl Rogue {
             cid,
             complete: false,
             closes: Vec::new(),
+            answers: Vec::new(),
         };
         rogue.take_events();
         rogue
@@ -225,6 +238,7 @@ impl Rogue {
                         }
                     }
                     Frame::ConnectionClose { code, frame_type, .. } => self.closes.push((code, frame_type)),
+                    Frame::PathResponse { data } => self.answers.push(data),
                     _ => {}
                 }
             }
@@ -269,13 +283,18 @@ impl Rogue {
 
 /// Each datagram that `connection` sends now.
 fn sent(connection: &mut Connection) -> Vec<Vec<u8>> {
+    routed(connection).into_iter().map(|(_, datagram)| datagram).collect()
+}
+
+/// Each datagram that `connection` sends now, with its path.
+fn routed(connection: &mut Connection) -> Vec<(Path, Vec<u8>)> {
     let mut datagrams = Vec::new();
     for _ in 0..64 {
         let mut out = vec![0; 1500];
         match connection.transmit(&mut out, now()).unwrap() {
-            Some(len) => {
-                out.truncate(len);
-                datagrams.push(out);
+            Some(sent) => {
+                out.truncate(sent.len);
+                datagrams.push((sent.path, out));
             }
             None => return datagrams,
         }
@@ -283,13 +302,19 @@ fn sent(connection: &mut Connection) -> Vec<Vec<u8>> {
     panic!("a server sends at most 64 datagrams at once");
 }
 
-/// Gives `datagram` to `connection`, and gives the events of the call.
+/// Gives `datagram` to `connection` on its path, and gives the events of the call.
 fn give(connection: &mut Connection, datagram: &[u8]) -> Vec<Event> {
+    let path = connection.path();
+    give_on(connection, path, datagram)
+}
+
+/// Gives `datagram` to `connection` as a datagram that arrived on `path`.
+fn give_on(connection: &mut Connection, path: Path, datagram: &[u8]) -> Vec<Event> {
     let len = connection.local_cid().as_bytes().len();
     let mut datagrams = Datagrams::new(Backing::from(datagram.to_vec()), None, len);
     let mut events = Vec::new();
     for _ in 0..64 {
-        match connection.receive(&mut datagrams, now()) {
+        match connection.receive(&mut datagrams, path, now()) {
             (Some(event), _) => events.push(event),
             (None, turn) if turn.progress == Progress::Pending => {}
             (None, _) => return events,
@@ -321,7 +346,7 @@ fn pair(limits: Limits, complete: bool) -> (Connection, Rogue) {
     });
     let hello = rogue.crypto(0);
     let header = Header::parse(&hello[0], 0).unwrap();
-    let mut server = Connection::server(&config, &header, limits, &budget, now()).unwrap();
+    let mut server = Connection::server(&config, &header, path(4301), limits, &budget, now()).unwrap();
     for datagram in &hello {
         assert!(give(&mut server, datagram).is_empty());
     }
@@ -347,13 +372,20 @@ fn attack(server: &mut Connection, rogue: &mut Rogue, frames: &[Frame<'_>]) -> V
     give(server, &datagram)
 }
 
-/// Checks that the server closed with `code` for a frame of type `frame`, and ended.
-fn closed_with(server: &mut Connection, rogue: &mut Rogue, code: ErrorCode, frame: u64) {
+/// Gives the 1-RTT packet with `frames`, which breaks a rule, to the server. Checks that the
+/// server ends for its application at once, closes with `code` for a frame of type `frame`, and
+/// gives its terminal outcome at the end of its closing period.
+fn refused(server: &mut Connection, rogue: &mut Rogue, frames: &[Frame<'_>], code: ErrorCode, frame: u64) {
+    let events = attack(server, rogue, frames);
+    assert_matches!(&events[..], [Event::Closed(Err(error))] if error.kind() == Kind::Malformed);
     for datagram in sent(server) {
         rogue.receive(&datagram);
     }
     assert_eq!(rogue.closes, [(code.0, Some(frame))]);
-    assert_matches!(server.drive(now()).1.progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Malformed);
+    let turn = server.drive(now()).1;
+    assert_eq!(turn.progress, Progress::Blocked(Blocked::Input));
+    let end = turn.deadline.expect("a closing period has its end").instant();
+    assert_matches!(server.drive(end).1.progress, Progress::Terminal(Err(error)) if error.kind() == Kind::Malformed);
 }
 
 fn stream(stream: u64, offset: u64, data: &[u8], fin: bool) -> Frame<'_> {
@@ -375,20 +407,35 @@ fn data_past_the_window_of_a_stream_or_of_the_connection_closes_with_flow_contro
     let bytes = [7; 1001];
     // One byte past the window of the stream, in order.
     let (mut server, mut rogue) = pair(limits, true);
-    assert!(attack(&mut server, &mut rogue, &[stream(0, 0, &bytes, false)]).is_empty());
-    closed_with(&mut server, &mut rogue, ErrorCode::FLOW_CONTROL_ERROR, 0x08);
+    refused(
+        &mut server,
+        &mut rogue,
+        &[stream(0, 0, &bytes, false)],
+        ErrorCode::FLOW_CONTROL_ERROR,
+        0x08,
+    );
 
     // One byte past it far out of order: the offset alone breaks the rule, and no page holds it.
     let (mut server, mut rogue) = pair(limits, true);
-    assert!(attack(&mut server, &mut rogue, &[stream(0, 1000, &bytes[..1], false)]).is_empty());
-    closed_with(&mut server, &mut rogue, ErrorCode::FLOW_CONTROL_ERROR, 0x08);
+    refused(
+        &mut server,
+        &mut rogue,
+        &[stream(0, 1000, &bytes[..1], false)],
+        ErrorCode::FLOW_CONTROL_ERROR,
+        0x08,
+    );
 
     // Each stream inside its window, and the second one byte past the window of the connection.
     let (mut server, mut rogue) = pair(limits, true);
     let events = attack(&mut server, &mut rogue, &[stream(0, 0, &bytes[..1000], false)]);
     assert_matches!(&events[..], [Event::Stream { data, end: false, .. }] if data.bytes() == &bytes[..1000]);
-    assert!(attack(&mut server, &mut rogue, &[stream(4, 0, &bytes[..501], false)]).is_empty());
-    closed_with(&mut server, &mut rogue, ErrorCode::FLOW_CONTROL_ERROR, 0x08);
+    refused(
+        &mut server,
+        &mut rogue,
+        &[stream(4, 0, &bytes[..501], false)],
+        ErrorCode::FLOW_CONTROL_ERROR,
+        0x08,
+    );
 
     // A reset counts its final size, also for the bytes that never arrived.
     let (mut server, mut rogue) = pair(limits, true);
@@ -397,8 +444,7 @@ fn data_past_the_window_of_a_stream_or_of_the_connection_closes_with_flow_contro
         code: 1,
         final_size: 1001,
     };
-    assert!(attack(&mut server, &mut rogue, &[reset]).is_empty());
-    closed_with(&mut server, &mut rogue, ErrorCode::FLOW_CONTROL_ERROR, 0x04);
+    refused(&mut server, &mut rogue, &[reset], ErrorCode::FLOW_CONTROL_ERROR, 0x04);
 }
 
 #[test]
@@ -415,8 +461,13 @@ fn a_stream_past_the_stream_limit_closes_and_a_stream_opens_each_stream_below_it
     let events = attack(&mut server, &mut rogue, &[stream(8, 0, b"low", false)]);
     assert_matches!(&events[..], [Event::Stream { stream, data, .. }] if stream.get() == 8 && data.bytes() == b"low");
     // The next stream is past the limit.
-    assert!(attack(&mut server, &mut rogue, &[stream(40, 0, b"x", false)]).is_empty());
-    closed_with(&mut server, &mut rogue, ErrorCode::STREAM_LIMIT_ERROR, 0x08);
+    refused(
+        &mut server,
+        &mut rogue,
+        &[stream(40, 0, b"x", false)],
+        ErrorCode::STREAM_LIMIT_ERROR,
+        0x08,
+    );
 }
 
 #[test]
@@ -425,14 +476,24 @@ fn a_frame_that_changes_a_final_size_closes_with_final_size_error() {
     let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
     let events = attack(&mut server, &mut rogue, &[stream(0, 0, b"0123456789", true)]);
     assert_matches!(&events[..], [Event::Stream { end: true, .. }]);
-    assert!(attack(&mut server, &mut rogue, &[stream(0, 10, b"x", false)]).is_empty());
-    closed_with(&mut server, &mut rogue, ErrorCode::FINAL_SIZE_ERROR, 0x08);
+    refused(
+        &mut server,
+        &mut rogue,
+        &[stream(0, 10, b"x", false)],
+        ErrorCode::FINAL_SIZE_ERROR,
+        0x08,
+    );
 
     // An end before the bytes that arrived.
     let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
     assert!(attack(&mut server, &mut rogue, &[stream(0, 5, b"56789", false)]).is_empty());
-    assert!(attack(&mut server, &mut rogue, &[stream(0, 0, b"0123", true)]).is_empty());
-    closed_with(&mut server, &mut rogue, ErrorCode::FINAL_SIZE_ERROR, 0x08);
+    refused(
+        &mut server,
+        &mut rogue,
+        &[stream(0, 0, b"0123", true)],
+        ErrorCode::FINAL_SIZE_ERROR,
+        0x08,
+    );
 
     // A reset with a final size below the bytes that arrived.
     let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
@@ -445,8 +506,7 @@ fn a_frame_that_changes_a_final_size_closes_with_final_size_error() {
         code: 1,
         final_size: 9,
     };
-    assert!(attack(&mut server, &mut rogue, &[reset]).is_empty());
-    closed_with(&mut server, &mut rogue, ErrorCode::FINAL_SIZE_ERROR, 0x04);
+    refused(&mut server, &mut rogue, &[reset], ErrorCode::FINAL_SIZE_ERROR, 0x04);
 }
 
 #[test]
@@ -454,8 +514,13 @@ fn a_frame_on_a_stream_that_cannot_carry_it_closes_with_stream_state_error() {
     // Data on a unidirectional stream of the server, and on a stream that the server did not open.
     for id in [3, 1] {
         let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
-        assert!(attack(&mut server, &mut rogue, &[stream(id, 0, b"x", false)]).is_empty());
-        closed_with(&mut server, &mut rogue, ErrorCode::STREAM_STATE_ERROR, 0x08);
+        refused(
+            &mut server,
+            &mut rogue,
+            &[stream(id, 0, b"x", false)],
+            ErrorCode::STREAM_STATE_ERROR,
+            0x08,
+        );
     }
     // Credit and a stop for a stream that the server only receives.
     let frames = [
@@ -464,8 +529,7 @@ fn a_frame_on_a_stream_that_cannot_carry_it_closes_with_stream_state_error() {
     ];
     for (frame, kind) in frames {
         let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
-        assert!(attack(&mut server, &mut rogue, &[frame]).is_empty());
-        closed_with(&mut server, &mut rogue, ErrorCode::STREAM_STATE_ERROR, kind);
+        refused(&mut server, &mut rogue, &[frame], ErrorCode::STREAM_STATE_ERROR, kind);
     }
     // The server opens its own stream: then the client can send on it.
     let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
@@ -493,8 +557,13 @@ fn a_frame_on_a_stream_that_cannot_carry_it_closes_with_stream_state_error() {
 #[test]
 fn an_unreliable_datagram_that_the_server_did_not_offer_to_take_closes_the_connection() {
     let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
-    assert!(attack(&mut server, &mut rogue, &[Frame::Datagram { data: b"x" }]).is_empty());
-    closed_with(&mut server, &mut rogue, ErrorCode::PROTOCOL_VIOLATION, 0x30);
+    refused(
+        &mut server,
+        &mut rogue,
+        &[Frame::Datagram { data: b"x" }],
+        ErrorCode::PROTOCOL_VIOLATION,
+        0x30,
+    );
 }
 
 #[test]
@@ -510,4 +579,69 @@ fn a_server_reads_no_1_rtt_packet_before_its_handshake_completes() {
     // The data that the server did not read arrives again.
     let events = attack(&mut server, &mut rogue, &[stream(0, 0, b"early", false)]);
     assert_matches!(&events[..], [Event::Stream { data, .. }] if data.bytes() == b"early");
+}
+
+#[test]
+fn crypto_data_past_the_buffer_bound_of_its_level_closes_with_crypto_buffer_exceeded() {
+    let (mut server, mut rogue) = pair(Limits::DEFAULT, false);
+    // One byte at the first offset past the bound: no memory holds the bytes before it.
+    let far = Frame::Crypto {
+        offset: CRYPTO_BUFFER_BYTES_MAX as u64,
+        data: b"x",
+    };
+    let datagram = rogue.packet(1, &[far]);
+    assert!(give(&mut server, &datagram).is_empty());
+    for datagram in sent(&mut server) {
+        rogue.receive(&datagram);
+    }
+    let close = (ErrorCode::CRYPTO_BUFFER_EXCEEDED.0, Some(0x06));
+    assert!(!rogue.closes.is_empty() && rogue.closes.iter().all(|sent| *sent == close));
+    // The handshake is not confirmed, so the server ends at once.
+    assert_matches!(
+        server.drive(now()).1.progress,
+        Progress::Terminal(Err(error))
+            if (error.kind(), error.reason())
+                == (Kind::Overload, "the CRYPTO data of the peer passed the buffer bound of its level")
+    );
+}
+
+/// The datagrams that `server` sends now to the path `to`. Its acknowledgements go to the path of
+/// the connection.
+fn answers_to(server: &mut Connection, to: Path) -> Vec<Vec<u8>> {
+    let sent = routed(server);
+    sent.into_iter()
+        .filter(|(path, _)| *path == to)
+        .map(|(_, datagram)| datagram)
+        .collect()
+}
+
+#[test]
+fn a_probe_from_another_path_gets_its_answer_there_within_the_limit_and_moves_no_connection() {
+    let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
+    let (home, other) = (server.path(), path(4400));
+    // A probe of 1,200 bytes: the answer has the same data, on the path of the probe, in a datagram
+    // of 1,200 bytes (RFC 9000, section 8.2.2).
+    let probe = rogue.data(&[Frame::PathChallenge { data: [7; 8] }, Frame::Padding { len: 1200 }]);
+    assert!(probe.len() >= 1200);
+    assert!(give_on(&mut server, other, &probe).is_empty());
+    let answers = answers_to(&mut server, other);
+    assert_eq!(answers.iter().map(Vec::len).collect::<Vec<_>>(), [1200]);
+    rogue.receive(&answers[0]);
+    assert_eq!(rogue.answers, [[7; 8]]);
+    // A probe is no move: the connection stays on its path (RFC 9000, section 9.1).
+    assert_eq!(server.path(), home);
+    assert!(server.address_validated());
+
+    // A small probe: its answer has at most three times its bytes.
+    let small = rogue.data(&[Frame::PathChallenge { data: [9; 8] }]);
+    assert!(give_on(&mut server, other, &small).is_empty());
+    let answers = answers_to(&mut server, other);
+    assert_eq!(answers.len(), 1);
+    assert!(answers[0].len() <= 3 * small.len());
+    rogue.receive(&answers[0]);
+    assert_eq!(rogue.answers, [[7; 8], [9; 8]]);
+    assert_eq!(server.path(), home);
+    // The server still serves the client on its path.
+    let events = attack(&mut server, &mut rogue, &[stream(0, 0, b"after", false)]);
+    assert_matches!(&events[..], [Event::Stream { data, .. }] if data.bytes() == b"after");
 }

@@ -13,6 +13,13 @@
 //!
 //! Each packet number space keeps its received ranges and outstanding packets. The spaces share
 //! the round-trip estimate, congestion window, and pacer of the path.
+//!
+//! The host gives the [`Path`] of each received region, and sends each datagram on the path that
+//! its [`Transmission`] names. A server follows a peer that moves to a new address, and validates
+//! that address before it sends more than three times the bytes that came from it. A client moves
+//! with [`Connection::migrate`]. [`Connection::close`] ends the connection with a code of the
+//! application. An end that closes, or that reads the close of its peer, gives [`Event::Closed`]
+//! at once and its terminal outcome three probe timeouts later (RFC 9000, section 10.2).
 
 use core::cmp::Ordering;
 use core::fmt;
@@ -37,8 +44,9 @@ use super::crypto::{self, Refused};
 use super::endpoint::{self, Issuer};
 use super::frame::{Ack, Direction, Frame, STREAMS_MAX};
 use super::packet::{self, Builder, Datagrams, Header, Kind as PacketKind, OpenError, Outgoing, Side};
-use super::params::{Parameters, Sender};
-use super::recovery::{self, DataRange, History, Output, Path, Received, Record, RecoveryStats, Sent};
+use super::params::{Migration, Parameters, Sender};
+use super::path::{Path, Validation};
+use super::recovery::{self, DataRange, History, Output, PathState, Paths, Received, Record, RecoveryStats, Sent};
 use super::stream::{self, Event, Priority, Stop, StreamId, Streams};
 use super::{CongestionControl, ConnectionId, ErrorCode, VARINT_MAX};
 use crate::drive::{Blocked, Ecn, Error, Kind, Progress, Turn, TurnLimits, Work};
@@ -60,8 +68,14 @@ pub struct Limits {
     /// The time from the start of the connection to a confirmed handshake. At this deadline the
     /// connection ends with [`Kind::Deadline`].
     pub handshake_timeout: Duration,
-    /// The largest datagram that this end sends: 1,200 to 65,527 bytes. A datagram that carries an
-    /// ack-eliciting Initial packet or a client Initial has at least 1,200 bytes (RFC 9000, section 14.1).
+    /// The largest datagram that this end sends: 1,200 to 65,527 bytes. Each path starts at 1,200
+    /// bytes. Above 1,200, the connection searches each validated path for the largest size that
+    /// the path carries, up to this limit and the limit of the peer (RFC 8899). The search sends at
+    /// most three probes of each size, and the loss of a probe is no sign of congestion. After three
+    /// probe timeouts in a row that lose only datagrams above 1,200 bytes, the path returns to 1,200
+    /// bytes. Set a limit above 1,200 only on a host that forbids the fragmentation of its
+    /// datagrams. A datagram that carries an ack-eliciting Initial packet or a client Initial has
+    /// at least 1,200 bytes (RFC 9000, section 14.1).
     pub datagram_bytes_max: usize,
     /// The bytes of the connection ID that this end chooses for itself: 0 to 20.
     pub cid_bytes: usize,
@@ -105,7 +119,7 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// An idle timeout of 30 s, a handshake timeout of 10 s, datagrams of at most 1,200 bytes,
+    /// An idle timeout of 30 s, a handshake timeout of 10 s, datagrams of 1,200 bytes with no search,
     /// connection IDs of 8 bytes, the key limit of the suite, and 1 MiB and 4,096 frames for each
     /// call. A window of 4 MiB for the connection and of 1 MiB for each stream, 100 streams of the
     /// peer in each direction, 6 MiB for data out of order, which the windows never reach, and no
@@ -140,8 +154,9 @@ impl Default for Limits {
     }
 }
 
-/// The smallest datagram that carries an Initial packet (RFC 9000, section 14.1).
-const DATAGRAM_MIN: usize = 1_200;
+/// The smallest datagram that carries an Initial packet, and the size that each path carries with
+/// no search (RFC 9000, section 14).
+pub(super) const DATAGRAM_MIN: usize = 1_200;
 /// A token of this size leaves room for a CRYPTO frame in a minimum-sized Initial.
 const CLIENT_TOKEN_MAX: usize = 1024;
 /// The largest UDP payload (RFC 9000, section 18.2).
@@ -439,12 +454,63 @@ enum End {
     },
 }
 
-/// A CONNECTION_CLOSE frame that waits to go out, and the error that ends the connection.
+/// The CONNECTION_CLOSE frame of an end that closes.
 #[derive(Clone, Copy, Debug)]
 struct Close {
     code: u64,
-    frame_type: u64,
-    error: Error,
+    /// The type of the frame that caused a close of the transport, or `None` for a close of the
+    /// application.
+    frame_type: Option<u64>,
+}
+
+impl Close {
+    /// The frame for a packet of `level`. A close of the application shows its code only in a
+    /// 1-RTT packet (RFC 9000, section 10.2.3).
+    const fn frame(self, level: Level) -> Frame<'static> {
+        let (code, frame_type) = match (self.frame_type, level) {
+            (None, Level::Initial | Level::Handshake) => (ErrorCode::APPLICATION_ERROR.0, Some(0)),
+            (frame_type, _) => (self.code, frame_type),
+        };
+        Frame::ConnectionClose {
+            code,
+            frame_type,
+            reason: &[],
+        }
+    }
+}
+
+/// The end of a connection, before its terminal outcome (RFC 9000, section 10.2): a closing end
+/// sends its CONNECTION_CLOSE frame, and a draining end sends nothing.
+#[derive(Clone, Copy, Debug)]
+struct Ending {
+    /// The terminal outcome of the connection.
+    outcome: Result<(), Error>,
+    /// The frame of a closing end. `None` for a draining end.
+    close: Option<Close>,
+    /// A copy of the frame waits to go out.
+    send: bool,
+    /// The datagrams of the peer since the end. A copy of the frame answers datagram 1, 2, 4, 8,
+    /// and so on, so a peer that lost the frame gets it again at a bounded rate.
+    heard: u64,
+    /// The application did not take [`Event::Closed`].
+    notify: bool,
+    /// The end of the closing or draining period. `None` before the handshake is confirmed: the
+    /// connection then ends when its frame is out, so its handshake slot is free at once.
+    until: Option<Instant>,
+}
+
+/// The answer to a PATH_CHALLENGE frame, which waits to go out on the path of the challenge
+/// (RFC 9000, section 8.2.2).
+#[derive(Clone, Copy)]
+struct Answer {
+    path: Path,
+    data: [u8; 8],
+    /// The connection ID of the peer for that path, when the challenge came.
+    dcid: ConnectionId,
+    /// The bytes of the datagram of an answer on a path that does not carry the connection: 1,200,
+    /// and for a path with no validation at most three times the bytes of the datagram of the
+    /// challenge.
+    room: usize,
 }
 
 /// The code from an authenticated CONNECTION_CLOSE frame of the peer.
@@ -487,13 +553,15 @@ impl PeerClose {
     }
 }
 
-/// The length and IP ECN codepoint of one outgoing UDP datagram.
+/// The length, the IP ECN codepoint, and the path of one outgoing UDP datagram.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Transmission {
     /// The initialized prefix of the output buffer.
     pub len: usize,
     /// The codepoint for the host to apply to this datagram.
     pub ecn: Ecn,
+    /// Send the datagram from `path.local` to `path.peer`.
+    pub path: Path,
 }
 
 #[derive(Clone, Copy)]
@@ -548,7 +616,13 @@ pub struct Connection {
     parameters_kept: bool,
     events: Vec<QuicEvent>,
     spaces: [Space; 3],
-    path: Path,
+    paths: Paths,
+    /// The answers to the PATH_CHALLENGE frames of the peer that wait to go out: one for a
+    /// challenge on the path of the connection, and one for a challenge on another path. A later
+    /// challenge of the same kind replaces the answer, and the peer then sends its challenge again.
+    answers: [Option<Answer>; 2],
+    /// The room for frames that the queue of unreliable datagrams follows.
+    fitted: usize,
     sides: super::side::Flows,
     window: u64,
     /// Start of the client probe timer when address validation still needs a packet.
@@ -561,8 +635,6 @@ pub struct Connection {
     /// The connection ID of this end: the destination of the packets of the peer.
     local_cid: ConnectionId,
     initial_local: ConnectionId,
-    /// The connection ID of the peer: the destination of the packets of this end.
-    remote_cid: ConnectionId,
     /// The destination connection ID of the first Initial packet of the client.
     original_cid: ConnectionId,
     retry_cid: Option<ConnectionId>,
@@ -573,7 +645,6 @@ pub struct Connection {
     random: &'static dyn rustls::crypto::SecureRandom,
     reset_mask: rscrypto::SecretBytes<32>,
     used_remote: Option<ConnectionId>,
-    reset_until: Option<Instant>,
     /// The peer source ID in Initial and Handshake packets. Rotation only affects the data path.
     initial_peer: Option<ConnectionId>,
     facts: Option<Facts>,
@@ -592,7 +663,7 @@ pub struct Connection {
     handshake_done: bool,
     /// A PING frame waits for the next 1-RTT packet.
     ping: bool,
-    close: Option<Close>,
+    ending: Option<Ending>,
     peer_close: Option<PeerClose>,
     outcome: Option<Result<(), Error>>,
     /// The packets of the peer that failed authentication, across each key.
@@ -611,6 +682,11 @@ pub struct Connection {
 /// The frames of an opened packet: its payload, and the offset of the next frame.
 struct Reading {
     destination: ConnectionId,
+    /// The path and the bytes of the datagram of the packet.
+    path: Path,
+    datagram: usize,
+    /// Each frame so far only probes a path (RFC 9000, section 9.1).
+    probing: bool,
     level: Level,
     payload: Lease,
     at: usize,
@@ -729,8 +805,8 @@ fn encode(parameters: &Parameters, credit: &mut Credit) -> Result<Vec<u8>, Error
 }
 
 impl Connection {
-    /// Makes the client end of a connection to the server `name`, a DNS name or an IP address.
-    /// The first Initial packet waits for [`transmit`](Self::transmit).
+    /// Makes the client end of a connection to the server `name`, a DNS name or an IP address, on
+    /// `path`. The first Initial packet waits for [`transmit`](Self::transmit).
     ///
     /// Refuses with [`Kind::Misuse`] when `name` is not valid, `config` offers no ALPN name
     /// (RFC 9001, section 8.1), or `limits` cannot work, and with [`Kind::Overload`] when
@@ -738,6 +814,7 @@ impl Connection {
     pub fn client(
         config: &tls::ClientConfig,
         name: &str,
+        path: Path,
         limits: Limits,
         budget: &Budget,
         now: Instant,
@@ -773,6 +850,7 @@ impl Connection {
             ),
             (stream, random, held, config.cost, Arc::clone(&config.own)),
             (local_cid, original_cid, original_cid),
+            path,
             limits,
             budget,
             now,
@@ -792,8 +870,8 @@ impl Connection {
         Ok(connection)
     }
 
-    /// Makes the server end of the connection that the client starts with the Initial packet of
-    /// `initial`, the header of its first packet. Give that packet to
+    /// Makes the server end of the connection that the client starts on `path` with the Initial
+    /// packet of `initial`, the header of its first packet. Give that packet to
     /// [`receive`](Self::receive) next. Use [`super::Endpoint`] for a listener with shared routing,
     /// address proofs, stateless reset, and handshake admission. This constructor serves one externally routed connection.
     ///
@@ -803,17 +881,19 @@ impl Connection {
     pub fn server(
         config: &tls::ServerConfig,
         initial: &Header,
+        path: Path,
         limits: Limits,
         budget: &Budget,
         now: Instant,
     ) -> Result<Self, Error> {
-        Self::server_admitted(config, initial, None, limits, budget, now)
+        Self::server_admitted(config, initial, None, path, limits, budget, now)
     }
 
     pub(super) fn server_admitted(
         config: &tls::ServerConfig,
         initial: &Header,
         admission: Option<(Issuer, Option<endpoint::Proof>)>,
+        path: Path,
         limits: Limits,
         budget: &Budget,
         now: Instant,
@@ -852,6 +932,7 @@ impl Connection {
             ),
             (stream, random, held, config.cost, Arc::clone(&config.own)),
             (local_cid, scid, dcid),
+            path,
             limits,
             budget,
             now,
@@ -859,7 +940,7 @@ impl Connection {
         if let Some((issuer, proof)) = admission {
             connection.issuer = Some(issuer);
             if proof.is_some() {
-                connection.path.amplification_credit = None;
+                connection.paths.active.amplification_credit = None;
             }
             if let Some(endpoint::Proof::Retry { original, retry }) = proof {
                 connection.original_cid = original;
@@ -885,6 +966,7 @@ impl Connection {
             Arc<Owns>,
         ),
         (local_cid, remote_cid, original_cid): (ConnectionId, ConnectionId, ConnectionId),
+        path: Path,
         limits: Limits,
         budget: &Budget,
         now: Instant,
@@ -909,8 +991,8 @@ impl Connection {
         } else {
             Side::Server
         };
-        let mut path = Path::new(limits.datagram_bytes_max, limits.congestion_control, budget);
-        path.amplification_credit = (side == Side::Server).then_some(0);
+        let mut active = PathState::new(path, remote_cid, limits.datagram_bytes_max, limits.congestion_control);
+        active.amplification_credit = (side == Side::Server).then_some(0);
         Ok(Self {
             end,
             tls,
@@ -923,7 +1005,9 @@ impl Connection {
             parameters_kept: false,
             events,
             spaces: core::array::from_fn(|_| Space::new(budget, window)),
-            path,
+            paths: Paths::new(active, budget),
+            answers: [None; 2],
+            fitted: usize::MAX,
             sides: super::side::Flows::new(budget, limits.side_flows_max),
             window,
             validation_at: now,
@@ -931,7 +1015,6 @@ impl Connection {
             write: Level::Initial,
             read: Level::Initial,
             local_cid,
-            remote_cid,
             original_cid,
             retry_cid: None,
             initial_token: None,
@@ -941,7 +1024,6 @@ impl Connection {
             random,
             reset_mask,
             used_remote: None,
-            reset_until: None,
             initial_local: local_cid,
             initial_peer: None,
             facts: None,
@@ -955,7 +1037,7 @@ impl Connection {
             confirmed: false,
             handshake_done: false,
             ping: false,
-            close: None,
+            ending: None,
             peer_close: None,
             outcome: None,
             failures: 0,
@@ -1012,9 +1094,15 @@ impl Connection {
         self.ids.issued()
     }
 
-    /// Whether the server can send beyond three times the bytes it received on this path.
+    /// The path that carries the connection: the destination of its datagrams, but for the
+    /// probes of other paths.
+    pub const fn path(&self) -> Path {
+        self.paths.active.addresses
+    }
+
+    /// Whether this end can send beyond three times the bytes it received on this path.
     pub fn address_validated(&self) -> bool {
-        self.path.amplification_credit.is_none()
+        self.paths.active.amplification_credit.is_none()
     }
 
     /// Takes the latest unused NEW_TOKEN. Keep it only for a future connection to the same service.
@@ -1044,27 +1132,203 @@ impl Connection {
         AddressToken::copy(bytes, service, &self.budget)
     }
 
-    /// Switches to a spare destination ID and retires the old ID. Returns false if no spare has arrived.
+    /// Switches to a spare destination ID and retires the old ID. Returns false if no spare has
+    /// arrived, and while the validation of a path keeps the old ID for the path before it.
     pub fn rotate_peer_id(&mut self) -> Result<bool, Error> {
         self.live()?;
-        let Some(spare) = self.ids.spare(self.remote_cid) else {
+        let current = self.paths.active.remote_cid;
+        let Some(spare) = self.ids.spare(current).filter(|_| self.paths.validation.is_none()) else {
             return Ok(false);
         };
-        let old = self
-            .ids
-            .peer(self.remote_cid)
-            .expect("a spare accompanies a current ID");
+        let old = self.ids.peer(current).expect("a spare accompanies a current ID");
         self.ids.rotate(old.sequence).map_err(|_| endpoint::NO_ROOM)?;
-        self.destination(spare.id);
+        self.paths.active.remote_cid = spare.id;
         Ok(true)
     }
 
-    fn destination(&mut self, cid: ConnectionId) {
-        let previous = self.remote_cid.as_bytes().len();
-        self.remote_cid = cid;
-        if cid.as_bytes().len() > previous {
-            self.streams.resize_unreliable(self.frame_room());
+    /// Moves a client to `path`, a new local address with the same address of the server (RFC
+    /// 9000, section 9.2). The next packets leave on `path` with a spare connection ID of the
+    /// server, and the client validates the path. If the path gives no answer in three probe
+    /// timeouts, the client returns to the path that it left. Returns false when no spare
+    /// connection ID has arrived: the client then stays on its path.
+    ///
+    /// Refuses with [`Kind::Misuse`] on a server, before the handshake is confirmed, and for
+    /// another address of the server. Refuses with [`Kind::Unsupported`] when the server
+    /// disabled migration.
+    pub fn migrate(&mut self, path: Path, now: Instant) -> Result<bool, Error> {
+        self.live()?;
+        self.check_clock(now)?;
+        let active = &self.paths.active;
+        if matches!(self.end, End::Server { .. }) || !self.confirmed || path.peer != active.addresses.peer {
+            return Err(Error::new(
+                Kind::Misuse,
+                "only a confirmed QUIC client moves, and to the same server address",
+            ));
         }
+        if path == active.addresses {
+            return Ok(true);
+        }
+        if self.peer.is_some_and(|peer| peer.migration == Migration::Disabled) {
+            return Err(Error::new(Kind::Unsupported, "the QUIC server disabled migration"));
+        }
+        // A connection ID goes out from one local address only (RFC 9000, section 9.5).
+        let returns = self
+            .paths
+            .validation
+            .as_ref()
+            .is_some_and(|validation| validation.fallback.addresses == path);
+        if !returns && !active.remote_cid.as_bytes().is_empty() && self.ids.spare(active.remote_cid).is_none() {
+            return Ok(false);
+        }
+        self.moved(path, 0, now)?;
+        // A packet that is not a probe shows the server the new path (RFC 9000, section 9.2).
+        self.ping = true;
+        Ok(true)
+    }
+
+    /// Makes `path` the active path: the path of the newest packet of a peer that moved, or the
+    /// path that a client selected (RFC 9000, section 9.3). `received` is the size of the datagram
+    /// that showed the path to a server, which sends at most three times the bytes that came from
+    /// an address with no validation.
+    fn moved(&mut self, path: Path, received: u64, now: Instant) -> Result<(), Error> {
+        // A return to the last validated path ends the validation of the path that the connection
+        // leaves, and restores the delivery state of the path (RFC 9000, section 9.3.2).
+        if let Some(validation) = self
+            .paths
+            .validation
+            .take_if(|validation| validation.fallback.addresses == path)
+        {
+            self.paths.active = validation.fallback;
+            return Ok(());
+        }
+        let server = matches!(self.end, End::Server { .. });
+        let old = &self.paths.active;
+        // A new path takes a connection ID that no other path used, when the peer gave one, and
+        // never waits for one (RFC 9000, section 9.5).
+        let remote_cid = self.ids.spare(old.remote_cid).map_or(old.remote_cid, |spare| spare.id);
+        let mut next = old.next(path, remote_cid, self.datagram_top(), self.limits.congestion_control);
+        next.amplification_credit = server.then_some(received.saturating_mul(3));
+        // The new path can have a longer round trip than the old one (RFC 9000, section 8.2.4).
+        let until = after(now, 3 * self.pto().max(next.pto(self.ack_delay_max())))?;
+        let data = self.challenge()?;
+        // A server also asks the path that the peer left, so a peer that did not move answers
+        // there and brings the connection back (RFC 9000, section 9.3.3).
+        let left = if server { Some(self.challenge()?) } else { None };
+        let old = self.paths.switch(next);
+        match &mut self.paths.validation {
+            // The path that the connection leaves had no validation: the fallback path stays.
+            Some(validation) => {
+                validation.data = data;
+                validation.send = true;
+                validation.padded = None;
+                validation.until = until;
+            }
+            None => {
+                self.paths.validation = Some(Validation {
+                    fallback: old,
+                    data,
+                    send: true,
+                    padded: None,
+                    until,
+                    left,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The data of a PATH_CHALLENGE frame, from the source of the connection.
+    fn challenge(&self) -> Result<[u8; 8], Error> {
+        let mut data = [0; 8];
+        tls::scoped(self.stream.as_ref(), || self.random.fill(&mut data)).map_err(|_| endpoint::RANDOM)?;
+        Ok(data)
+    }
+
+    /// Takes a PATH_RESPONSE frame. The data of the challenge of the active path shows that the
+    /// peer is at its address. When each copy of the challenge had 1,200 bytes, it also shows that
+    /// the path carries QUIC, and the validation is complete. Else a challenge of 1,200 bytes
+    /// follows (RFC 9000, section 8.2.1).
+    fn responded(&mut self, data: [u8; 8], now: Instant) -> Result<(), Failure> {
+        let Some(validation) = self
+            .paths
+            .validation
+            .take_if(|validation| validation.data == data && validation.padded.is_some())
+        else {
+            return Ok(());
+        };
+        let active = &mut self.paths.active;
+        active.amplification_credit = None;
+        active.amplification_blocked = false;
+        if validation.padded != Some(true) {
+            self.paths.validation = Some(Validation {
+                data: self.challenge()?,
+                send: true,
+                padded: None,
+                until: after(now, 3 * self.pto())?,
+                ..validation
+            });
+            return Ok(());
+        }
+        // The connection ID of the path that the connection left is not used again.
+        if validation.fallback.remote_cid != active.remote_cid
+            && let Some(old) = self.ids.peer(validation.fallback.remote_cid)
+        {
+            self.ids
+                .rotate(old.sequence)
+                .map_err(|code| Failure::transport(code, 0x1b, VIOLATION))?;
+        }
+        Ok(())
+    }
+
+    /// Ends the connection with the error code `code` of the application protocol. The next
+    /// [`transmit`](Self::transmit) gives the CONNECTION_CLOSE frame, and each later call of the
+    /// application refuses with [`Kind::Cancelled`]. After the handshake is confirmed, the
+    /// connection sends the frame again when datagrams of the peer still arrive, and gives its
+    /// terminal outcome, `Ok`, three probe timeouts later (RFC 9000, section 10.2.1). Before that,
+    /// it ends when the frame is out, and the frame of an Initial or Handshake packet shows only
+    /// that the application closed.
+    ///
+    /// Refuses with [`Kind::Misuse`] when `code` is above 2^62 - 1, and with the error of a
+    /// connection that ended.
+    pub fn close(&mut self, code: u64, now: Instant) -> Result<(), Error> {
+        self.live()?;
+        self.check_clock(now)?;
+        if code > VARINT_MAX {
+            return Err(Error::new(
+                Kind::Misuse,
+                "the error code of a QUIC close is above 2^62 - 1",
+            ));
+        }
+        let close = Close { code, frame_type: None };
+        self.end_with(Ok(()), Some(close), now);
+        if let Some(ending) = &mut self.ending {
+            ending.notify = false;
+        }
+        Ok(())
+    }
+
+    /// Ends the connection for the application: `close` is the frame of a closing end, and `None`
+    /// starts the draining period of an end that read the close of its peer. The terminal outcome
+    /// follows three probe timeouts later (RFC 9000, section 10.2).
+    fn end_with(&mut self, outcome: Result<(), Error>, close: Option<Close>, now: Instant) {
+        self.reading = None;
+        let until = if self.confirmed {
+            after(now, 3 * self.pto()).ok()
+        } else {
+            None
+        };
+        if until.is_none() && close.is_none() {
+            self.outcome = Some(outcome);
+            return;
+        }
+        self.ending = Some(Ending {
+            outcome,
+            close,
+            send: close.is_some(),
+            heard: 0,
+            notify: until.is_some(),
+            until,
+        });
     }
 
     fn issue_id(&mut self) -> Result<(), Error> {
@@ -1093,12 +1357,12 @@ impl Connection {
         })
     }
 
+    /// Starts the draining period of a connection that the peer reset (RFC 9000, section 10.3.1).
     pub(super) fn stateless_reset(&mut self, now: Instant) -> Result<(), Error> {
         self.check_clock(now)?;
-        if self.outcome.is_none() && self.reset_until.is_none() {
-            self.reset_until = Some(after(now, 3 * self.pto())?);
+        if self.outcome.is_none() && self.ending.is_none() {
             self.peer_close = Some(PeerClose::StatelessReset);
-            self.close = None;
+            self.end_with(PeerClose::StatelessReset.outcome(), None, now);
         }
         Ok(())
     }
@@ -1125,7 +1389,7 @@ impl Connection {
 
     /// The round-trip estimate, congestion window, and recovery counters of the current path.
     pub fn recovery(&self) -> RecoveryStats {
-        self.path.stats()
+        self.paths.active.stats()
     }
 
     /// Opens a recovery space for a negotiated side flow. The extension owns the wire protocol.
@@ -1157,12 +1421,13 @@ impl Connection {
         }
         self.check_clock(now)?;
         let control = self.spaces.iter().any(|space| space.probe || space.ranges.due)
-            || (self.path.room() >= self.datagram_bytes() as u64
+            || (self.paths.active.room() >= self.datagram_bytes() as u64
                 && (self.ping
                     || self.handshake_done
+                    || self.path_frames()
                     || self.streams.control_pending()
                     || self.spaces.iter().any(|space| space.send.pending())));
-        self.sides.admit(flow, &mut self.path, bytes as u64, now, control)
+        self.sides.admit(flow, &mut self.paths, bytes as u64, now, control)
     }
 
     /// Applies the packet ranges and ECN counts from an authenticated side acknowledgement.
@@ -1173,12 +1438,12 @@ impl Connection {
         self.check_clock(now)?;
         let limited = self.limited();
         let delay = self.ack_delay(ack.delay);
-        self.sides.acknowledge(flow, &mut self.path, ack, delay, now, limited)
+        self.sides.acknowledge(flow, &mut self.paths, ack, delay, now, limited)
     }
 
     /// Releases the recovery state and outstanding flight of an ended side flow.
     pub fn close_side_flow(&mut self, flow: super::SideFlow) -> Result<(), Error> {
-        self.sides.close(flow, &mut self.path)
+        self.sides.close(flow, &mut self.paths)
     }
 
     /// The transport parameters of the peer, after the handshake completed.
@@ -1207,14 +1472,10 @@ impl Connection {
 
     /// Refuses a call of the application after the connection ended.
     fn live(&self) -> Result<(), Error> {
-        if self.reset_until.is_some() {
-            return PeerClose::StatelessReset.outcome();
-        }
-        match (self.outcome, &self.close) {
-            (Some(Err(error)), _) => Err(error),
-            (Some(Ok(())), _) => Err(Error::new(Kind::Cancelled, "the QUIC connection closed")),
-            (None, Some(close)) => Err(close.error),
-            (None, None) => Ok(()),
+        match self.outcome.or_else(|| self.ending.map(|ending| ending.outcome)) {
+            Some(Err(error)) => Err(error),
+            Some(Ok(())) => Err(Error::new(Kind::Cancelled, "the QUIC connection closed")),
+            None => Ok(()),
         }
     }
 
@@ -1300,7 +1561,19 @@ impl Connection {
     /// header, with the longest packet number, and before its tag.
     fn frame_room(&self) -> usize {
         self.datagram_bytes()
-            .saturating_sub(1 + self.remote_cid.as_bytes().len() + 4 + packet::TAG)
+            .saturating_sub(1 + self.paths.active.remote_cid.as_bytes().len() + 4 + packet::TAG)
+    }
+
+    /// Applies the datagram size of the active path: the controller counts its window in
+    /// datagrams of this size, and an unreliable datagram that waits and no longer fits drops
+    /// with its count.
+    fn fit(&mut self) {
+        let bytes = self.datagram_bytes() as u64;
+        self.paths.active.controller.datagram_limit(bytes);
+        let room = self.frame_room();
+        if room < core::mem::replace(&mut self.fitted, room) {
+            self.streams.resize_unreliable(room);
+        }
     }
 
     /// The bytes of the largest unreliable datagram (RFC 9221) that goes out now, or `None` when
@@ -1309,7 +1582,8 @@ impl Connection {
         self.streams.unreliable_room(self.frame_room())
     }
 
-    /// Queued unreliable datagrams dropped because a new destination ID left too little space.
+    /// Queued unreliable datagrams dropped because a longer destination ID or a smaller datagram
+    /// size of the path left too little space.
     pub const fn unreliable_dropped(&self) -> u64 {
         self.streams.unreliable_dropped
     }
@@ -1334,21 +1608,24 @@ impl Connection {
         self.refused
     }
 
-    /// Opens the packets of `datagrams`, the received region, runs the handshake on their CRYPTO
-    /// data, and reads the frames of the streams. A packet that this end cannot open is
-    /// discarded. Gives the next event, and stops there: call again with the same region while
-    /// the call gives an event or [`Progress::Pending`].
-    pub fn receive(&mut self, datagrams: &mut Datagrams, now: Instant) -> (Option<Event>, Turn) {
+    /// Opens the packets of `datagrams`, the received region, which arrived on `path`. Runs the
+    /// handshake on their CRYPTO data, and reads the frames of the streams. A packet that this end
+    /// cannot open is discarded. Gives the next event, and stops there: call again with the same
+    /// region and path while the call gives an event or [`Progress::Pending`].
+    ///
+    /// A server takes the packets of each path, and follows its peer to the path of its newest
+    /// packet. A client takes only the packets of its path, and of the path that it left.
+    pub fn receive(&mut self, datagrams: &mut Datagrams, path: Path, now: Instant) -> (Option<Event>, Turn) {
         let mut work = Work::default();
         self.more = false;
         if let Err(error) = self.timers(now) {
             self.outcome = Some(Err(error));
         }
         loop {
-            if let Some(event) = self.next_event(&mut work) {
+            if let Some(event) = self.next_event(&mut work, now) {
                 return (Some(event), self.turn());
             }
-            if self.outcome.is_some() || self.close.is_some() || self.reset_until.is_some() {
+            if self.outcome.is_some() {
                 break;
             }
             if work.reached(&self.limits.turn) {
@@ -1361,9 +1638,10 @@ impl Connection {
                 break;
             };
             match next {
+                Ok(packet) if self.ending.is_some() => self.heard(&packet, &mut work),
                 Ok(packet) => {
-                    if let Err(failure) = self.packet(packet, &mut work, now, ecn) {
-                        self.fail(failure);
+                    if let Err(failure) = self.packet(packet, path, &mut work, now, ecn) {
+                        self.fail(failure, now);
                     }
                 }
                 Err(_) => work.add(1, 1),
@@ -1378,6 +1656,20 @@ impl Connection {
         (None, self.turn())
     }
 
+    /// Counts a datagram of the peer for a closing end, which reads no packet. A copy of the
+    /// CONNECTION_CLOSE frame answers datagram 1, 2, 4, 8, and so on (RFC 9000, section 10.2.1).
+    fn heard(&mut self, packet: &packet::Protected<'_>, work: &mut Work) {
+        work.add(packet.header().end(), 0);
+        if let Header::Protected { dcid, .. } = packet.header()
+            && packet.datagram().1
+            && self.ids.issued().contains(&Some(*dcid))
+            && let Some(ending) = &mut self.ending
+        {
+            ending.heard = ending.heard.saturating_add(1);
+            ending.send |= ending.close.is_some() && ending.heard.is_power_of_two();
+        }
+    }
+
     /// Runs the timers at `now`, and the work that waits: the events of the streams, the frames
     /// after an event, and the handshake work that a limit of a turn or the budget stopped. Gives
     /// the next event. Call it at the deadline of the last turn, when capacity is free, after the
@@ -1389,15 +1681,23 @@ impl Connection {
         if let Err(error) = self.timers(now) {
             self.outcome = Some(Err(error));
         }
-        let event = self.next_event(&mut work);
+        let event = self.next_event(&mut work, now);
         (event, self.turn())
     }
 
-    /// Gives the next event of the streams, from the events that wait and then from the frames of
-    /// the packet that the engine reads, and else runs the handshake.
-    fn next_event(&mut self, work: &mut Work) -> Option<Event> {
+    /// Gives the next event: the end of the connection, then the events of the streams that wait,
+    /// and then the events of the frames of the packet that the engine reads. Else runs the
+    /// handshake.
+    fn next_event(&mut self, work: &mut Work, now: Instant) -> Option<Event> {
         for _ in 0..2 {
-            if self.outcome.is_some() || self.close.is_some() || self.reset_until.is_some() {
+            if let Some(ending) = &mut self.ending
+                && self.outcome.is_none()
+                && core::mem::take(&mut ending.notify)
+            {
+                self.more = true;
+                return Some(Event::Closed(ending.outcome));
+            }
+            if self.outcome.is_some() || self.ending.is_some() {
                 return None;
             }
             if let Some(flow) = self.sides.notify_probe.take() {
@@ -1414,14 +1714,14 @@ impl Connection {
                     return Some(event);
                 }
                 Ok(None) => {}
-                Err(failure) => self.fail(failure),
+                Err(failure) => self.fail(failure, now),
             }
         }
         if self.outcome.is_none()
-            && self.close.is_none()
+            && self.ending.is_none()
             && let Err(failure) = self.advance(work)
         {
-            self.fail(failure);
+            self.fail(failure, now);
         }
         None
     }
@@ -1449,19 +1749,20 @@ impl Connection {
         if self.outcome.is_some() {
             return Ok(None);
         }
-        if self.reset_until.is_some() {
-            return Ok(self.reset_until);
+        if let Some(ending) = &self.ending {
+            return Ok(ending.until.or(self.handshake_deadline));
         }
         let previous = self
             .one_rtt
             .as_ref()
             .and_then(|keys| keys.previous.as_ref().map(|(_, until)| *until));
         let handshake = if self.confirmed { None } else { self.handshake_deadline };
+        let validation = self.paths.validation.as_ref().map(|validation| validation.until);
         Ok(earlier(
-            earlier(self.idle_deadline()?, handshake),
+            earlier(earlier(self.idle_deadline()?, handshake), validation),
             earlier(
                 earlier(previous, self.recovery_timer().map(|(at, _)| at)),
-                self.path.pacing_wait,
+                self.paths.active.pacing_wait,
             ),
         ))
     }
@@ -1480,8 +1781,8 @@ impl Connection {
             .chain(self.sides.deadline().map(|at| (at, Alarm::SideLoss)))
             .min_by_key(|(at, _)| at.as_nanos());
         if loss.is_some()
-            || self.path.amplification_credit == Some(0)
-            || self.path.amplification_blocked
+            || self.paths.active.amplification_credit == Some(0)
+            || self.paths.active.amplification_blocked
             || self.spaces.iter().any(|space| space.probe)
         {
             return loss;
@@ -1489,7 +1790,7 @@ impl Connection {
         let delay = |base: Instant, pto: Duration| {
             let nanos = pto
                 .as_nanos()
-                .checked_mul(1u128.checked_shl(self.path.backoff)?)?
+                .checked_mul(1u128.checked_shl(self.paths.active.backoff)?)?
                 .try_into()
                 .ok()?;
             base.checked_add(Duration::from_nanos(nanos)).ok()
@@ -1498,7 +1799,7 @@ impl Connection {
             let pto = if level == Level::Data {
                 self.pto()
             } else {
-                self.path.pto(Duration::ZERO)
+                self.paths.active.pto(Duration::ZERO)
             };
             delay(base, pto).map(|at| (at, Alarm::Probe(level)))
         };
@@ -1537,20 +1838,23 @@ impl Connection {
     }
 
     /// Ends the connection at its idle or handshake deadline, with no packet (RFC 9000, section
-    /// 10.1), and drops the old key of the peer at its deadline.
+    /// 10.1), and at the end of its closing or draining period. Drops the old key of the peer at
+    /// its deadline, and leaves a path that gave no answer in the time of its validation.
     fn timers(&mut self, now: Instant) -> Result<(), Error> {
         if self.outcome.is_some() {
             return Ok(());
         }
         self.check_clock(now)?;
-        if self.reset_until.is_some() {
-            if reached(self.reset_until, now)? {
-                self.outcome = Some(PeerClose::StatelessReset.outcome());
+        if let Some(ending) = self.ending {
+            // An end with no period ends when its frame is out, and at the handshake deadline at
+            // the latest.
+            if reached(ending.until.or(self.handshake_deadline), now)? {
+                self.outcome = Some(ending.outcome);
             }
             return Ok(());
         }
-        if reached(self.path.pacing_wait, now)? {
-            self.path.pacing_wait = None;
+        if reached(self.paths.active.pacing_wait, now)? {
+            self.paths.active.pacing_wait = None;
         }
         if reached(self.idle_deadline()?, now)? {
             return Err(IDLE);
@@ -1563,6 +1867,15 @@ impl Connection {
         {
             keys.previous = None;
         }
+        // The connection returns to its last validated path, with the delivery state of that path
+        // (RFC 9000, sections 8.2.4 and 9.3.2).
+        if let Some(validation) = self
+            .paths
+            .validation
+            .take_if(|validation| validation.until.as_nanos() <= now.as_nanos())
+        {
+            self.paths.active = validation.fallback;
+        }
         if let Some((at, alarm)) = self.recovery_timer()
             && reached(Some(at), now)?
         {
@@ -1570,23 +1883,31 @@ impl Connection {
                 Alarm::Loss(level) => {
                     self.detect_loss(level, now)?;
                 }
-                Alarm::SideLoss => self.sides.timers(&mut self.path, now)?,
-                Alarm::Probe(level) => {
-                    self.spaces[level as usize].probe = true;
-                    self.path.backoff = self.path.backoff.saturating_add(1);
-                }
+                Alarm::SideLoss => self.sides.timers(&mut self.paths, now)?,
+                Alarm::Probe(level) => self.probe(level),
                 Alarm::SideProbe(flow) => {
                     self.sides.probe(flow, now);
-                    self.spaces[Level::Data as usize].probe = true;
-                    self.path.backoff = self.path.backoff.saturating_add(1);
+                    self.probe(Level::Data);
                 }
             }
         }
         Ok(())
     }
 
+    /// A probe timeout of `level` ended: its next packet is a probe (RFC 9002, section 6.2.4).
+    fn probe(&mut self, level: Level) {
+        self.spaces[level as usize].probe = true;
+        let path = &mut self.paths.active;
+        path.backoff = path.backoff.saturating_add(1);
+        path.mtu.timed_out();
+        // The probe also carries the challenge of a path that waits for its validation.
+        if let Some(validation) = &mut self.paths.validation {
+            validation.send = true;
+        }
+    }
+
     fn limited(&self) -> bool {
-        self.path.room() < self.datagram_bytes() as u64
+        self.paths.active.room() < self.datagram_bytes() as u64
             || self.sides.waiting()
             || Level::ALL.into_iter().any(|l| self.has_data(l))
     }
@@ -1621,11 +1942,11 @@ impl Connection {
             delay = self.ack_delay(ack.delay);
         }
         let limited = self.limited();
-        self.path.controller.limited(now, limited);
+        self.paths.active.controller.limited(now, limited);
         let space = &mut self.spaces[level as usize];
         let acked = space
             .history
-            .ack(ack, &mut self.path, now, delay, |record| match record {
+            .ack(ack, &mut self.paths, now, delay, |record| match record {
                 Record::Range(DataRange::Crypto { offset, len }) => space.send.acknowledged(offset, len),
                 record @ (Record::RetireId(_) | Record::NewToken) => self.ids.acknowledged(record),
                 other => self.streams.acknowledged(other),
@@ -1634,19 +1955,21 @@ impl Connection {
             space.probe = false;
             self.validation_at = now;
             if self.validated() {
-                self.path.backoff = 0;
+                self.paths.active.backoff = 0;
             }
         }
         let congestion = self.detect_loss(level, now)?;
-        self.path.acknowledged(acked, now, limited && !congestion);
+        self.paths.active.acknowledged(acked, now, limited && !congestion);
         Ok(())
     }
 
     fn detect_loss(&mut self, level: Level, now: Instant) -> Result<bool, Error> {
         let space = &mut self.spaces[level as usize];
-        space.history.detect(&mut self.path, now, |record| {
+        space.history.detect(&mut self.paths, now, |record| {
             match record {
                 record @ (Record::IssueId(_) | Record::RetireId(_) | Record::NewToken) => self.ids.lost(record),
+                // The recovery layer takes these records.
+                Record::Mtu(_) | Record::Challenge => {}
                 Record::HandshakeDone => self.handshake_done = true,
                 Record::Limit(_) | Record::Control(_, _) => self.streams.lost_control(record),
                 Record::Range(range) => {
@@ -1664,16 +1987,21 @@ impl Connection {
         })
     }
 
-    /// Opens one packet and reads its frames.
+    /// Opens one packet, which arrived on `path`, and reads its frames.
     fn packet(
         &mut self,
         packet: packet::Protected<'_>,
+        path: Path,
         work: &mut Work,
         now: Instant,
         ecn: Ecn,
     ) -> Result<(), Failure> {
         work.add(packet.header().end(), 0);
+        let active = path == self.paths.active.addresses;
         let Header::Protected { kind, dcid, scid, .. } = *packet.header() else {
+            if !active {
+                return Ok(());
+            }
             if matches!(self.end, End::Client { .. })
                 && matches!(packet.header(), Header::Negotiation { .. })
                 && packet::Negotiation::of(
@@ -1700,20 +2028,21 @@ impl Connection {
             {
                 let token = self.copy_token(&packet.bytes()[token.clone()])?;
                 let space = &mut self.spaces[0];
-                space.history.discard(&mut self.path);
+                space.history.discard(&mut self.paths);
                 space.retry.clear();
                 space.keys = None;
                 space.keys = Some(packet::initial_keys(scid, Side::Client));
                 space.send.rewind();
                 space.probe = false;
-                self.path = Path::new(
+                // The connection starts again, with the connection ID of the Retry packet.
+                self.paths.switch(PathState::new(
+                    path,
+                    *scid,
                     self.limits.datagram_bytes_max,
                     self.limits.congestion_control,
-                    &self.budget,
-                );
+                ));
                 self.initial_token = Some(token);
                 self.retry_cid = Some(*scid);
-                self.remote_cid = *scid;
                 self.validation_at = now;
             }
             return Ok(());
@@ -1727,11 +2056,12 @@ impl Connection {
         let (bytes, first) = packet.datagram();
         if first
             && ours
-            && let Some(credit) = self.path.amplification_credit.as_mut()
+            && active
+            && let Some(credit) = self.paths.active.amplification_credit.as_mut()
         {
             *credit = credit.saturating_add((bytes as u64).saturating_mul(3));
             if *credit >= DATAGRAM_MIN as u64 {
-                self.path.amplification_blocked = false;
+                self.paths.active.amplification_blocked = false;
             }
         }
         if server && kind == PacketKind::Initial && bytes < DATAGRAM_MIN {
@@ -1740,6 +2070,17 @@ impl Connection {
         let Some(level) = Level::of(kind).filter(|_| ours) else {
             return Ok(());
         };
+        // Another path carries only 1-RTT packets, after the handshake is confirmed. A server takes
+        // each path. A client takes only the path that it left, and no other address of the
+        // server (RFC 9000, section 9).
+        let known = self
+            .paths
+            .validation
+            .as_ref()
+            .is_some_and(|validation| validation.fallback.addresses == path);
+        if !active && !(level == Level::Data && self.confirmed && (server || known)) {
+            return Ok(());
+        }
         // A client takes the connection ID of the server from its first Initial packet, and drops
         // each later packet with another one (RFC 9000, section 7.2).
         if level != Level::Data && self.initial_peer.is_some_and(|first| first != scid) {
@@ -1804,20 +2145,23 @@ impl Connection {
             keys.first_received = Some(keys.first_received.map_or(number, |first| first.min(number)));
         }
         if !server && level == Level::Initial && self.initial_peer.is_none() {
-            self.remote_cid = scid;
+            self.paths.active.remote_cid = scid;
             self.initial_peer = Some(scid);
         }
         // A server drops the Initial keys when a Handshake packet of the client opens (RFC 9001,
         // section 4.9.1).
         if server && level == Level::Handshake && !self.spaces[0].discarded {
-            self.path.amplification_credit = None;
-            self.path.amplification_blocked = false;
+            self.paths.active.amplification_credit = None;
+            self.paths.active.amplification_blocked = false;
             self.discard(Level::Initial);
         }
         self.received = true;
         self.last_activity = now;
         self.reading = Some(Reading {
             destination: dcid,
+            path,
+            datagram: bytes,
+            probing: true,
             level,
             payload: packet.payload(),
             at: 0,
@@ -1865,12 +2209,17 @@ impl Connection {
             let bytes = reading.payload.bytes().get(reading.at..).unwrap_or_default();
             if bytes.is_empty() {
                 if !reading.accepted && !self.spaces[level as usize].discarded {
-                    self.spaces[level as usize].ranges.accept(
-                        reading.number,
-                        reading.received_at,
-                        reading.eliciting,
-                        reading.ecn,
-                    )?;
+                    let ranges = &mut self.spaces[level as usize].ranges;
+                    ranges.accept(reading.number, reading.received_at, reading.eliciting, reading.ecn)?;
+                    // The peer moved: its newest packet came on another path, and the packet is
+                    // not a probe (RFC 9000, section 9.3).
+                    if server
+                        && reading.path != self.paths.active.addresses
+                        && !reading.probing
+                        && ranges.largest() == Some(reading.number)
+                    {
+                        self.moved(reading.path, reading.datagram as u64, reading.received_at)?;
+                    }
                     if let Some(at) = reading.first_datagram {
                         reading.at = at;
                         reading.accepted = true;
@@ -1898,6 +2247,13 @@ impl Connection {
                 frame,
                 Frame::Padding { .. } | Frame::Ack(_) | Frame::ConnectionClose { .. }
             );
+            reading.probing &= matches!(
+                frame,
+                Frame::Padding { .. }
+                    | Frame::PathChallenge { .. }
+                    | Frame::PathResponse { .. }
+                    | Frame::NewConnectionId { .. }
+            );
             let taken = match frame {
                 Frame::Padding { .. } | Frame::Ping => Ok(None),
                 Frame::Ack(ack) => {
@@ -1921,14 +2277,14 @@ impl Connection {
                         None => PeerClose::Application(code),
                     };
                     self.peer_close = Some(close);
-                    self.outcome = Some(close.outcome());
+                    self.end_with(close.outcome(), None, reading.received_at);
                     return Ok(None);
                 }
                 Frame::HandshakeDone if !server && !handshake_level => {
                     self.confirm();
                     Ok(None)
                 }
-                Frame::HandshakeDone if server || handshake_level => {
+                Frame::HandshakeDone => {
                     return Err(Failure::transport(ErrorCode::PROTOCOL_VIOLATION, 0x1e, VIOLATION));
                 }
                 Frame::NewToken { token } => {
@@ -1996,9 +2352,15 @@ impl Connection {
                     };
                     let destination = self
                         .ids
-                        .receive(id, retire_prior_to, self.remote_cid)
+                        .receive(id, retire_prior_to, self.paths.active.remote_cid)
                         .map_err(|code| Failure::transport(code, 0x18, VIOLATION))?;
-                    self.destination(destination);
+                    self.paths.active.remote_cid = destination;
+                    // The peer also retired the connection ID of the path that the connection left.
+                    if let Some(validation) = &mut self.paths.validation
+                        && self.ids.peer(validation.fallback.remote_cid).is_none()
+                    {
+                        validation.fallback.remote_cid = destination;
+                    }
                     Ok(None)
                 }
                 Frame::RetireConnectionId { sequence } => {
@@ -2017,8 +2379,42 @@ impl Connection {
                     }
                     Ok(None)
                 }
-                // N307 owns the path frames.
-                _ => Ok(None),
+                Frame::PathChallenge { data } => {
+                    let active = &self.paths.active;
+                    let on_active = reading.path == active.addresses;
+                    let fallback = self.paths.validation.as_ref().map(|validation| &validation.fallback);
+                    let spare = self.ids.spare(active.remote_cid);
+                    let (dcid, validated) = match fallback.filter(|fallback| fallback.addresses == reading.path) {
+                        _ if on_active => (active.remote_cid, active.amplification_credit.is_none()),
+                        Some(fallback) => (fallback.remote_cid, true),
+                        // A new path takes a connection ID that no other path used, when the peer
+                        // gave one (RFC 9000, section 9.5).
+                        None => (spare.map_or(active.remote_cid, |spare| spare.id), false),
+                    };
+                    // A path with no validation takes at most three times the bytes of its challenge.
+                    let room = if validated {
+                        DATAGRAM_MIN
+                    } else {
+                        DATAGRAM_MIN.min(reading.datagram.saturating_mul(3))
+                    };
+                    self.answers[usize::from(!on_active)] = Some(Answer {
+                        path: reading.path,
+                        data,
+                        dcid,
+                        room,
+                    });
+                    // The answer on the active path goes in a packet that is not a probe, so a
+                    // peer that did not move brings the connection back (RFC 9000, section 9.3.3).
+                    self.ping |= on_active;
+                    Ok(None)
+                }
+                Frame::PathResponse { data } => {
+                    self.responded(data, reading.received_at)?;
+                    Ok(None)
+                }
+                // The credit of the peer follows the consumer of this end: these frames change
+                // nothing.
+                Frame::DataBlocked { .. } | Frame::StreamsBlocked { .. } => Ok(None),
             };
             match taken {
                 Ok(None) => {}
@@ -2076,18 +2472,21 @@ impl Connection {
             self.initial_token = None;
         }
         let space = &mut self.spaces[level as usize];
-        space.history.discard(&mut self.path);
-        self.path.backoff = 0;
+        space.history.discard(&mut self.paths);
+        self.paths.active.backoff = 0;
         space.discard(&self.budget, self.window);
+    }
+
+    /// The longest time that the peer delays an acknowledgement, after the handshake is confirmed.
+    fn ack_delay_max(&self) -> Duration {
+        self.peer
+            .filter(|_| self.confirmed)
+            .map_or(Duration::ZERO, |peer| peer.ack_delay_max)
     }
 
     /// The probe timeout of the data space, including the peer's maximum ACK delay.
     fn pto(&self) -> Duration {
-        self.path.pto(
-            self.peer
-                .filter(|_| self.confirmed)
-                .map_or(Duration::ZERO, |peer| peer.ack_delay_max),
-        )
+        self.paths.active.pto(self.ack_delay_max())
     }
 
     /// Runs rustls on the CRYPTO data in order, one level at a time, until it needs more, a limit
@@ -2096,7 +2495,7 @@ impl Connection {
         self.wait = None;
         let mut stalled = false;
         loop {
-            if matches!(self.tls, Tls::Failed) || self.close.is_some() || self.outcome.is_some() {
+            if matches!(self.tls, Tls::Failed) || self.ending.is_some() || self.outcome.is_some() {
                 return Ok(());
             }
             let level = self.read;
@@ -2340,11 +2739,12 @@ impl Connection {
         self.facts = Some(facts);
         self.held.finished(peer, evidence, &self.own.get());
         self.validate(&parameters)?;
-        self.ids.first_peer(self.remote_cid, parameters.stateless_reset_token);
+        self.ids
+            .first_peer(self.paths.active.remote_cid, parameters.stateless_reset_token);
         self.peer = Some(parameters);
         self.streams.peer(&parameters);
-        self.path.ack_delay_max = parameters.ack_delay_max;
-        self.path.datagram_limit(self.datagram_bytes());
+        self.paths.active.ack_delay_max = parameters.ack_delay_max;
+        self.paths.active.mtu.limit(parameters.udp_payload_bytes_max);
         self.idle = match (self.limits.idle_timeout, parameters.idle_timeout) {
             (Some(local), Some(remote)) => Some(local.min(remote)),
             (local, remote) => local.or(remote),
@@ -2374,7 +2774,7 @@ impl Connection {
     fn validate(&self, parameters: &Parameters) -> Result<(), Failure> {
         let invalid = || Failure::transport(ErrorCode::TRANSPORT_PARAMETER_ERROR, 0, PARAMETERS);
         if parameters.initial_source_cid != self.initial_peer
-            || (parameters.stateless_reset_token.is_some() && self.remote_cid.as_bytes().is_empty())
+            || (parameters.stateless_reset_token.is_some() && self.paths.active.remote_cid.as_bytes().is_empty())
         {
             return Err(invalid());
         }
@@ -2389,30 +2789,32 @@ impl Connection {
 
     /// Ends the connection with `failure`: its CONNECTION_CLOSE waits for
     /// [`transmit`](Self::transmit) when this end has keys to send it.
-    fn fail(&mut self, failure: Failure) {
-        if self.outcome.is_some() || self.close.is_some() {
+    fn fail(&mut self, failure: Failure, now: Instant) {
+        if self.outcome.is_some() || self.ending.is_some() {
             return;
         }
         self.reading = None;
         let keys = self.spaces.iter().any(|space| space.keys.is_some()) || self.one_rtt.is_some();
         match failure.code {
             Some((code, frame_type)) if keys => {
-                self.close = Some(Close {
+                let close = Close {
                     code,
-                    frame_type,
-                    error: failure.error,
-                });
+                    frame_type: Some(frame_type),
+                };
+                self.end_with(Err(failure.error), Some(close), now);
             }
             _ => self.outcome = Some(Err(failure.error)),
         }
     }
 
-    /// Builds an unmarked datagram at the start of `out`. Gives its length, or `None` when no datagram can leave now. Call it until it gives `None`. The datagram has at most
-    /// [`Limits::datagram_bytes_max`] bytes. A client Initial or an ack-eliciting server Initial needs at least 1,200.
+    /// Builds an unmarked datagram at the start of `out`. Gives its length and its path, or `None`
+    /// when no datagram can leave now. Call it until it gives `None`. The datagram has at most
+    /// [`Limits::datagram_bytes_max`] bytes. A client Initial or an ack-eliciting server Initial
+    /// needs at least 1,200.
     ///
     /// Refuses with [`Kind::Misuse`] when `out` has fewer bytes than
     /// [`Limits::datagram_bytes_max`].
-    pub fn transmit(&mut self, out: &mut [u8], now: Instant) -> Result<Option<usize>, Error> {
+    pub fn transmit(&mut self, out: &mut [u8], now: Instant) -> Result<Option<Transmission>, Error> {
         self.transmit_mark(out, now, Ecn::NotEct)
     }
 
@@ -2421,15 +2823,15 @@ impl Connection {
     /// After `None`, call [`drive`](Self::drive) to get the next deadline.
     pub fn transmit_ecn(&mut self, out: &mut [u8], now: Instant) -> Result<Option<Transmission>, Error> {
         self.check_clock(now)?;
-        let ecn = self.path.mark(now);
-        let len = self.transmit_mark(out, now, ecn)?;
-        if len.is_some() {
-            self.path.marked(ecn, now);
+        let ecn = self.paths.active.mark(now);
+        let sent = self.transmit_mark(out, now, ecn)?;
+        if let Some(sent) = sent {
+            self.paths.active.marked(sent.ecn, now);
         }
-        Ok(len.map(|len| Transmission { len, ecn }))
+        Ok(sent)
     }
 
-    fn transmit_mark(&mut self, out: &mut [u8], now: Instant, mark: Ecn) -> Result<Option<usize>, Error> {
+    fn transmit_mark(&mut self, out: &mut [u8], now: Instant, mark: Ecn) -> Result<Option<Transmission>, Error> {
         self.check_clock(now)?;
         if out.len() < self.limits.datagram_bytes_max {
             return Err(Error::new(
@@ -2437,60 +2839,95 @@ impl Connection {
                 "a QUIC datagram needs an output of the bytes of its limit",
             ));
         }
-        if self.outcome.is_some() || self.reset_until.is_some() {
+        if self.outcome.is_some() {
             return Ok(None);
         }
-        let mut room = self.datagram_bytes();
-        if let Some(credit) = self.path.amplification_credit {
-            room = room.min(usize::try_from(credit).unwrap_or(usize::MAX));
-            let pad = self.close.is_some()
-                || (self.spaces[0].keys.is_some() && (self.spaces[0].probe || self.has_data(Level::Initial)));
-            if room == 0 || (pad && room < DATAGRAM_MIN) {
-                self.amplification_blocked();
-                return Ok(None);
+        let send = SendAt {
+            now,
+            mark,
+            admitted: false,
+        };
+        if self.ending.is_none() {
+            self.fit();
+            match self.build(out, send) {
+                Ok(sent) => return Ok(sent),
+                Err(failure) => self.fail(failure, now),
             }
         }
-        let out = &mut out[..room];
-        let built = match self.close {
-            Some(close) => self.closing(out, close, now, mark),
-            None => self.datagram(out, now, mark),
-        };
-        let sent = match built {
-            Ok(len) => len,
-            Err(failure) => {
-                self.fail(failure);
-                self.close
-                    .and_then(|close| self.closing(out, close, now, mark).ok().flatten())
-            }
-        };
-        if let (Some(n), Some(credit)) = (sent, &mut self.path.amplification_credit) {
-            *credit -= n as u64;
-            self.path.amplification_blocked = false;
-        } else if sent.is_none()
-            && room < DATAGRAM_MIN
-            && self.path.pacing_wait.is_none()
-            && self.path.room() >= room as u64
-        {
+        Ok(self.closing(out, send))
+    }
+
+    /// Builds the next datagram of a live connection: for a path that does not carry the
+    /// connection, then a probe of the datagram size, and then the packets that wait.
+    fn build(&mut self, out: &mut [u8], send: SendAt) -> Result<Option<Transmission>, Failure> {
+        if let Some((len, path)) = self.off_path(out, send)? {
+            let ecn = Ecn::NotEct;
+            return Ok(Some(Transmission { len, ecn, path }));
+        }
+        let (path, ecn) = (self.paths.active.addresses, send.mark);
+        if let Some(len) = self.size_probe(out, send)? {
+            return Ok(Some(Transmission { len, ecn, path }));
+        }
+        let room = self.room();
+        let pad = self.spaces[0].keys.is_some() && (self.spaces[0].probe || self.has_data(Level::Initial));
+        if self.paths.active.amplification_credit.is_some() && (room == 0 || (pad && room < DATAGRAM_MIN)) {
             self.amplification_blocked();
+            return Ok(None);
         }
-        Ok(sent)
+        let Some(len) = self.datagram(&mut out[..room], send.now, send.mark)? else {
+            let active = &self.paths.active;
+            if room < DATAGRAM_MIN && active.pacing_wait.is_none() && active.room() >= room as u64 {
+                self.amplification_blocked();
+            }
+            return Ok(None);
+        };
+        self.paths.active.charge(len as u64);
+        Ok(Some(Transmission { len, ecn, path }))
+    }
+
+    /// The bytes of the next datagram to the active path: its datagram size, and what the
+    /// amplification limit leaves. After a probe timeout, at most 1,200 bytes, so a path that now
+    /// drops larger datagrams still carries the probe.
+    fn room(&self) -> usize {
+        let path = &self.paths.active;
+        let size = if self.spaces.iter().any(|space| space.probe) {
+            DATAGRAM_MIN
+        } else {
+            path.mtu.size()
+        };
+        path.amplification_credit
+            .map_or(size, |credit| size.min(usize::try_from(credit).unwrap_or(usize::MAX)))
     }
 
     fn amplification_blocked(&mut self) {
-        let pending = self.close.is_some() || Level::ALL.into_iter().any(|level| self.wants(level, true));
-        if pending && !self.path.amplification_blocked {
-            self.path.amplification_blocked = true;
-            self.path.amplification_rounds = self.path.amplification_rounds.saturating_add(1);
+        let pending = self.ending.is_some() || Level::ALL.into_iter().any(|level| self.wants(level, true));
+        let path = &mut self.paths.active;
+        if pending && !path.amplification_blocked {
+            path.amplification_blocked = true;
+            path.amplification_rounds = path.amplification_rounds.saturating_add(1);
         }
     }
 
-    /// The bytes of the largest datagram that this end sends: its limit, and the limit of the
-    /// peer.
+    /// The bytes of the largest datagram that this end sends now: the datagram size of the
+    /// active path.
     fn datagram_bytes(&self) -> usize {
+        self.paths.active.mtu.size()
+    }
+
+    /// The top of the search for the datagram size of a path: the limit of this end, and the
+    /// limit of the peer.
+    fn datagram_top(&self) -> usize {
         let peer = self.peer.map_or(usize::MAX, |peer| {
             usize::try_from(peer.udp_payload_bytes_max).unwrap_or(usize::MAX)
         });
         self.limits.datagram_bytes_max.min(peer)
+    }
+
+    /// Whether a PATH_RESPONSE or a PATH_CHALLENGE frame waits for the active path.
+    fn path_frames(&self) -> bool {
+        let active = self.paths.active.addresses;
+        self.answers.iter().flatten().any(|answer| answer.path == active)
+            || self.paths.validation.as_ref().is_some_and(|validation| validation.send)
     }
 
     /// Whether an ack-eliciting frame waits at this level.
@@ -2499,7 +2936,11 @@ impl Connection {
         space.send.pending()
             || !space.retry.is_empty()
             || (level == Level::Data
-                && (self.handshake_done || self.ping || self.ids.pending() || self.streams.pending()))
+                && (self.handshake_done
+                    || self.ping
+                    || self.path_frames()
+                    || self.ids.pending()
+                    || self.streams.pending()))
     }
 
     fn wants(&self, level: Level, admitted: bool) -> bool {
@@ -2515,10 +2956,10 @@ impl Connection {
     /// Builds a datagram of the packets that wait, at most one for each level.
     fn datagram(&mut self, out: &mut [u8], now: Instant, mark: Ecn) -> Result<Option<usize>, Failure> {
         let data = Level::ALL.into_iter().any(|level| self.has_data(level));
-        let admitted = data && self.path.paced(out.len() as u64, now)?;
-        self.path
-            .controller
-            .limited(now, data || self.sides.waiting() || self.path.room() < out.len() as u64);
+        let path = &mut self.paths.active;
+        let admitted = data && path.paced(out.len() as u64, now)?;
+        let limited = data || self.sides.waiting() || path.room() < out.len() as u64;
+        path.controller.limited(now, limited);
         let send = SendAt { now, mark, admitted };
         let wanted = Level::ALL.map(|level| self.wants(level, admitted));
         let Some(last) = wanted.iter().rposition(|&wanted| wanted) else {
@@ -2550,13 +2991,22 @@ impl Connection {
         Ok(Some(at))
     }
 
-    /// Builds a datagram with a CONNECTION_CLOSE frame in each level that has keys, and then ends
-    /// the connection.
-    fn closing(&mut self, out: &mut [u8], close: Close, now: Instant, mark: Ecn) -> Result<Option<usize>, Failure> {
+    /// Builds the datagram of a closing end when a copy of its CONNECTION_CLOSE frame is due, with
+    /// the frame in each level that has keys (RFC 9000, section 10.2.1). An end with no closing
+    /// period ends when its frame is out.
+    fn closing(&mut self, out: &mut [u8], SendAt { now, mark, .. }: SendAt) -> Option<Transmission> {
+        let ending = self.ending?;
+        let close = ending.close.filter(|_| ending.send)?;
         let keyed = Level::ALL.map(|level| match level {
             Level::Data => self.one_rtt.is_some(),
             _ => self.spaces[level as usize].keys.is_some(),
         });
+        // A datagram with an Initial packet has 1,200 bytes, so the frame waits for that credit.
+        let room = self.room();
+        if room < if keyed[0] { DATAGRAM_MIN } else { 1 } {
+            self.amplification_blocked();
+            return None;
+        }
         let last = keyed.iter().rposition(|&keyed| keyed);
         let mut at = 0;
         for level in Level::ALL {
@@ -2566,24 +3016,182 @@ impl Connection {
             let pad = last
                 .filter(|_| keyed[0])
                 .map(|i| (DATAGRAM_MIN.saturating_sub(at), Level::ALL[i]));
-            match self.packet_out(
-                level,
-                &mut out[at..],
-                pad,
-                Some(close),
-                SendAt {
-                    now,
-                    mark,
-                    admitted: false,
-                },
-            ) {
+            let send = SendAt {
+                now,
+                mark,
+                admitted: false,
+            };
+            match self.packet_out(level, &mut out[at..room], pad, Some(close), send) {
                 Ok(Some(len)) => at += len,
                 _ => break,
             }
         }
-        self.close = None;
-        self.outcome = Some(Err(close.error));
-        Ok((at > 0).then_some(at))
+        if let Some(ending) = &mut self.ending {
+            ending.send = false;
+        }
+        if ending.until.is_none() {
+            self.ending = None;
+            self.outcome = Some(ending.outcome);
+        }
+        let path = &mut self.paths.active;
+        path.charge(at as u64);
+        (at > 0).then_some(Transmission {
+            len: at,
+            ecn: mark,
+            path: path.addresses,
+        })
+    }
+
+    /// The number of the next packet of `level`, and the bytes of its encoding.
+    fn number(&self, level: Level) -> Result<(u64, usize), Failure> {
+        let space = &self.spaces[level as usize];
+        let number = space.next;
+        let number_len = packet::number_len(number, space.history.largest)
+            .filter(|_| number <= VARINT_MAX)
+            .ok_or(Failure::local(Error::new(
+                Kind::Overload,
+                "the packet numbers of a QUIC space passed their limit",
+            )))?;
+        Ok((
+            number,
+            if level == Level::Data {
+                number_len.max(packet::number_len(self.window - 1, None).unwrap_or(4))
+            } else {
+                number_len
+            },
+        ))
+    }
+
+    /// Seals the packet of `builder`, which has the number `number` of `level`. Gives its bytes.
+    fn seal(&mut self, level: Level, builder: Builder<'_>, number: u64) -> Result<usize, Failure> {
+        let keys = match level {
+            Level::Data => self.one_rtt.as_ref().map(|keys| &keys.local),
+            _ => self.spaces[level as usize].keys.as_ref().map(|keys| &keys.local),
+        };
+        let keys = keys.ok_or(Failure::local(Error::new(
+            Kind::Unsupported,
+            "a QUIC level has no keys for its packet",
+        )))?;
+        let len = builder.seal(keys).map_err(|_| {
+            Failure::local(Error::new(
+                Kind::Unsupported,
+                "the packet key refused to seal a QUIC packet",
+            ))
+        })?;
+        self.spaces[level as usize].next = number + 1;
+        if level == Level::Data
+            && let Some(keys) = &mut self.one_rtt
+        {
+            keys.sealed += 1;
+            keys.first_sent.get_or_insert(number);
+        }
+        Ok(len)
+    }
+
+    /// Builds a datagram of `out.len()` bytes with one 1-RTT packet: `frame` and its padding, to
+    /// the connection ID `dcid`. With `record`, the packet counts on the active path, and the
+    /// record tells its delivery or its loss. Else no state follows the packet.
+    fn single(
+        &mut self,
+        out: &mut [u8],
+        dcid: ConnectionId,
+        frame: &Frame<'_>,
+        record: Option<Record>,
+        SendAt { now, mark, .. }: SendAt,
+    ) -> Result<Option<usize>, Failure> {
+        let (number, number_len) = self.number(Level::Data)?;
+        self.key_limit(now)?;
+        let header = Outgoing::OneRtt {
+            dcid: &dcid,
+            spin: false,
+            key_phase: self.one_rtt.as_ref().is_some_and(|keys| keys.phase),
+        };
+        let size = out.len();
+        let Ok(builder) = Builder::new(out, header, number, number_len) else {
+            return Ok(None);
+        };
+        let mut output = Output::new(builder, &self.budget);
+        let written = match record {
+            Some(record) => output.track(frame, record),
+            None => output.builder.frame(frame),
+        };
+        if written.is_err() || output.builder.pad_to(size).is_err() {
+            return Ok(None);
+        }
+        if output.refused {
+            return Err(Failure::local(recovery::NO_ROOM));
+        }
+        let Output { builder, records, .. } = output;
+        let len = self.seal(Level::Data, builder, number)?;
+        if record.is_none() {
+            self.paths.untracked();
+            return Ok(Some(len));
+        }
+        let space = &mut self.spaces[Level::Data as usize];
+        space.history.ect_sent += u64::from(mark == Ecn::Ect0);
+        space.history.insert(
+            &mut self.paths,
+            Sent {
+                mark,
+                number,
+                time: now,
+                bytes: len as u64,
+                eliciting: true,
+                records,
+            },
+        )?;
+        Ok(Some(len))
+    }
+
+    /// Builds a datagram for a path that does not carry the connection: the PATH_RESPONSE for a
+    /// path that the peer probes, or the PATH_CHALLENGE for the path that the peer left (RFC
+    /// 9000, sections 8.2.2 and 9.3.3). The datagram has 1,200 bytes, or the bytes that the
+    /// limit of a path with no validation allows.
+    fn off_path(&mut self, out: &mut [u8], send: SendAt) -> Result<Option<(usize, Path)>, Failure> {
+        let active = self.paths.active.addresses;
+        if let Some(slot) = self
+            .answers
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|answer| answer.path != active))
+            && let Some(answer) = slot.take()
+        {
+            let frame = Frame::PathResponse { data: answer.data };
+            let sent = self.single(&mut out[..answer.room], answer.dcid, &frame, None, send)?;
+            return Ok(sent.map(|len| (len, answer.path)));
+        }
+        if let Some(validation) = &mut self.paths.validation
+            && let Some(data) = validation.left.take()
+        {
+            let (dcid, path) = (validation.fallback.remote_cid, validation.fallback.addresses);
+            let frame = Frame::PathChallenge { data };
+            let sent = self.single(&mut out[..DATAGRAM_MIN], dcid, &frame, None, send)?;
+            return Ok(sent.map(|len| (len, path)));
+        }
+        Ok(None)
+    }
+
+    /// Builds a probe of the next datagram size of the active path: a PING frame and its padding
+    /// (RFC 8899, and RFC 9000, section 14.4). The probe counts in the window. Only a validated
+    /// path of a confirmed connection searches.
+    fn size_probe(&mut self, out: &mut [u8], send: SendAt) -> Result<Option<usize>, Failure> {
+        let searches = self.confirmed && self.paths.validation.is_none();
+        let path = &mut self.paths.active;
+        let Some(size) = path
+            .mtu
+            .next()
+            .filter(|_| searches && path.amplification_credit.is_none())
+        else {
+            return Ok(None);
+        };
+        if !path.paced(size as u64, send.now)? {
+            return Ok(None);
+        }
+        let dcid = path.remote_cid;
+        let sent = self.single(&mut out[..size], dcid, &Frame::Ping, Some(Record::Mtu(size)), send)?;
+        if sent.is_some() {
+            self.paths.active.mtu.sent(size);
+        }
+        Ok(sent)
     }
 
     /// Builds one packet of `level` at the start of `out`: a CONNECTION_CLOSE frame for `close`,
@@ -2594,28 +3202,17 @@ impl Connection {
         &mut self,
         level: Level,
         out: &mut [u8],
-        pad: Option<(usize, Level)>,
+        mut pad: Option<(usize, Level)>,
         close: Option<Close>,
         SendAt { now, mark, admitted }: SendAt,
     ) -> Result<Option<usize>, Failure> {
+        let (number, number_len) = self.number(level)?;
         let space = &self.spaces[level as usize];
-        let number = space.next;
-        let number_len = packet::number_len(number, space.history.largest)
-            .filter(|_| number <= VARINT_MAX)
-            .ok_or(Failure::local(Error::new(
-                Kind::Overload,
-                "the packet numbers of a QUIC space passed their limit",
-            )))?;
-        let number_len = if level == Level::Data {
-            number_len.max(packet::number_len(self.window - 1, None).unwrap_or(4))
-        } else {
-            number_len
-        };
-        let admitted = space.probe || (admitted && self.path.room() >= out.len() as u64);
+        let admitted = space.probe || (admitted && self.paths.active.room() >= out.len() as u64);
         if level == Level::Data && close.is_none() {
             self.key_limit(now)?;
         }
-        let (dcid, scid) = (self.remote_cid, self.initial_local);
+        let (dcid, scid) = (self.paths.active.remote_cid, self.initial_local);
         let header = match level {
             Level::Initial => Outgoing::Initial {
                 dcid: &dcid,
@@ -2632,22 +3229,21 @@ impl Connection {
                 key_phase: self.one_rtt.as_ref().is_some_and(|keys| keys.phase),
             },
         };
+        // A datagram with a frame of the paths has 1,200 bytes where the limit of the path allows
+        // them (RFC 9000, sections 8.2.1 and 8.2.2).
+        let full = out.len() >= DATAGRAM_MIN;
+        let full_pad = full.then_some((DATAGRAM_MIN, level));
         let Ok(builder) = Builder::new(out, header, number, number_len) else {
             return Ok(None);
         };
-        let full = |_: packet::BuildError| {
+        let overflow = |_: packet::BuildError| {
             Failure::local(Error::new(Kind::Unsupported, "a QUIC frame did not fit its packet"))
         };
         let mut output = Output::new(builder, &self.budget);
         let room = output.room();
         let mut eliciting = false;
         if let Some(close) = close {
-            let frame = Frame::ConnectionClose {
-                code: close.code,
-                frame_type: Some(close.frame_type),
-                reason: &[],
-            };
-            if output.builder.frame(&frame).is_err() {
+            if output.builder.frame(&close.frame(level)).is_err() {
                 return Ok(None);
             }
         } else {
@@ -2655,6 +3251,28 @@ impl Connection {
             space.ranges.write(&mut output.builder, now)?;
             let after_ack = output.room();
             if admitted {
+                if level == Level::Data {
+                    let active = self.paths.active.addresses;
+                    if let Some(slot) = self
+                        .answers
+                        .iter_mut()
+                        .find(|slot| slot.is_some_and(|answer| answer.path == active))
+                        && let Some(answer) = *slot
+                        && output.builder.frame(&Frame::PathResponse { data: answer.data }).is_ok()
+                    {
+                        *slot = None;
+                        pad = pad.or(full_pad);
+                    }
+                    if let Some(validation) = self.paths.validation.as_mut().filter(|validation| validation.send)
+                        && output
+                            .track(&Frame::PathChallenge { data: validation.data }, Record::Challenge)
+                            .is_ok()
+                    {
+                        validation.send = false;
+                        validation.padded = Some(validation.padded.unwrap_or(true) && full);
+                        pad = pad.or(full_pad);
+                    }
+                }
                 if level == Level::Data
                     && self.handshake_done
                     && output.track(&Frame::HandshakeDone, Record::HandshakeDone).is_ok()
@@ -2675,7 +3293,7 @@ impl Connection {
                             &Frame::Crypto { offset, data },
                             Record::Range(DataRange::Crypto { offset, len }),
                         )
-                        .map_err(full)?;
+                        .map_err(overflow)?;
                     send.sent(len);
                 }
                 if level == Level::Data {
@@ -2695,62 +3313,44 @@ impl Connection {
                 return Ok(None);
             }
         }
-        let mut builder = output.builder;
+        let Output {
+            mut builder, records, ..
+        } = output;
         let before_pad = builder.room();
         if let Some((minimum, last)) = pad
             && (level == last || before_pad < COALESCED_ROOM)
         {
-            builder.pad_to(minimum).map_err(full)?;
+            builder.pad_to(minimum).map_err(overflow)?;
         }
         let in_flight = eliciting || builder.room() < before_pad;
-        let keys = match level {
-            Level::Data => self.one_rtt.as_ref().map(|keys| &keys.local),
-            _ => self.spaces[level as usize].keys.as_ref().map(|keys| &keys.local),
-        };
-        let keys = keys.ok_or(Failure::local(Error::new(
-            Kind::Unsupported,
-            "a QUIC level has no keys for its packet",
-        )))?;
-        let len = builder.seal(keys).map_err(|_| {
-            Failure::local(Error::new(
-                Kind::Unsupported,
-                "the packet key refused to seal a QUIC packet",
-            ))
-        })?;
+        let len = self.seal(level, builder, number)?;
         self.used_remote = Some(dcid);
-        self.spaces[level as usize].next = number + 1;
         self.spaces[level as usize].history.ect_sent += u64::from(mark == Ecn::Ect0);
         // A later bare ACK can be the largest number in an ACK that also covers a live elicitor.
         if close.is_none() && (in_flight || self.spaces[level as usize].history.pto_start().is_some()) {
             let bytes = if in_flight { len as u64 } else { 0 };
             let space = &mut self.spaces[level as usize];
             space.history.insert(
-                &mut self.path,
+                &mut self.paths,
                 Sent {
                     mark,
                     number,
                     time: now,
                     bytes,
                     eliciting,
-                    records: output.records,
+                    records,
                 },
             )?;
             if eliciting {
                 if core::mem::take(&mut space.probe) {
-                    self.path.probes = self.path.probes.saturating_add(1);
+                    self.paths.active.probes = self.paths.active.probes.saturating_add(1);
                 }
                 if core::mem::take(&mut self.received) {
                     self.last_activity = now;
                 }
             }
         } else {
-            self.path.untracked();
-        }
-        if level == Level::Data
-            && let Some(keys) = &mut self.one_rtt
-        {
-            keys.sealed += 1;
-            keys.first_sent.get_or_insert(number);
+            self.paths.untracked();
         }
         Ok(Some(len))
     }

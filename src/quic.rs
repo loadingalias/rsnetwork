@@ -1,7 +1,8 @@
 //! QUIC version 1 in the core (RFC 9000 and RFC 9001): the connection engine, the packet layer,
 //! the frame codec, and the transport parameters, with no I/O.
 //!
-//! - **Listeners.** [`Endpoint`] routes server datagrams and bounds new handshakes.
+//! - **Listeners.** [`Endpoint`] routes server datagrams and bounds new handshakes. It follows a
+//!   connection whose client moves to a new address.
 //!   A client can take a NEW_TOKEN with [`Connection::take_address_token`] and use it when it reconnects.
 //! - **Connections.** [`Connection`] runs the TLS 1.3 handshake on rustls's QUIC API, with the
 //!   configurations of [`tls`](crate::tls): the packet number spaces and their keys, the CRYPTO
@@ -9,6 +10,15 @@
 //!   of [`Limits`]. 0-RTT is off. Each byte that the engine and rustls keep is charged to the
 //!   budget of the connection. After a peer closes the connection, [`Connection::peer_close`]
 //!   gives its application code or its transport code and frame type.
+//! - **Paths.** The host gives the [`Path`] of each received region, and sends each datagram on
+//!   the path of its [`Transmission`]. A server follows a peer that moves, and validates the new
+//!   address before it sends more than three times the bytes that came from it. A validation with
+//!   no answer ends after three probe timeouts, and the connection returns to its last validated
+//!   path. A client moves with [`Connection::migrate`]. Above 1,200 bytes,
+//!   [`Limits::datagram_bytes_max`] starts a search for the datagram size of each path.
+//! - **Close.** [`Connection::close`] ends the connection with a code of the application. Each end
+//!   gives [`Event::Closed`] when the connection ends, and its terminal outcome after the closing
+//!   or draining period of three probe timeouts.
 //! - **Streams.** After the handshake, each end opens streams, gives them regions to send, and
 //!   takes an [`Event`] for each call of [`Connection::receive`] and [`Connection::drive`]. Stream
 //!   data in order goes up as views of the received regions, with no copy. The flow control of
@@ -50,6 +60,7 @@ mod endpoint;
 pub mod frame;
 pub mod packet;
 pub mod params;
+mod path;
 mod reassembly;
 mod recovery;
 mod side;
@@ -59,6 +70,7 @@ pub use congestion::CongestionControl;
 pub use connection::{AddressToken, Connection, Limits, PeerClose, Transmission};
 pub use crypto::CRYPTO_BUFFER_BYTES_MAX;
 pub use endpoint::{Endpoint, EndpointKeys, EndpointLimits, Handle, Route};
+pub use path::Path;
 pub use recovery::{EcnState, RecoveryStats};
 pub use side::{SideDatagram, SideFlow};
 pub use stream::{Event, Priority, STREAM_REGIONS_MAX, StreamId};

@@ -10,7 +10,7 @@ use rsnetwork::buffer::Backing;
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Blocked, Progress, Turn};
 use rsnetwork::quic::packet::{Datagrams, Header};
-use rsnetwork::quic::{Connection, Event, Limits};
+use rsnetwork::quic::{Connection, Event, Limits, Path};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{ClientConfig, ServerConfig};
 
@@ -61,7 +61,11 @@ pub(super) fn run(
     let (mut connection, mut first) = match endpoint {
         Endpoint::Client(config, name, address) => {
             socket.connect(address)?;
-            (Connection::client(config, name, limits, budget, now())?, None)
+            let path = Path {
+                local: socket.local_addr()?,
+                peer: address,
+            };
+            (Connection::client(config, name, path, limits, budget, now())?, None)
         }
         Endpoint::Server(config) => loop {
             if start.elapsed() >= RUN_LIMIT {
@@ -70,13 +74,22 @@ pub(super) fn run(
             if let Some((len, peer)) = ready(socket.recv_from(&mut input))? {
                 let header = Header::parse(&input[..len], 0).map_err(|_| "invalid first packet header")?;
                 socket.connect(peer)?;
-                break (Connection::server(config, &header, limits, budget, now())?, Some(len));
+                let path = Path {
+                    local: socket.local_addr()?,
+                    peer,
+                };
+                break (
+                    Connection::server(config, &header, path, limits, budget, now())?,
+                    Some(len),
+                );
             }
             std::thread::sleep(POLL);
         },
     };
 
-    let cid_len = connection.local_cid().as_bytes().len();
+    // The socket is connected: each datagram arrives on the one path of the connection, and
+    // leaves on it.
+    let (cid_len, path) = (connection.local_cid().as_bytes().len(), connection.path());
     let mut output = vec![0; limits.datagram_bytes_max];
     let mut unsent = None;
     while start.elapsed() < RUN_LIMIT {
@@ -94,7 +107,7 @@ pub(super) fn run(
                 return Err("the connection exceeded the run deadline".into());
             }
             let (event, turn) = match &mut datagrams {
-                Some(region) => connection.receive(region, now()),
+                Some(region) => connection.receive(region, path, now()),
                 None => connection.drive(now()),
             };
             if let Progress::Terminal(result) = turn.progress {
@@ -115,7 +128,7 @@ pub(super) fn run(
             let len = match unsent {
                 Some(len) => len,
                 None => match connection.transmit(&mut output, now())? {
-                    Some(len) => len,
+                    Some(sent) => sent.len,
                     None => break,
                 },
             };

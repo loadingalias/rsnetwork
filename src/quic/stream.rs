@@ -114,9 +114,16 @@ impl Default for Priority {
     }
 }
 
-/// An event of the streams of a connection.
+/// An event of a connection or of its streams.
 #[derive(Clone)]
 pub enum Event {
+    /// The connection ended for the application, with this outcome: the peer closed it or reset it,
+    /// or this end closed it for an error. Each later call of the application refuses. The host
+    /// drives the connection until its terminal outcome, which follows three probe timeouts later
+    /// (RFC 9000, section 10.2). A connection that ends before its handshake is confirmed, at a
+    /// deadline, or by [`Connection::close`](super::Connection::close) gives only its terminal
+    /// outcome.
+    Closed(Result<(), Error>),
     /// This side flow needs fresh acknowledgement state. The next parent packet probes the path.
     /// Only authenticated side feedback acknowledges its data.
     SideProbe(super::SideFlow),
@@ -192,6 +199,7 @@ impl fmt::Debug for Event {
                 .field("code", code)
                 .finish(),
             Self::SideProbe(flow) => f.debug_tuple("SideProbe").field(flow).finish(),
+            Self::Closed(outcome) => f.debug_tuple("Closed").field(outcome).finish(),
             Self::Sent { stream } => f.debug_struct("Sent").field("stream", stream).finish(),
             Self::Acknowledged { stream, offset, end } => f
                 .debug_struct("Acknowledged")

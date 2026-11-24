@@ -8,7 +8,7 @@ use rstypes::time::Instant;
 use super::VARINT_MAX;
 use super::frame::Ack;
 use super::reassembly::grow;
-use super::recovery::{History, NO_ROOM, Path, Records, Sent};
+use super::recovery::{History, NO_ROOM, Paths, Records, Sent};
 use crate::drive::{Ecn, Error, Kind};
 
 /// A side-flow packet number space on the connection that opened it.
@@ -86,11 +86,11 @@ impl Flows {
             .map_err(|_| Error::new(Kind::Misuse, "the QUIC side flow is not open"))
     }
 
-    pub(super) fn close(&mut self, id: SideFlow, path: &mut Path) -> Result<(), Error> {
+    pub(super) fn close(&mut self, id: SideFlow, paths: &mut Paths) -> Result<(), Error> {
         let index = self.index(id)?;
         let mut space = self.spaces.remove(index);
         self.waiting -= usize::from(space.waiting);
-        space.history.discard(path);
+        space.history.discard(paths);
         if self.notify_probe == Some(id) {
             self.notify_probe = None;
         }
@@ -98,10 +98,12 @@ impl Flows {
         Ok(())
     }
 
+    /// Admits one side datagram to the active path, under its window, its pacer, and its
+    /// amplification limit, which the connection shares with its side flows.
     pub(super) fn admit(
         &mut self,
         id: SideFlow,
-        path: &mut Path,
+        paths: &mut Paths,
         bytes: u64,
         now: Instant,
         control_pending: bool,
@@ -114,7 +116,8 @@ impl Flows {
                 "the QUIC side flow reached its packet number limit",
             ));
         }
-        if control_pending || !path.paced(bytes, now)? {
+        let path = &mut paths.active;
+        if control_pending || !path.allows(bytes) || !path.paced(bytes, now)? {
             if !core::mem::replace(&mut space.waiting, true) {
                 self.waiting += 1;
             }
@@ -123,7 +126,7 @@ impl Flows {
         let number = space.next;
         let ecn = path.mark(now);
         space.history.insert(
-            path,
+            paths,
             Sent {
                 number,
                 time: now,
@@ -134,7 +137,8 @@ impl Flows {
             },
         )?;
         space.history.ect_sent += u64::from(ecn == Ecn::Ect0);
-        path.marked(ecn, now);
+        paths.active.charge(bytes);
+        paths.active.marked(ecn, now);
         space.next += 1;
         self.waiting -= usize::from(core::mem::take(&mut space.waiting));
         if self.oldest.is_none_or(|(_, oldest)| oldest == id) {
@@ -150,7 +154,7 @@ impl Flows {
     pub(super) fn acknowledge(
         &mut self,
         id: SideFlow,
-        path: &mut Path,
+        paths: &mut Paths,
         ack: &Ack<'_>,
         delay: Duration,
         now: Instant,
@@ -159,17 +163,17 @@ impl Flows {
         let index = self.index(id)?;
         let space = &mut self.spaces[index];
         if ack.largest >= space.next || !ack.valid() {
-            self.close(id, path)?;
+            self.close(id, paths)?;
             return Err(Error::new(
                 Kind::Malformed,
                 "the QUIC side acknowledgement has invalid packet numbers or counts",
             ));
         }
-        path.controller.limited(now, limited);
-        let acked = space.history.ack(ack, path, now, delay, |_| {})?;
+        paths.active.controller.limited(now, limited);
+        let acked = space.history.ack(ack, paths, now, delay, |_| {})?;
         let delivered = acked.eliciting;
-        let congestion = space.history.detect(path, now, |_| Ok(()))?;
-        path.acknowledged(acked, now, limited && !congestion);
+        let congestion = space.history.detect(paths, now, |_| Ok(()))?;
+        paths.active.acknowledged(acked, now, limited && !congestion);
         if let Some(at) = space.history.loss_time
             && self.deadline.is_none_or(|old| old.as_nanos() > at.as_nanos())
         {
@@ -179,7 +183,7 @@ impl Flows {
             if self.notify_probe == Some(id) {
                 self.notify_probe = None;
             }
-            path.backoff = 0;
+            paths.active.backoff = 0;
         }
         if self.oldest.is_some_and(|(_, oldest)| oldest == id) {
             self.refresh_oldest();
@@ -222,7 +226,7 @@ impl Flows {
             .min_by_key(|at| at.as_nanos());
     }
 
-    pub(super) fn timers(&mut self, path: &mut Path, now: Instant) -> Result<(), Error> {
+    pub(super) fn timers(&mut self, paths: &mut Paths, now: Instant) -> Result<(), Error> {
         if self.deadline.is_some_and(|at| at.as_nanos() <= now.as_nanos()) {
             for space in &mut self.spaces {
                 if space
@@ -230,7 +234,7 @@ impl Flows {
                     .loss_time
                     .is_some_and(|at| at.as_nanos() <= now.as_nanos())
                 {
-                    space.history.detect(path, now, |_| Ok(()))?;
+                    space.history.detect(paths, now, |_| Ok(()))?;
                 }
             }
             self.refresh();

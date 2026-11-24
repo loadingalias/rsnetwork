@@ -8,6 +8,7 @@ mod counting;
 use counting::allocations;
 
 use core::cell::{Cell, RefCell};
+use core::net::{Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use rsnetwork::capacity::Budget;
 use rsnetwork::drive::Kind;
 use rsnetwork::quic::frame::Direction;
 use rsnetwork::quic::packet::{Datagrams, Header, Kind as PacketKind};
-use rsnetwork::quic::{Connection, Event, Limits};
+use rsnetwork::quic::{Connection, Event, Limits, Path};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
     CertificateDer, ClientConfig, ClientOptions, Entropy, Handshake, Identity, PrivateKeyDer, Resumption, ServerConfig,
@@ -135,14 +136,22 @@ impl Profile {
     }
 }
 
+/// The path from the local port `local` to the port `peer`, on the loopback address.
+fn path(local: u16, peer: u16) -> Path {
+    Path {
+        local: SocketAddr::from((Ipv4Addr::LOCALHOST, local)),
+        peer: SocketAddr::from((Ipv4Addr::LOCALHOST, peer)),
+    }
+}
+
 /// The datagrams that `connection` of `owner` sends.
 fn send(owner: usize, connection: &mut Connection) -> Vec<Vec<u8>> {
     let mut datagrams = Vec::new();
     for _ in 0..512 {
         let mut out = vec![0; 1500];
         match owned(owner, || connection.transmit(&mut out, now())).unwrap() {
-            Some(len) => {
-                out.truncate(len);
+            Some(sent) => {
+                out.truncate(sent.len);
                 datagrams.push(out);
             }
             None => return datagrams,
@@ -157,7 +166,8 @@ fn give(owner: usize, connection: &mut Connection, datagram: Vec<u8>) -> usize {
     let len = connection.local_cid().as_bytes().len();
     let mut datagrams = Datagrams::new(Backing::from(datagram), None, len);
     let mut bytes = 0;
-    while let (Some(event), _) = owned(owner, || connection.receive(&mut datagrams, now())) {
+    let path = connection.path();
+    while let (Some(event), _) = owned(owner, || connection.receive(&mut datagrams, path, now())) {
         if let Event::Stream { data, .. } = event {
             bytes += data.as_ref().len();
         }
@@ -246,7 +256,15 @@ fn run(profile: &Profile) -> ([u64; 2], Vec<Option<Handshake>>, [u64; 2]) {
         let client_budget = budget(CLIENT_END);
         let server_budget = budget(SERVER_END);
         let mut client = owned(CLIENT_END, || {
-            Connection::client(&client_config, "server.test", client_limits, &client_budget, now())
+            let route = path(4301, 443);
+            Connection::client(
+                &client_config,
+                "server.test",
+                route,
+                client_limits,
+                &client_budget,
+                now(),
+            )
         })
         .unwrap();
         let mut server: Option<Connection> = None;
@@ -263,7 +281,8 @@ fn run(profile: &Profile) -> ([u64; 2], Vec<Option<Handshake>>, [u64; 2]) {
                 let server = server.get_or_insert_with(|| {
                     let header = Header::parse(&datagram, 0).unwrap();
                     owned(SERVER_END, || {
-                        Connection::server(&server_config, &header, server_limits, &server_budget, now())
+                        let route = path(443, 4301);
+                        Connection::server(&server_config, &header, route, server_limits, &server_budget, now())
                     })
                     .unwrap()
                 });
@@ -406,15 +425,17 @@ fn a_client_or_server_that_the_budget_refuses_allocates_nothing() {
     })
     .unwrap();
     let small = Budget::new(NonZeroU64::new(1024).unwrap());
-    let (refused, count) =
-        allocations(|| Connection::client(&config, "server.test", Limits::DEFAULT, &small, now()).map(drop));
+    let (refused, count) = allocations(|| {
+        Connection::client(&config, "server.test", path(4301, 443), Limits::DEFAULT, &small, now()).map(drop)
+    });
     assert_eq!((refused.map_err(|error| error.kind()), count), (Err(Kind::Overload), 0));
 
     // The first datagram of a client, for the header of the server.
     let budget = Budget::new(NonZeroU64::new(1 << 24).unwrap());
-    let mut client = Connection::client(&config, "server.test", Limits::DEFAULT, &budget, now()).unwrap();
+    let mut client =
+        Connection::client(&config, "server.test", path(4301, 443), Limits::DEFAULT, &budget, now()).unwrap();
     let mut out = vec![0; 1500];
-    let len = client.transmit(&mut out, now()).unwrap().unwrap();
+    let len = client.transmit(&mut out, now()).unwrap().unwrap().len;
     let header = Header::parse(&out[..len], 0).unwrap();
     let server = ServerConfig::new(ServerOptions {
         identity: Identity {
@@ -430,6 +451,6 @@ fn a_client_or_server_that_the_budget_refuses_allocates_nothing() {
     })
     .unwrap();
     let (refused, count) =
-        allocations(|| Connection::server(&server, &header, Limits::DEFAULT, &small, now()).map(drop));
+        allocations(|| Connection::server(&server, &header, path(443, 4301), Limits::DEFAULT, &small, now()).map(drop));
     assert_eq!((refused.map_err(|error| error.kind()), count), (Err(Kind::Overload), 0));
 }

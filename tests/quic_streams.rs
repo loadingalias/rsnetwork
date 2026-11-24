@@ -1,7 +1,10 @@
 //! The streams of a QUIC connection between two engines of the core: flow control that follows
 //! the consumer, data out of order under its bound, the outcomes of a stream, the send order, the
-//! stream credit, and unreliable datagrams (N305; RFC 9000, sections 2 to 4, and RFC 9221).
+//! stream credit, and unreliable datagrams (N305; RFC 9000, sections 2 to 4, and RFC 9221). Then
+//! the delivery of packets (N306, N320), and the paths and the close of a connection (N307; RFC
+//! 9000, sections 8.2, 9, 10.2, and 14, and RFC 8899).
 
+use core::net::{Ipv4Addr, SocketAddr};
 use core::num::NonZeroU64;
 use core::time::Duration;
 use std::assert_matches;
@@ -13,7 +16,9 @@ use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Kind, Progress};
 use rsnetwork::quic::frame::{Ack, Direction, Frame};
 use rsnetwork::quic::packet::{Datagrams, Header};
-use rsnetwork::quic::{CongestionControl, Connection, EcnState, Event, Limits, Priority, STREAM_REGIONS_MAX, StreamId};
+use rsnetwork::quic::{
+    CongestionControl, Connection, EcnState, Event, Limits, Path, PeerClose, Priority, STREAM_REGIONS_MAX, StreamId,
+};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
     CertificateDer, ClientConfig, ClientOptions, Entropy, Identity, PrivateKeyDer, Resumption, ServerConfig,
@@ -59,19 +64,42 @@ fn region(offset: usize, len: usize) -> Lease {
     Lease::from((offset..offset + len).map(byte).collect::<Vec<u8>>())
 }
 
+/// The address of the server, and the address of a client at the port `port`.
+const SERVER_ADDRESS: SocketAddr = SocketAddr::new(core::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 443);
+
+fn client_address(port: u16) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::new(198, 51, 100, 7), port))
+}
+
+/// The path of the server to a client at `peer`.
+fn from_server(peer: SocketAddr) -> Path {
+    Path {
+        local: SERVER_ADDRESS,
+        peer,
+    }
+}
+
 /// Each datagram that `connection` sends now.
 fn sent(connection: &mut Connection) -> Vec<Vec<u8>> {
     sent_at(connection, now())
 }
 
 fn sent_at(connection: &mut Connection, at: Instant) -> Vec<Vec<u8>> {
+    routed_at(connection, at)
+        .into_iter()
+        .map(|(_, datagram)| datagram)
+        .collect()
+}
+
+/// Each datagram that `connection` sends at `at`, with its path.
+fn routed_at(connection: &mut Connection, at: Instant) -> Vec<(Path, Vec<u8>)> {
     let mut datagrams = Vec::new();
     for _ in 0..8192 {
         let mut out = vec![0; 1500];
         match connection.transmit(&mut out, at).unwrap() {
-            Some(len) => {
-                out.truncate(len);
-                datagrams.push(out);
+            Some(sent) => {
+                out.truncate(sent.len);
+                datagrams.push((sent.path, out));
             }
             None => return datagrams,
         }
@@ -89,11 +117,17 @@ fn give_at(connection: &mut Connection, datagram: &[u8], at: Instant) -> Vec<Eve
 }
 
 fn give_marked(connection: &mut Connection, datagram: &[u8], at: Instant, mark: Ecn) -> Vec<Event> {
+    let path = connection.path();
+    give_on(connection, path, datagram, at, mark)
+}
+
+/// Gives `datagram` to `connection` as a datagram that arrived on `path`.
+fn give_on(connection: &mut Connection, path: Path, datagram: &[u8], at: Instant, mark: Ecn) -> Vec<Event> {
     let len = connection.local_cid().as_bytes().len();
     let mut datagrams = Datagrams::new(Backing::from(datagram.to_vec()), None, len).with_ecn(mark);
     let mut events = Vec::new();
     for _ in 0..8192 {
-        match connection.receive(&mut datagrams, at) {
+        match connection.receive(&mut datagrams, path, at) {
             (Some(event), _) => events.push(event),
             (None, turn) if turn.progress == Progress::Pending => {}
             (None, _) => return events,
@@ -166,10 +200,26 @@ struct Pair {
     server: Connection,
     at_client: Received,
     at_server: Received,
+    /// The address that the network gives the client. The server gets each datagram of the client
+    /// from it, and the client gets only the datagrams that the server sends to it.
+    seen: SocketAddr,
+    /// The datagrams that the server sent to another address.
+    elsewhere: Vec<(Path, Vec<u8>)>,
+    /// The largest datagram that the path carries: it drops each larger one, and counts it.
+    path_bytes: usize,
+    dropped: usize,
+    /// The largest datagram of the client that the path carried.
+    largest: usize,
 }
 
 impl Pair {
     fn new(client: Limits, server: Limits) -> Self {
+        Self::on_path(client, server, usize::MAX)
+    }
+
+    /// A client and a server after their handshake, on a path that carries datagrams of at most
+    /// `path_bytes` bytes.
+    fn on_path(client: Limits, server: Limits, path_bytes: usize) -> Self {
         let client_config = ClientConfig::new(ClientOptions {
             roots: &[CertificateDer::from(CA.to_vec())],
             identity: None,
@@ -193,10 +243,16 @@ impl Pair {
             entropy: Entropy::System,
         })
         .unwrap();
-        let mut client_end = Connection::client(&client_config, "server.test", client, &budget(), now()).unwrap();
+        let route = Path {
+            local: client_address(4301),
+            peer: SERVER_ADDRESS,
+        };
+        let mut client_end =
+            Connection::client(&client_config, "server.test", route, client, &budget(), now()).unwrap();
         let first = sent(&mut client_end);
         let header = Header::parse(&first[0], 0).unwrap();
-        let mut server_end = Connection::server(&server_config, &header, server, &budget(), now()).unwrap();
+        let route = from_server(client_address(4301));
+        let mut server_end = Connection::server(&server_config, &header, route, server, &budget(), now()).unwrap();
         for datagram in &first {
             assert!(give(&mut server_end, datagram).is_empty());
         }
@@ -205,6 +261,11 @@ impl Pair {
             server: server_end,
             at_client: Received::default(),
             at_server: Received::default(),
+            seen: client_address(4301),
+            elsewhere: Vec::new(),
+            path_bytes,
+            dropped: 0,
+            largest: 0,
         };
         pair.run(|_| true);
         assert!(pair.client.is_confirmed() && pair.server.is_confirmed());
@@ -224,22 +285,65 @@ impl Pair {
             let mut quiet = to_server.is_empty() && events.is_empty();
             self.at_client.take(&mut self.client, events, &releases);
             for datagram in &to_server {
-                let events = give_at(&mut self.server, datagram, at);
+                if datagram.len() > self.path_bytes {
+                    self.dropped += 1;
+                    continue;
+                }
+                self.largest = self.largest.max(datagram.len());
+                let events = give_on(&mut self.server, from_server(self.seen), datagram, at, Ecn::NotEct);
                 self.at_server.take(&mut self.server, events, &releases);
             }
             let events = driven_at(&mut self.server, at);
-            let to_client = sent_at(&mut self.server, at);
+            let to_client = routed_at(&mut self.server, at);
             quiet &= to_client.is_empty() && events.is_empty();
             self.at_server.take(&mut self.server, events, &releases);
-            for datagram in &to_client {
-                let events = give_at(&mut self.client, datagram, at);
-                self.at_client.take(&mut self.client, events, &releases);
+            for (path, datagram) in to_client {
+                if path.peer != self.seen {
+                    self.elsewhere.push((path, datagram));
+                } else if datagram.len() <= self.path_bytes {
+                    let events = give_at(&mut self.client, &datagram, at);
+                    self.at_client.take(&mut self.client, events, &releases);
+                }
             }
             if quiet {
                 return;
             }
         }
         panic!("the connection is not quiet after 4,096 rounds");
+    }
+
+    /// Runs the connection, and moves the clock to the next deadline of an end, until `done`.
+    /// Gives the time.
+    fn run_until(&mut self, mut at: Instant, done: impl Fn(&Self) -> bool) -> Instant {
+        for _ in 0..512 {
+            self.run_at(at, |_| true);
+            if done(self) {
+                return at;
+            }
+            at = [self.client.drive(at).1.deadline, self.server.drive(at).1.deadline]
+                .into_iter()
+                .flatten()
+                .map(|deadline| deadline.instant())
+                .min_by_key(|instant| instant.as_nanos())
+                .expect("an end that waits has a deadline");
+        }
+        panic!("the connection does not reach its state after 512 deadlines");
+    }
+
+    /// The server sends `len` bytes of the test data on a new stream of the client, from the
+    /// time `at`. Gives the stream.
+    fn download(&mut self, at: Instant, len: usize) -> StreamId {
+        let stream = self.open(Direction::Bidirectional);
+        self.client.send(stream, region(0, 1), true).unwrap();
+        let mut offset = 0;
+        for _ in 0..4096 {
+            self.run_at(at, |_| true);
+            if self.at_client.complete(stream, len) {
+                return stream;
+            }
+            offset = feed(&mut self.server, stream, offset, len, 16 * 1024);
+        }
+        panic!("the download does not end");
     }
 
     /// Opens a stream of the client.
@@ -896,7 +1000,8 @@ fn the_declared_reordering_interval_preserves_goodput_and_delivers_each_datagram
                 .client
                 .transmit(&mut out, at)
                 .unwrap()
-                .expect("the offered packet fits the path");
+                .expect("the offered packet fits the path")
+                .len;
             let mut arrive = |packet: &[u8]| {
                 for event in give_at(&mut pair.server, packet, at) {
                     let Event::Unreliable(data) = event else {
@@ -1137,4 +1242,314 @@ fn a_full_side_window_uses_a_parent_probe_and_reordered_feedback_keeps_validated
     assert_eq!(pair.client.recovery().ecn_counts.ect0, 3);
     assert_eq!(pair.client.recovery().ecn, EcnState::Capable);
     assert_eq!(pair.client.recovery().bytes_in_flight, 1200);
+}
+
+/// The window of a path with datagrams of 1,200 bytes and no acknowledgement: ten datagrams (RFC
+/// 9002, section 7.2).
+const INITIAL_WINDOW: u64 = 12_000;
+/// The probe timeout of a path with no round-trip sample: 333 ms, four times 166.5 ms, and the
+/// 25 ms that the peer can delay an acknowledgement (RFC 9002, sections 6.2.1 and 6.2.2).
+const FIRST_TIMEOUT_MS: u64 = 1_024;
+
+fn moved_address() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::new(203, 0, 113, 9), 4301))
+}
+
+#[test]
+fn a_rebound_client_keeps_its_connection_after_path_validation() {
+    // A new port is the same network, so the window stays. A new address starts from the initial
+    // window (RFC 9000, section 9.4).
+    for (rebound, window) in [(client_address(4302), None), (moved_address(), Some(INITIAL_WINDOW))] {
+        let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+        pair.download(now(), 60_000);
+        let before = pair.server.recovery().congestion_window;
+        assert!(before > INITIAL_WINDOW);
+        // The client does not know that its address changed.
+        pair.client.ping();
+        for datagram in sent(&mut pair.client) {
+            give_on(&mut pair.server, from_server(rebound), &datagram, now(), Ecn::NotEct);
+        }
+        assert_eq!(pair.server.path(), from_server(rebound));
+        assert!(!pair.server.address_validated());
+        assert_eq!(pair.server.recovery().congestion_window, window.unwrap_or(before));
+        // The client answers the challenge of the server. The server also asks the old address,
+        // one time, in a full datagram (RFC 9000, section 9.3.3).
+        pair.seen = rebound;
+        pair.run(|_| true);
+        assert!(pair.server.address_validated());
+        let old: Vec<(SocketAddr, usize)> = pair.elsewhere.iter().map(|(to, d)| (to.peer, d.len())).collect();
+        assert_eq!(old, [(client_address(4301), 1200)]);
+        // The connection goes on at the new address.
+        pair.download(now(), 60_000);
+        assert_eq!(pair.server.path(), from_server(rebound));
+        assert_eq!(pair.elsewhere.len(), 1);
+    }
+}
+
+#[test]
+fn data_to_a_new_peer_address_stays_within_three_times_its_received_bytes_until_validation() {
+    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    let stream = pair.open(Direction::Bidirectional);
+    pair.client.send(stream, region(0, 1), true).unwrap();
+    pair.run(|_| true);
+    // The server has 64 KB to send when the client moves.
+    assert_eq!(feed(&mut pair.server, stream, 0, 64_000, 16_000), 64_000);
+    // Each datagram of the client from the new address raises the limit by three times its bytes.
+    // No datagram of the server reaches the client, so the address gets no validation.
+    let (mut received, mut to_new) = (0, 0);
+    for _ in 0..3 {
+        pair.client.ping();
+        for datagram in sent(&mut pair.client) {
+            received += datagram.len();
+            give_on(
+                &mut pair.server,
+                from_server(moved_address()),
+                &datagram,
+                now(),
+                Ecn::NotEct,
+            );
+        }
+        for (path, datagram) in routed_at(&mut pair.server, now()) {
+            if path.peer == moved_address() {
+                to_new += datagram.len();
+            }
+        }
+        assert_eq!(pair.server.path(), from_server(moved_address()));
+        assert!(!pair.server.address_validated());
+        assert!(
+            to_new > 0 && to_new <= 3 * received,
+            "{to_new} bytes after {received} bytes"
+        );
+    }
+    // The client hears the server again, and answers its challenge: the limit ends, and the data
+    // arrives.
+    pair.seen = moved_address();
+    pair.run_until(now(), |pair| pair.at_client.complete(stream, 64_000));
+    assert!(pair.server.address_validated());
+    assert_eq!(pair.server.path(), from_server(moved_address()));
+}
+
+#[test]
+fn a_client_with_no_spare_connection_id_stays_on_its_path_and_only_a_client_moves() {
+    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    let home = pair.client.path();
+    // This server gave no second connection ID, and one ID goes out from one local address only
+    // (RFC 9000, section 9.5).
+    let other = Path {
+        local: client_address(4400),
+        ..home
+    };
+    assert_eq!(pair.client.migrate(other, now()), Ok(false));
+    assert_eq!(pair.client.path(), home);
+    // A client moves to no other address of the server, and a server does not move.
+    let elsewhere = Path {
+        peer: moved_address(),
+        ..home
+    };
+    assert_eq!(pair.client.migrate(elsewhere, now()).unwrap_err().kind(), Kind::Misuse);
+    let server = Path {
+        local: moved_address(),
+        ..pair.server.path()
+    };
+    assert_eq!(pair.server.migrate(server, now()).unwrap_err().kind(), Kind::Misuse);
+}
+
+/// A server with a window above the initial one, which an attacker moves: a copy of a datagram
+/// of the client arrives from the address of the attacker, and the datagram itself is lost. Gives
+/// the window before the move, that address, and the bytes of the copy.
+fn forwarded(pair: &mut Pair) -> (u64, SocketAddr, usize) {
+    pair.download(now(), 60_000);
+    let window = pair.server.recovery().congestion_window;
+    assert!(window > INITIAL_WINDOW);
+    pair.client.ping();
+    let copy = sent(&mut pair.client).remove(0);
+    let attacker = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 66), 9));
+    give_on(&mut pair.server, from_server(attacker), &copy, now(), Ecn::NotEct);
+    assert_eq!(pair.server.path(), from_server(attacker));
+    assert_eq!(pair.server.recovery().congestion_window, INITIAL_WINDOW);
+    (window, attacker, copy.len())
+}
+
+#[test]
+fn the_validation_of_an_address_that_never_answers_ends_at_its_timer_and_the_old_path_keeps_its_window() {
+    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    let (window, attacker, copied) = forwarded(&mut pair);
+    let home = from_server(client_address(4301));
+    // Nothing answers, and the server follows its deadlines.
+    let (mut at, mut to_attacker) = (now(), 0);
+    for _ in 0..64 {
+        for (path, datagram) in routed_at(&mut pair.server, at) {
+            if path.peer == attacker {
+                to_attacker += datagram.len();
+            }
+        }
+        if pair.server.path() == home {
+            break;
+        }
+        at = pair
+            .server
+            .drive(at)
+            .1
+            .deadline
+            .expect("a validation has its end")
+            .instant();
+        driven_at(&mut pair.server, at);
+    }
+    // The validation ends after three probe timeouts of the new path, which are longer than the
+    // ones of the old path (RFC 9000, section 8.2.4).
+    assert_eq!(at, ms(3 * FIRST_TIMEOUT_MS));
+    assert_eq!(pair.server.path(), home);
+    assert!(pair.server.address_validated());
+    assert_eq!(pair.server.recovery().congestion_window, window);
+    assert!(to_attacker <= 3 * copied, "{to_attacker} bytes after {copied} bytes");
+    // The client, which heard nothing of this, still has its connection.
+    pair.download(at, 20_000);
+    assert_eq!(pair.server.path(), home);
+}
+
+#[test]
+fn a_client_that_did_not_move_answers_on_its_path_and_the_server_returns_at_once() {
+    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    let (window, _, _) = forwarded(&mut pair);
+    let home = from_server(client_address(4301));
+    // The server asks the path that the client seemed to leave, in a full datagram.
+    let asked: Vec<Vec<u8>> = routed_at(&mut pair.server, now())
+        .into_iter()
+        .filter(|(path, _)| *path == home)
+        .map(|(_, datagram)| datagram)
+        .collect();
+    assert_eq!(asked.iter().map(Vec::len).collect::<Vec<_>>(), [1200]);
+    // The answer of the client is a packet that is not a probe. It is the newest packet of the
+    // client, and it comes from the address of the client (RFC 9000, section 9.3.3).
+    give(&mut pair.client, &asked[0]);
+    for datagram in sent(&mut pair.client) {
+        give_on(&mut pair.server, home, &datagram, now(), Ecn::NotEct);
+    }
+    assert_eq!(pair.server.path(), home);
+    assert!(pair.server.address_validated());
+    assert_eq!(pair.server.recovery().congestion_window, window);
+}
+
+#[test]
+fn the_search_finds_the_datagram_size_of_the_path_and_a_lost_probe_is_no_congestion() {
+    // The client can send datagrams of 1,452 bytes, and the path carries 1,300.
+    let limits = Limits {
+        datagram_bytes_max: 1452,
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::on_path(limits, Limits::DEFAULT, 1300);
+    // The search runs with no data. It ends before the idle timeout is the only deadline.
+    let mut at = now();
+    for _ in 0..512 {
+        pair.run_at(at, |_| true);
+        let next = pair.client.drive(at).1.deadline.expect("the idle deadline").instant();
+        if next.as_nanos() >= ms(20_000).as_nanos() {
+            break;
+        }
+        at = next;
+    }
+    // At most three probes of each size, and at most six sizes: the top, and then each half of
+    // the 252 bytes above 1,200 down to a step of 20 bytes.
+    assert!((1..=18).contains(&pair.dropped), "{} probes were lost", pair.dropped);
+    let recovery = pair.client.recovery();
+    assert_eq!(recovery.packets_lost, 0);
+    assert!(recovery.congestion_window >= INITIAL_WINDOW);
+    // The data then goes in datagrams of the size that the search found: at most 20 bytes below
+    // the size that the path carries.
+    let stream = pair.open(Direction::Bidirectional);
+    let mut offset = 0;
+    for _ in 0..64 {
+        offset = feed(&mut pair.client, stream, offset, 100_000, 16_000);
+        pair.run_at(at, |_| true);
+    }
+    assert!(pair.at_server.complete(stream, 100_000));
+    assert!(
+        (1281..=1300).contains(&pair.largest),
+        "datagrams of {} bytes",
+        pair.largest
+    );
+    assert_eq!(pair.client.recovery().packets_lost, 0);
+}
+
+#[test]
+fn a_path_that_starts_to_drop_large_datagrams_returns_to_1200_bytes_in_three_probe_timeouts() {
+    let limits = Limits {
+        datagram_bytes_max: 1452,
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(limits, Limits::DEFAULT);
+    // The path carries each size, so the first probe finds the top of the search.
+    let stream = pair.open(Direction::Bidirectional);
+    let mut offset = feed(&mut pair.client, stream, 0, 60_000, 5_000);
+    pair.run(|_| true);
+    assert_eq!((offset, pair.largest), (20_000, 1452));
+    let probes = pair.client.recovery().probes_sent;
+    // The path now drops each datagram above 1,200 bytes.
+    (pair.path_bytes, pair.largest) = (1200, 0);
+    let mut at = now();
+    for _ in 0..64 {
+        offset = feed(&mut pair.client, stream, offset, 60_000, 5_000);
+        at = pair.run_until(at, |pair| pair.client.recovery().bytes_in_flight == 0);
+        if pair.at_server.complete(stream, 60_000) {
+            break;
+        }
+    }
+    assert!(pair.at_server.complete(stream, 60_000));
+    assert_eq!(pair.client.recovery().probes_sent - probes, 3);
+    assert_eq!(pair.largest, 1200);
+}
+
+#[test]
+fn a_close_sends_its_code_at_once_then_at_a_bounded_rate_and_each_end_releases_after_its_period() {
+    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    let stream = pair.open(Direction::Bidirectional);
+    // Eight datagrams of the server, which arrive after the client closes.
+    let late: Vec<Vec<u8>> = (0..8)
+        .flat_map(|_| {
+            pair.server.ping();
+            sent(&mut pair.server)
+        })
+        .collect();
+    assert_eq!(late.len(), 8);
+    pair.client.close(0x2a, now()).unwrap();
+    assert_eq!(
+        pair.client.send(stream, region(0, 1), false).unwrap_err().kind(),
+        Kind::Cancelled
+    );
+    let first = sent(&mut pair.client);
+    assert_eq!(
+        first.len(),
+        1,
+        "the frame goes out one time with no datagram of the peer"
+    );
+    // A copy answers datagram 1, 2, 4, and 8 of the peer.
+    let copies: Vec<Vec<Vec<u8>>> = late
+        .iter()
+        .map(|datagram| {
+            assert!(give(&mut pair.client, datagram).is_empty());
+            sent(&mut pair.client)
+        })
+        .collect();
+    assert_eq!(
+        copies.iter().map(Vec::len).collect::<Vec<_>>(),
+        [1, 1, 0, 1, 0, 0, 0, 1]
+    );
+    // The first frame is lost, and a copy reaches the server: it ends for its application at
+    // once, and sends nothing more.
+    let events = give(&mut pair.server, &copies[7][0]);
+    assert_matches!(&events[..], [Event::Closed(Ok(()))]);
+    assert_eq!(pair.server.peer_close(), Some(PeerClose::Application(0x2a)));
+    assert_eq!(
+        pair.server.open(Direction::Bidirectional).unwrap_err().kind(),
+        Kind::Cancelled
+    );
+    assert!(sent(&mut pair.server).is_empty());
+    // Each end gives its terminal outcome after three probe timeouts, not before. With no round
+    // trip time, a probe timeout is the 1 ms of the timer and the 25 ms of the peer.
+    for end in [&mut pair.client, &mut pair.server] {
+        let turn = end.drive(ms(77)).1;
+        assert_eq!(turn.progress, Progress::Blocked(rsnetwork::drive::Blocked::Input));
+        assert_eq!(turn.deadline.map(|deadline| deadline.instant()), Some(ms(78)));
+        assert_eq!(end.drive(ms(78)).1.progress, Progress::Terminal(Ok(())));
+    }
 }
