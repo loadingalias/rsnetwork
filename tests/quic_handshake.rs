@@ -6,6 +6,9 @@ use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+#[path = "quic/endpoint.rs"]
+mod endpoint;
+
 use rsnetwork::buffer::Backing;
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Error, Kind, Progress};
@@ -102,6 +105,16 @@ enum Order {
     HandshakeReversed,
 }
 
+impl Order {
+    fn flight(self, datagrams: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        if self == Self::Sent {
+            return datagrams;
+        }
+        let (initial, rest): (Vec<_>, Vec<_>) = datagrams.iter().flat_map(|d| packets(d)).partition(|d| is_initial(d));
+        initial.into_iter().chain(rest.into_iter().rev()).collect()
+    }
+}
+
 /// A client and the server that its first datagram makes, and the datagrams between them.
 struct Pair {
     client: Connection,
@@ -174,13 +187,7 @@ impl Pair {
             while let Some(datagram) = self.to_server.pop_front() {
                 self.deliver(datagram, now);
             }
-            let mut to_client: Vec<_> = self.to_client.drain(..).collect();
-            if order == Order::HandshakeReversed {
-                let packets: Vec<Vec<u8>> = to_client.iter().flat_map(|datagram| packets(datagram)).collect();
-                let (initial, rest): (Vec<_>, Vec<_>) = packets.into_iter().partition(|d| is_initial(d));
-                to_client = initial.into_iter().chain(rest.into_iter().rev()).collect();
-            }
-            for datagram in to_client {
+            for datagram in order.flight(self.to_client.drain(..).collect()) {
                 Self::give(&mut self.client, datagram, now);
             }
         }
@@ -274,6 +281,45 @@ fn a_client_and_a_server_complete_the_handshake_with_classical_and_ml_dsa_chains
 }
 
 #[test]
+fn an_unvalidated_server_counts_udp_bytes_and_stops_its_probe_timer_at_the_limit() {
+    let mut pair = Pair::new(
+        &client_config(MLDSA_CA, Resumption::Off),
+        server_config(MLDSA65, &[MLDSA_INTERMEDIATE], Resumption::Off),
+        (Limits::DEFAULT, Limits::DEFAULT),
+    );
+    let initial = Pair::send(&mut pair.client, at(0));
+    let received: usize = initial.iter().map(Vec::len).sum();
+    for datagram in initial {
+        pair.deliver(datagram, at(0));
+    }
+    let flight = Pair::send(pair.server(), at(0));
+    let sent: usize = flight.iter().map(Vec::len).sum();
+    assert!(sent <= 3 * received && sent > 3 * received - 1200);
+    assert_eq!(pair.server().recovery().amplification_blocked_round_trips, 1);
+    assert!(Pair::send(pair.server(), at(2000)).is_empty());
+    let next = pair.server().drive(at(2000)).1.deadline.unwrap().instant();
+    assert!(next.as_nanos() > at(2000).as_nanos());
+    assert_eq!(pair.server().recovery().amplification_blocked_round_trips, 1);
+    for datagram in flight {
+        Pair::give(&mut pair.client, datagram, at(2000));
+    }
+    let mut now = at(2000);
+    for _ in 0..64 {
+        pair.run(now, Order::Sent);
+        if pair.client.is_confirmed() {
+            break;
+        }
+        now = [pair.client.drive(now).1, pair.server().drive(now).1]
+            .into_iter()
+            .filter_map(|turn| turn.deadline.map(|d| d.instant()))
+            .min_by_key(|instant| instant.as_nanos())
+            .expect("a pending handshake has a deadline");
+    }
+    assert!(pair.client.is_confirmed());
+    assert_eq!(pair.server().recovery().amplification_blocked_round_trips, 1);
+}
+
+#[test]
 fn a_handshake_message_in_two_datagrams_waits_for_its_rest_with_no_work() {
     let mut pair = Pair::new(
         &client_config(CA, Resumption::Off),
@@ -342,13 +388,13 @@ fn a_chain_inside_the_crypto_bound_completes_out_of_order_and_one_past_it_refuse
         datagram_bytes_max: 48 * 1024,
         ..Limits::DEFAULT
     };
-    let mut pair = Pair::new(
+    // Validate the address before the server sends the full flight in reverse packet order.
+    let (client, server) = endpoint::validated_reversed_flight(
         &client_config(MLDSA_CA, Resumption::Off),
-        server_config(MLDSA65, &past, Resumption::Off),
-        (Limits::DEFAULT, large),
+        &server_config(MLDSA65, &past, Resumption::Off),
+        large,
     );
-    pair.run(at(0), Order::HandshakeReversed);
-    let outcome = terminal(pair.client_outcome(at(0))).expect("the client ended");
+    let outcome = terminal(client).expect("the client ended");
     let error = outcome.unwrap_err();
     assert_eq!(
         (error.kind(), error.reason()),
@@ -358,7 +404,7 @@ fn a_chain_inside_the_crypto_bound_completes_out_of_order_and_one_past_it_refuse
         )
     );
     // The client closed with CRYPTO_BUFFER_EXCEEDED, which the server reads as an error.
-    let server = terminal(pair.server().drive(at(0)).1.progress).expect("the close of the client ended the server");
+    let server = terminal(server).expect("the close of the client ended the server");
     assert_eq!(
         server.unwrap_err().reason(),
         "the peer closed the QUIC connection with a transport error"

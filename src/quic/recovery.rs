@@ -24,6 +24,8 @@ const PACKET_THRESHOLD: u64 = 3;
 /// The delivery state of the current path. Byte counts include QUIC headers and packet protection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryStats {
+    /// Handshake flights that waited for more receive credit under the server amplification limit.
+    pub amplification_blocked_round_trips: u64,
     /// The bytes in outstanding packets that elicit an ACK or contain padding.
     pub bytes_in_flight: u64,
     /// The congestion window in bytes.
@@ -56,6 +58,10 @@ pub enum EcnState {
 }
 
 pub(super) struct Path {
+    /// Remaining send credit before client address validation. A validated path has no cap.
+    pub(super) amplification_credit: Option<u64>,
+    pub(super) amplification_blocked: bool,
+    pub(super) amplification_rounds: u64,
     pub(super) controller: Controller,
     store: Store,
     /// The virtual end of the last paced transmission, in clock nanoseconds.
@@ -81,6 +87,9 @@ pub(super) struct Path {
 impl Path {
     pub(super) fn new(datagram: usize, algorithm: CongestionControl, budget: &Budget) -> Self {
         Self {
+            amplification_credit: None,
+            amplification_blocked: false,
+            amplification_rounds: 0,
             controller: Controller::new(datagram as u64, algorithm),
             store: Store::new(budget),
             departure: 0,
@@ -105,6 +114,7 @@ impl Path {
 
     pub(super) fn stats(&self) -> RecoveryStats {
         RecoveryStats {
+            amplification_blocked_round_trips: self.amplification_rounds,
             bytes_in_flight: self.flight,
             congestion_window: self.controller.window,
             latest_rtt: self.minimum.map(|_| self.latest),
@@ -390,6 +400,9 @@ pub(super) enum DataRange {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Record {
+    IssueId(u64),
+    RetireId(u64),
+    NewToken,
     Range(DataRange),
     Limit(u8),
     Control(StreamId, u8),

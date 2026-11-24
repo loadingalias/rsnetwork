@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use rstypes::buffer::{Buffer as _, Lease};
-use rstypes::capacity::{Budget, Credit};
+use rstypes::capacity::{Budget, Credit, Permit};
 use rstypes::time::{Deadline, Instant};
 use rustls::error::AlertDescription;
 use rustls::pki_types::ServerName;
@@ -32,7 +32,9 @@ use rustls::quic::{
 };
 use rustls::{ClientSide, ServerSide};
 
+use super::cid::{Id, Ids};
 use super::crypto::{self, Refused};
+use super::endpoint::{self, Issuer};
 use super::frame::{Ack, Direction, Frame, STREAMS_MAX};
 use super::packet::{self, Builder, Datagrams, Header, Kind as PacketKind, OpenError, Outgoing, Side};
 use super::params::{Parameters, Sender};
@@ -140,6 +142,8 @@ impl Default for Limits {
 
 /// The smallest datagram that carries an Initial packet (RFC 9000, section 14.1).
 const DATAGRAM_MIN: usize = 1_200;
+/// A token of this size leaves room for a CRYPTO frame in a minimum-sized Initial.
+const CLIENT_TOKEN_MAX: usize = 1024;
 /// The largest UDP payload (RFC 9000, section 18.2).
 const DATAGRAM_MAX: usize = 65_527;
 /// The bytes of the destination connection ID of the first Initial packet of a client: at least
@@ -426,6 +430,7 @@ enum Tls {
 enum End {
     Client {
         tickets: Option<Arc<ClientStore>>,
+        service: [u8; 32],
     },
     Server {
         config: Arc<rustls::ServerConfig>,
@@ -445,6 +450,8 @@ struct Close {
 /// The code from an authenticated CONNECTION_CLOSE frame of the peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerClose {
+    /// A stateless reset matched the token for a destination this connection used.
+    StatelessReset,
     /// The application protocol supplied this code.
     Application(u64),
     /// The peer closed the QUIC transport.
@@ -459,6 +466,7 @@ pub enum PeerClose {
 impl PeerClose {
     fn outcome(self) -> Result<(), Error> {
         match self {
+            Self::StatelessReset => Err(Error::new(Kind::Uncertain, "the peer reset the QUIC connection")),
             Self::Application(_)
             | Self::Transport {
                 code: ErrorCode::NO_ERROR,
@@ -495,6 +503,33 @@ struct SendAt {
     admitted: bool,
 }
 
+/// The caller consumes this address proof on its next connection to the same service.
+pub struct AddressToken {
+    bytes: Vec<u8>,
+    service: [u8; 32],
+    _storage: Permit,
+}
+
+impl fmt::Debug for AddressToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AddressToken").finish_non_exhaustive()
+    }
+}
+
+impl AddressToken {
+    fn copy(bytes: &[u8], service: [u8; 32], budget: &Budget) -> Result<Self, Error> {
+        let storage = budget.reserve(bytes.len() as u64).map_err(|_| endpoint::NO_ROOM)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(bytes.len()).map_err(|_| endpoint::NO_ROOM)?;
+        data.extend_from_slice(bytes);
+        Ok(Self {
+            bytes: data,
+            service,
+            _storage: storage,
+        })
+    }
+}
+
 /// One QUIC connection of version 1, client or server, with no I/O.
 pub struct Connection {
     end: End,
@@ -525,12 +560,22 @@ pub struct Connection {
     read: Level,
     /// The connection ID of this end: the destination of the packets of the peer.
     local_cid: ConnectionId,
+    initial_local: ConnectionId,
     /// The connection ID of the peer: the destination of the packets of this end.
     remote_cid: ConnectionId,
     /// The destination connection ID of the first Initial packet of the client.
     original_cid: ConnectionId,
-    /// A client took the connection ID of the server from its first Initial packet.
-    remote_known: bool,
+    retry_cid: Option<ConnectionId>,
+    initial_token: Option<AddressToken>,
+    future_token: Option<AddressToken>,
+    pub(super) ids: Ids,
+    issuer: Option<Issuer>,
+    random: &'static dyn rustls::crypto::SecureRandom,
+    reset_mask: rscrypto::SecretBytes<32>,
+    used_remote: Option<ConnectionId>,
+    reset_until: Option<Instant>,
+    /// The peer source ID in Initial and Handshake packets. Rotation only affects the data path.
+    initial_peer: Option<ConnectionId>,
     facts: Option<Facts>,
     peer: Option<Parameters>,
     limits: Limits,
@@ -565,6 +610,7 @@ pub struct Connection {
 
 /// The frames of an opened packet: its payload, and the offset of the next frame.
 struct Reading {
+    destination: ConnectionId,
     level: Level,
     payload: Lease,
     at: usize,
@@ -641,7 +687,7 @@ fn receive_window(limits: &Limits) -> Result<u64, Error> {
 }
 
 /// Checks the limits that the caller set.
-fn check(limits: &Limits) -> Result<(), Error> {
+pub(super) fn check(limits: &Limits) -> Result<(), Error> {
     if !(DATAGRAM_MIN..=DATAGRAM_MAX).contains(&limits.datagram_bytes_max)
         || limits.cid_bytes > ConnectionId::MAX
         || limits.key_packets_max < 2
@@ -700,7 +746,8 @@ impl Connection {
         if config.protocols == 0 {
             return Err(Error::new(Kind::Misuse, "a QUIC client offers no ALPN name"));
         }
-        let name = ServerName::try_from(name)
+        let input_name = name;
+        let name = ServerName::try_from(input_name)
             .map_err(|_| Error::new(Kind::Misuse, "the server name is not a DNS name or an IP address"))?;
         let name_bytes = match &name {
             ServerName::DnsName(dns) => dns.as_ref().len(),
@@ -720,10 +767,11 @@ impl Connection {
             (
                 End::Client {
                     tickets: config.store.clone(),
+                    service: rscrypto::Sha256::digest(input_name.as_bytes()),
                 },
                 Tls::Failed,
             ),
-            (stream, held, config.cost, Arc::clone(&config.own)),
+            (stream, random, held, config.cost, Arc::clone(&config.own)),
             (local_cid, original_cid, original_cid),
             limits,
             budget,
@@ -746,7 +794,8 @@ impl Connection {
 
     /// Makes the server end of the connection that the client starts with the Initial packet of
     /// `initial`, the header of its first packet. Give that packet to
-    /// [`receive`](Self::receive) next.
+    /// [`receive`](Self::receive) next. Use [`super::Endpoint`] for a listener with shared routing,
+    /// address proofs, stateless reset, and handshake admission. This constructor serves one externally routed connection.
     ///
     /// Refuses with [`Kind::Misuse`] when `initial` is not the header of an Initial packet,
     /// `config` accepts no ALPN name, or `limits` cannot work, and with [`Kind::Overload`] when
@@ -754,6 +803,17 @@ impl Connection {
     pub fn server(
         config: &tls::ServerConfig,
         initial: &Header,
+        limits: Limits,
+        budget: &Budget,
+        now: Instant,
+    ) -> Result<Self, Error> {
+        Self::server_admitted(config, initial, None, limits, budget, now)
+    }
+
+    pub(super) fn server_admitted(
+        config: &tls::ServerConfig,
+        initial: &Header,
+        admission: Option<(Issuer, Option<endpoint::Proof>)>,
         limits: Limits,
         budget: &Budget,
         now: Instant,
@@ -776,7 +836,10 @@ impl Connection {
         }
         let stream = config.entropy.stream(QUIC);
         let random = config.config.provider().secure_random;
-        let local_cid = tls::scoped(stream.as_ref(), || random_cid(random, limits.cid_bytes))?;
+        let local_cid = tls::scoped(stream.as_ref(), || match &admission {
+            Some((issuer, _)) => issuer.issue(random),
+            None => random_cid(random, limits.cid_bytes),
+        })?;
         let own = config.own.get();
         let held = Held::new(budget, &config.cost, 0, &own)?;
         let mut connection = Self::new(
@@ -787,13 +850,23 @@ impl Connection {
                 },
                 Tls::Server(ServerHandshake::NeedsInput(ServerHandshake::start(TlsVersion::V1))),
             ),
-            (stream, held, config.cost, Arc::clone(&config.own)),
+            (stream, random, held, config.cost, Arc::clone(&config.own)),
             (local_cid, scid, dcid),
             limits,
             budget,
             now,
         )?;
-        connection.remote_known = true;
+        if let Some((issuer, proof)) = admission {
+            connection.issuer = Some(issuer);
+            if proof.is_some() {
+                connection.path.amplification_credit = None;
+            }
+            if let Some(endpoint::Proof::Retry { original, retry }) = proof {
+                connection.original_cid = original;
+                connection.retry_cid = Some(retry);
+            }
+        }
+        connection.initial_peer = Some(scid);
         connection.spaces[Level::Initial as usize].install(|| packet::initial_keys(&dcid, Side::Server))?;
         let parameters = encode(&connection.parameters(), &mut connection.kept)?;
         if let End::Server { parameters: slot, .. } = &mut connection.end {
@@ -804,13 +877,23 @@ impl Connection {
 
     fn new(
         (end, tls): (End, Tls),
-        (stream, held, cost, own): (Option<rscrypto_rustls::replay::Stream>, Held, Cost, Arc<Owns>),
+        (stream, random, held, cost, own): (
+            Option<rscrypto_rustls::replay::Stream>,
+            &'static dyn rustls::crypto::SecureRandom,
+            Held,
+            Cost,
+            Arc<Owns>,
+        ),
         (local_cid, remote_cid, original_cid): (ConnectionId, ConnectionId, ConnectionId),
         limits: Limits,
         budget: &Budget,
         now: Instant,
     ) -> Result<Self, Error> {
         let window = receive_window(&limits)?;
+        let reset_mask = tls::scoped(stream.as_ref(), || {
+            rscrypto::SecretBytes::try_fill_with(|b| random.fill(b))
+        })
+        .map_err(|_| endpoint::RANDOM)?;
         let mut output = budget.credit(0);
         output
             .charge((EVENTS * size_of::<QuicEvent>()) as u64)
@@ -826,6 +909,8 @@ impl Connection {
         } else {
             Side::Server
         };
+        let mut path = Path::new(limits.datagram_bytes_max, limits.congestion_control, budget);
+        path.amplification_credit = (side == Side::Server).then_some(0);
         Ok(Self {
             end,
             tls,
@@ -838,7 +923,7 @@ impl Connection {
             parameters_kept: false,
             events,
             spaces: core::array::from_fn(|_| Space::new(budget, window)),
-            path: Path::new(limits.datagram_bytes_max, limits.congestion_control, budget),
+            path,
             sides: super::side::Flows::new(budget, limits.side_flows_max),
             window,
             validation_at: now,
@@ -848,7 +933,17 @@ impl Connection {
             local_cid,
             remote_cid,
             original_cid,
-            remote_known: false,
+            retry_cid: None,
+            initial_token: None,
+            future_token: None,
+            ids: Ids::new(local_cid),
+            issuer: None,
+            random,
+            reset_mask,
+            used_remote: None,
+            reset_until: None,
+            initial_local: local_cid,
+            initial_peer: None,
             facts: None,
             peer: None,
             limits,
@@ -888,8 +983,10 @@ impl Connection {
         let server = matches!(self.end, End::Server { .. });
         Parameters {
             original_destination_cid: server.then_some(self.original_cid),
+            retry_source_cid: self.retry_cid,
+            stateless_reset_token: self.issuer.as_ref().map(|issuer| issuer.reset(&self.local_cid)),
             idle_timeout: self.limits.idle_timeout,
-            initial_source_cid: Some(self.local_cid),
+            initial_source_cid: Some(self.initial_local),
             data_bytes_initial: self.limits.data_bytes_max,
             stream_bytes_bidi_local_initial: self.limits.stream_bytes_max,
             stream_bytes_bidi_remote_initial: self.limits.stream_bytes_max,
@@ -908,6 +1005,106 @@ impl Connection {
     /// connection, and read their short headers with its length.
     pub const fn local_cid(&self) -> &ConnectionId {
         &self.local_cid
+    }
+
+    /// Gives the live local destination IDs. An endpoint routes each of these to this connection.
+    pub fn local_ids(&self) -> [Option<ConnectionId>; 2] {
+        self.ids.issued()
+    }
+
+    /// Whether the server can send beyond three times the bytes it received on this path.
+    pub fn address_validated(&self) -> bool {
+        self.path.amplification_credit.is_none()
+    }
+
+    /// Takes the latest unused NEW_TOKEN. Keep it only for a future connection to the same service.
+    pub fn take_address_token(&mut self) -> Option<AddressToken> {
+        self.future_token.take()
+    }
+
+    /// Gives a client an address token from this service before its first Initial leaves.
+    pub fn use_address_token(&mut self, token: AddressToken) -> Result<(), Error> {
+        if !matches!(self.end, End::Client { service, .. } if token.service == service) || self.spaces[0].next != 0 {
+            return Err(Error::new(
+                Kind::Misuse,
+                "use the same server name before sending the first client Initial",
+            ));
+        }
+        self.initial_token = Some(token);
+        Ok(())
+    }
+
+    fn copy_token(&self, bytes: &[u8]) -> Result<AddressToken, Error> {
+        let End::Client { service, .. } = self.end else {
+            return Err(Error::new(
+                Kind::Misuse,
+                "only a QUIC client retains a received address token",
+            ));
+        };
+        AddressToken::copy(bytes, service, &self.budget)
+    }
+
+    /// Switches to a spare destination ID and retires the old ID. Returns false if no spare has arrived.
+    pub fn rotate_peer_id(&mut self) -> Result<bool, Error> {
+        self.live()?;
+        let Some(spare) = self.ids.spare(self.remote_cid) else {
+            return Ok(false);
+        };
+        let old = self
+            .ids
+            .peer(self.remote_cid)
+            .expect("a spare accompanies a current ID");
+        self.ids.rotate(old.sequence).map_err(|_| endpoint::NO_ROOM)?;
+        self.destination(spare.id);
+        Ok(true)
+    }
+
+    fn destination(&mut self, cid: ConnectionId) {
+        let previous = self.remote_cid.as_bytes().len();
+        self.remote_cid = cid;
+        if cid.as_bytes().len() > previous {
+            self.streams.resize_unreliable(self.frame_room());
+        }
+    }
+
+    fn issue_id(&mut self) -> Result<(), Error> {
+        let (id, reset) = tls::scoped(self.stream.as_ref(), || -> Result<_, Error> {
+            if let Some(issuer) = &self.issuer {
+                let id = issuer.issue(self.random)?;
+                return Ok((id, issuer.reset(&id)));
+            }
+            let id = random_cid(self.random, self.limits.cid_bytes)?;
+            let mut reset = [0; 16];
+            self.random.fill(&mut reset).map_err(|_| endpoint::RANDOM)?;
+            Ok((id, reset))
+        })?;
+        self.ids.issue(id, reset).map_err(|_| endpoint::NO_ROOM)
+    }
+
+    pub(super) fn used_reset(&self) -> Option<[u8; 16]> {
+        self.ids.peer(self.used_remote?)?.reset
+    }
+
+    fn matches_reset(&self, tail: &[u8; 16]) -> bool {
+        self.used_reset().is_some_and(|expected| {
+            let key = self.reset_mask.as_bytes();
+            let expected = rscrypto::HmacSha256::mac(key, &expected);
+            rscrypto::HmacSha256::verify_tag(key, tail, &expected).is_ok()
+        })
+    }
+
+    pub(super) fn stateless_reset(&mut self, now: Instant) -> Result<(), Error> {
+        self.check_clock(now)?;
+        if self.outcome.is_none() && self.reset_until.is_none() {
+            self.reset_until = Some(after(now, 3 * self.pto())?);
+            self.peer_close = Some(PeerClose::StatelessReset);
+            self.close = None;
+        }
+        Ok(())
+    }
+
+    pub(super) fn ended(&self) -> bool {
+        self.outcome.is_some()
     }
 
     /// What the handshake negotiated, or `None` before it completed.
@@ -1010,6 +1207,9 @@ impl Connection {
 
     /// Refuses a call of the application after the connection ended.
     fn live(&self) -> Result<(), Error> {
+        if self.reset_until.is_some() {
+            return PeerClose::StatelessReset.outcome();
+        }
         match (self.outcome, &self.close) {
             (Some(Err(error)), _) => Err(error),
             (Some(Ok(())), _) => Err(Error::new(Kind::Cancelled, "the QUIC connection closed")),
@@ -1109,6 +1309,11 @@ impl Connection {
         self.streams.unreliable_room(self.frame_room())
     }
 
+    /// Queued unreliable datagrams dropped because a new destination ID left too little space.
+    pub const fn unreliable_dropped(&self) -> u64 {
+        self.streams.unreliable_dropped
+    }
+
     /// Queues `data` as one unreliable datagram (RFC 9221), with no copy. It goes out one time, in
     /// one packet, before the data of the streams, and no loss sends it again.
     ///
@@ -1143,7 +1348,7 @@ impl Connection {
             if let Some(event) = self.next_event(&mut work) {
                 return (Some(event), self.turn());
             }
-            if self.outcome.is_some() || self.close.is_some() {
+            if self.outcome.is_some() || self.close.is_some() || self.reset_until.is_some() {
                 break;
             }
             if work.reached(&self.limits.turn) {
@@ -1151,14 +1356,23 @@ impl Connection {
                 break;
             }
             let ecn = datagrams.ecn;
+            let suffix = datagrams.next_datagram().and_then(endpoint::reset_suffix).copied();
             let Some(next) = datagrams.next_packet() else {
                 break;
             };
-            let Ok(packet) = next else {
-                continue;
-            };
-            if let Err(failure) = self.packet(packet, &mut work, now, ecn) {
-                self.fail(failure);
+            match next {
+                Ok(packet) => {
+                    if let Err(failure) = self.packet(packet, &mut work, now, ecn) {
+                        self.fail(failure);
+                    }
+                }
+                Err(_) => work.add(1, 1),
+            }
+            if self.reading.is_none()
+                && suffix.is_some_and(|tail| self.matches_reset(&tail))
+                && let Err(error) = self.stateless_reset(now)
+            {
+                self.outcome = Some(Err(error));
             }
         }
         (None, self.turn())
@@ -1183,7 +1397,7 @@ impl Connection {
     /// the packet that the engine reads, and else runs the handshake.
     fn next_event(&mut self, work: &mut Work) -> Option<Event> {
         for _ in 0..2 {
-            if self.outcome.is_some() || self.close.is_some() {
+            if self.outcome.is_some() || self.close.is_some() || self.reset_until.is_some() {
                 return None;
             }
             if let Some(flow) = self.sides.notify_probe.take() {
@@ -1235,6 +1449,9 @@ impl Connection {
         if self.outcome.is_some() {
             return Ok(None);
         }
+        if self.reset_until.is_some() {
+            return Ok(self.reset_until);
+        }
         let previous = self
             .one_rtt
             .as_ref()
@@ -1262,7 +1479,11 @@ impl Connection {
             .filter_map(|l| self.spaces[l as usize].history.loss_time.map(|at| (at, Alarm::Loss(l))))
             .chain(self.sides.deadline().map(|at| (at, Alarm::SideLoss)))
             .min_by_key(|(at, _)| at.as_nanos());
-        if loss.is_some() || self.spaces.iter().any(|space| space.probe) {
+        if loss.is_some()
+            || self.path.amplification_credit == Some(0)
+            || self.path.amplification_blocked
+            || self.spaces.iter().any(|space| space.probe)
+        {
             return loss;
         }
         let delay = |base: Instant, pto: Duration| {
@@ -1322,6 +1543,12 @@ impl Connection {
             return Ok(());
         }
         self.check_clock(now)?;
+        if self.reset_until.is_some() {
+            if reached(self.reset_until, now)? {
+                self.outcome = Some(PeerClose::StatelessReset.outcome());
+            }
+            return Ok(());
+        }
         if reached(self.path.pacing_wait, now)? {
             self.path.pacing_wait = None;
         }
@@ -1400,6 +1627,7 @@ impl Connection {
             .history
             .ack(ack, &mut self.path, now, delay, |record| match record {
                 Record::Range(DataRange::Crypto { offset, len }) => space.send.acknowledged(offset, len),
+                record @ (Record::RetireId(_) | Record::NewToken) => self.ids.acknowledged(record),
                 other => self.streams.acknowledged(other),
             })?;
         if acked.eliciting {
@@ -1418,6 +1646,7 @@ impl Connection {
         let space = &mut self.spaces[level as usize];
         space.history.detect(&mut self.path, now, |record| {
             match record {
+                record @ (Record::IssueId(_) | Record::RetireId(_) | Record::NewToken) => self.ids.lost(record),
                 Record::HandshakeDone => self.handshake_done = true,
                 Record::Limit(_) | Record::Control(_, _) => self.streams.lost_control(record),
                 Record::Range(range) => {
@@ -1443,20 +1672,77 @@ impl Connection {
         now: Instant,
         ecn: Ecn,
     ) -> Result<(), Failure> {
+        work.add(packet.header().end(), 0);
         let Header::Protected { kind, dcid, scid, .. } = *packet.header() else {
-            // A Retry, a Version Negotiation, or another version: the endpoint (N304) reads them.
+            if matches!(self.end, End::Client { .. })
+                && matches!(packet.header(), Header::Negotiation { .. })
+                && packet::Negotiation::of(
+                    (packet.bytes(), packet.header()),
+                    (&self.original_cid, &self.local_cid, super::Version::V1),
+                    self.initial_peer.is_some() || self.retry_cid.is_some(),
+                ) == packet::Negotiation::Abandon
+            {
+                self.outcome = Some(Err(Error::new(
+                    Kind::Unsupported,
+                    "the peer offered no supported QUIC version",
+                )));
+                return Ok(());
+            }
+            if let Header::Retry { dcid, scid, token, .. } = packet.header()
+                && matches!(self.end, End::Client { .. })
+                && self.retry_cid.is_none()
+                && self.initial_peer.is_none()
+                && self.local_cid == *dcid
+                && *scid != self.original_cid
+                && !token.is_empty()
+                && token.len() <= CLIENT_TOKEN_MAX
+                && packet::retry_is_valid(packet.bytes(), &self.original_cid)
+            {
+                let token = self.copy_token(&packet.bytes()[token.clone()])?;
+                let space = &mut self.spaces[0];
+                space.history.discard(&mut self.path);
+                space.retry.clear();
+                space.keys = None;
+                space.keys = Some(packet::initial_keys(scid, Side::Client));
+                space.send.rewind();
+                space.probe = false;
+                self.path = Path::new(
+                    self.limits.datagram_bytes_max,
+                    self.limits.congestion_control,
+                    &self.budget,
+                );
+                self.initial_token = Some(token);
+                self.retry_cid = Some(*scid);
+                self.remote_cid = *scid;
+                self.validation_at = now;
+            }
             return Ok(());
         };
-        work.add(packet.header().end(), 0);
         let server = matches!(self.end, End::Server { .. });
-        let ours = dcid == self.local_cid
-            || (server && kind == PacketKind::Initial && dcid == self.original_cid && !self.spaces[0].discarded);
+        let ours = self.ids.issued().contains(&Some(dcid))
+            || (server
+                && kind == PacketKind::Initial
+                && dcid == self.retry_cid.unwrap_or(self.original_cid)
+                && !self.spaces[0].discarded);
+        let (bytes, first) = packet.datagram();
+        if first
+            && ours
+            && let Some(credit) = self.path.amplification_credit.as_mut()
+        {
+            *credit = credit.saturating_add((bytes as u64).saturating_mul(3));
+            if *credit >= DATAGRAM_MIN as u64 {
+                self.path.amplification_blocked = false;
+            }
+        }
+        if server && kind == PacketKind::Initial && bytes < DATAGRAM_MIN {
+            return Ok(());
+        }
         let Some(level) = Level::of(kind).filter(|_| ours) else {
             return Ok(());
         };
         // A client takes the connection ID of the server from its first Initial packet, and drops
         // each later packet with another one (RFC 9000, section 7.2).
-        if level != Level::Data && self.remote_known && scid != self.remote_cid {
+        if level != Level::Data && self.initial_peer.is_some_and(|first| first != scid) {
             return Ok(());
         }
         let space = &self.spaces[level as usize];
@@ -1517,18 +1803,21 @@ impl Connection {
         {
             keys.first_received = Some(keys.first_received.map_or(number, |first| first.min(number)));
         }
-        if !server && level == Level::Initial && !self.remote_known {
+        if !server && level == Level::Initial && self.initial_peer.is_none() {
             self.remote_cid = scid;
-            self.remote_known = true;
+            self.initial_peer = Some(scid);
         }
         // A server drops the Initial keys when a Handshake packet of the client opens (RFC 9001,
         // section 4.9.1).
         if server && level == Level::Handshake && !self.spaces[0].discarded {
+            self.path.amplification_credit = None;
+            self.path.amplification_blocked = false;
             self.discard(Level::Initial);
         }
         self.received = true;
         self.last_activity = now;
         self.reading = Some(Reading {
+            destination: dcid,
             level,
             payload: packet.payload(),
             at: 0,
@@ -1639,8 +1928,19 @@ impl Connection {
                     self.confirm();
                     Ok(None)
                 }
-                Frame::HandshakeDone | Frame::NewToken { .. } if server || handshake_level => {
+                Frame::HandshakeDone if server || handshake_level => {
                     return Err(Failure::transport(ErrorCode::PROTOCOL_VIOLATION, 0x1e, VIOLATION));
+                }
+                Frame::NewToken { token } => {
+                    if server || handshake_level {
+                        return Err(Failure::transport(ErrorCode::PROTOCOL_VIOLATION, 7, VIOLATION));
+                    }
+                    if token.len() <= CLIENT_TOKEN_MAX
+                        && let Ok(token) = self.copy_token(token)
+                    {
+                        self.future_token = Some(token);
+                    }
+                    Ok(None)
                 }
                 // Only PADDING, PING, ACK, CRYPTO, and CONNECTION_CLOSE are in Initial and
                 // Handshake packets (RFC 9000, section 12.4).
@@ -1683,8 +1983,41 @@ impl Connection {
                             }
                         })
                 }
-                // The frames of paths and connection IDs come with N304 and N307. The other
-                // BLOCKED frames and a NEW_TOKEN frame change nothing.
+                Frame::NewConnectionId {
+                    sequence,
+                    retire_prior_to,
+                    id,
+                    reset_token,
+                } => {
+                    let id = Id {
+                        sequence,
+                        id,
+                        reset: Some(reset_token),
+                    };
+                    let destination = self
+                        .ids
+                        .receive(id, retire_prior_to, self.remote_cid)
+                        .map_err(|code| Failure::transport(code, 0x18, VIOLATION))?;
+                    self.destination(destination);
+                    Ok(None)
+                }
+                Frame::RetireConnectionId { sequence } => {
+                    if self.local_cid.as_bytes().is_empty() {
+                        return Err(Failure::transport(ErrorCode::PROTOCOL_VIOLATION, 0x19, VIOLATION));
+                    }
+                    if self
+                        .ids
+                        .retire_local(sequence, reading.destination)
+                        .map_err(|code| Failure::transport(code, 0x19, VIOLATION))?
+                    {
+                        self.issue_id()?;
+                        if !self.ids.issued().contains(&Some(self.local_cid)) {
+                            self.local_cid = reading.destination;
+                        }
+                    }
+                    Ok(None)
+                }
+                // N307 owns the path frames.
                 _ => Ok(None),
             };
             match taken {
@@ -1739,6 +2072,9 @@ impl Connection {
     }
 
     fn discard(&mut self, level: Level) {
+        if level == Level::Initial {
+            self.initial_token = None;
+        }
         let space = &mut self.spaces[level as usize];
         space.history.discard(&mut self.path);
         self.path.backoff = 0;
@@ -1836,7 +2172,13 @@ impl Connection {
     /// The charge of a session ticket that a client can read in `visible` bytes of the data
     /// space, for the store of its configuration, or `None`.
     fn ticket(&self, level: Level, visible: usize) -> Option<memory::Ticket> {
-        let (End::Client { tickets: Some(store) }, Level::Data) = (&self.end, level) else {
+        let (
+            End::Client {
+                tickets: Some(store), ..
+            },
+            Level::Data,
+        ) = (&self.end, level)
+        else {
             return None;
         };
         let chain = match &self.tls {
@@ -1998,6 +2340,7 @@ impl Connection {
         self.facts = Some(facts);
         self.held.finished(peer, evidence, &self.own.get());
         self.validate(&parameters)?;
+        self.ids.first_peer(self.remote_cid, parameters.stateless_reset_token);
         self.peer = Some(parameters);
         self.streams.peer(&parameters);
         self.path.ack_delay_max = parameters.ack_delay_max;
@@ -2007,8 +2350,20 @@ impl Connection {
             (local, remote) => local.or(remote),
         };
         self.read = Level::Data;
+        if !self.local_cid.as_bytes().is_empty()
+            && (self.issuer.is_some() || parameters.stateless_reset_token.is_some())
+        {
+            self.issue_id()?;
+        }
         if sender == Sender::Client {
             self.handshake_done = true;
+            if let (Some(issuer), End::Server { config, .. }) = (&self.issuer, &self.end) {
+                let now = config.time_provider.current_time().ok_or(endpoint::TIME)?.as_secs();
+                self.ids.token = Some(tls::scoped(self.stream.as_ref(), || {
+                    issuer.repeat(now, self.random, &self.budget)
+                })?);
+                self.ids.send_token = true;
+            }
             self.confirm();
         }
         Ok(())
@@ -2018,11 +2373,14 @@ impl Connection {
     /// packets (RFC 9000, section 7.3).
     fn validate(&self, parameters: &Parameters) -> Result<(), Failure> {
         let invalid = || Failure::transport(ErrorCode::TRANSPORT_PARAMETER_ERROR, 0, PARAMETERS);
-        if parameters.initial_source_cid != Some(self.remote_cid) {
+        if parameters.initial_source_cid != self.initial_peer
+            || (parameters.stateless_reset_token.is_some() && self.remote_cid.as_bytes().is_empty())
+        {
             return Err(invalid());
         }
         if matches!(self.end, End::Client { .. })
-            && (parameters.original_destination_cid != Some(self.original_cid) || parameters.retry_source_cid.is_some())
+            && (parameters.original_destination_cid != Some(self.original_cid)
+                || parameters.retry_source_cid != self.retry_cid)
         {
             return Err(invalid());
         }
@@ -2079,21 +2437,50 @@ impl Connection {
                 "a QUIC datagram needs an output of the bytes of its limit",
             ));
         }
-        if self.outcome.is_some() {
+        if self.outcome.is_some() || self.reset_until.is_some() {
             return Ok(None);
         }
-        let out = &mut out[..self.datagram_bytes()];
+        let mut room = self.datagram_bytes();
+        if let Some(credit) = self.path.amplification_credit {
+            room = room.min(usize::try_from(credit).unwrap_or(usize::MAX));
+            let pad = self.close.is_some()
+                || (self.spaces[0].keys.is_some() && (self.spaces[0].probe || self.has_data(Level::Initial)));
+            if room == 0 || (pad && room < DATAGRAM_MIN) {
+                self.amplification_blocked();
+                return Ok(None);
+            }
+        }
+        let out = &mut out[..room];
         let built = match self.close {
             Some(close) => self.closing(out, close, now, mark),
             None => self.datagram(out, now, mark),
         };
-        let Err(failure) = built else {
-            return Ok(built.unwrap_or_default());
+        let sent = match built {
+            Ok(len) => len,
+            Err(failure) => {
+                self.fail(failure);
+                self.close
+                    .and_then(|close| self.closing(out, close, now, mark).ok().flatten())
+            }
         };
-        self.fail(failure);
-        match self.close {
-            Some(close) => Ok(self.closing(out, close, now, mark).unwrap_or_default()),
-            None => Ok(None),
+        if let (Some(n), Some(credit)) = (sent, &mut self.path.amplification_credit) {
+            *credit -= n as u64;
+            self.path.amplification_blocked = false;
+        } else if sent.is_none()
+            && room < DATAGRAM_MIN
+            && self.path.pacing_wait.is_none()
+            && self.path.room() >= room as u64
+        {
+            self.amplification_blocked();
+        }
+        Ok(sent)
+    }
+
+    fn amplification_blocked(&mut self) {
+        let pending = self.close.is_some() || Level::ALL.into_iter().any(|level| self.wants(level, true));
+        if pending && !self.path.amplification_blocked {
+            self.path.amplification_blocked = true;
+            self.path.amplification_rounds = self.path.amplification_rounds.saturating_add(1);
         }
     }
 
@@ -2111,7 +2498,8 @@ impl Connection {
         let space = &self.spaces[level as usize];
         space.send.pending()
             || !space.retry.is_empty()
-            || (level == Level::Data && (self.handshake_done || self.ping || self.streams.pending()))
+            || (level == Level::Data
+                && (self.handshake_done || self.ping || self.ids.pending() || self.streams.pending()))
     }
 
     fn wants(&self, level: Level, admitted: bool) -> bool {
@@ -2227,12 +2615,12 @@ impl Connection {
         if level == Level::Data && close.is_none() {
             self.key_limit(now)?;
         }
-        let (dcid, scid) = (self.remote_cid, self.local_cid);
+        let (dcid, scid) = (self.remote_cid, self.initial_local);
         let header = match level {
             Level::Initial => Outgoing::Initial {
                 dcid: &dcid,
                 scid: &scid,
-                token: &[],
+                token: self.initial_token.as_ref().map_or(&[], |t| t.bytes.as_slice()),
             },
             Level::Handshake => Outgoing::Handshake {
                 dcid: &dcid,
@@ -2291,6 +2679,7 @@ impl Connection {
                     send.sent(len);
                 }
                 if level == Level::Data {
+                    self.ids.write(&mut output);
                     self.streams.write(&mut output);
                 }
                 if space.probe && output.room() == after_ack {
@@ -2328,6 +2717,7 @@ impl Connection {
                 "the packet key refused to seal a QUIC packet",
             ))
         })?;
+        self.used_remote = Some(dcid);
         self.spaces[level as usize].next = number + 1;
         self.spaces[level as usize].history.ect_sent += u64::from(mark == Ecn::Ect0);
         // A later bare ACK can be the largest number in an ACK that also covers a live elicitor.

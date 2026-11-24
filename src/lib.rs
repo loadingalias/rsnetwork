@@ -37,6 +37,8 @@
 // The TCP binding reads into uninitialized memory with no zeroing, and aborts a connection with a
 // reset. Each feature leaves when std makes it stable.
 #![cfg_attr(feature = "tcp", feature(read_buf, core_io_borrowed_buf, tcp_linger))]
+// The QUIC listener can refuse the allocation of a connection.
+#![cfg_attr(feature = "tls", feature(allocator_ext))]
 
 pub use rstypes::{buffer, capacity, time};
 

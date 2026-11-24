@@ -250,8 +250,12 @@ impl Send {
         self.next < self.end
     }
 
-    /// The next bytes to send, at most `room` of them and inside one message, with their stream
-    /// offset.
+    /// Resends the ClientHello after a Retry, before any server packet acknowledged it.
+    pub(super) fn rewind(&mut self) {
+        self.next = 0;
+    }
+
+    /// Borrows up to `room` bytes of one CRYPTO message with its stream offset.
     pub(super) fn next(&self, room: usize) -> Option<(u64, &[u8])> {
         self.retained(self.next, room).map(|bytes| (self.next, bytes))
     }

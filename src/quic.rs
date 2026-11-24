@@ -1,6 +1,8 @@
 //! QUIC version 1 in the core (RFC 9000 and RFC 9001): the connection engine, the packet layer,
 //! the frame codec, and the transport parameters, with no I/O.
 //!
+//! - **Listeners.** [`Endpoint`] routes server datagrams and bounds new handshakes.
+//!   A client can take a NEW_TOKEN with [`Connection::take_address_token`] and use it when it reconnects.
 //! - **Connections.** [`Connection`] runs the TLS 1.3 handshake on rustls's QUIC API, with the
 //!   configurations of [`tls`](crate::tls): the packet number spaces and their keys, the CRYPTO
 //!   streams under [`CRYPTO_BUFFER_BYTES_MAX`], key updates, and the idle and handshake timeouts
@@ -40,9 +42,11 @@
 //!   [`SecureRandom`](rustls::crypto::SecureRandom), so a seeded source replays each packet byte
 //!   for byte.
 
+mod cid;
 mod congestion;
 mod connection;
 mod crypto;
+mod endpoint;
 pub mod frame;
 pub mod packet;
 pub mod params;
@@ -52,8 +56,9 @@ mod side;
 mod stream;
 
 pub use congestion::CongestionControl;
-pub use connection::{Connection, Limits, PeerClose, Transmission};
+pub use connection::{AddressToken, Connection, Limits, PeerClose, Transmission};
 pub use crypto::CRYPTO_BUFFER_BYTES_MAX;
+pub use endpoint::{Endpoint, EndpointKeys, EndpointLimits, Handle, Route};
 pub use recovery::{EcnState, RecoveryStats};
 pub use side::{SideDatagram, SideFlow};
 pub use stream::{Event, Priority, STREAM_REGIONS_MAX, StreamId};

@@ -19,7 +19,7 @@ rstypes = { git = "https://github.com/loadingalias/rsasync", branch = "main", de
 rscrypto-rustls = { version = "0.1.0", default-features = false, features = ["sha2", "hmac", "hkdf", "aes-gcm", "chacha20poly1305", "x25519", "ml-kem", "ecdsa-p256", "ecdsa-p384", "ed25519", "rsa", "ml-dsa", "getrandom", "chacha20-rng"], optional = true }
 # The seeded generator of a replayable run (`tls::Entropy::Seeded`), and the ciphers of the record
 # layer of the core: the three suites of the provider.
-rscrypto = { version = "0.13.0", default-features = false, features = ["aes-gcm", "chacha20-rng", "chacha20poly1305"], optional = true }
+rscrypto = { version = "0.13.0", default-features = false, features = ["aes-gcm", "chacha20-rng", "chacha20poly1305", "hmac", "siphash"], optional = true }
 # The rustls that the provider builds against. Move it to 0.24.0 when the provider does.
 rustls = { version = "=0.24.0-dev.3", default-features = false, features = ["std", "webpki"], optional = true }
 

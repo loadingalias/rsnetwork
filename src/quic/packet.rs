@@ -313,12 +313,24 @@ pub struct Datagrams {
     rest: Option<Backing>,
     /// The bytes of the rest that belong to the current datagram.
     datagram: usize,
+    /// The full UDP payload, including all coalesced packets.
+    datagram_bytes: usize,
     /// The size of each datagram of the region, or `None` for one datagram.
     segment: Option<NonZeroUsize>,
     short_dcid_len: usize,
 }
 
 impl Datagrams {
+    /// The next whole UDP payload before any packet in it has been opened.
+    pub(super) fn next_datagram(&self) -> Option<&[u8]> {
+        if self.datagram != 0 {
+            return None;
+        }
+        let rest = self.rest.as_ref()?.bytes();
+        let bytes = self.segment.map_or(rest.len(), |size| rest.len().min(size.get()));
+        rest.get(..bytes).filter(|d| !d.is_empty())
+    }
+
     /// The packets of `region`, whose initialized bytes are one datagram, or datagrams of
     /// `segment` bytes each, the last of them shorter or equal. A short header has a destination
     /// connection ID of `short_dcid_len` bytes.
@@ -327,6 +339,7 @@ impl Datagrams {
             ecn: Ecn::NotEct,
             rest: Some(region),
             datagram: 0,
+            datagram_bytes: 0,
             segment,
             short_dcid_len,
         }
@@ -349,6 +362,7 @@ impl Datagrams {
         if self.datagram == 0 {
             let all = rest.initialized();
             self.datagram = self.segment.map_or(all, |segment| segment.get().min(all));
+            self.datagram_bytes = self.datagram;
         }
         match Header::parse(&rest.bytes()[..self.datagram], self.short_dcid_len) {
             Ok(header) => Some(Ok(Protected {
@@ -387,6 +401,12 @@ pub struct Protected<'a> {
 }
 
 impl<'a> Protected<'a> {
+    /// The UDP payload length and whether this is its first packet.
+    pub(super) fn datagram(&self) -> (usize, bool) {
+        let (region, _) = self.inner();
+        (region.datagram_bytes, region.datagram == region.datagram_bytes)
+    }
+
     fn inner(&self) -> &(&'a mut Datagrams, Header) {
         self.inner.as_ref().expect("the packet is there until it leaves")
     }
@@ -556,7 +576,7 @@ impl Packet {
 }
 
 /// The header of a packet that this end sends.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub enum Outgoing<'a> {
     /// An Initial packet.
     Initial {
@@ -592,6 +612,33 @@ pub enum Outgoing<'a> {
     },
 }
 
+impl fmt::Debug for Outgoing<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Initial { dcid, scid, token } => f
+                .debug_struct("Initial")
+                .field("dcid", dcid)
+                .field("scid", scid)
+                .field("token_bytes", &token.len())
+                .finish(),
+            Self::Handshake { dcid, scid } | Self::ZeroRtt { dcid, scid } => {
+                let name = if matches!(self, Self::Handshake { .. }) {
+                    "Handshake"
+                } else {
+                    "ZeroRtt"
+                };
+                f.debug_struct(name).field("dcid", dcid).field("scid", scid).finish()
+            }
+            Self::OneRtt { dcid, spin, key_phase } => f
+                .debug_struct("OneRtt")
+                .field("dcid", dcid)
+                .field("spin", spin)
+                .field("key_phase", key_phase)
+                .finish(),
+        }
+    }
+}
+
 /// Why a packet could not be built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuildError {
@@ -618,7 +665,6 @@ impl core::error::Error for BuildError {}
 
 /// A packet that this end builds in place in its output: the header, the frames, and then the
 /// seal, which encrypts the payload and protects the header in place.
-#[derive(Debug)]
 pub struct Builder<'a> {
     out: &'a mut [u8],
     /// The offset of the Length field of a long header, and its width.
@@ -629,6 +675,15 @@ pub struct Builder<'a> {
     number: u64,
     /// The end of the frames.
     end: usize,
+}
+
+impl fmt::Debug for Builder<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Builder")
+            .field("number", &self.number)
+            .field("bytes", &self.end)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> Builder<'a> {

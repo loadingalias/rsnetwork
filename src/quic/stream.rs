@@ -471,6 +471,7 @@ pub(super) struct Streams {
     /// The unreliable datagrams that wait to go out, and their bytes.
     unreliable: VecDeque<Lease>,
     unreliable_bytes: u64,
+    pub(super) unreliable_dropped: u64,
     /// The largest DATAGRAM frame that the peer takes.
     peer_unreliable: Option<u64>,
     reassembly: Reassembly,
@@ -537,6 +538,7 @@ impl Streams {
             fifo: [[NONE; 2]; 2],
             unreliable: VecDeque::new(),
             unreliable_bytes: 0,
+            unreliable_dropped: 0,
             peer_unreliable: None,
             reassembly: Reassembly::new(config.reassembly_bytes, budget),
             credit: budget.credit(0),
@@ -1434,6 +1436,18 @@ impl Streams {
     }
 
     /// Queues `data` as one unreliable datagram, for a packet with `room` bytes for its frames.
+    pub(super) fn resize_unreliable(&mut self, room: usize) {
+        let Some(max) = self.unreliable_room(room) else { return };
+        self.unreliable.retain(|data| {
+            if data.initialized() <= max {
+                return true;
+            }
+            self.unreliable_bytes -= data.initialized() as u64;
+            self.unreliable_dropped = self.unreliable_dropped.saturating_add(1);
+            false
+        });
+    }
+
     pub(super) fn unreliable(&mut self, data: Lease, room: usize) -> Result<(), Error> {
         if !self.active {
             return Err(Error::new(Kind::Misuse, "the QUIC handshake is not complete"));

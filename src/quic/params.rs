@@ -17,7 +17,7 @@ pub enum Migration {
 }
 
 /// The address that a server prefers after the handshake (RFC 9000, section 18.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PreferredAddress {
     /// The IPv4 address and port, or all zero bytes when the server gives none.
     pub ipv4: ([u8; 4], u16),
@@ -29,9 +29,19 @@ pub struct PreferredAddress {
     pub reset_token: [u8; 16],
 }
 
+impl fmt::Debug for PreferredAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreferredAddress")
+            .field("ipv4", &self.ipv4)
+            .field("ipv6", &self.ipv6)
+            .field("connection_id", &self.connection_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The transport parameters of one end. [`Parameters::default`] has the default value of each
 /// parameter, which the encoding then omits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Parameters {
     /// The destination connection ID of the first Initial packet of the client. Only a server
     /// sends it.
@@ -71,6 +81,34 @@ pub struct Parameters {
     /// The largest DATAGRAM frame that this end receives, or `None` when it receives none
     /// (RFC 9221).
     pub datagram_bytes_max: Option<u64>,
+}
+
+impl fmt::Debug for Parameters {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Parameters")
+            .field("original_destination_cid", &self.original_destination_cid)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("has_reset_token", &self.stateless_reset_token.is_some())
+            .field("udp_payload_bytes_max", &self.udp_payload_bytes_max)
+            .field("data_bytes_initial", &self.data_bytes_initial)
+            .field("stream_bytes_bidi_local_initial", &self.stream_bytes_bidi_local_initial)
+            .field(
+                "stream_bytes_bidi_remote_initial",
+                &self.stream_bytes_bidi_remote_initial,
+            )
+            .field("stream_bytes_uni_initial", &self.stream_bytes_uni_initial)
+            .field("streams_bidi_initial", &self.streams_bidi_initial)
+            .field("streams_uni_initial", &self.streams_uni_initial)
+            .field("ack_delay_exponent", &self.ack_delay_exponent)
+            .field("ack_delay_max", &self.ack_delay_max)
+            .field("migration", &self.migration)
+            .field("preferred_address", &self.preferred_address)
+            .field("connection_ids_active_max", &self.connection_ids_active_max)
+            .field("initial_source_cid", &self.initial_source_cid)
+            .field("retry_source_cid", &self.retry_source_cid)
+            .field("datagram_bytes_max", &self.datagram_bytes_max)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Parameters {
