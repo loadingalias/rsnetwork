@@ -117,6 +117,9 @@ impl Default for Priority {
 /// An event of the streams of a connection.
 #[derive(Clone)]
 pub enum Event {
+    /// This side flow needs fresh acknowledgement state. The next parent packet probes the path.
+    /// Only authenticated side feedback acknowledges its data.
+    SideProbe(super::SideFlow),
     /// The next bytes of a stream, in order: a view of the region that they arrived in, with no
     /// copy, or of a page of the engine for bytes that arrived out of order. The view keeps its
     /// whole region, so copy the bytes out, or hold the view only as long as the region can stay.
@@ -188,6 +191,7 @@ impl fmt::Debug for Event {
                 .field("stream", stream)
                 .field("code", code)
                 .finish(),
+            Self::SideProbe(flow) => f.debug_tuple("SideProbe").field(flow).finish(),
             Self::Sent { stream } => f.debug_struct("Sent").field("stream", stream).finish(),
             Self::Acknowledged { stream, offset, end } => f
                 .debug_struct("Acknowledged")
@@ -1543,10 +1547,13 @@ impl Streams {
         }
     }
 
-    /// Whether a frame of the layer waits to go out.
+    /// Whether a parent control frame has priority over side data.
+    pub(super) fn control_pending(&self) -> bool {
+        self.owed != 0 || self.fifo[list::CONTROL][0] != NONE
+    }
+
     pub(super) fn pending(&self) -> bool {
-        self.owed != 0
-            || self.fifo[list::CONTROL][0] != NONE
+        self.control_pending()
             || !self.unreliable.is_empty()
             || (self.send_used < self.send_max && self.first().is_some())
     }

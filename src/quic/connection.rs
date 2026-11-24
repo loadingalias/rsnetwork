@@ -12,7 +12,7 @@
 //! packets that went out, and the next deadline.
 //!
 //! Each packet number space keeps its received ranges and outstanding packets. The spaces share
-//! the round-trip estimate and the NewReno congestion window of the path.
+//! the round-trip estimate, congestion window, and pacer of the path.
 
 use core::cmp::Ordering;
 use core::fmt;
@@ -38,8 +38,8 @@ use super::packet::{self, Builder, Datagrams, Header, Kind as PacketKind, OpenEr
 use super::params::{Parameters, Sender};
 use super::recovery::{self, DataRange, History, Output, Path, Received, Record, RecoveryStats, Sent};
 use super::stream::{self, Event, Priority, Stop, StreamId, Streams};
-use super::{ConnectionId, ErrorCode, VARINT_MAX};
-use crate::drive::{Blocked, Error, Kind, Progress, Turn, TurnLimits, Work};
+use super::{CongestionControl, ConnectionId, ErrorCode, VARINT_MAX};
+use crate::drive::{Blocked, Ecn, Error, Kind, Progress, Turn, TurnLimits, Work};
 use crate::tls::memory::{self, ClientStore, Cost, Held, Owns};
 use crate::tls::{self, Facts, Negotiated};
 
@@ -47,6 +47,10 @@ use crate::tls::{self, Facts, Negotiated};
 /// each one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
+    /// The controller of the path. Both controllers pace the admitted bytes.
+    pub congestion_control: CongestionControl,
+    /// The maximum number of separate side-flow packet number spaces. Zero disables side-flow admission.
+    pub side_flows_max: u16,
     /// The time with no activity after which the connection ends, or `None` for no limit of this
     /// end. The connection uses the smaller of this time and the time of the peer, and at least
     /// three probe timeouts (RFC 9000, section 10.1).
@@ -103,8 +107,10 @@ impl Limits {
     /// connection IDs of 8 bytes, the key limit of the suite, and 1 MiB and 4,096 frames for each
     /// call. A window of 4 MiB for the connection and of 1 MiB for each stream, 100 streams of the
     /// peer in each direction, 6 MiB for data out of order, which the windows never reach, and no
-    /// unreliable datagrams. Send regions share 4 MiB. Duplicate detection covers 100,000 packets/s for 100 ms.
+    /// unreliable datagrams. The path uses CUBIC. Side-flow admission is off. Send regions share 4 MiB. Duplicate detection covers 100,000 packets/s for 100 ms.
     pub const DEFAULT: Self = Self {
+        congestion_control: CongestionControl::Cubic,
+        side_flows_max: 0,
         idle_timeout: Some(Duration::from_secs(30)),
         handshake_timeout: Duration::from_secs(10),
         datagram_bytes_max: DATAGRAM_MIN,
@@ -177,6 +183,14 @@ impl Level {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Alarm {
+    Loss(Level),
+    Probe(Level),
+    SideLoss,
+    SideProbe(super::SideFlow),
+}
+
 /// One packet number space: its keys, its CRYPTO streams, and its packet numbers.
 struct Space {
     /// The keys of an Initial or Handshake space. The data space keeps its keys in [`OneRtt`].
@@ -206,7 +220,7 @@ impl Space {
             received: 0,
             next: 0,
             ranges: Received::new(window, budget),
-            history: History::new(budget),
+            history: History::new(),
             retry: VecDeque::new(),
             probe: false,
             discarded: false,
@@ -465,6 +479,22 @@ impl PeerClose {
     }
 }
 
+/// The length and IP ECN codepoint of one outgoing UDP datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Transmission {
+    /// The initialized prefix of the output buffer.
+    pub len: usize,
+    /// The codepoint for the host to apply to this datagram.
+    pub ecn: Ecn,
+}
+
+#[derive(Clone, Copy)]
+struct SendAt {
+    now: Instant,
+    mark: Ecn,
+    admitted: bool,
+}
+
 /// One QUIC connection of version 1, client or server, with no I/O.
 pub struct Connection {
     end: End,
@@ -484,6 +514,7 @@ pub struct Connection {
     events: Vec<QuicEvent>,
     spaces: [Space; 3],
     path: Path,
+    sides: super::side::Flows,
     window: u64,
     /// Start of the client probe timer when address validation still needs a packet.
     validation_at: Instant,
@@ -539,6 +570,7 @@ struct Reading {
     at: usize,
     number: u64,
     received_at: Instant,
+    ecn: Ecn,
     eliciting: bool,
     first_datagram: Option<usize>,
     accepted: bool,
@@ -806,7 +838,8 @@ impl Connection {
             parameters_kept: false,
             events,
             spaces: core::array::from_fn(|_| Space::new(budget, window)),
-            path: Path::new(limits.datagram_bytes_max),
+            path: Path::new(limits.datagram_bytes_max, limits.congestion_control, budget),
+            sides: super::side::Flows::new(budget, limits.side_flows_max),
             window,
             validation_at: now,
             one_rtt: None,
@@ -898,6 +931,59 @@ impl Connection {
         self.path.stats()
     }
 
+    /// Opens a recovery space for a negotiated side flow. The extension owns the wire protocol.
+    /// The parent must have confirmed its handshake. Set [`Limits::side_flows_max`] before creating the connection.
+    /// A full table or a refused memory charge returns [`Kind::Overload`].
+    pub fn open_side_flow(&mut self) -> Result<super::SideFlow, Error> {
+        self.live()?;
+        if !self.confirmed {
+            return Err(Error::new(Kind::Misuse, "a QUIC side flow needs a confirmed parent"));
+        }
+        self.sides.open()
+    }
+
+    /// Admits one complete side datagram for immediate transmission, including headers and its tag.
+    /// Apply its returned ECN codepoint. A full window, a pacing deadline, or waiting parent control gives `None`.
+    /// Drive the parent at its deadline. [`Event::SideProbe`] identifies a flow that needs fresh feedback from the peer.
+    pub fn admit_side(
+        &mut self,
+        flow: super::SideFlow,
+        bytes: usize,
+        now: Instant,
+    ) -> Result<Option<super::SideDatagram>, Error> {
+        self.live()?;
+        if bytes == 0 || bytes > self.datagram_bytes() {
+            return Err(Error::new(
+                Kind::Misuse,
+                "the QUIC side datagram length is outside the path limit",
+            ));
+        }
+        self.check_clock(now)?;
+        let control = self.spaces.iter().any(|space| space.probe || space.ranges.due)
+            || (self.path.room() >= self.datagram_bytes() as u64
+                && (self.ping
+                    || self.handshake_done
+                    || self.streams.control_pending()
+                    || self.spaces.iter().any(|space| space.send.pending())));
+        self.sides.admit(flow, &mut self.path, bytes as u64, now, control)
+    }
+
+    /// Applies the packet ranges and ECN counts from an authenticated side acknowledgement.
+    /// The delay uses the parent's ACK delay exponent. An invalid packet range ends this side flow with [`Kind::Malformed`].
+    /// The extension keeps the payload and acknowledges its consumer separately.
+    pub fn acknowledge_side(&mut self, flow: super::SideFlow, ack: &Ack<'_>, now: Instant) -> Result<(), Error> {
+        self.live()?;
+        self.check_clock(now)?;
+        let limited = self.limited();
+        let delay = self.ack_delay(ack.delay);
+        self.sides.acknowledge(flow, &mut self.path, ack, delay, now, limited)
+    }
+
+    /// Releases the recovery state and outstanding flight of an ended side flow.
+    pub fn close_side_flow(&mut self, flow: super::SideFlow) -> Result<(), Error> {
+        self.sides.close(flow, &mut self.path)
+    }
+
     /// The transport parameters of the peer, after the handshake completed.
     pub const fn peer_parameters(&self) -> Option<&Parameters> {
         self.peer.as_ref()
@@ -912,6 +998,14 @@ impl Connection {
     /// activity for the idle timeout of the peer. Before the 1-RTT keys, the PING waits for them.
     pub fn ping(&mut self) {
         self.ping = true;
+    }
+
+    fn check_clock(&self, now: Instant) -> Result<(), Error> {
+        if now.domain() == self.last_activity.domain() {
+            Ok(())
+        } else {
+            Err(CLOCK)
+        }
     }
 
     /// Refuses a call of the application after the connection ended.
@@ -1056,13 +1150,14 @@ impl Connection {
                 self.more = true;
                 break;
             }
+            let ecn = datagrams.ecn;
             let Some(next) = datagrams.next_packet() else {
                 break;
             };
             let Ok(packet) = next else {
                 continue;
             };
-            if let Err(failure) = self.packet(packet, &mut work, now) {
+            if let Err(failure) = self.packet(packet, &mut work, now, ecn) {
                 self.fail(failure);
             }
         }
@@ -1090,6 +1185,10 @@ impl Connection {
         for _ in 0..2 {
             if self.outcome.is_some() || self.close.is_some() {
                 return None;
+            }
+            if let Some(flow) = self.sides.notify_probe.take() {
+                self.more = true;
+                return Some(Event::SideProbe(flow));
             }
             let event = self
                 .streams
@@ -1143,7 +1242,10 @@ impl Connection {
         let handshake = if self.confirmed { None } else { self.handshake_deadline };
         Ok(earlier(
             earlier(self.idle_deadline()?, handshake),
-            earlier(previous, self.recovery_timer().map(|(at, _)| at)),
+            earlier(
+                earlier(previous, self.recovery_timer().map(|(at, _)| at)),
+                self.path.pacing_wait,
+            ),
         ))
     }
 
@@ -1154,45 +1256,57 @@ impl Connection {
     }
 
     /// The loss timer takes priority over a probe in any space (RFC 9002, section 6).
-    fn recovery_timer(&self) -> Option<(Instant, Level)> {
-        let earliest =
-            |times: [Option<(Instant, Level)>; 3]| times.into_iter().flatten().min_by_key(|(at, _)| at.as_nanos());
-        let loss =
-            earliest(Level::ALL.map(|level| self.spaces[level as usize].history.loss_time.map(|at| (at, level))));
+    fn recovery_timer(&self) -> Option<(Instant, Alarm)> {
+        let loss = Level::ALL
+            .into_iter()
+            .filter_map(|l| self.spaces[l as usize].history.loss_time.map(|at| (at, Alarm::Loss(l))))
+            .chain(self.sides.deadline().map(|at| (at, Alarm::SideLoss)))
+            .min_by_key(|(at, _)| at.as_nanos());
         if loss.is_some() || self.spaces.iter().any(|space| space.probe) {
             return loss;
         }
-        let delay = |base: Instant, level| {
-            let pto = if level == Level::Data {
-                self.pto()
-            } else {
-                self.path.pto(Duration::ZERO)
-            };
+        let delay = |base: Instant, pto: Duration| {
             let nanos = pto
                 .as_nanos()
                 .checked_mul(1u128.checked_shl(self.path.backoff)?)?
                 .try_into()
                 .ok()?;
-            base.checked_add(Duration::from_nanos(nanos)).ok().map(|at| (at, level))
+            base.checked_add(Duration::from_nanos(nanos)).ok()
         };
-        earliest(Level::ALL.map(|level| {
-            self.spaces[level as usize]
-                .history
-                .pto_start()
-                .filter(|_| level != Level::Data || self.confirmed)
-                .and_then(|base| delay(base, level))
-        }))
-        .or_else(|| {
-            if self.validated() {
-                return None;
-            }
-            let level = if self.spaces[Level::Handshake as usize].keys.is_some() {
-                Level::Handshake
+        let parent = |base, level| {
+            let pto = if level == Level::Data {
+                self.pto()
             } else {
-                Level::Initial
+                self.path.pto(Duration::ZERO)
             };
-            delay(self.validation_at, level)
-        })
+            delay(base, pto).map(|at| (at, Alarm::Probe(level)))
+        };
+        Level::ALL
+            .into_iter()
+            .filter_map(|level| {
+                self.spaces[level as usize]
+                    .history
+                    .pto_start()
+                    .filter(|_| level != Level::Data || self.confirmed)
+                    .and_then(|base| parent(base, level))
+            })
+            .chain(
+                self.sides
+                    .probe_start()
+                    .and_then(|(base, flow)| delay(base, self.pto()).map(|at| (at, Alarm::SideProbe(flow)))),
+            )
+            .min_by_key(|(at, _)| at.as_nanos())
+            .or_else(|| {
+                if self.validated() {
+                    return None;
+                }
+                let level = if self.spaces[Level::Handshake as usize].keys.is_some() {
+                    Level::Handshake
+                } else {
+                    Level::Initial
+                };
+                parent(self.validation_at, level)
+            })
     }
 
     fn validated(&self) -> bool {
@@ -1207,6 +1321,10 @@ impl Connection {
         if self.outcome.is_some() {
             return Ok(());
         }
+        self.check_clock(now)?;
+        if reached(self.path.pacing_wait, now)? {
+            self.path.pacing_wait = None;
+        }
         if reached(self.idle_deadline()?, now)? {
             return Err(IDLE);
         }
@@ -1218,17 +1336,43 @@ impl Connection {
         {
             keys.previous = None;
         }
-        if let Some((at, level)) = self.recovery_timer()
+        if let Some((at, alarm)) = self.recovery_timer()
             && reached(Some(at), now)?
         {
-            if self.spaces[level as usize].history.loss_time.is_some() {
-                self.detect_loss(level, now)?;
-            } else {
-                self.spaces[level as usize].probe = true;
-                self.path.backoff = self.path.backoff.saturating_add(1);
+            match alarm {
+                Alarm::Loss(level) => {
+                    self.detect_loss(level, now)?;
+                }
+                Alarm::SideLoss => self.sides.timers(&mut self.path, now)?,
+                Alarm::Probe(level) => {
+                    self.spaces[level as usize].probe = true;
+                    self.path.backoff = self.path.backoff.saturating_add(1);
+                }
+                Alarm::SideProbe(flow) => {
+                    self.sides.probe(flow, now);
+                    self.spaces[Level::Data as usize].probe = true;
+                    self.path.backoff = self.path.backoff.saturating_add(1);
+                }
             }
         }
         Ok(())
+    }
+
+    fn limited(&self) -> bool {
+        self.path.room() < self.datagram_bytes() as u64
+            || self.sides.waiting()
+            || Level::ALL.into_iter().any(|l| self.has_data(l))
+    }
+
+    fn ack_delay(&self, encoded: u64) -> Duration {
+        self.peer.map_or(Duration::ZERO, |peer| {
+            let delay = Duration::from_micros(encoded.saturating_mul(1 << peer.ack_delay_exponent));
+            if self.confirmed {
+                delay.min(peer.ack_delay_max)
+            } else {
+                delay
+            }
+        })
     }
 
     fn acknowledge(&mut self, level: Level, ack: &Ack<'_>, now: Instant) -> Result<(), Failure> {
@@ -1247,32 +1391,26 @@ impl Connection {
             {
                 keys.acknowledged = true;
             }
-            if let Some(peer) = self.peer {
-                delay = Duration::from_micros(ack.delay.saturating_mul(1 << peer.ack_delay_exponent));
-                if self.confirmed {
-                    delay = delay.min(peer.ack_delay_max);
-                }
-            }
+            delay = self.ack_delay(ack.delay);
         }
-        let limited =
-            self.path.room() < self.datagram_bytes() as u64 || Level::ALL.into_iter().any(|l| self.has_data(l));
+        let limited = self.limited();
+        self.path.controller.limited(now, limited);
         let space = &mut self.spaces[level as usize];
-        let (eliciting, bytes) = space
+        let acked = space
             .history
             .ack(ack, &mut self.path, now, delay, |record| match record {
                 Record::Range(DataRange::Crypto { offset, len }) => space.send.acknowledged(offset, len),
                 other => self.streams.acknowledged(other),
             })?;
-        if eliciting {
+        if acked.eliciting {
             space.probe = false;
             self.validation_at = now;
             if self.validated() {
                 self.path.backoff = 0;
             }
         }
-        if !self.detect_loss(level, now)? && limited && bytes > 0 {
-            self.path.acknowledged(bytes);
-        }
+        let congestion = self.detect_loss(level, now)?;
+        self.path.acknowledged(acked, now, limited && !congestion);
         Ok(())
     }
 
@@ -1298,7 +1436,13 @@ impl Connection {
     }
 
     /// Opens one packet and reads its frames.
-    fn packet(&mut self, packet: packet::Protected<'_>, work: &mut Work, now: Instant) -> Result<(), Failure> {
+    fn packet(
+        &mut self,
+        packet: packet::Protected<'_>,
+        work: &mut Work,
+        now: Instant,
+        ecn: Ecn,
+    ) -> Result<(), Failure> {
         let Header::Protected { kind, dcid, scid, .. } = *packet.header() else {
             // A Retry, a Version Negotiation, or another version: the endpoint (N304) reads them.
             return Ok(());
@@ -1390,6 +1534,7 @@ impl Connection {
             at: 0,
             number,
             received_at: now,
+            ecn,
             eliciting: false,
             first_datagram: None,
             accepted: false,
@@ -1435,6 +1580,7 @@ impl Connection {
                         reading.number,
                         reading.received_at,
                         reading.eliciting,
+                        reading.ecn,
                     )?;
                     if let Some(at) = reading.first_datagram {
                         reading.at = at;
@@ -1594,7 +1740,8 @@ impl Connection {
 
     fn discard(&mut self, level: Level) {
         let space = &mut self.spaces[level as usize];
-        self.path.discard(space.history.bytes);
+        space.history.discard(&mut self.path);
+        self.path.backoff = 0;
         space.discard(&self.budget, self.window);
     }
 
@@ -1853,6 +2000,7 @@ impl Connection {
         self.validate(&parameters)?;
         self.peer = Some(parameters);
         self.streams.peer(&parameters);
+        self.path.ack_delay_max = parameters.ack_delay_max;
         self.path.datagram_limit(self.datagram_bytes());
         self.idle = match (self.limits.idle_timeout, parameters.idle_timeout) {
             (Some(local), Some(remote)) => Some(local.min(remote)),
@@ -1901,13 +2049,30 @@ impl Connection {
         }
     }
 
-    /// Builds the next datagram at the start of `out`, and gives its length, or `None` when this
-    /// end has nothing to send. Call it until it gives `None`. The datagram has at most
+    /// Builds an unmarked datagram at the start of `out`. Gives its length, or `None` when no datagram can leave now. Call it until it gives `None`. The datagram has at most
     /// [`Limits::datagram_bytes_max`] bytes. A client Initial or an ack-eliciting server Initial needs at least 1,200.
     ///
     /// Refuses with [`Kind::Misuse`] when `out` has fewer bytes than
     /// [`Limits::datagram_bytes_max`].
     pub fn transmit(&mut self, out: &mut [u8], now: Instant) -> Result<Option<usize>, Error> {
+        self.transmit_mark(out, now, Ecn::NotEct)
+    }
+
+    /// Builds a datagram for a host that can set its IP ECN codepoint. Apply the returned mark to that datagram.
+    /// Supply the received mark with [`Datagrams::with_ecn`]. A host without send metadata uses [`transmit`](Self::transmit).
+    /// After `None`, call [`drive`](Self::drive) to get the next deadline.
+    pub fn transmit_ecn(&mut self, out: &mut [u8], now: Instant) -> Result<Option<Transmission>, Error> {
+        self.check_clock(now)?;
+        let ecn = self.path.mark(now);
+        let len = self.transmit_mark(out, now, ecn)?;
+        if len.is_some() {
+            self.path.marked(ecn, now);
+        }
+        Ok(len.map(|len| Transmission { len, ecn }))
+    }
+
+    fn transmit_mark(&mut self, out: &mut [u8], now: Instant, mark: Ecn) -> Result<Option<usize>, Error> {
+        self.check_clock(now)?;
         if out.len() < self.limits.datagram_bytes_max {
             return Err(Error::new(
                 Kind::Misuse,
@@ -1919,15 +2084,15 @@ impl Connection {
         }
         let out = &mut out[..self.datagram_bytes()];
         let built = match self.close {
-            Some(close) => self.closing(out, close, now),
-            None => self.datagram(out, now),
+            Some(close) => self.closing(out, close, now, mark),
+            None => self.datagram(out, now, mark),
         };
         let Err(failure) = built else {
             return Ok(built.unwrap_or_default());
         };
         self.fail(failure);
         match self.close {
-            Some(close) => Ok(self.closing(out, close, now).unwrap_or_default()),
+            Some(close) => Ok(self.closing(out, close, now, mark).unwrap_or_default()),
             None => Ok(None),
         }
     }
@@ -1949,22 +2114,25 @@ impl Connection {
             || (level == Level::Data && (self.handshake_done || self.ping || self.streams.pending()))
     }
 
-    fn wants(&self, level: Level) -> bool {
+    fn wants(&self, level: Level, admitted: bool) -> bool {
         let space = &self.spaces[level as usize];
         let keyed = if level == Level::Data {
             self.one_rtt.is_some()
         } else {
             space.keys.is_some()
         };
-        keyed
-            && (space.ranges.due
-                || space.probe
-                || (self.has_data(level) && self.path.room() >= self.datagram_bytes() as u64))
+        keyed && (space.ranges.due || space.probe || (self.has_data(level) && admitted))
     }
 
     /// Builds a datagram of the packets that wait, at most one for each level.
-    fn datagram(&mut self, out: &mut [u8], now: Instant) -> Result<Option<usize>, Failure> {
-        let wanted = Level::ALL.map(|level| self.wants(level));
+    fn datagram(&mut self, out: &mut [u8], now: Instant, mark: Ecn) -> Result<Option<usize>, Failure> {
+        let data = Level::ALL.into_iter().any(|level| self.has_data(level));
+        let admitted = data && self.path.paced(out.len() as u64, now)?;
+        self.path
+            .controller
+            .limited(now, data || self.sides.waiting() || self.path.room() < out.len() as u64);
+        let send = SendAt { now, mark, admitted };
+        let wanted = Level::ALL.map(|level| self.wants(level, admitted));
         let Some(last) = wanted.iter().rposition(|&wanted| wanted) else {
             return Ok(None);
         };
@@ -1977,7 +2145,7 @@ impl Connection {
                 continue;
             }
             let pad = initial.then_some((DATAGRAM_MIN.saturating_sub(at), Level::ALL[last]));
-            let Some(len) = self.packet_out(level, &mut out[at..], pad, (None, now))? else {
+            let Some(len) = self.packet_out(level, &mut out[at..], pad, None, send)? else {
                 break;
             };
             at += len;
@@ -1996,7 +2164,7 @@ impl Connection {
 
     /// Builds a datagram with a CONNECTION_CLOSE frame in each level that has keys, and then ends
     /// the connection.
-    fn closing(&mut self, out: &mut [u8], close: Close, now: Instant) -> Result<Option<usize>, Failure> {
+    fn closing(&mut self, out: &mut [u8], close: Close, now: Instant, mark: Ecn) -> Result<Option<usize>, Failure> {
         let keyed = Level::ALL.map(|level| match level {
             Level::Data => self.one_rtt.is_some(),
             _ => self.spaces[level as usize].keys.is_some(),
@@ -2010,7 +2178,17 @@ impl Connection {
             let pad = last
                 .filter(|_| keyed[0])
                 .map(|i| (DATAGRAM_MIN.saturating_sub(at), Level::ALL[i]));
-            match self.packet_out(level, &mut out[at..], pad, (Some(close), now)) {
+            match self.packet_out(
+                level,
+                &mut out[at..],
+                pad,
+                Some(close),
+                SendAt {
+                    now,
+                    mark,
+                    admitted: false,
+                },
+            ) {
                 Ok(Some(len)) => at += len,
                 _ => break,
             }
@@ -2029,7 +2207,8 @@ impl Connection {
         level: Level,
         out: &mut [u8],
         pad: Option<(usize, Level)>,
-        (close, now): (Option<Close>, Instant),
+        close: Option<Close>,
+        SendAt { now, mark, admitted }: SendAt,
     ) -> Result<Option<usize>, Failure> {
         let space = &self.spaces[level as usize];
         let number = space.next;
@@ -2044,7 +2223,7 @@ impl Connection {
         } else {
             number_len
         };
-        let admitted = space.probe || self.path.room() >= out.len() as u64;
+        let admitted = space.probe || (admitted && self.path.room() >= out.len() as u64);
         if level == Level::Data && close.is_none() {
             self.key_limit(now)?;
         }
@@ -2150,18 +2329,22 @@ impl Connection {
             ))
         })?;
         self.spaces[level as usize].next = number + 1;
+        self.spaces[level as usize].history.ect_sent += u64::from(mark == Ecn::Ect0);
         // A later bare ACK can be the largest number in an ACK that also covers a live elicitor.
         if close.is_none() && (in_flight || self.spaces[level as usize].history.pto_start().is_some()) {
             let bytes = if in_flight { len as u64 } else { 0 };
             let space = &mut self.spaces[level as usize];
-            space.history.insert(Sent {
-                number,
-                time: now,
-                bytes,
-                eliciting,
-                records: output.records,
-            })?;
-            self.path.sent(bytes);
+            space.history.insert(
+                &mut self.path,
+                Sent {
+                    mark,
+                    number,
+                    time: now,
+                    bytes,
+                    eliciting,
+                    records: output.records,
+                },
+            )?;
             if eliciting {
                 if core::mem::take(&mut space.probe) {
                     self.path.probes = self.path.probes.saturating_add(1);
@@ -2170,6 +2353,8 @@ impl Connection {
                     self.last_activity = now;
                 }
             }
+        } else {
+            self.path.untracked();
         }
         if level == Level::Data
             && let Some(keys) = &mut self.one_rtt

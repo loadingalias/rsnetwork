@@ -15,9 +15,11 @@
 //!   scheduler orders the streams by their [`Priority`]. Unreliable datagrams (RFC 9221) go when
 //!   both ends take them.
 //! - **Recovery.** Each packet number space acknowledges accepted packets and discards duplicates.
-//!   Lost stream and handshake bytes go into new packets. The spaces share the NewReno window
-//!   and round-trip estimate of the path. [`Connection::recovery`] reports both.
-//!   Drive the connection at its deadline to send probes during a loss of traffic.
+//!   Lost stream and handshake bytes go into new packets. Each path uses paced CUBIC by default.
+//!   Select NewReno with [`Limits::congestion_control`]. Parent and side datagrams share the window and the pacer.
+//!   [`Connection::recovery`] reports the window, bytes in flight, round-trip time, and ECN feedback.
+//!   Drive the connection at its deadline to send paced packets and loss probes.
+//!   A host with ECN metadata uses [`Connection::transmit_ecn`] and [`packet::Datagrams::with_ecn`].
 //! - **Parameters.** [`params::Parameters`] writes and checks the transport parameters of each end
 //!   (RFC 9000, section 18).
 //! - **Packets.** [`packet::Datagrams`] walks the packets of a received region in place: the
@@ -38,6 +40,7 @@
 //!   [`SecureRandom`](rustls::crypto::SecureRandom), so a seeded source replays each packet byte
 //!   for byte.
 
+mod congestion;
 mod connection;
 mod crypto;
 pub mod frame;
@@ -45,11 +48,14 @@ pub mod packet;
 pub mod params;
 mod reassembly;
 mod recovery;
+mod side;
 mod stream;
 
-pub use connection::{Connection, Limits, PeerClose};
+pub use congestion::CongestionControl;
+pub use connection::{Connection, Limits, PeerClose, Transmission};
 pub use crypto::CRYPTO_BUFFER_BYTES_MAX;
-pub use recovery::RecoveryStats;
+pub use recovery::{EcnState, RecoveryStats};
+pub use side::{SideDatagram, SideFlow};
 pub use stream::{Event, Priority, STREAM_REGIONS_MAX, StreamId};
 
 use core::fmt;

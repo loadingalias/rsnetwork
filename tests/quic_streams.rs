@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
-use rsnetwork::drive::{Kind, Progress};
-use rsnetwork::quic::frame::Direction;
+use rsnetwork::drive::{Ecn, Kind, Progress};
+use rsnetwork::quic::frame::{Ack, Direction, Frame};
 use rsnetwork::quic::packet::{Datagrams, Header};
-use rsnetwork::quic::{Connection, Event, Limits, Priority, STREAM_REGIONS_MAX, StreamId};
+use rsnetwork::quic::{CongestionControl, Connection, EcnState, Event, Limits, Priority, STREAM_REGIONS_MAX, StreamId};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
     CertificateDer, ClientConfig, ClientOptions, Entropy, Identity, PrivateKeyDer, Resumption, ServerConfig,
@@ -85,8 +85,12 @@ fn give(connection: &mut Connection, datagram: &[u8]) -> Vec<Event> {
 }
 
 fn give_at(connection: &mut Connection, datagram: &[u8], at: Instant) -> Vec<Event> {
+    give_marked(connection, datagram, at, Ecn::NotEct)
+}
+
+fn give_marked(connection: &mut Connection, datagram: &[u8], at: Instant, mark: Ecn) -> Vec<Event> {
     let len = connection.local_cid().as_bytes().len();
-    let mut datagrams = Datagrams::new(Backing::from(datagram.to_vec()), None, len);
+    let mut datagrams = Datagrams::new(Backing::from(datagram.to_vec()), None, len).with_ecn(mark);
     let mut events = Vec::new();
     for _ in 0..8192 {
         match connection.receive(&mut datagrams, at) {
@@ -653,9 +657,30 @@ fn a_stream_takes_its_regions_up_to_its_bound_and_refuses_what_its_state_forbids
     );
 }
 
+/// Collects a window of full packets at the deadlines of the pacer.
+fn paced_flight(connection: &mut Connection, mut at: Instant, count: usize) -> Vec<Vec<u8>> {
+    let mut flight = Vec::new();
+    for _ in 0..=count {
+        flight.extend(sent_at(connection, at));
+        if flight.len() == count {
+            return flight;
+        }
+        let next = connection.drive(at).1.deadline.unwrap().instant();
+        assert!(next.as_nanos() > at.as_nanos());
+        at = next;
+    }
+    panic!("the pacer did not release the requested flight");
+}
+
 #[test]
 fn newreno_grows_on_delivery_and_halves_once_for_packet_and_time_threshold_losses() {
-    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    let mut pair = Pair::new(
+        Limits {
+            congestion_control: CongestionControl::NewReno,
+            ..Limits::DEFAULT
+        },
+        Limits::DEFAULT,
+    );
     let stream = pair.open(Direction::Unidirectional);
     pair.client.send(stream, region(0, 128 * 1024), true).unwrap();
     assert_eq!(pair.client.recovery().congestion_window, 12_000);
@@ -673,7 +698,7 @@ fn newreno_grows_on_delivery_and_halves_once_for_packet_and_time_threshold_losse
     // The handshake took zero ticks. The first data sample is 10 ms less 2 ms of ACK delay.
     assert_eq!(path.smoothed_rtt, Some(Duration::from_millis(1)));
 
-    let second = sent_at(&mut pair.client, ms(30));
+    let second = paced_flight(&mut pair.client, ms(30), 20);
     assert_eq!(second.len(), 20);
     give_at(&mut pair.server, &second[3], ms(34));
     for ack in sent_at(&mut pair.server, ms(35)) {
@@ -702,7 +727,7 @@ fn newreno_grows_on_delivery_and_halves_once_for_packet_and_time_threshold_losse
         give_at(&mut pair.client, &ack, ms(45));
     }
     assert_eq!(pair.client.recovery().congestion_window, 12_000);
-    let third = sent_at(&mut pair.client, ms(46));
+    let third = paced_flight(&mut pair.client, ms(46), 10);
     assert_eq!(third.iter().map(Vec::len).sum::<usize>(), 12_000);
     for packet in third {
         give_at(&mut pair.server, &packet, ms(50));
@@ -921,4 +946,195 @@ fn the_declared_reordering_interval_preserves_goodput_and_delivers_each_datagram
         32_000,
         "the late fifth is outside a 10 ms interval"
     );
+}
+
+/// An authenticated side ACK uses the same packet-range and ECN fields as a QUIC ACK.
+fn feedback(bytes: &[u8]) -> Ack<'_> {
+    let (Frame::Ack(ack), len) = Frame::parse(bytes).unwrap() else {
+        panic!("expected an ACK")
+    };
+    assert_eq!(len, bytes.len());
+    ack
+}
+
+#[test]
+fn side_datagrams_share_the_parent_window_and_release_it_on_ack_or_close() {
+    let limits = Limits {
+        side_flows_max: 2,
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(limits, Limits::DEFAULT);
+    let first = pair.client.open_side_flow().unwrap();
+    let second = pair.client.open_side_flow().unwrap();
+    for number in 0..9 {
+        assert_eq!(
+            pair.client.admit_side(first, 1200, ms(1)).unwrap().unwrap().number,
+            number
+        );
+    }
+    assert_eq!(pair.client.admit_side(second, 1200, ms(1)).unwrap().unwrap().number, 0);
+    assert_eq!(pair.client.recovery().bytes_in_flight, 12_000);
+    let stream = pair.open(Direction::Unidirectional);
+    pair.client.send(stream, region(0, 2400), true).unwrap();
+    assert!(sent_at(&mut pair.client, ms(1)).is_empty());
+    pair.client
+        .acknowledge_side(first, &feedback(&[3, 8, 0, 0, 8, 9, 0, 0]), ms(2))
+        .unwrap();
+    assert_eq!(pair.client.recovery().bytes_in_flight, 1200);
+    assert_eq!(pair.client.recovery().ecn, EcnState::Capable);
+    pair.client.close_side_flow(second).unwrap();
+    assert_eq!(pair.client.recovery().bytes_in_flight, 0);
+    assert!(!sent_at(&mut pair.client, ms(3)).is_empty());
+}
+
+#[test]
+fn a_valid_ce_mark_reduces_cubic_once_and_a_cleared_mark_disables_ecn() {
+    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    let mut out = [0; 1200];
+    for (sent, observed, window, state) in [
+        (10, Ecn::Ect0, 12_000, EcnState::Capable),
+        (20, Ecn::Ce, 8400, EcnState::Capable),
+        (30, Ecn::NotEct, 8400, EcnState::Failed),
+    ] {
+        pair.client.ping();
+        let packet = pair.client.transmit_ecn(&mut out, ms(sent)).unwrap().unwrap();
+        assert_eq!(packet.ecn, Ecn::Ect0);
+        give_marked(&mut pair.server, &out[..packet.len], ms(sent + 1), observed);
+        for ack in sent_at(&mut pair.server, ms(sent + 1)) {
+            give_at(&mut pair.client, &ack, ms(sent + 2));
+            give_at(&mut pair.client, &ack, ms(sent + 3));
+        }
+        let path = pair.client.recovery();
+        assert_eq!((path.ecn, path.congestion_window), (state, window));
+    }
+    assert_eq!(pair.client.recovery().ecn_counts.ce, 1);
+    pair.client.ping();
+    assert_eq!(
+        pair.client.transmit_ecn(&mut out, ms(40)).unwrap().unwrap().ecn,
+        Ecn::NotEct
+    );
+}
+
+#[test]
+fn each_datagram_in_a_full_window_leaves_at_its_pacing_deadline() {
+    let mut pair = Pair::new(
+        Limits {
+            side_flows_max: 1,
+            ..Limits::DEFAULT
+        },
+        Limits::DEFAULT,
+    );
+    let side = pair.client.open_side_flow().unwrap();
+    pair.client.ping();
+    let ping = sent_at(&mut pair.client, ms(10));
+    give_at(&mut pair.server, &ping[0], ms(410));
+    for ack in sent_at(&mut pair.server, ms(410)) {
+        give_at(&mut pair.client, &ack, ms(810));
+    }
+    // The 800 ms sample after a zero-tick handshake gives a 100 ms smoothed RTT.
+    assert_eq!(pair.client.recovery().smoothed_rtt, Some(Duration::from_millis(100)));
+    let stream = pair.open(Direction::Unidirectional);
+    pair.client.send(stream, region(0, 18_000), true).unwrap();
+    let mut at = ms(900);
+    for index in 0..10 {
+        if index == 0 {
+            pair.client.admit_side(side, 1200, at).unwrap().unwrap();
+            assert!(sent_at(&mut pair.client, at).is_empty());
+        } else {
+            let packets = sent_at(&mut pair.client, at);
+            assert_eq!(packets.iter().map(Vec::len).collect::<Vec<_>>(), [1200]);
+        }
+        if index < 9 {
+            let deadline = pair.client.drive(at).1.deadline.unwrap().instant();
+            // One full packet every 10 ms, with at most 1 ms of batching.
+            assert_eq!(deadline, ms(900 + (index + 1) * 10 - 1));
+            let early = Instant::new(deadline.domain(), deadline.as_nanos() - 1);
+            assert!(sent_at(&mut pair.client, early).is_empty());
+            at = deadline;
+        }
+    }
+    assert_eq!(pair.client.recovery().bytes_in_flight, 12_000);
+}
+
+#[test]
+fn persistent_congestion_spans_side_flows_and_a_delivered_parent_packet_breaks_the_run() {
+    for delivered in [false, true] {
+        let limits = Limits {
+            side_flows_max: 2,
+            ..Limits::DEFAULT
+        };
+        let mut pair = Pair::new(limits, Limits::DEFAULT);
+        let first = pair.client.open_side_flow().unwrap();
+        let second = pair.client.open_side_flow().unwrap();
+        pair.client.admit_side(first, 1200, ms(1)).unwrap().unwrap();
+        if delivered {
+            pair.client.ping();
+            let ping = sent_at(&mut pair.client, ms(40));
+            give_at(&mut pair.server, &ping[0], ms(40));
+            for ack in sent_at(&mut pair.server, ms(40)) {
+                give_at(&mut pair.client, &ack, ms(40));
+            }
+        }
+        pair.client.admit_side(second, 1200, ms(100)).unwrap().unwrap();
+        for space in [second, first] {
+            for _ in 0..3 {
+                pair.client.admit_side(space, 1200, ms(101)).unwrap().unwrap();
+            }
+        }
+        let ack = feedback(&[2, 3, 0, 0, 2]);
+        for space in [second, first] {
+            pair.client.acknowledge_side(space, &ack, ms(102)).unwrap();
+        }
+        let path = pair.client.recovery();
+        assert_eq!(path.packets_lost, 2);
+        assert_eq!(path.congestion_window, if delivered { 8400 } else { 2400 });
+    }
+}
+
+#[test]
+fn a_full_side_window_uses_a_parent_probe_and_reordered_feedback_keeps_validated_ecn() {
+    let mut pair = Pair::new(
+        Limits {
+            side_flows_max: 1,
+            ..Limits::DEFAULT
+        },
+        Limits::DEFAULT,
+    );
+    let flow = pair.client.open_side_flow().unwrap();
+    pair.client.admit_side(flow, 1200, ms(0)).unwrap().unwrap();
+    pair.client
+        .acknowledge_side(flow, &feedback(&[3, 0, 0, 0, 0, 1, 0, 0]), ms(0))
+        .unwrap();
+    for _ in 0..10 {
+        pair.client.admit_side(flow, 1200, ms(1)).unwrap().unwrap();
+    }
+    assert!(pair.client.admit_side(flow, 1200, ms(1)).unwrap().is_none());
+    let at = pair.client.drive(ms(1)).1.deadline.unwrap().instant();
+    assert_eq!(at, ms(27));
+    assert_matches!(pair.client.drive(at).0, Some(Event::SideProbe(id)) if id == flow);
+    assert!(pair.client.admit_side(flow, 1200, at).unwrap().is_none());
+    let probe = sent_at(&mut pair.client, at);
+    assert_eq!(probe.len(), 1);
+    let flight = 12_000 + probe[0].len() as u64;
+    assert_eq!(pair.client.recovery().bytes_in_flight, flight);
+    assert_eq!(pair.client.recovery().packets_lost, 0);
+    give_at(&mut pair.server, &probe[0], at);
+    for ack in sent_at(&mut pair.server, at) {
+        give_at(&mut pair.client, &ack, at);
+    }
+    // A parent ACK proves path reachability. The side bytes still need their own ACK.
+    assert_eq!(pair.client.recovery().bytes_in_flight, 12_000);
+    assert_eq!(pair.client.recovery().probes_sent, 1);
+    assert!(pair.client.drive(at).1.deadline.unwrap().instant().as_nanos() > at.as_nanos());
+    // Side feedback for packet 10 arrives before earlier feedback for packet 8.
+    pair.client
+        .acknowledge_side(flow, &feedback(&[3, 10, 0, 0, 0, 3, 0, 0]), ms(300))
+        .unwrap();
+    pair.client
+        .acknowledge_side(flow, &feedback(&[3, 8, 0, 0, 0, 2, 0, 0]), ms(300))
+        .unwrap();
+    assert!(pair.client.recovery().packets_lost > 0);
+    assert_eq!(pair.client.recovery().ecn_counts.ect0, 3);
+    assert_eq!(pair.client.recovery().ecn, EcnState::Capable);
+    assert_eq!(pair.client.recovery().bytes_in_flight, 1200);
 }

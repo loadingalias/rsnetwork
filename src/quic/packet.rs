@@ -19,6 +19,7 @@ pub use rustls::quic::{DirectionalKeys, HeaderProtectionKey, Keys, PacketKey, Si
 
 use super::frame::Frame;
 use super::{ConnectionId, Reader, VARINT_MAX, Version, Writer};
+use crate::drive::Ecn;
 
 /// The first bit of a long header.
 const LONG: u8 = 0x80;
@@ -307,6 +308,7 @@ impl core::error::Error for OpenError {}
 /// one datagram, or of each datagram of a region that segmentation offload filled.
 #[derive(Debug)]
 pub struct Datagrams {
+    pub(super) ecn: Ecn,
     /// The bytes that no packet took yet.
     rest: Option<Backing>,
     /// The bytes of the rest that belong to the current datagram.
@@ -322,11 +324,18 @@ impl Datagrams {
     /// connection ID of `short_dcid_len` bytes.
     pub fn new(region: Backing, segment: Option<NonZeroUsize>, short_dcid_len: usize) -> Self {
         Self {
+            ecn: Ecn::NotEct,
             rest: Some(region),
             datagram: 0,
             segment,
             short_dcid_len,
         }
+    }
+
+    /// Uses the ECN codepoint reported by the host for this receive region.
+    pub fn with_ecn(mut self, ecn: Ecn) -> Self {
+        self.ecn = ecn;
+        self
     }
 
     /// Gives the next packet, still protected, or `None` at the end of the region. A header that

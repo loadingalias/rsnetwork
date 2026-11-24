@@ -21,7 +21,7 @@ pub enum Direction {
 }
 
 /// The ECN counts of an ACK frame (RFC 9000, section 19.3.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EcnCounts {
     /// The packets with the ECT(0) codepoint.
     pub ect0: u64,
@@ -42,6 +42,8 @@ pub struct Ack<'a> {
     pub first: u64,
     /// The number of ranges after the first.
     count: u64,
+    /// The packet numbers below the first range that the encoded gaps and ranges span.
+    span: u64,
     /// The encoded gaps and lengths of those ranges.
     ranges: &'a [u8],
     /// The ECN counts of an ACK frame of type 0x03.
@@ -49,12 +51,20 @@ pub struct Ack<'a> {
 }
 
 impl Ack<'_> {
+    pub(super) fn valid(&self) -> bool {
+        self.largest <= VARINT_MAX
+            && self.delay <= VARINT_MAX
+            && self.largest.checked_sub(self.first).is_some_and(|low| low >= self.span)
+            && self.ecn.is_none_or(|c| c.ect0.max(c.ect1).max(c.ce) <= VARINT_MAX)
+    }
+
     /// Each acknowledged range of packet numbers, from the largest down.
     pub fn ranges(&self) -> impl Iterator<Item = RangeInclusive<u64>> + '_ {
         let mut reader = Reader::new(self.ranges);
-        let mut low = self.largest - self.first;
-        let first = core::iter::once(low..=self.largest);
-        first.chain((0..self.count).map_while(move |_| {
+        let mut low = self.largest.saturating_sub(self.first);
+        let valid = self.valid();
+        let first = valid.then_some(low..=self.largest).into_iter();
+        first.chain((0..if valid { self.count } else { 0 }).map_while(move |_| {
             let (gap, length) = (reader.varint()?, reader.varint()?);
             let high = low.checked_sub(gap)?.checked_sub(2)?;
             low = high.checked_sub(length)?;
@@ -420,6 +430,7 @@ impl<'a> Frame<'a> {
             return Err(WriteError::Value);
         }
         let fits = match *self {
+            Self::Ack(ack) => ack.valid(),
             Self::Crypto { offset, data } | Self::Stream { offset, data, .. } => offset
                 .checked_add(data.len() as u64)
                 .is_some_and(|end| end <= VARINT_MAX),
@@ -738,6 +749,7 @@ fn ack<'a>(reader: &mut Reader<'a>, ecn: bool) -> Option<Ack<'a>> {
         delay,
         first,
         count,
+        span: largest - first - low,
         ranges,
         ecn,
     })

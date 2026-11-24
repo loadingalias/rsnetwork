@@ -70,7 +70,7 @@ use rstypes::buffer::{Buffer as _, Lease, PoolRefused};
 use rstypes::capacity::{Budget, Permit};
 use rstypes::time::Deadline;
 
-/// The ECN codepoint of a received datagram (RFC 3168, section 5).
+/// The Explicit Congestion Notification (ECN) codepoint of an IP datagram (RFC 3168, section 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ecn {
     /// Not ECN-capable transport. A byte stream also has this codepoint.

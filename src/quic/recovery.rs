@@ -8,12 +8,13 @@ use std::collections::VecDeque;
 use rstypes::capacity::{Budget, Credit};
 use rstypes::time::Instant;
 
-use super::frame::{Ack, Frame};
+use super::congestion::{CongestionControl, Controller};
+use super::frame::{Ack, EcnCounts, Frame};
 use super::packet::{BuildError, Builder};
 use super::reassembly::grow;
 use super::stream::StreamId;
 use super::{VARINT_MAX, Writer, varint_len};
-use crate::drive::{Error, Kind};
+use crate::drive::{Ecn, Error, Kind};
 
 pub(super) const NO_ROOM: Error = Error::new(Kind::Overload, "the budget refused QUIC recovery state");
 const GRANULARITY: Duration = Duration::from_millis(1);
@@ -35,88 +36,38 @@ pub struct RecoveryStats {
     pub packets_lost: u64,
     /// The probe packets sent after a probe timeout.
     pub probes_sent: u64,
+    /// The state of ECN validation on this path.
+    pub ecn: EcnState,
+    /// The marks that the peer reported in validated feedback across all flows.
+    pub ecn_counts: EcnCounts,
 }
 
-/// The congestion controller of one path. Each packet number space uses the same window.
-trait Controller {
-    fn window(&self) -> u64;
-    fn datagram_limit(&mut self, bytes: u64);
-    fn can_grow(&self, sent: Instant) -> bool;
-    fn lost(&mut self, sent: Instant, now: Instant) -> bool;
-    fn acknowledged(&mut self, bytes: u64);
-}
-
-struct NewReno {
-    datagram: u64,
-    window: u64,
-    threshold: u64,
-    recovery: Option<Instant>,
-    /// Bytes acknowledged in congestion avoidance toward the next one-datagram increase.
-    increase: u64,
-}
-
-impl NewReno {
-    fn new(datagram: u64) -> Self {
-        Self {
-            datagram,
-            window: (10 * datagram).min((2 * datagram).max(14_720)),
-            threshold: u64::MAX,
-            recovery: None,
-            increase: 0,
-        }
-    }
-}
-
-impl Controller for NewReno {
-    fn window(&self) -> u64 {
-        self.window
-    }
-
-    fn datagram_limit(&mut self, bytes: u64) {
-        if bytes < self.datagram {
-            let scale = |n| {
-                u64::try_from(u128::from(n) * u128::from(bytes) / u128::from(self.datagram))
-                    .expect("the datagram limit only decreases")
-            };
-            self.window = scale(self.window).max(2 * bytes);
-            if self.threshold != u64::MAX {
-                self.threshold = scale(self.threshold);
-            }
-            self.increase = scale(self.increase);
-            self.datagram = bytes;
-        }
-    }
-
-    fn can_grow(&self, sent: Instant) -> bool {
-        self.recovery.is_none_or(|start| sent.as_nanos() > start.as_nanos())
-    }
-
-    fn lost(&mut self, sent: Instant, now: Instant) -> bool {
-        if !self.can_grow(sent) {
-            return false;
-        }
-        self.recovery = Some(now);
-        self.threshold = (self.window / 2).max(2 * self.datagram);
-        self.window = self.threshold;
-        self.increase = 0;
-        true
-    }
-
-    fn acknowledged(&mut self, bytes: u64) {
-        if self.window < self.threshold {
-            self.window = self.window.saturating_add(bytes);
-        } else {
-            self.increase = self.increase.saturating_add(bytes);
-            if self.increase >= self.window {
-                self.increase -= self.window;
-                self.window = self.window.saturating_add(self.datagram);
-            }
-        }
-    }
+/// Whether the peer has confirmed the ECN marks sent on this path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EcnState {
+    /// The sender can mark up to ten datagrams to test the path.
+    Testing,
+    /// The trial ended. Datagrams leave unmarked until the peer confirms a trial mark.
+    Unknown,
+    /// The peer reported valid counts for marked traffic.
+    Capable,
+    /// Validation failed. The sender uses Not-ECT.
+    Failed,
 }
 
 pub(super) struct Path {
-    controller: NewReno,
+    pub(super) controller: Controller,
+    store: Store,
+    /// The virtual end of the last paced transmission, in clock nanoseconds.
+    departure: u64,
+    pub(super) pacing_wait: Option<Instant>,
+    ecn: EcnState,
+    trial_datagrams: u8,
+    first_mark: Option<Instant>,
+    ecn_counts: EcnCounts,
+    collapsed: Option<u64>,
+    reset_rtt: bool,
+    pub(super) ack_delay_max: Duration,
     flight: u64,
     minimum: Option<Duration>,
     latest: Duration,
@@ -128,9 +79,19 @@ pub(super) struct Path {
 }
 
 impl Path {
-    pub(super) fn new(datagram: usize) -> Self {
+    pub(super) fn new(datagram: usize, algorithm: CongestionControl, budget: &Budget) -> Self {
         Self {
-            controller: NewReno::new(datagram as u64),
+            controller: Controller::new(datagram as u64, algorithm),
+            store: Store::new(budget),
+            departure: 0,
+            pacing_wait: None,
+            ecn: EcnState::Testing,
+            trial_datagrams: 0,
+            first_mark: None,
+            ecn_counts: EcnCounts::default(),
+            collapsed: None,
+            reset_rtt: false,
+            ack_delay_max: Duration::from_millis(25),
             flight: 0,
             minimum: None,
             latest: INITIAL_RTT,
@@ -145,20 +106,95 @@ impl Path {
     pub(super) fn stats(&self) -> RecoveryStats {
         RecoveryStats {
             bytes_in_flight: self.flight,
-            congestion_window: self.controller.window(),
+            congestion_window: self.controller.window,
             latest_rtt: self.minimum.map(|_| self.latest),
             smoothed_rtt: self.minimum.map(|_| self.smoothed),
             packets_lost: self.lost,
             probes_sent: self.probes,
+            ecn: self.ecn,
+            ecn_counts: self.ecn_counts,
         }
     }
 
     pub(super) fn room(&self) -> u64 {
-        self.controller.window().saturating_sub(self.flight)
+        self.controller.window.saturating_sub(self.flight)
     }
 
-    pub(super) fn sent(&mut self, bytes: u64) {
+    fn interval_ns(&self, bytes: u64) -> u64 {
+        u64::try_from((self.smoothed.as_nanos() * u128::from(bytes)).div_ceil(u128::from(self.controller.window)))
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Allow one millisecond of batching, up to the initial window. Before the first RTT,
+    /// the initial flight can leave together (RFC 9002, section 7.7).
+    pub(super) fn paced(&mut self, bytes: u64, now: Instant) -> Result<bool, Error> {
+        if self.pacing_wait.is_some_and(|at| at.as_nanos() <= now.as_nanos()) {
+            self.pacing_wait = None;
+        }
+        if bytes > self.room() {
+            return Ok(false);
+        }
+        let initial = (10 * self.controller.datagram).min((2 * self.controller.datagram).max(14_720));
+        let allowance = self.interval_ns(initial.saturating_sub(bytes));
+        let allowance = if self.minimum.is_some() {
+            allowance.min(1_000_000)
+        } else {
+            allowance
+        };
+        let wait = self.departure.saturating_sub(now.as_nanos()).saturating_sub(allowance);
+        if wait == 0 || self.smoothed.is_zero() {
+            return Ok(true);
+        }
+        let at = now
+            .checked_add(Duration::from_nanos(wait))
+            .map_err(|_| super::connection::CLOCK)?;
+        if self
+            .pacing_wait
+            .is_none_or(|previous| previous.as_nanos() > at.as_nanos())
+        {
+            self.pacing_wait = Some(at);
+        }
+        Ok(false)
+    }
+
+    fn sent(&mut self, bytes: u64, now: Instant) {
         self.flight += bytes;
+        if bytes != 0 {
+            self.departure = now
+                .as_nanos()
+                .max(self.departure)
+                .saturating_add(self.interval_ns(bytes));
+        }
+    }
+
+    pub(super) fn mark(&mut self, now: Instant) -> Ecn {
+        if self.ecn == EcnState::Testing
+            && self.first_mark.is_some_and(|first| {
+                u128::from(now.as_nanos().saturating_sub(first.as_nanos()))
+                    >= 3 * self.pto(self.ack_delay_max).as_nanos()
+            })
+        {
+            self.ecn = EcnState::Unknown;
+        }
+        match self.ecn {
+            EcnState::Capable => Ecn::Ect0,
+            EcnState::Testing => Ecn::Ect0,
+            _ => Ecn::NotEct,
+        }
+    }
+
+    pub(super) fn marked(&mut self, mark: Ecn, now: Instant) {
+        if mark == Ecn::Ect0 && self.ecn == EcnState::Testing {
+            self.first_mark.get_or_insert(now);
+            self.trial_datagrams += 1;
+            if self.trial_datagrams == 10 {
+                self.ecn = EcnState::Unknown;
+            }
+        }
+    }
+
+    pub(super) fn untracked(&mut self) {
+        self.store.tail = self.store.tail.join(Gap::BARRIER);
     }
 
     /// The peer can negotiate a smaller maximum datagram. Preserve the number of packets in the window.
@@ -166,22 +202,24 @@ impl Path {
         self.controller.datagram_limit(bytes as u64);
     }
 
-    pub(super) fn acknowledged(&mut self, bytes: u64) {
-        self.controller.acknowledged(bytes);
-    }
-
-    pub(super) fn discard(&mut self, bytes: u64) {
-        self.flight -= bytes;
-        self.backoff = 0;
+    pub(super) fn acknowledged(&mut self, ack: Acked, now: Instant, grow: bool) {
+        if grow && ack.bytes > 0 {
+            self.controller.acknowledged(ack.bytes, now, self.smoothed);
+        }
+        if let Some(round) = ack.round {
+            self.controller.round_sample(round, self.latest);
+        }
     }
 
     pub(super) fn pto(&self, ack_delay: Duration) -> Duration {
         self.smoothed + (4 * self.variation).max(GRANULARITY) + ack_delay
     }
 
-    fn sample(&mut self, latest: Duration, delay: Duration) {
+    fn sample(&mut self, latest: Duration, delay: Duration, now: Instant) {
         self.latest = latest;
-        let Some(previous) = self.minimum else {
+        let reset = core::mem::take(&mut self.reset_rtt);
+        let Some(previous) = self.minimum.filter(|_| !reset) else {
+            self.departure = now.as_nanos();
             self.minimum = Some(latest);
             self.smoothed = latest;
             self.variation = latest / 2;
@@ -209,6 +247,7 @@ pub(super) struct Received {
     window: u64,
     credit: Credit,
     pub(super) due: bool,
+    ecn: EcnCounts,
 }
 
 impl Received {
@@ -219,6 +258,7 @@ impl Received {
             window,
             credit: budget.credit(0),
             due: false,
+            ecn: EcnCounts::default(),
         }
     }
 
@@ -239,7 +279,7 @@ impl Received {
     }
 
     /// Commits a packet only after the engine accepts all its frames.
-    pub(super) fn accept(&mut self, number: u64, now: Instant, eliciting: bool) -> Result<(), Error> {
+    pub(super) fn accept(&mut self, number: u64, now: Instant, eliciting: bool, mark: Ecn) -> Result<(), Error> {
         if self.largest().is_none_or(|largest| number > largest) {
             let floor = (number + 1).saturating_sub(self.window);
             while self.ranges.front().is_some_and(|r| r.end <= floor) {
@@ -269,6 +309,12 @@ impl Received {
             .map_err(|_| NO_ROOM)?;
             ranges.insert(at, number..end);
         }
+        match mark {
+            Ecn::Ect0 => self.ecn.ect0 += 1,
+            Ecn::Ect1 => self.ecn.ect1 += 1,
+            Ecn::Ce => self.ecn.ce += 1,
+            Ecn::NotEct => {}
+        }
         self.due |= eliciting;
         Ok(())
     }
@@ -290,8 +336,15 @@ impl Received {
     fn encode(&self, out: &mut [u8], delay: u64) -> Option<usize> {
         let mut ranges = self.ranges.iter().rev();
         let first = ranges.next()?;
-        let mut writer = Writer::new(out);
-        writer.u8(0x02)?;
+        let marked = self.ecn != EcnCounts::default();
+        let tail = if marked {
+            varint_len(self.ecn.ect0)? + varint_len(self.ecn.ect1)? + varint_len(self.ecn.ce)?
+        } else {
+            0
+        };
+        let limit = out.len().checked_sub(tail)?;
+        let mut writer = Writer::new(&mut out[..limit]);
+        writer.u8(if marked { 0x03 } else { 0x02 })?;
         writer.varint(first.end - 1)?;
         writer.varint(delay)?;
         let count_at = writer.len();
@@ -308,6 +361,13 @@ impl Received {
             count += 1;
         }
         Writer::new(&mut out[count_at..]).varint_in(count, width)?;
+        if marked {
+            let mut tail = Writer::new(&mut out[written..]);
+            tail.varint(self.ecn.ect0)?;
+            tail.varint(self.ecn.ect1)?;
+            tail.varint(self.ecn.ce)?;
+            written += tail.len();
+        }
         Some(written)
     }
 }
@@ -402,6 +462,7 @@ pub(super) struct Sent {
     pub(super) bytes: u64,
     pub(super) eliciting: bool,
     pub(super) records: Records,
+    pub(super) mark: Ecn,
 }
 
 /// Slots in send order. Removal unlinks two neighbors. The next insertion reuses the free slot.
@@ -409,6 +470,11 @@ struct Slot {
     packet: Option<Sent>,
     previous: usize,
     next: usize,
+    path_previous: usize,
+    path_next: usize,
+    gap: Gap,
+    sampled: bool,
+    round: u64,
 }
 
 const NONE: usize = usize::MAX;
@@ -471,32 +537,98 @@ impl Slots {
     }
 }
 
-pub(super) struct History {
+/// Settled packets between two live packets in path send order. An ACK splits a loss run.
+/// Only the two ends can still join a run as its neighboring packets settle.
+#[derive(Clone, Copy, Default)]
+struct Gap {
+    prefix_end: Option<u64>,
+    suffix_start: Option<u64>,
+    broken: bool,
+}
+
+impl Gap {
+    const BARRIER: Self = Self {
+        prefix_end: None,
+        suffix_start: None,
+        broken: true,
+    };
+
+    fn join(self, right: Self) -> Self {
+        Self {
+            prefix_end: if self.broken {
+                self.prefix_end
+            } else {
+                right.prefix_end.or(self.prefix_end)
+            },
+            suffix_start: if right.broken {
+                right.suffix_start
+            } else {
+                self.suffix_start.or(right.suffix_start)
+            },
+            broken: self.broken || right.broken,
+        }
+    }
+}
+
+/// All number spaces and side flows allocate slots here. Each slot also links its path neighbors.
+struct Store {
     slots: Slots,
+    free: usize,
+    last: usize,
+    tail: Gap,
+    credit: Credit,
+}
+
+impl Store {
+    fn new(budget: &Budget) -> Self {
+        Self {
+            slots: Slots::default(),
+            free: NONE,
+            last: NONE,
+            tail: Gap::default(),
+            credit: budget.credit(0),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Settlement {
+    Delivered,
+    Lost,
+    Discarded,
+}
+
+#[derive(Default)]
+pub(super) struct Acked {
+    pub(super) eliciting: bool,
+    bytes: u64,
+    round: Option<u64>,
+}
+
+pub(super) struct History {
     first: usize,
     last: usize,
-    free: usize,
-    credit: Credit,
     pub(super) bytes: u64,
     elicitors: usize,
     last_sent: Option<Instant>,
     pub(super) largest: Option<u64>,
     pub(super) loss_time: Option<Instant>,
+    pub(super) ect_sent: u64,
+    feedback: EcnCounts,
 }
 
 impl History {
-    pub(super) fn new(budget: &Budget) -> Self {
+    pub(super) fn new() -> Self {
         Self {
-            slots: Slots::default(),
             first: NONE,
             last: NONE,
-            free: NONE,
-            credit: budget.credit(0),
             bytes: 0,
             elicitors: 0,
             last_sent: None,
             largest: None,
             loss_time: None,
+            ect_sent: 0,
+            feedback: EcnCounts::default(),
         }
     }
 
@@ -504,52 +636,143 @@ impl History {
         self.last_sent.filter(|_| self.elicitors > 0)
     }
 
-    pub(super) fn insert(&mut self, packet: Sent) -> Result<(), Error> {
+    pub(super) fn insert(&mut self, path: &mut Path, packet: Sent) -> Result<(), Error> {
         let (bytes, eliciting, time) = (packet.bytes, packet.eliciting, packet.time);
+        let store = &mut path.store;
         let slot = Slot {
             packet: Some(packet),
             previous: self.last,
             next: NONE,
+            path_previous: store.last,
+            path_next: NONE,
+            gap: store.tail,
+            sampled: path.minimum.is_some(),
+            round: path.controller.round(),
         };
-        let at = if let Some(free) = self.slots.get_mut(self.free) {
-            let at = core::mem::replace(&mut self.free, free.next);
+        let at = if let Some(free) = store.slots.get_mut(store.free) {
+            let at = core::mem::replace(&mut store.free, free.next);
             *free = slot;
             at
         } else {
-            self.slots.push(slot, &mut self.credit)?
+            store.slots.push(slot, &mut store.credit)?
         };
+        store.tail = Gap::default();
+        if let Some(last) = store.slots.get_mut(store.last) {
+            last.path_next = at;
+        }
+        store.last = at;
         self.bytes += bytes;
         if eliciting {
             self.elicitors += 1;
             self.last_sent = Some(time);
         }
-        if let Some(last) = self.slots.get_mut(self.last) {
+        if let Some(last) = store.slots.get_mut(self.last) {
             last.next = at;
         } else {
             self.first = at;
         }
         self.last = at;
+        path.sent(bytes, time);
         Ok(())
     }
 
-    fn remove(&mut self, at: usize) -> Sent {
-        let slot = self.slots.get_mut(at).expect("the packet has a slot");
+    fn remove(&mut self, path: &mut Path, at: usize, reason: Settlement) -> Sent {
+        let store = &mut path.store;
+        let slot = store.slots.get_mut(at).expect("the packet has a slot");
         let packet = slot.packet.take().expect("only a live packet leaves the list");
-        let (previous, next) = (slot.previous, core::mem::replace(&mut slot.next, self.free));
-        self.free = at;
-        if let Some(before) = self.slots.get_mut(previous) {
+        let (previous, next) = (slot.previous, core::mem::replace(&mut slot.next, store.free));
+        let (left, right, gap, sampled) = (slot.path_previous, slot.path_next, slot.gap, slot.sampled);
+        store.free = at;
+        if let Some(before) = store.slots.get_mut(previous) {
             before.next = next;
         } else {
             self.first = next;
         }
-        if let Some(after) = self.slots.get_mut(next) {
+        if let Some(after) = store.slots.get_mut(next) {
             after.previous = previous;
         } else {
             self.last = previous;
         }
+        if let Some(before) = store.slots.get_mut(left) {
+            before.path_next = right;
+        }
+        let after = if let Some(after) = store.slots.get_mut(right) {
+            after.path_previous = left;
+            &mut after.gap
+        } else {
+            store.last = left;
+            &mut store.tail
+        };
+        let mut middle = Gap::BARRIER;
+        let mut span = None;
+        if matches!(reason, Settlement::Lost) {
+            let time = (sampled && packet.eliciting).then(|| packet.time.as_nanos());
+            middle = Gap {
+                prefix_end: time,
+                suffix_start: time,
+                broken: false,
+            };
+            if let (Some(first), Some(last)) = (gap.suffix_start.or(time), after.prefix_end.or(time)) {
+                span = Some((first, last));
+            }
+        }
+        *after = gap.join(middle).join(*after);
         self.bytes -= packet.bytes;
+        path.flight -= packet.bytes;
         self.elicitors -= usize::from(packet.eliciting);
+        if let Some((first, last)) = span
+            && path.collapsed.is_none_or(|previous| first > previous)
+            && u128::from(last.saturating_sub(first)) > 3 * path.pto(path.ack_delay_max).as_nanos()
+        {
+            path.controller.persistent();
+            path.collapsed = Some(last);
+            path.reset_rtt = true;
+        }
         packet
+    }
+
+    pub(super) fn discard(&mut self, path: &mut Path) {
+        while self.first != NONE {
+            self.remove(path, self.first, Settlement::Discarded);
+        }
+    }
+
+    fn validate_ecn(
+        &mut self,
+        path: &mut Path,
+        counts: Option<EcnCounts>,
+        marked: u64,
+        sent: Option<Instant>,
+        now: Instant,
+    ) -> bool {
+        if path.ecn == EcnState::Failed {
+            return false;
+        }
+        let Some(counts) = counts else {
+            if marked > 0 {
+                path.ecn = EcnState::Failed;
+            }
+            return false;
+        };
+        let Some(ect) = counts.ect0.checked_sub(self.feedback.ect0) else {
+            path.ecn = EcnState::Failed;
+            return false;
+        };
+        let Some(ce) = counts.ce.checked_sub(self.feedback.ce) else {
+            path.ecn = EcnState::Failed;
+            return false;
+        };
+        if counts.ect1 != 0 || counts.ect0 + counts.ce > self.ect_sent || ect + ce < marked {
+            path.ecn = EcnState::Failed;
+            return false;
+        }
+        self.feedback = counts;
+        if marked > 0 {
+            path.ecn = EcnState::Capable;
+        }
+        path.ecn_counts.ect0 = path.ecn_counts.ect0.saturating_add(ect);
+        path.ecn_counts.ce = path.ecn_counts.ce.saturating_add(ce);
+        ce > 0 && sent.is_some_and(|sent| path.controller.congestion(sent, now))
     }
 
     /// Walks the ranges and the live packets together, once. A gap in packet numbers costs no work.
@@ -560,35 +783,41 @@ impl History {
         now: Instant,
         delay: Duration,
         mut delivered: impl FnMut(Record),
-    ) -> Result<(bool, u64), Error> {
+    ) -> Result<Acked, Error> {
+        let advances = self.largest.is_none_or(|old| ack.largest > old);
         self.largest = Some(self.largest.map_or(ack.largest, |old| old.max(ack.largest)));
-        if self
+        if path
+            .store
             .slots
             .get(self.first)
             .and_then(|slot| slot.packet.as_ref())
             .is_none_or(|first| first.number > ack.largest)
         {
-            return Ok((false, 0));
+            return Ok(Acked::default());
         }
         let mut at = self.last;
         let mut eliciting = false;
         let mut grow_by = 0;
+        let mut marked = 0;
         let mut sample = None;
+        let mut round = None;
         for range in ack.ranges() {
-            while let Some(slot) = self.slots.get(at) {
+            while let Some(slot) = path.store.slots.get(at) {
                 let packet = slot.packet.as_ref().expect("the send list links live packets");
                 if packet.number < *range.start() {
                     break;
                 }
                 let previous = slot.previous;
                 if packet.number <= *range.end() {
-                    let packet = self.remove(at);
-                    path.flight -= packet.bytes;
+                    let sent_round = slot.round;
+                    let packet = self.remove(path, at, Settlement::Delivered);
+                    marked += u64::from(packet.mark == Ecn::Ect0);
                     if path.controller.can_grow(packet.time) {
                         grow_by += packet.bytes;
                     }
                     if packet.number == ack.largest {
                         sample = Some(packet.time);
+                        round = Some(sent_round);
                     }
                     eliciting |= packet.eliciting;
                     packet.records.iter().for_each(&mut delivered);
@@ -600,9 +829,20 @@ impl History {
             }
         }
         if eliciting && let Some(sent) = sample {
-            path.sample(now.duration_since(sent).map_err(|_| super::connection::CLOCK)?, delay);
+            path.sample(
+                now.duration_since(sent).map_err(|_| super::connection::CLOCK)?,
+                delay,
+                now,
+            );
         }
-        Ok((eliciting, grow_by))
+        if advances && self.validate_ecn(path, ack.ecn, marked, sample, now) {
+            grow_by = 0;
+        }
+        Ok(Acked {
+            eliciting,
+            bytes: grow_by,
+            round: round.filter(|_| eliciting),
+        })
     }
 
     /// Stops at the first packet below both loss thresholds. Each later packet is newer.
@@ -614,11 +854,12 @@ impl History {
     ) -> Result<bool, Error> {
         self.loss_time = None;
         let delay = path.loss_delay();
+        let previous_collapse = path.collapsed;
         let mut congestion = false;
-        while let Some(packet) = self.slots.get(self.first).and_then(|slot| slot.packet.as_ref()) {
-            // A bare ACK older than every live elicitor can no longer supply an RTT sample.
-            if packet.bytes == 0 {
-                self.remove(self.first);
+        while let Some(packet) = path.store.slots.get(self.first).and_then(|slot| slot.packet.as_ref()) {
+            // A bare ACK below no acknowledged number has no remaining RTT or loss evidence.
+            if packet.bytes == 0 && self.largest.is_none_or(|largest| largest < packet.number) {
+                self.remove(path, self.first, Settlement::Discarded);
                 continue;
             }
             let Some(largest) = self.largest.filter(|largest| *largest >= packet.number) else {
@@ -629,13 +870,14 @@ impl History {
                 self.loss_time = Some(due);
                 break;
             }
-            let packet = self.remove(self.first);
-            path.flight -= packet.bytes;
-            path.lost = path.lost.saturating_add(1);
-            congestion |= path.controller.lost(packet.time, now);
+            if packet.bytes > 0 {
+                congestion |= path.controller.congestion(packet.time, now);
+                path.lost = path.lost.saturating_add(1);
+            }
+            let packet = self.remove(path, self.first, Settlement::Lost);
             packet.records.iter().try_for_each(&mut lost)?;
         }
-        Ok(congestion)
+        Ok(congestion || previous_collapse != path.collapsed)
     }
 }
 
