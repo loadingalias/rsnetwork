@@ -611,7 +611,7 @@ impl Http2 {
     /// until no event comes.
     fn fill(&mut self, stream: Stream, now: Instant) -> Result<usize, Error> {
         self.live(now)?;
-        let index = self.expire(stream, now)?;
+        let mut index = self.expire(stream, now)?;
         if self.exchanges[index].head.is_none() {
             if let Some(error) = self.exchanges[index].error {
                 return Err(error);
@@ -619,12 +619,11 @@ impl Http2 {
             return Err(misuse("read the response head first"));
         }
         self.exchanges[index].inflow.feed();
-        while self.exchanges[index].inflow.waits() {
-            if !self.pump(now)? {
-                break;
-            }
-            let found = self.find(stream).ok_or_else(|| misuse("the stream is not open"))?;
-            self.exchanges[found].inflow.feed();
+        // Each drive can remove an exchange that the application left, so the place of this
+        // exchange can change.
+        while self.exchanges[index].inflow.waits() && self.pump(now)? {
+            index = self.find(stream).ok_or_else(|| misuse("the stream is not open"))?;
+            self.exchanges[index].inflow.feed();
         }
         self.find(stream).ok_or_else(|| misuse("the stream is not open"))
     }

@@ -810,7 +810,12 @@ impl Http {
             let (session, outbound) = server.h2_parts();
             session.connection().data(outbound, id, data.clone(), false)
         })?;
-        if let Some(out) = &mut self.h2().exchanges[index].out {
+        // A full queue drives the connection, and a drive can remove a stream that the
+        // application closed, so the place of this stream can change.
+        let h2 = self.h2();
+        if let Some(index) = h2.find(stream)
+            && let Some(out) = &mut h2.exchanges[index].out
+        {
             out.written += len;
             out.chunk = true;
         }

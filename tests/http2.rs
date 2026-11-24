@@ -467,6 +467,26 @@ fn the_cancel_of_one_stream_resets_it_and_the_connection_carries_the_others() {
 }
 
 #[test]
+fn a_read_goes_on_when_its_drive_removes_a_stream_that_the_application_left() {
+    let mut pair = Pair::plain();
+    let a = pair.send(&get(b"/a"), later(), at(0));
+    let b = pair.send(&get(b"/b"), later(), at(0));
+    pair.request(at(0));
+    let (second, _) = pair.request(at(0));
+    // The second stream has its response head, and waits for its body.
+    assert!(pair.server.respond(second, &ok(Some(5)), at(0)).unwrap());
+    pair.response(b, at(0)).unwrap();
+    // The application leaves the first stream: the next drive of the client removes it. The
+    // body of the second stream arrives for that same drive.
+    pair.client.cancel(a);
+    pair.server.write(second, &Lease::from(&b"three"[..]), at(0)).unwrap();
+    pair.server.finish(second, at(0)).unwrap();
+    let bytes = take(&mut pair.server);
+    give(&mut pair.client, bytes);
+    assert_matches!(pair.collect(b, at(0)), (body, Collect::Complete(None)) if body == b"three");
+}
+
+#[test]
 fn a_slow_body_meets_its_deadline_on_its_stream_and_the_connection_goes_on() {
     let mut pair = Pair::plain();
     let slow = pair.send(&get(b"/slow"), Deadline::at(at(1_000)), at(0));
