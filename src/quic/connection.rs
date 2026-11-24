@@ -24,6 +24,7 @@
 use core::cmp::Ordering;
 use core::fmt;
 use core::mem::size_of;
+use core::net::SocketAddr;
 use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -79,8 +80,9 @@ pub struct Limits {
     pub datagram_bytes_max: usize,
     /// The bytes of the connection ID that this end chooses for itself: 0 to 20.
     pub cid_bytes: usize,
-    /// The most packets that one 1-RTT key seals, at least 2. Then this end updates its keys
-    /// (RFC 9001, section 6). The connection uses the smaller of this limit and the
+    /// The most packets that one 1-RTT key seals, at least 2. The last of them is kept for a
+    /// CONNECTION_CLOSE frame. Thus this end updates its keys one packet before the limit (RFC
+    /// 9001, sections 6 and 6.6). The connection uses the smaller of this limit and the
     /// confidentiality limit of its suite, so `u64::MAX` gives the limit of the suite.
     pub key_packets_max: u64,
     /// The stream bytes, of each stream together, that the consumers of this end hold at one
@@ -179,6 +181,14 @@ const KEYS_BYTES: u64 = 2 * memory::RECORD_KEY + 2 * memory::HEADER_KEY;
 /// The events of one rustls call that the engine keeps room for: a flight of the server, its key
 /// changes, and its session tickets.
 const EVENTS: usize = 16;
+/// The addresses of the peer that a stateless reset can come from, each with the connection ID
+/// that this end sent to it. They are the active path, the path that the connection left, and one
+/// path that the peer probes.
+pub(super) const RESET_ROUTES: usize = 3;
+/// The bytes of the datagram of a close that has a closing period: one 1-RTT packet. It has the
+/// longest connection ID and packet number, a CONNECTION_CLOSE frame of the transport with an
+/// empty reason, and the tag.
+const CLOSE_BYTES_MAX: usize = 1 + ConnectionId::MAX + 4 + (1 + 8 + 8 + 1) + packet::TAG;
 
 /// The packet number spaces, and the levels of their keys (RFC 9000, section 12.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -497,6 +507,9 @@ struct Ending {
     /// The end of the closing or draining period. `None` before the handshake is confirmed: the
     /// connection then ends when its frame is out, so its handshake slot is free at once.
     until: Option<Instant>,
+    /// The protected datagram of the frame, and its bytes, after it went out. Each copy is this
+    /// datagram, so no key seals the frame again (RFC 9000, section 10.2.1).
+    sealed: Option<([u8; CLOSE_BYTES_MAX], usize)>,
 }
 
 /// The answer to a PATH_CHALLENGE frame, which waits to go out on the path of the challenge
@@ -507,10 +520,10 @@ struct Answer {
     data: [u8; 8],
     /// The connection ID of the peer for that path, when the challenge came.
     dcid: ConnectionId,
-    /// The bytes of the datagram of an answer on a path that does not carry the connection: 1,200,
-    /// and for a path with no validation at most three times the bytes of the datagram of the
-    /// challenge.
-    room: usize,
+    /// The address of the peer on that path had its validation when the challenge came, and an
+    /// address keeps it. Else the credit of the path pays for the datagram of the answer when it
+    /// goes out.
+    validated: bool,
 }
 
 /// The code from an authenticated CONNECTION_CLOSE frame of the peer.
@@ -644,7 +657,10 @@ pub struct Connection {
     issuer: Option<Issuer>,
     random: &'static dyn rustls::crypto::SecureRandom,
     reset_mask: rscrypto::SecretBytes<32>,
-    used_remote: Option<ConnectionId>,
+    /// The address and the connection ID of the peer of the newest datagrams of this end, the
+    /// newest first. A stateless reset from one of these addresses is valid with the token of its
+    /// connection ID (RFC 9000, section 10.3.1).
+    used: [Option<(SocketAddr, ConnectionId)>; RESET_ROUTES],
     /// The peer source ID in Initial and Handshake packets. Rotation only affects the data path.
     initial_peer: Option<ConnectionId>,
     facts: Option<Facts>,
@@ -682,9 +698,8 @@ pub struct Connection {
 /// The frames of an opened packet: its payload, and the offset of the next frame.
 struct Reading {
     destination: ConnectionId,
-    /// The path and the bytes of the datagram of the packet.
+    /// The path of the datagram of the packet.
     path: Path,
-    datagram: usize,
     /// Each frame so far only probes a path (RFC 9000, section 9.1).
     probing: bool,
     level: Level,
@@ -1023,7 +1038,7 @@ impl Connection {
             issuer: None,
             random,
             reset_mask,
-            used_remote: None,
+            used: [None; RESET_ROUTES],
             initial_local: local_cid,
             initial_peer: None,
             facts: None,
@@ -1180,17 +1195,17 @@ impl Connection {
         if !returns && !active.remote_cid.as_bytes().is_empty() && self.ids.spare(active.remote_cid).is_none() {
             return Ok(false);
         }
-        self.moved(path, 0, now)?;
+        self.moved(path, now)?;
         // A packet that is not a probe shows the server the new path (RFC 9000, section 9.2).
         self.ping = true;
         Ok(true)
     }
 
     /// Makes `path` the active path: the path of the newest packet of a peer that moved, or the
-    /// path that a client selected (RFC 9000, section 9.3). `received` is the size of the datagram
-    /// that showed the path to a server, which sends at most three times the bytes that came from
-    /// an address with no validation.
-    fn moved(&mut self, path: Path, received: u64, now: Instant) -> Result<(), Error> {
+    /// path that a client selected (RFC 9000, section 9.3). A server sends at most three times the
+    /// bytes that came from an address with no validation. Thus the path starts with the credit
+    /// that its datagrams left.
+    fn moved(&mut self, path: Path, now: Instant) -> Result<(), Error> {
         // A return to the last validated path ends the validation of the path that the connection
         // leaves, and restores the delivery state of the path (RFC 9000, section 9.3.2).
         if let Some(validation) = self
@@ -1198,7 +1213,7 @@ impl Connection {
             .validation
             .take_if(|validation| validation.fallback.addresses == path)
         {
-            self.paths.active = validation.fallback;
+            self.paths.activate(validation.fallback);
             return Ok(());
         }
         let server = matches!(self.end, End::Server { .. });
@@ -1207,7 +1222,7 @@ impl Connection {
         // never waits for one (RFC 9000, section 9.5).
         let remote_cid = self.ids.spare(old.remote_cid).map_or(old.remote_cid, |spare| spare.id);
         let mut next = old.next(path, remote_cid, self.datagram_top(), self.limits.congestion_control);
-        next.amplification_credit = server.then_some(received.saturating_mul(3));
+        next.amplification_credit = server.then(|| self.paths.take_credit(path));
         // The new path can have a longer round trip than the old one (RFC 9000, section 8.2.4).
         let until = after(now, 3 * self.pto().max(next.pto(self.ack_delay_max())))?;
         let data = self.challenge()?;
@@ -1328,6 +1343,7 @@ impl Connection {
             heard: 0,
             notify: until.is_some(),
             until,
+            sealed: None,
         });
     }
 
@@ -1345,22 +1361,57 @@ impl Connection {
         self.ids.issue(id, reset).map_err(|_| endpoint::NO_ROOM)
     }
 
-    pub(super) fn used_reset(&self) -> Option<[u8; 16]> {
-        self.ids.peer(self.used_remote?)?.reset
+    /// Records a datagram to the address `peer` with the connection ID `dcid` of the peer, as the
+    /// newest pair. A pair of a retired connection ID leaves, and then the oldest pair.
+    fn sent_to(&mut self, peer: SocketAddr, dcid: ConnectionId) {
+        let newest = Some((peer, dcid));
+        if self.used[0] == newest {
+            return;
+        }
+        let mut used = [None; RESET_ROUTES];
+        used[0] = newest;
+        let older = self
+            .used
+            .into_iter()
+            .flatten()
+            .filter(|old| Some(*old) != newest && self.ids.peer(old.1).is_some());
+        for (slot, old) in used[1..].iter_mut().zip(older) {
+            *slot = Some(old);
+        }
+        self.used = used;
     }
 
-    fn matches_reset(&self, tail: &[u8; 16]) -> bool {
-        self.used_reset().is_some_and(|expected| {
-            let key = self.reset_mask.as_bytes();
+    /// Each stateless reset that is valid for this connection. It has an address of the peer that
+    /// this end sent to, and the token of the connection ID that this end used there. A retired
+    /// connection ID has no token (RFC 9000, section 10.3.1).
+    pub(super) fn resets(&self) -> [Option<(SocketAddr, [u8; 16])>; RESET_ROUTES] {
+        self.used.map(|used| {
+            let (peer, id) = used?;
+            Some((peer, self.ids.peer(id)?.reset?))
+        })
+    }
+
+    fn matches_reset(&self, tail: &[u8; 16], from: SocketAddr) -> bool {
+        let key = self.reset_mask.as_bytes();
+        let mut tokens = self.resets().into_iter().flatten().filter(|(peer, _)| *peer == from);
+        tokens.any(|(_, expected)| {
             let expected = rscrypto::HmacSha256::mac(key, &expected);
             rscrypto::HmacSha256::verify_tag(key, tail, &expected).is_ok()
         })
     }
 
     /// Starts the draining period of a connection that the peer reset (RFC 9000, section 10.3.1).
+    /// A closing end sends no more copies of its frame, and keeps the outcome of its close.
     pub(super) fn stateless_reset(&mut self, now: Instant) -> Result<(), Error> {
         self.check_clock(now)?;
-        if self.outcome.is_none() && self.ending.is_none() {
+        if let Some(ending) = &mut self.ending {
+            ending.close = None;
+            ending.send = false;
+            // An end with no closing period waited only for its frame.
+            if ending.until.is_none() {
+                self.outcome = Some(ending.outcome);
+            }
+        } else if self.outcome.is_none() {
             self.peer_close = Some(PeerClose::StatelessReset);
             self.end_with(PeerClose::StatelessReset.outcome(), None, now);
         }
@@ -1647,7 +1698,7 @@ impl Connection {
                 Err(_) => work.add(1, 1),
             }
             if self.reading.is_none()
-                && suffix.is_some_and(|tail| self.matches_reset(&tail))
+                && suffix.is_some_and(|tail| self.matches_reset(&tail, path.peer))
                 && let Err(error) = self.stateless_reset(now)
             {
                 self.outcome = Some(Err(error));
@@ -1874,7 +1925,7 @@ impl Connection {
             .validation
             .take_if(|validation| validation.until.as_nanos() <= now.as_nanos())
         {
-            self.paths.active = validation.fallback;
+            self.paths.activate(validation.fallback);
         }
         if let Some((at, alarm)) = self.recovery_timer()
             && reached(Some(at), now)?
@@ -2054,15 +2105,11 @@ impl Connection {
                 && dcid == self.retry_cid.unwrap_or(self.original_cid)
                 && !self.spaces[0].discarded);
         let (bytes, first) = packet.datagram();
-        if first
-            && ours
-            && active
-            && let Some(credit) = self.paths.active.amplification_credit.as_mut()
-        {
-            *credit = credit.saturating_add((bytes as u64).saturating_mul(3));
-            if *credit >= DATAGRAM_MIN as u64 {
-                self.paths.active.amplification_blocked = false;
-            }
+        // Each datagram counts one time, for the address that it came from. The active path counts
+        // each datagram of the connection, also one that this end then discards (RFC 9000, section
+        // 8.1).
+        if server && first && ours && active {
+            self.paths.received(path, bytes as u64);
         }
         if server && kind == PacketKind::Initial && bytes < DATAGRAM_MIN {
             return Ok(());
@@ -2130,6 +2177,11 @@ impl Connection {
         if self.spaces[level as usize].ranges.seen(number) {
             return Ok(());
         }
+        // Another address counts only a datagram whose first packet opens, so no forged datagram
+        // changes its credit.
+        if server && first && !active {
+            self.paths.received(path, bytes as u64);
+        }
         if updated {
             // The peer updated its keys: this end follows in its next packet (RFC 9001, section
             // 6.2).
@@ -2160,7 +2212,6 @@ impl Connection {
         self.reading = Some(Reading {
             destination: dcid,
             path,
-            datagram: bytes,
             probing: true,
             level,
             payload: packet.payload(),
@@ -2218,7 +2269,7 @@ impl Connection {
                         && !reading.probing
                         && ranges.largest() == Some(reading.number)
                     {
-                        self.moved(reading.path, reading.datagram as u64, reading.received_at)?;
+                        self.moved(reading.path, reading.received_at)?;
                     }
                     if let Some(at) = reading.first_datagram {
                         reading.at = at;
@@ -2391,17 +2442,11 @@ impl Connection {
                         // gave one (RFC 9000, section 9.5).
                         None => (spare.map_or(active.remote_cid, |spare| spare.id), false),
                     };
-                    // A path with no validation takes at most three times the bytes of its challenge.
-                    let room = if validated {
-                        DATAGRAM_MIN
-                    } else {
-                        DATAGRAM_MIN.min(reading.datagram.saturating_mul(3))
-                    };
                     self.answers[usize::from(!on_active)] = Some(Answer {
                         path: reading.path,
                         data,
                         dcid,
-                        room,
+                        validated,
                     });
                     // The answer on the active path goes in a packet that is not a probe, so a
                     // peer that did not move brings the connection back (RFC 9000, section 9.3.3).
@@ -2992,51 +3037,70 @@ impl Connection {
     }
 
     /// Builds the datagram of a closing end when a copy of its CONNECTION_CLOSE frame is due, with
-    /// the frame in each level that has keys (RFC 9000, section 10.2.1). An end with no closing
+    /// the frame in each level that has keys (RFC 9000, section 10.2.1). Each copy after the first
+    /// one is the same protected datagram, so the copies use no packet key. An end with no closing
     /// period ends when its frame is out.
     fn closing(&mut self, out: &mut [u8], SendAt { now, mark, .. }: SendAt) -> Option<Transmission> {
         let ending = self.ending?;
         let close = ending.close.filter(|_| ending.send)?;
-        let keyed = Level::ALL.map(|level| match level {
-            Level::Data => self.one_rtt.is_some(),
-            _ => self.spaces[level as usize].keys.is_some(),
-        });
-        // A datagram with an Initial packet has 1,200 bytes, so the frame waits for that credit.
         let room = self.room();
-        if room < if keyed[0] { DATAGRAM_MIN } else { 1 } {
-            self.amplification_blocked();
-            return None;
-        }
-        let last = keyed.iter().rposition(|&keyed| keyed);
-        let mut at = 0;
-        for level in Level::ALL {
-            if !keyed[level as usize] {
-                continue;
+        let len = if let Some((sealed, len)) = ending.sealed {
+            if room < len {
+                self.amplification_blocked();
+                return None;
             }
-            let pad = last
-                .filter(|_| keyed[0])
-                .map(|i| (DATAGRAM_MIN.saturating_sub(at), Level::ALL[i]));
-            let send = SendAt {
-                now,
-                mark,
-                admitted: false,
-            };
-            match self.packet_out(level, &mut out[at..room], pad, Some(close), send) {
-                Ok(Some(len)) => at += len,
-                _ => break,
+            out[..len].copy_from_slice(&sealed[..len]);
+            len
+        } else {
+            let keyed = Level::ALL.map(|level| match level {
+                Level::Data => self.one_rtt.is_some(),
+                _ => self.spaces[level as usize].keys.is_some(),
+            });
+            // A datagram with an Initial packet has 1,200 bytes, so the frame waits for that credit.
+            if room < if keyed[0] { DATAGRAM_MIN } else { 1 } {
+                self.amplification_blocked();
+                return None;
             }
-        }
+            let last = keyed.iter().rposition(|&keyed| keyed);
+            let mut at = 0;
+            for level in Level::ALL {
+                if !keyed[level as usize] {
+                    continue;
+                }
+                let pad = last
+                    .filter(|_| keyed[0])
+                    .map(|i| (DATAGRAM_MIN.saturating_sub(at), Level::ALL[i]));
+                let send = SendAt {
+                    now,
+                    mark,
+                    admitted: false,
+                };
+                match self.packet_out(level, &mut out[at..room], pad, Some(close), send) {
+                    Ok(Some(len)) => at += len,
+                    _ => break,
+                }
+            }
+            at
+        };
         if let Some(ending) = &mut self.ending {
             ending.send = false;
+            let mut sealed = [0; CLOSE_BYTES_MAX];
+            if ending.sealed.is_none()
+                && len > 0
+                && let Some(copy) = sealed.get_mut(..len)
+            {
+                copy.copy_from_slice(&out[..len]);
+                ending.sealed = Some((sealed, len));
+            }
         }
         if ending.until.is_none() {
             self.ending = None;
             self.outcome = Some(ending.outcome);
         }
         let path = &mut self.paths.active;
-        path.charge(at as u64);
-        (at > 0).then_some(Transmission {
-            len: at,
+        path.charge(len as u64);
+        (len > 0).then_some(Transmission {
+            len,
             ecn: mark,
             path: path.addresses,
         })
@@ -3063,7 +3127,16 @@ impl Connection {
     }
 
     /// Seals the packet of `builder`, which has the number `number` of `level`. Gives its bytes.
+    /// Refuses a 1-RTT packet past the limit of its key: this end then sends no packet more (RFC
+    /// 9001, section 6.6).
     fn seal(&mut self, level: Level, builder: Builder<'_>, number: u64) -> Result<usize, Failure> {
+        if level == Level::Data && self.one_rtt.as_ref().is_some_and(|keys| keys.sealed >= keys.limit) {
+            return Err(Failure::transport(
+                ErrorCode::AEAD_LIMIT_REACHED,
+                0,
+                Error::new(Kind::Overload, "the QUIC packet key sealed each packet of its limit"),
+            ));
+        }
         let keys = match level {
             Level::Data => self.one_rtt.as_ref().map(|keys| &keys.local),
             _ => self.spaces[level as usize].keys.as_ref().map(|keys| &keys.local),
@@ -3089,12 +3162,13 @@ impl Connection {
     }
 
     /// Builds a datagram of `out.len()` bytes with one 1-RTT packet: `frame` and its padding, to
-    /// the connection ID `dcid`. With `record`, the packet counts on the active path, and the
-    /// record tells its delivery or its loss. Else no state follows the packet.
+    /// the address `peer` with the connection ID `dcid`. With `record`, the packet counts on the
+    /// active path, and the record tells its delivery or its loss. Else the packet goes to another
+    /// path, and no delivery state of the active path follows it.
     fn single(
         &mut self,
         out: &mut [u8],
-        dcid: ConnectionId,
+        (peer, dcid): (SocketAddr, ConnectionId),
         frame: &Frame<'_>,
         record: Option<Record>,
         SendAt { now, mark, .. }: SendAt,
@@ -3123,8 +3197,8 @@ impl Connection {
         }
         let Output { builder, records, .. } = output;
         let len = self.seal(Level::Data, builder, number)?;
+        self.sent_to(peer, dcid);
         if record.is_none() {
-            self.paths.untracked();
             return Ok(Some(len));
         }
         let space = &mut self.spaces[Level::Data as usize];
@@ -3146,7 +3220,7 @@ impl Connection {
     /// Builds a datagram for a path that does not carry the connection: the PATH_RESPONSE for a
     /// path that the peer probes, or the PATH_CHALLENGE for the path that the peer left (RFC
     /// 9000, sections 8.2.2 and 9.3.3). The datagram has 1,200 bytes, or the bytes that the
-    /// limit of a path with no validation allows.
+    /// credit of a path with no validation allows, and it takes them from that credit.
     fn off_path(&mut self, out: &mut [u8], send: SendAt) -> Result<Option<(usize, Path)>, Failure> {
         let active = self.paths.active.addresses;
         if let Some(slot) = self
@@ -3156,7 +3230,13 @@ impl Connection {
             && let Some(answer) = slot.take()
         {
             let frame = Frame::PathResponse { data: answer.data };
-            let sent = self.single(&mut out[..answer.room], answer.dcid, &frame, None, send)?;
+            let room = if answer.validated {
+                DATAGRAM_MIN
+            } else {
+                self.paths.take_room(answer.path)
+            };
+            let to = (answer.path.peer, answer.dcid);
+            let sent = self.single(&mut out[..room], to, &frame, None, send)?;
             return Ok(sent.map(|len| (len, answer.path)));
         }
         if let Some(validation) = &mut self.paths.validation
@@ -3164,7 +3244,7 @@ impl Connection {
         {
             let (dcid, path) = (validation.fallback.remote_cid, validation.fallback.addresses);
             let frame = Frame::PathChallenge { data };
-            let sent = self.single(&mut out[..DATAGRAM_MIN], dcid, &frame, None, send)?;
+            let sent = self.single(&mut out[..DATAGRAM_MIN], (path.peer, dcid), &frame, None, send)?;
             return Ok(sent.map(|len| (len, path)));
         }
         Ok(None)
@@ -3186,8 +3266,8 @@ impl Connection {
         if !path.paced(size as u64, send.now)? {
             return Ok(None);
         }
-        let dcid = path.remote_cid;
-        let sent = self.single(&mut out[..size], dcid, &Frame::Ping, Some(Record::Mtu(size)), send)?;
+        let to = (path.addresses.peer, path.remote_cid);
+        let sent = self.single(&mut out[..size], to, &Frame::Ping, Some(Record::Mtu(size)), send)?;
         if sent.is_some() {
             self.paths.active.mtu.sent(size);
         }
@@ -3324,7 +3404,7 @@ impl Connection {
         }
         let in_flight = eliciting || builder.room() < before_pad;
         let len = self.seal(level, builder, number)?;
-        self.used_remote = Some(dcid);
+        self.sent_to(self.paths.active.addresses.peer, dcid);
         self.spaces[level as usize].history.ect_sent += u64::from(mark == Ecn::Ect0);
         // A later bare ACK can be the largest number in an ACK that also covers a live elicitor.
         if close.is_none() && (in_flight || self.spaces[level as usize].history.pto_start().is_some()) {
@@ -3355,15 +3435,16 @@ impl Connection {
         Ok(Some(len))
     }
 
-    /// Updates the 1-RTT keys of this end before the key seals more packets than its limit
-    /// (RFC 9001, sections 6 and 6.6). A key update needs a confirmed handshake, and after the
-    /// first one an acknowledgement of a packet of the current phase: without them the connection
-    /// ends with AEAD_LIMIT_REACHED.
+    /// Updates the 1-RTT keys of this end before the key seals the last packet of its limit
+    /// (RFC 9001, sections 6 and 6.6). A key update needs a confirmed handshake. After the first
+    /// one, it also needs an acknowledgement of a packet of the current phase. Without them the
+    /// connection ends with AEAD_LIMIT_REACHED, and the last packet of the key carries that close.
     fn key_limit(&mut self, now: Instant) -> Result<(), Failure> {
         let Some(keys) = &self.one_rtt else {
             return Ok(());
         };
-        if keys.sealed < keys.limit {
+        // The limit is at least 2.
+        if keys.sealed < keys.limit - 1 {
             return Ok(());
         }
         if self.confirmed && (!keys.updated || keys.acknowledged) {

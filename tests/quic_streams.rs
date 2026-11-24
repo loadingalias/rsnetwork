@@ -1607,6 +1607,9 @@ fn a_close_sends_its_code_at_once_then_at_a_bounded_rate_and_each_end_releases_a
         copies.iter().map(Vec::len).collect::<Vec<_>>(),
         [1, 1, 0, 1, 0, 0, 0, 1]
     );
+    // Each copy is the datagram that went out first: the key seals the frame one time (RFC 9000,
+    // section 10.2.1).
+    assert!(copies.iter().flatten().all(|copy| *copy == first[0]));
     // The first frame is lost, and a copy reaches the server: it ends for its application at
     // once, and sends nothing more.
     let events = give(&mut pair.server, &copies[7][0]);
@@ -1625,4 +1628,57 @@ fn a_close_sends_its_code_at_once_then_at_a_bounded_rate_and_each_end_releases_a
         assert_eq!(turn.deadline.map(|deadline| deadline.instant()), Some(ms(78)));
         assert_eq!(end.drive(ms(78)).1.progress, Progress::Terminal(Ok(())));
     }
+}
+
+#[test]
+fn a_key_that_cannot_update_seals_its_close_inside_its_limit_and_no_packet_after_it() {
+    const KEY_PACKETS: usize = 8;
+    let limits = Limits {
+        key_packets_max: KEY_PACKETS as u64,
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(limits, Limits::DEFAULT);
+    let late: Vec<Vec<u8>> = (0..4)
+        .flat_map(|_| {
+            pair.server.ping();
+            sent(&mut pair.server)
+        })
+        .collect();
+    // No datagram of the client arrives, so the server acknowledges no packet of a new key phase.
+    // The client updates its keys one time, and cannot update them again (RFC 9001, section 6.1).
+    let mut sealed: Vec<(Option<bool>, Vec<u8>)> = Vec::new();
+    for _ in 0..3 * KEY_PACKETS {
+        pair.client.ping();
+        for datagram in sent(&mut pair.client) {
+            sealed.push((pair.client.key_phase(), datagram));
+        }
+    }
+    assert_matches!(
+        &driven_at(&mut pair.client, now())[..],
+        [Event::Closed(Err(error))] if error.kind() == Kind::Overload
+    );
+    // The datagrams of the server that still arrive get the datagram of the close again.
+    for datagram in &late {
+        give(&mut pair.client, datagram);
+        for copy in sent(&mut pair.client) {
+            sealed.push((pair.client.key_phase(), copy));
+        }
+    }
+    // The packets of the last key: at most its limit, with the close as the last of them (RFC
+    // 9001, section 6.6).
+    let (phase, close) = sealed.last().cloned().expect("the client sent its close");
+    let mut last_key: Vec<&Vec<u8>> = sealed
+        .iter()
+        .rev()
+        .take_while(|(of, _)| *of == phase)
+        .map(|(_, datagram)| datagram)
+        .collect();
+    last_key.sort();
+    last_key.dedup();
+    assert!(last_key.len() <= KEY_PACKETS, "{} packets with one key", last_key.len());
+    give(&mut pair.server, &close);
+    assert_matches!(
+        pair.server.peer_close(),
+        Some(PeerClose::Transport { code, .. }) if code == rsnetwork::quic::ErrorCode::AEAD_LIMIT_REACHED
+    );
 }

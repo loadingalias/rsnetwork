@@ -366,7 +366,7 @@ fn the_heap_of_each_end_of_a_quic_connection_stays_within_its_charges() {
             ..Profile::new("resumption")
         },
         Profile {
-            keys: (2, 3),
+            keys: (3, 3),
             ..Profile::new("a key update of the server")
         },
         // About 170 datagrams, which wait in the pages of the server out of order.

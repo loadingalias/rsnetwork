@@ -556,8 +556,9 @@ fn loss_of_the_client_initial_or_handshake_done_recovers_on_the_reported_deadlin
 #[test]
 fn a_key_update_keeps_the_connection_and_the_crypto_stream_of_its_data_space() {
     let config = client_config(CA, SESSIONS);
+    // The last packet of each key is kept for a close, so each key seals two packets here.
     let server_limits = Limits {
-        key_packets_max: 2,
+        key_packets_max: 3,
         ..Limits::DEFAULT
     };
     let mut pair = Pair::new(

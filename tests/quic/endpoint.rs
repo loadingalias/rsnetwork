@@ -295,11 +295,55 @@ fn retired_connection_ids_leave_the_route_and_a_stateless_reset_drains_the_peer(
     other[n - 1] ^= 1;
     Pair::give(&mut client, other, at(0));
     assert_eq!(client.peer_close(), None);
+    // The token is valid only from the address that the client sent to (RFC 9000, section 10.3.1).
+    let elsewhere = Path {
+        peer: (Ipv4Addr::new(127, 0, 0, 2), SERVER_PORT).into(),
+        ..client.path()
+    };
+    arrive(&mut client, elsewhere, reply[..n].to_vec());
+    assert_eq!(client.peer_close(), None);
     Pair::give(&mut client, reply[..n].to_vec(), at(0));
     assert_eq!(client.peer_close(), Some(PeerClose::StatelessReset));
     assert!(Pair::send(&mut client, at(0)).is_empty());
     let end = client.drive(at(0)).1.deadline.unwrap().instant();
     assert!(matches!(client.drive(end).1.progress, Progress::Terminal(Err(_))));
+}
+
+#[test]
+fn a_stateless_reset_stops_the_copies_of_the_close_of_a_closing_end() {
+    let (config, server, keys) = configs();
+    let mut endpoint = listener(&server, &keys, 2);
+    let mut client = client(&config);
+    let addr = address(4301);
+    let h = handshake(&mut endpoint, &mut client, addr).handle;
+    // A datagram of the server that arrives late, and the reset of a listener that lost its state.
+    client.ping();
+    let ping = Pair::send(&mut client, at(0)).remove(0);
+    let mut reply = [0; 1200];
+    let Route::Reply(n) = listener(&server, &keys, 2)
+        .route(addr, &ping, &mut reply, at(0))
+        .unwrap()
+    else {
+        panic!("a listener that lost state sends a reset")
+    };
+    let late = endpoint
+        .with_connection(h, |c| {
+            Pair::give(c, ping, at(0));
+            Pair::send(c, at(0))
+        })
+        .unwrap();
+    assert!(!late.is_empty());
+    client.close(7, at(0)).unwrap();
+    assert_eq!(Pair::send(&mut client, at(0)).len(), 1);
+    // The reset ends the copies of the frame: the client sends nothing more (RFC 9000, section
+    // 10.3.1). It keeps the outcome of its own close.
+    Pair::give(&mut client, reply[..n].to_vec(), at(0));
+    for datagram in late {
+        Pair::give(&mut client, datagram, at(0));
+    }
+    assert!(Pair::send(&mut client, at(0)).is_empty());
+    let end = client.drive(at(0)).1.deadline.unwrap().instant();
+    assert_eq!(client.drive(end).1.progress, Progress::Terminal(Ok(())));
 }
 
 /// The same path, as the other end names it.

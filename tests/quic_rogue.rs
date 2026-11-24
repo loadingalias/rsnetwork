@@ -1,7 +1,8 @@
 //! A server engine of the core against a client that breaks the rules of the streams: each
 //! frame past a window, a limit, a final size, or the direction of a stream closes the connection
 //! with its code of RFC 9000, section 20.1, and takes no memory (N305). The same client probes a
-//! path that the connection does not use (N307).
+//! path that the connection does not use, and moves between its frames (N307). It also gives a
+//! listener a connection ID whose reset token the test knows (N304).
 //!
 //! The client is a harness: rustls runs its handshake, and the packet layer of the core seals and
 //! opens its packets. It sends each frame that a test gives it, on a path with no loss.
@@ -18,7 +19,10 @@ use rsnetwork::drive::{Blocked, Kind, Progress};
 use rsnetwork::quic::frame::{Direction, Frame};
 use rsnetwork::quic::packet::{self, Builder, Datagrams, Header, Keys, Kind as PacketKind, Outgoing, Side};
 use rsnetwork::quic::params::Parameters;
-use rsnetwork::quic::{CRYPTO_BUFFER_BYTES_MAX, Connection, ConnectionId, ErrorCode, Event, Limits, Path};
+use rsnetwork::quic::{
+    CRYPTO_BUFFER_BYTES_MAX, Connection, ConnectionId, Endpoint, EndpointKeys, EndpointLimits, ErrorCode, Event,
+    Handle, Limits, Path, Route,
+};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
     CertificateDer, Entropy, Identity, PrivateKeyDer, Resumption, ServerConfig, ServerOptions, TimeProvider, UnixTime,
@@ -323,11 +327,8 @@ fn give_on(connection: &mut Connection, path: Path, datagram: &[u8]) -> Vec<Even
     panic!("a datagram gives at most 64 events");
 }
 
-/// A server with `limits`, and the hostile client. With `complete`, the client sends its
-/// Finished message, so the handshake completes at both ends.
-fn pair(limits: Limits, complete: bool) -> (Connection, Rogue) {
-    let budget = Budget::new(NonZeroU64::new(1 << 24).unwrap());
-    let config = ServerConfig::new(ServerOptions {
+fn server_config(budget: &Budget) -> ServerConfig {
+    ServerConfig::new(ServerOptions {
         identity: Identity {
             chain: vec![CertificateDer::from(SERVER.0.to_vec())],
             key: PrivateKeyDer::try_from(SERVER.1.to_vec()).unwrap(),
@@ -335,11 +336,18 @@ fn pair(limits: Limits, complete: bool) -> (Connection, Rogue) {
         client_roots: None,
         protocols: &[b"test"],
         resumption: Resumption::Off,
-        budget: &budget,
+        budget,
         clock: Arc::new(At(VALID)),
         entropy: Entropy::System,
     })
-    .unwrap();
+    .unwrap()
+}
+
+/// A server with `limits`, and the hostile client. With `complete`, the client sends its
+/// Finished message, so the handshake completes at both ends.
+fn pair(limits: Limits, complete: bool) -> (Connection, Rogue) {
+    let budget = Budget::new(NonZeroU64::new(1 << 24).unwrap());
+    let config = server_config(&budget);
     let mut rogue = Rogue::new(Parameters {
         data_bytes_initial: 1 << 20,
         ..Parameters::default()
@@ -624,6 +632,11 @@ fn a_probe_from_another_path_gets_its_answer_there_within_the_limit_and_moves_no
     let probe = rogue.data(&[Frame::PathChallenge { data: [7; 8] }, Frame::Padding { len: 1200 }]);
     assert!(probe.len() >= 1200);
     assert!(give_on(&mut server, other, &probe).is_empty());
+    // A datagram that no key opens, from a third address, changes nothing for the probe.
+    let mut forged = vec![0x40];
+    forged.extend_from_slice(rogue.server_cid.as_bytes());
+    forged.extend_from_slice(&[0x5c; 40]);
+    assert!(give_on(&mut server, path(4700), &forged).is_empty());
     let answers = answers_to(&mut server, other);
     assert_eq!(answers.iter().map(Vec::len).collect::<Vec<_>>(), [1200]);
     rogue.receive(&answers[0]);
@@ -632,10 +645,12 @@ fn a_probe_from_another_path_gets_its_answer_there_within_the_limit_and_moves_no
     assert_eq!(server.path(), home);
     assert!(server.address_validated());
 
-    // A small probe: its answer has at most three times its bytes.
+    // A small probe from an address that sent nothing before: its answer has at most three times
+    // its bytes.
+    let third = path(4500);
     let small = rogue.data(&[Frame::PathChallenge { data: [9; 8] }]);
-    assert!(give_on(&mut server, other, &small).is_empty());
-    let answers = answers_to(&mut server, other);
+    assert!(give_on(&mut server, third, &small).is_empty());
+    let answers = answers_to(&mut server, third);
     assert_eq!(answers.len(), 1);
     assert!(answers[0].len() <= 3 * small.len());
     rogue.receive(&answers[0]);
@@ -644,4 +659,125 @@ fn a_probe_from_another_path_gets_its_answer_there_within_the_limit_and_moves_no
     // The server still serves the client on its path.
     let events = attack(&mut server, &mut rogue, &[stream(0, 0, b"after", false)]);
     assert_matches!(&events[..], [Event::Stream { data, .. }] if data.bytes() == b"after");
+}
+
+#[test]
+fn a_datagram_from_a_new_address_pays_for_three_times_its_bytes_one_time() {
+    let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
+    let moved = path(4400);
+    // One datagram from a new address: a probe of the path, and then data. The data gives an
+    // event, so the host can send before the server reads the end of the packet.
+    let datagram = rogue.data(&[Frame::PathChallenge { data: [7; 8] }, stream(0, 0, b"data", false)]);
+    let len = server.local_cid().as_bytes().len();
+    let mut datagrams = Datagrams::new(Backing::from(datagram.clone()), None, len);
+    assert_matches!(
+        server.receive(&mut datagrams, moved, now()).0,
+        Some(Event::Stream { .. })
+    );
+    let bytes = |sent: Vec<Vec<u8>>| sent.iter().map(Vec::len).sum::<usize>();
+    let answer = bytes(answers_to(&mut server, moved));
+    assert!(answer > 0, "the answer to the probe goes to its path");
+    // The packet was not a probe: at its end the server follows the client to the new address.
+    for _ in 0..64 {
+        let (event, turn) = server.receive(&mut datagrams, moved, now());
+        if event.is_none() && turn.progress != Progress::Pending {
+            break;
+        }
+    }
+    assert_eq!(server.path(), moved);
+    assert!(!server.address_validated());
+    let to_new = answer + bytes(answers_to(&mut server, moved));
+    assert!(
+        to_new <= 3 * datagram.len(),
+        "{to_new} bytes after {} bytes",
+        datagram.len()
+    );
+}
+
+/// A listener, its connection with the hostile client after the handshake, and the client.
+fn listened() -> (Endpoint, Handle, Rogue) {
+    let budget = Budget::new(NonZeroU64::new(1 << 24).unwrap());
+    let config = server_config(&budget);
+    let keys = Arc::new(EndpointKeys::generate(&config, 0).unwrap());
+    let limits = EndpointLimits {
+        connections_max: 4,
+        handshakes_max: 2,
+        retry_at: 2,
+        ..EndpointLimits::default()
+    };
+    let mut endpoint = Endpoint::new(&config, keys, 1, limits, Limits::DEFAULT, &budget).unwrap();
+    let mut rogue = Rogue::new(Parameters {
+        data_bytes_initial: 1 << 20,
+        ..Parameters::default()
+    });
+    let hello = rogue.crypto(0);
+    let mut reply = [0; 1200];
+    let Route::Accepted(handle) = endpoint.route(path(4301), &hello[0], &mut reply, now()).unwrap() else {
+        panic!("the listener takes the first Initial packet")
+    };
+    for flight in [hello, Vec::new()] {
+        for datagram in &flight {
+            endpoint.with_connection(handle, |server| give(server, datagram));
+        }
+        for datagram in endpoint.with_connection(handle, sent).unwrap() {
+            rogue.receive(&datagram);
+        }
+        if rogue.sent[1] == 0 {
+            for datagram in rogue.crypto(1) {
+                endpoint.with_connection(handle, |server| give(server, &datagram));
+            }
+        }
+    }
+    assert_eq!(
+        endpoint.with_connection(handle, |server| server.is_confirmed()),
+        Some(true)
+    );
+    (endpoint, handle, rogue)
+}
+
+#[test]
+fn a_stateless_reset_routes_from_each_address_that_the_connection_sent_to_with_its_token() {
+    let (mut endpoint, handle, mut rogue) = listened();
+    let (second, third, probed) = (path(4400), path(4500), path(4600));
+    // The client gives a second connection ID, with its reset token.
+    let token = [0xc3; 16];
+    let spare = Frame::NewConnectionId {
+        sequence: 1,
+        retire_prior_to: 0,
+        id: ConnectionId::new(&[0x6b; 8]).unwrap(),
+        reset_token: token,
+    };
+    let datagram = rogue.data(&[spare]);
+    endpoint.with_connection(handle, |server| give(server, &datagram));
+    // The client moves, and the server sends to the second address with that connection ID.
+    let datagram = rogue.data(&[Frame::Ping]);
+    let to_second = endpoint.with_connection(handle, |server| {
+        give_on(server, second, &datagram);
+        answers_to(server, second)
+    });
+    assert!(to_second.is_some_and(|sent| !sent.is_empty()));
+    // The client moves again. The server sent nothing to the third address, so a reset from
+    // there is not valid. A reset from the second address is (RFC 9000, section 10.3.1).
+    let datagram = rogue.data(&[Frame::Ping]);
+    endpoint.with_connection(handle, |server| give_on(server, third, &datagram));
+    let mut reset = [0x41; 43];
+    reset[27..].copy_from_slice(&token);
+    let mut reply = [0; 1200];
+    assert_ne!(
+        endpoint.route(third, &reset, &mut reply, now()).unwrap(),
+        Route::Reset(handle)
+    );
+    // The answer to a probe of another path also uses the connection ID at that address.
+    let probe = rogue.data(&[Frame::PathChallenge { data: [7; 8] }, Frame::Padding { len: 1200 }]);
+    let to_probed = endpoint.with_connection(handle, |server| {
+        give_on(server, probed, &probe);
+        answers_to(server, probed)
+    });
+    assert!(to_probed.is_some_and(|sent| !sent.is_empty()));
+    for from in [probed, second] {
+        assert_eq!(
+            endpoint.route(from, &reset, &mut reply, now()).unwrap(),
+            Route::Reset(handle)
+        );
+    }
 }

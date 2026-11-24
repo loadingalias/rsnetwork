@@ -1,6 +1,7 @@
 //! Packet delivery and loss on the paths of a QUIC connection (RFC 9000, section 13, and
 //! RFC 9002). Each path has its window, pacer, and round-trip estimate. The paths share one store
-//! of sent packets, and each packet counts only for the path that sent it (RFC 9000, section 9.4).
+//! of sent packets, and each packet counts only for the path that sent it (RFC 9000, section 9.4):
+//! its acknowledgement, its congestion mark, and its loss change no other path.
 
 use core::alloc::Layout;
 use core::ops::Range;
@@ -674,6 +675,10 @@ pub(super) struct Paths {
     pub(super) active: PathState,
     /// The validation of the active path, with the path that the connection came from.
     pub(super) validation: Option<Validation>,
+    /// The send credit of one address with no validation that does not carry the connection. It
+    /// is the newest such address that a datagram came from, or that the connection left. Each
+    /// address has one credit, here or in its [`PathState`], so no datagram pays for two sends.
+    off_path: Option<(Path, u64)>,
     /// The tag of the next path.
     next: u32,
 }
@@ -684,6 +689,7 @@ impl Paths {
             store: Store::new(budget),
             active,
             validation: None,
+            off_path: None,
             next: 1,
         }
     }
@@ -695,12 +701,79 @@ impl Paths {
         // Only the live packets hold a tag, and the last paths sent them, so a tag that comes
         // again after 2^32 paths meets no packet of its first use.
         self.next = self.next.wrapping_add(1);
-        core::mem::replace(&mut self.active, next)
+        self.activate(next)
+    }
+
+    /// Makes `next` the active path: a new path, or the fallback path of a validation that
+    /// ended. Gives the path before it. A loss run does not continue from one path to the next.
+    /// The credit of a path with no validation stays with its address.
+    pub(super) fn activate(&mut self, next: PathState) -> PathState {
+        self.untracked();
+        let old = core::mem::replace(&mut self.active, next);
+        if let Some(credit) = old.amplification_credit {
+            self.off_path = Some((old.addresses, credit));
+        }
+        old
     }
 
     /// A packet went out with no delivery state: it stands between its neighbors in send order.
     pub(super) fn untracked(&mut self) {
         self.store.tail = self.store.tail.join(Gap::BARRIER);
+    }
+
+    /// Counts a datagram of `bytes` bytes that came on `path`. A path with no validation gets
+    /// three times these bytes as send credit (RFC 9000, sections 8.1 and 9.3.1). The caller
+    /// counts each datagram one time.
+    pub(super) fn received(&mut self, path: Path, bytes: u64) {
+        let credit = bytes.saturating_mul(3);
+        if path == self.active.addresses {
+            if let Some(balance) = &mut self.active.amplification_credit {
+                *balance = balance.saturating_add(credit);
+                if *balance >= DATAGRAM_MIN as u64 {
+                    self.active.amplification_blocked = false;
+                }
+            }
+        } else if self
+            .validation
+            .as_ref()
+            .is_none_or(|validation| validation.fallback.addresses != path)
+        {
+            match &mut self.off_path {
+                Some((known, balance)) if *known == path => *balance = balance.saturating_add(credit),
+                other => *other = Some((path, credit)),
+            }
+        }
+    }
+
+    /// Takes the credit of `path`, which becomes the active path of a server.
+    pub(super) fn take_credit(&mut self, path: Path) -> u64 {
+        self.off_path
+            .take_if(|(known, _)| *known == path)
+            .map_or(0, |(_, credit)| credit)
+    }
+
+    /// Takes the bytes of one datagram to `path`, which has no validation and does not carry the
+    /// connection, from its credit: at most 1,200. A path with no credit gets no datagram.
+    pub(super) fn take_room(&mut self, path: Path) -> usize {
+        match &mut self.off_path {
+            Some((known, credit)) if *known == path => {
+                let room = DATAGRAM_MIN.min(usize::try_from(*credit).unwrap_or(usize::MAX));
+                *credit -= room as u64;
+                room
+            }
+            _ => 0,
+        }
+    }
+
+    /// The time threshold of a packet that the path with the tag `sender` sent. It is the
+    /// threshold of that path, or of the active path when the connection no longer has that path.
+    fn loss_delay(&self, sender: u32) -> Duration {
+        self.validation
+            .as_ref()
+            .map(|validation| &validation.fallback)
+            .filter(|fallback| fallback.id == sender)
+            .unwrap_or(&self.active)
+            .loss_delay()
     }
 }
 
@@ -711,8 +784,10 @@ enum Settlement {
     Discarded,
 }
 
+/// What an ACK frame newly acknowledged of the packets that the active path sent.
 #[derive(Default)]
 pub(super) struct Acked {
+    /// One of them was ack-eliciting.
     pub(super) eliciting: bool,
     bytes: u64,
     round: Option<u64>,
@@ -864,11 +939,14 @@ impl History {
         }
     }
 
+    /// Checks the ECN counts of an ACK frame for the active path `path`. `marked` of its marked
+    /// packets are newly acknowledged, and `elsewhere` marked packets of other paths. Gives
+    /// whether a congestion mark reduced the window.
     fn validate_ecn(
         &mut self,
         path: &mut PathState,
         counts: Option<EcnCounts>,
-        marked: u64,
+        (marked, elsewhere): (u64, u64),
         sent: Option<Instant>,
         now: Instant,
     ) -> bool {
@@ -897,13 +975,18 @@ impl History {
         if marked > 0 {
             path.ecn = EcnState::Capable;
         }
+        // The counts are for the packet number space. A mark that a packet of another path can
+        // explain is no feedback for this path (RFC 9000, section 9.4).
+        let here = ce.saturating_sub(elsewhere);
+        let ect = ect.saturating_sub(elsewhere - (ce - here));
         path.ecn_counts.ect0 = path.ecn_counts.ect0.saturating_add(ect);
-        path.ecn_counts.ce = path.ecn_counts.ce.saturating_add(ce);
-        ce > 0 && sent.is_some_and(|sent| path.controller.congestion(sent, now))
+        path.ecn_counts.ce = path.ecn_counts.ce.saturating_add(here);
+        here > 0 && sent.is_some_and(|sent| path.controller.congestion(sent, now))
     }
 
     /// Walks the ranges and the live packets together, once. A gap in packet numbers costs no work.
-    /// A packet of another path gives the active path no round-trip sample and no growth.
+    /// A packet of another path gives the active path no round-trip sample, no growth, no
+    /// congestion mark, and no sign that the path delivers.
     pub(super) fn ack(
         &mut self,
         ack: &Ack<'_>,
@@ -926,7 +1009,7 @@ impl History {
         let mut at = self.last;
         let mut eliciting = false;
         let mut grow_by = 0;
-        let mut marked = 0;
+        let (mut marked, mut elsewhere) = (0, 0);
         let mut sample = None;
         let mut round = None;
         for range in ack.ranges() {
@@ -940,8 +1023,8 @@ impl History {
                     let (sent_round, current) = (slot.round, slot.path == paths.active.id);
                     let packet = self.remove(paths, at, Settlement::Delivered);
                     let path = &mut paths.active;
-                    eliciting |= packet.eliciting;
                     if current {
+                        eliciting |= packet.eliciting;
                         marked += u64::from(packet.mark == Ecn::Ect0);
                         if path.controller.can_grow(packet.time) {
                             grow_by += packet.bytes;
@@ -953,6 +1036,8 @@ impl History {
                         if packet.bytes > DATAGRAM_MIN as u64 {
                             path.mtu.large_acknowledged();
                         }
+                    } else {
+                        elsewhere += u64::from(packet.mark == Ecn::Ect0);
                     }
                     for record in packet.records.iter() {
                         match record {
@@ -976,7 +1061,7 @@ impl History {
                 now,
             );
         }
-        if advances && self.validate_ecn(path, ack.ecn, marked, sample, now) {
+        if advances && self.validate_ecn(path, ack.ecn, (marked, elsewhere), sample, now) {
             grow_by = 0;
         }
         Ok(Acked {
@@ -986,8 +1071,10 @@ impl History {
         })
     }
 
-    /// Stops at the first packet below both loss thresholds. Each later packet is newer. Only a
-    /// packet of the active path is a sign of congestion on it.
+    /// Stops at the first packet of the active path below both loss thresholds. Each later packet
+    /// is newer. A packet of another path waits for the time threshold of its own path. An
+    /// acknowledgement that came on a faster path is no sign of its loss. Only a packet of the
+    /// active path is a sign of congestion on it.
     pub(super) fn detect(
         &mut self,
         paths: &mut Paths,
@@ -995,34 +1082,49 @@ impl History {
         mut lost: impl FnMut(Record) -> Result<(), Error>,
     ) -> Result<bool, Error> {
         self.loss_time = None;
-        let delay = paths.active.loss_delay();
         let previous_collapse = paths.active.collapsed;
         let mut congestion = false;
         // Whether each datagram that the active path lost here is above the base size.
         let mut large = None;
-        while let Some(slot) = paths.store.slots.get(self.first)
+        let mut at = self.first;
+        while let Some(slot) = paths.store.slots.get(at)
             && let Some(packet) = slot.packet.as_ref()
         {
+            let (next, sender) = (slot.next, slot.path);
             // A bare ACK below no acknowledged number has no remaining RTT or loss evidence.
-            if packet.bytes == 0 && self.largest.is_none_or(|largest| largest < packet.number) {
-                self.remove(paths, self.first, Settlement::Discarded);
+            if at == self.first && packet.bytes == 0 && self.largest.is_none_or(|largest| largest < packet.number) {
+                self.remove(paths, at, Settlement::Discarded);
+                at = next;
                 continue;
             }
             let Some(largest) = self.largest.filter(|largest| *largest >= packet.number) else {
                 break;
             };
-            let due = packet.time.checked_add(delay).map_err(|_| super::connection::CLOCK)?;
-            if largest - packet.number < PACKET_THRESHOLD && now.as_nanos() < due.as_nanos() {
-                self.loss_time = Some(due);
-                break;
+            let current = sender == paths.active.id;
+            let due = packet
+                .time
+                .checked_add(paths.loss_delay(sender))
+                .map_err(|_| super::connection::CLOCK)?;
+            let reordered = current && largest - packet.number >= PACKET_THRESHOLD;
+            if !reordered && now.as_nanos() < due.as_nanos() {
+                if self.loss_time.is_none_or(|first| due.as_nanos() < first.as_nanos()) {
+                    self.loss_time = Some(due);
+                }
+                // Each later packet is newer. Only a packet of the fallback path has another
+                // delay, and each of them went out before the active path sent.
+                if current {
+                    break;
+                }
+                at = next;
+                continue;
             }
-            let current = slot.path == paths.active.id;
             if current && packet.bytes > 0 && !packet.records.probe() {
                 congestion |= paths.active.controller.congestion(packet.time, now);
                 paths.active.lost = paths.active.lost.saturating_add(1);
                 large = Some(large.unwrap_or(true) && packet.bytes > DATAGRAM_MIN as u64);
             }
-            let packet = self.remove(paths, self.first, Settlement::Lost);
+            let packet = self.remove(paths, at, Settlement::Lost);
+            at = next;
             for record in packet.records.iter() {
                 match record {
                     Record::Mtu(size) if current => paths.active.mtu.probe_lost(size),

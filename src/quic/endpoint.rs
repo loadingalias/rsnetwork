@@ -16,6 +16,7 @@ use rstypes::time::Instant;
 use rustls::crypto::SecureRandom;
 use table::Table;
 
+use super::connection::RESET_ROUTES;
 use super::packet::{self, Header, Kind as PacketKind};
 use super::{Connection, ConnectionId, Limits, Path};
 use crate::drive::{Error, Kind};
@@ -104,9 +105,10 @@ struct Registered {
     /// The route of the first Initial packets, until the handshake is confirmed.
     initial: Option<Key>,
     ids: [Option<ConnectionId>; 2],
-    /// The route of a stateless reset: the address of the peer, which follows a peer that moves,
-    /// and the token of the connection ID that this end sends to.
-    reset: Option<(SocketAddr, [u8; 16])>,
+    /// The routes of a stateless reset that this connection has in the table. Each one is an
+    /// address of the peer that the connection sent to, with the token of the connection ID that
+    /// it used there.
+    resets: [Option<(SocketAddr, [u8; 16])>; RESET_ROUTES],
     _storage: Permit,
 }
 
@@ -169,8 +171,12 @@ impl Endpoint {
         let stream = config.entropy.stream(b"quic-end");
         let rng = config.config.provider().secure_random;
         let capacity = usize::from(limits.connections_max);
-        // Two issued IDs, one Initial alias, and one used reset token per connection.
-        let routes = Table::new(4 * capacity, |b| tls::scoped(stream.as_ref(), || rng.fill(b)), budget)?;
+        // Two issued IDs, one Initial alias, and the reset routes of each connection.
+        let routes = Table::new(
+            (3 + RESET_ROUTES) * capacity,
+            |b| tls::scoped(stream.as_ref(), || rng.fill(b)),
+            budget,
+        )?;
         let (slots, storage) = table::array(capacity, budget, |i| Slot {
             generation: 0,
             free: u16::try_from(i + 1).ok().filter(|&n| n < limits.connections_max),
@@ -319,7 +325,7 @@ impl Endpoint {
             connection,
             initial: Some(Key::Initial(peer, dcid)),
             ids,
-            reset: None,
+            resets: [None; RESET_ROUTES],
             _storage: storage,
         });
         Ok(Route::Accepted(handle))
@@ -347,19 +353,24 @@ impl Endpoint {
             }
             entry.ids = ids;
         }
-        let peer = entry.connection.path().peer;
-        let reset = entry.connection.used_reset().map(|token| (peer, token));
-        if reset != entry.reset {
-            if let Some((peer, token)) = entry.reset.take() {
+        let resets = entry.connection.resets();
+        if resets != entry.resets {
+            let held = entry.resets;
+            for (peer, token) in held.into_iter().flatten().filter(|old| !resets.contains(&Some(*old))) {
                 self.routes.remove(&Key::Reset(peer, token));
                 self.resets -= 1;
             }
-            if let Some((peer, token)) = reset
-                && self.routes.insert(Key::Reset(peer, token), h)
-            {
-                entry.reset = reset;
-                self.resets += 1;
-            }
+            // The peer chose its tokens: when another connection has the same route, this one has none.
+            entry.resets = resets.map(|route| {
+                let (peer, token) = route?;
+                if !held.contains(&route) {
+                    if !self.routes.insert(Key::Reset(peer, token), h) {
+                        return None;
+                    }
+                    self.resets += 1;
+                }
+                route
+            });
         }
         if (entry.connection.is_confirmed() || entry.connection.ended())
             && let Some(initial) = entry.initial.take()
@@ -387,7 +398,7 @@ impl Endpoint {
             self.routes.remove(&initial);
             self.handshakes -= 1;
         }
-        if let Some((peer, token)) = entry.reset {
+        for (peer, token) in entry.resets.into_iter().flatten() {
             self.routes.remove(&Key::Reset(peer, token));
             self.resets -= 1;
         }
