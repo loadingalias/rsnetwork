@@ -5,6 +5,7 @@ description = "Sans-I/O HTTP/1.1, HTTP/2, HTTP/3, and QUIC for clients and serve
 repository = "https://github.com/loadingalias/rsnetwork"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 # The crate is at the workspace root: the package holds only its sources, its license, and its
 # README. The vendored test data, the models, and the docs stay in the repository.
@@ -61,12 +62,14 @@ workspace = true
 resolver = "3"
 members = [".", "rsnetwork-tokio", "xtask"]
 
-# No `rust-version`: development requires the nightly pinned in
-# rust-toolchain.toml, which a release number cannot express.
+# `rust-version` is the release number of the nightly that rust-toolchain.toml pins. Cargo then
+# refuses an older toolchain with one message. A crate that turns on an unstable feature also needs
+# that nightly. Set it again when the pin moves.
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-# Private during stealth. Publication is a later, separate decision.
+rust-version = "1.101"
+# No crates.io release yet. The user releases an alpha when a consumer needs one.
 publish = false
 
 [workspace.lints.cargo]
