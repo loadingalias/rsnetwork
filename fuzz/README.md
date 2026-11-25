@@ -20,6 +20,7 @@ writes. The module documentation of each target gives its input format and its c
 | `h2` | `h2::Connection`, with its stream layer, `hpack::Decoder`, and the frame codec | A cut input gives the events, the output, and the end of the whole input. No drive allocates past the work limit. Each charge returns when the connection drops. No frame follows a GOAWAY, and a connection error ends with one. A body goes up only on a stream after its header section and before its end, and no event follows a reset. No frame follows a reset of the endpoint, and no reset goes on an idle stream. The WINDOW_UPDATE frames of each stream and of the connection give back at most the DATA bytes of the input. The last stream of a GOAWAY never increases. A server has at most 4 handlers in flight: a stream that a reset ended keeps its slot until the target closes it, at the wait for a free slot. |
 | `h2_send` | The send scheduler of `h2::Connection`, under the frames of a hostile peer | Each DATA frame has 1 to 16,384 bytes, fits in its stream window and the connection window of a model that reads the frames of the peer, and comes before the end, the reset, or the GOAWAY of its stream. Its payload is the next bytes of the body that the application gave. `Sent` comes only after each byte of its chunk went out. When the connection waits for input, no stream has body bytes that both windows admit. No drive allocates past the work limit, and each charge returns when the connection drops. |
 | `quic_packet` | `quic::packet::Datagrams`, `Header::parse`, the opening in place, and `Builder` | The walk of a region gives each packet inside the bytes that remain, and each step takes a byte. An opened payload is in the region. Fuzzed frames seal in a packet of each kind, and open in place to the same frames. |
+| `quic_params` | `quic::params::Parameters` | Each accepted set of a client or a server writes in the bytes of its `encoded_len`, and parses back to the same set. |
 | `quic_frame` | `quic::frame::Frame` | Each parsed frame takes at least one byte and at most the rest. It writes and parses back to the same frame. The ranges of an ACK frame go down, and none passes packet number 0. |
 | `differential` | `RequestParser` and `ChunkDecoder`, against `httparse` | Each head that rsnetwork accepts has the same method, target, version, field lines, and length for `httparse`. Each chunked body after it has the same data, trailer section, and length. |
 
@@ -75,6 +76,10 @@ conformance vector in `tests/conformance/mod.rs`, taken at `b43defd`.
 The seeds of `hpack` are the blocks of RFC 7541, Appendix C (`rfc7541-c2` to `rfc7541-c6`), and
 the first 12 blocks of `story_02.json` of four encoders of `tests/hpack-test-case`, each after the
 two control bytes of the target.
+
+The seeds of `quic_params` are the transport parameters of the client Initial of RFC 9001,
+appendix A.2, after the control byte of a client (`rfc9001-a2-client`) and of a server
+(`rfc9001-a2-as-server`).
 
 The seeds of `qpack` are the exchange of RFC 9204, Appendix B, with the cancellation of stream 8,
 and the first 24 records of three outputs of `tests/qifs`: `quinn` `netbsd.out.256.100.0`,

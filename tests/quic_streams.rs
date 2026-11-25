@@ -5,132 +5,31 @@
 //! 9000, sections 8.2, 9, 10.2, and 14, and RFC 8899), and the batches for segmentation offload
 //! (N308). Each end sends in batches of up to 64 datagrams, as a host with GSO does.
 
+#[expect(
+    dead_code,
+    reason = "the cells of `tests/quic_conformance.rs` use the seed, the marks, and the shared bottleneck"
+)]
+mod quic_path;
+
 use core::net::{Ipv4Addr, SocketAddr};
-use core::num::{NonZeroU64, NonZeroUsize};
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::assert_matches;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use quic_path::*;
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
-use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Kind, Progress, TurnLimits};
 use rsnetwork::quic::frame::{Ack, Direction, Frame};
-use rsnetwork::quic::packet::{Datagrams, Header};
+use rsnetwork::quic::packet::Datagrams;
 use rsnetwork::quic::{
     CongestionControl, Connection, EcnState, Event, Limits, Path, PeerClose, Priority, RecoveryStats,
     STREAM_REGIONS_MAX, StreamId,
 };
-use rsnetwork::time::{ClockDomain, Instant, Suspend};
-use rsnetwork::tls::{
-    CertificateDer, ClientConfig, ClientOptions, Entropy, Identity, PrivateKeyDer, Resumption, ServerConfig,
-    ServerOptions, TimeProvider, UnixTime,
-};
+use rsnetwork::time::Instant;
 
-const CA: &[u8] = include_bytes!("tls/ca.der");
-const SERVER: (&[u8], &[u8]) = (include_bytes!("tls/server.der"), include_bytes!("tls/server.key.der"));
-/// 2027-01-01, inside the validity of each certificate.
-const VALID: u64 = 1_798_761_600;
 /// The bytes of one page of the store of data out of order.
 const PAGE: u64 = 4096;
-
-/// A wall clock that stays at one time.
-#[derive(Debug)]
-struct At(u64);
-
-impl TimeProvider for At {
-    fn current_time(&self) -> Option<UnixTime> {
-        Some(UnixTime::since_unix_epoch(Duration::from_secs(self.0)))
-    }
-}
-
-fn budget() -> Budget {
-    Budget::new(NonZeroU64::new(1 << 26).unwrap())
-}
-
-fn now() -> Instant {
-    Instant::new(ClockDomain::new(1, Suspend::Pauses), 0)
-}
-
-fn ms(value: u64) -> Instant {
-    now().checked_add(Duration::from_millis(value)).unwrap()
-}
-
-/// The byte at `offset` of the data of each test stream, so a byte at a wrong place shows.
-fn byte(offset: usize) -> u8 {
-    u8::try_from(offset % 251).unwrap()
-}
-
-/// The `len` bytes of a test stream from `offset`, as a region.
-fn region(offset: usize, len: usize) -> Lease {
-    Lease::from((offset..offset + len).map(byte).collect::<Vec<u8>>())
-}
-
-/// The address of the server, and the address of a client at the port `port`.
-const SERVER_ADDRESS: SocketAddr = SocketAddr::new(core::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 443);
-
-fn client_address(port: u16) -> SocketAddr {
-    SocketAddr::from((Ipv4Addr::new(198, 51, 100, 7), port))
-}
-
-/// The path of the server to a client at `peer`.
-fn from_server(peer: SocketAddr) -> Path {
-    Path {
-        local: SERVER_ADDRESS,
-        peer,
-    }
-}
-
-/// Each datagram that `connection` sends now.
-fn sent(connection: &mut Connection) -> Vec<Vec<u8>> {
-    sent_at(connection, now())
-}
-
-fn sent_at(connection: &mut Connection, at: Instant) -> Vec<Vec<u8>> {
-    routed_at(connection, at)
-        .into_iter()
-        .map(|(_, datagram)| datagram)
-        .collect()
-}
-
-/// The segments of one send with segmentation offload on Linux (GSO).
-const SEGMENTS: NonZeroUsize = NonZeroUsize::new(64).unwrap();
-
-/// Each datagram that `connection` sends at `at`, with its path, from batches of at most
-/// [`SEGMENTS`] datagrams in 64 KB, as a host with segmentation offload sends them.
-fn routed_at(connection: &mut Connection, at: Instant) -> Vec<(Path, Vec<u8>)> {
-    let mut datagrams = Vec::new();
-    let mut out = vec![0; 65_536];
-    for _ in 0..8192 {
-        let Some(sent) = connection.transmit(&mut out, SEGMENTS, at).unwrap() else {
-            return datagrams;
-        };
-        let batch = out[..sent.len].chunks(sent.segment_bytes);
-        datagrams.extend(batch.map(|datagram| (sent.path, datagram.to_vec())));
-    }
-    panic!("a connection sends at most 8,192 batches at once");
-}
-
-/// Gives `datagram` to `connection` in a region of its own, and gives the events of the call.
-fn give(connection: &mut Connection, datagram: &[u8]) -> Vec<Event> {
-    give_at(connection, datagram, now())
-}
-
-fn give_at(connection: &mut Connection, datagram: &[u8], at: Instant) -> Vec<Event> {
-    give_marked(connection, datagram, at, Ecn::NotEct)
-}
-
-fn give_marked(connection: &mut Connection, datagram: &[u8], at: Instant, mark: Ecn) -> Vec<Event> {
-    let path = connection.path();
-    give_on(connection, path, datagram, at, mark)
-}
-
-/// Gives `datagram` to `connection` as a datagram that arrived on `path`.
-fn give_on(connection: &mut Connection, path: Path, datagram: &[u8], at: Instant, mark: Ecn) -> Vec<Event> {
-    let len = connection.local_cid().as_bytes().len();
-    let datagrams = Datagrams::new(Backing::from(datagram.to_vec()), None, len).with_ecn(mark);
-    receive(connection, path, datagrams, at)
-}
 
 /// Gives `region` to `connection` as one receive of datagrams of `segment` bytes each, as
 /// receive offload (GRO) gives the datagrams of one send with segmentation offload.
@@ -141,216 +40,7 @@ fn give_segments(connection: &mut Connection, region: &[u8], segment: usize, at:
     receive(connection, path, datagrams, at)
 }
 
-fn receive(connection: &mut Connection, path: Path, mut datagrams: Datagrams, at: Instant) -> Vec<Event> {
-    let mut events = Vec::new();
-    for _ in 0..8192 {
-        match connection.receive(&mut datagrams, path, at) {
-            (Some(event), _) => events.push(event),
-            (None, turn) if turn.progress == Progress::Pending => {}
-            (None, _) => return events,
-        }
-    }
-    panic!("a datagram gives at most 8,192 events");
-}
-
-/// The events that wait in `connection` after its last datagram went out.
-fn driven_at(connection: &mut Connection, at: Instant) -> Vec<Event> {
-    let mut events = Vec::new();
-    for _ in 0..8192 {
-        match connection.drive(at) {
-            (Some(event), _) => events.push(event),
-            (None, turn) if turn.progress == Progress::Pending => {}
-            (None, _) => return events,
-        }
-    }
-    panic!("a drive gives at most 8,192 events");
-}
-
-/// The bytes of each stream that an end received, in the order of their events, and whether the
-/// stream gave its end.
-#[derive(Default)]
-struct Received {
-    streams: BTreeMap<u64, (Vec<u8>, bool)>,
-    /// The stream of each event with bytes, in the order of the events.
-    order: Vec<u64>,
-    other: Vec<Event>,
-}
-
-impl Received {
-    /// Takes `events` of `connection`, and releases the bytes of each stream for which `releases`
-    /// gives `true`.
-    fn take(&mut self, connection: &mut Connection, events: Vec<Event>, releases: impl Fn(StreamId) -> bool) {
-        for event in events {
-            match event {
-                Event::Stream { stream, data, end } => {
-                    let entry = self.streams.entry(stream.get()).or_default();
-                    assert!(!entry.1, "no byte comes after the end of a stream");
-                    entry.0.extend_from_slice(data.bytes());
-                    entry.1 = end;
-                    if data.initialized() > 0 {
-                        self.order.push(stream.get());
-                    }
-                    if releases(stream) {
-                        connection.release(stream, data.initialized() as u64).unwrap();
-                    }
-                }
-                other => self.other.push(other),
-            }
-        }
-    }
-
-    fn bytes(&self, stream: StreamId) -> usize {
-        self.streams.get(&stream.get()).map_or(0, |(bytes, _)| bytes.len())
-    }
-
-    /// Whether `stream` gave its end after exactly the `len` bytes of its test data.
-    fn complete(&self, stream: StreamId, len: usize) -> bool {
-        self.streams.get(&stream.get()).is_some_and(|(bytes, end)| {
-            *end && bytes.len() == len && bytes.iter().enumerate().all(|(at, b)| *b == byte(at))
-        })
-    }
-}
-
-/// A client and a server after their handshake.
-struct Pair {
-    client: Connection,
-    server: Connection,
-    at_client: Received,
-    at_server: Received,
-    /// The address that the network gives the client. The server gets each datagram of the client
-    /// from it, and the client gets only the datagrams that the server sends to it.
-    seen: SocketAddr,
-    /// The datagrams that the server sent to another address.
-    elsewhere: Vec<(Path, Vec<u8>)>,
-    /// The largest datagram that the path carries: it drops each larger one, and keeps it.
-    path_bytes: usize,
-    dropped: Vec<Vec<u8>>,
-    /// The largest datagram of the client that the path carried.
-    largest: usize,
-    /// The budget of the client connection.
-    client_budget: Budget,
-}
-
 impl Pair {
-    fn new(client: Limits, server: Limits) -> Self {
-        Self::on_path(client, server, usize::MAX)
-    }
-
-    /// A client and a server after their handshake, on a path that carries datagrams of at most
-    /// `path_bytes` bytes.
-    fn on_path(client: Limits, server: Limits, path_bytes: usize) -> Self {
-        let client_config = ClientConfig::new(ClientOptions {
-            roots: &[CertificateDer::from(CA.to_vec())],
-            identity: None,
-            protocols: &[b"test"],
-            resumption: Resumption::Off,
-            budget: &budget(),
-            clock: Arc::new(At(VALID)),
-            entropy: Entropy::System,
-        })
-        .unwrap();
-        let server_config = ServerConfig::new(ServerOptions {
-            identity: Identity {
-                chain: vec![CertificateDer::from(SERVER.0.to_vec())],
-                key: PrivateKeyDer::try_from(SERVER.1.to_vec()).unwrap(),
-            },
-            client_roots: None,
-            protocols: &[b"test"],
-            resumption: Resumption::Off,
-            budget: &budget(),
-            clock: Arc::new(At(VALID)),
-            entropy: Entropy::System,
-        })
-        .unwrap();
-        let route = Path {
-            local: client_address(4301),
-            peer: SERVER_ADDRESS,
-        };
-        let client_budget = budget();
-        let mut client_end =
-            Connection::client(&client_config, "server.test", route, client, &client_budget, now()).unwrap();
-        let first = sent(&mut client_end);
-        let header = Header::parse(&first[0], 0).unwrap();
-        let route = from_server(client_address(4301));
-        let mut server_end = Connection::server(&server_config, &header, route, server, &budget(), now()).unwrap();
-        for datagram in &first {
-            assert!(give(&mut server_end, datagram).is_empty());
-        }
-        let mut pair = Self {
-            client: client_end,
-            server: server_end,
-            at_client: Received::default(),
-            at_server: Received::default(),
-            seen: client_address(4301),
-            elsewhere: Vec::new(),
-            path_bytes,
-            dropped: Vec::new(),
-            largest: 0,
-            client_budget,
-        };
-        pair.run(|_| true);
-        assert!(pair.client.is_confirmed() && pair.server.is_confirmed());
-        pair
-    }
-
-    /// Moves the datagrams of both ends until no datagram and no event moves. Each end releases
-    /// the bytes of each stream for which `releases` gives `true`.
-    fn run(&mut self, releases: impl Fn(StreamId) -> bool) {
-        self.run_at(now(), releases);
-    }
-
-    fn run_at(&mut self, at: Instant, releases: impl Fn(StreamId) -> bool) {
-        for _ in 0..4096 {
-            let events = driven_at(&mut self.client, at);
-            let to_server = sent_at(&mut self.client, at);
-            let mut quiet = to_server.is_empty() && events.is_empty();
-            self.at_client.take(&mut self.client, events, &releases);
-            for datagram in &to_server {
-                if datagram.len() > self.path_bytes {
-                    self.dropped.push(datagram.clone());
-                    continue;
-                }
-                self.largest = self.largest.max(datagram.len());
-                let events = give_on(&mut self.server, from_server(self.seen), datagram, at, Ecn::NotEct);
-                self.at_server.take(&mut self.server, events, &releases);
-            }
-            let events = driven_at(&mut self.server, at);
-            let to_client = routed_at(&mut self.server, at);
-            quiet &= to_client.is_empty() && events.is_empty();
-            self.at_server.take(&mut self.server, events, &releases);
-            for (path, datagram) in to_client {
-                if path.peer != self.seen {
-                    self.elsewhere.push((path, datagram));
-                } else if datagram.len() <= self.path_bytes {
-                    let events = give_at(&mut self.client, &datagram, at);
-                    self.at_client.take(&mut self.client, events, &releases);
-                }
-            }
-            if quiet {
-                return;
-            }
-        }
-        panic!("the connection is not quiet after 4,096 rounds");
-    }
-
-    /// Runs the connection, and moves the clock to the next deadline of an end, until `done`.
-    /// Gives the time.
-    fn run_until(&mut self, mut at: Instant, done: impl Fn(&Self) -> bool) -> Instant {
-        for _ in 0..512 {
-            self.run_at(at, |_| true);
-            if done(self) {
-                return at;
-            }
-            at = [self.client.drive(at).1.deadline, self.server.drive(at).1.deadline]
-                .into_iter()
-                .flatten()
-                .map(|deadline| deadline.instant())
-                .min_by_key(|instant| instant.as_nanos())
-                .expect("an end that waits has a deadline");
-        }
-        panic!("the connection does not reach its state after 512 deadlines");
-    }
-
     /// The server sends `len` bytes of the test data on a new stream of the client, from the
     /// time `at`. Gives the stream.
     fn download(&mut self, at: Instant, len: usize) -> StreamId {
@@ -366,34 +56,6 @@ impl Pair {
         }
         panic!("the download does not end");
     }
-
-    /// Opens a stream of the client.
-    fn open(&mut self, direction: Direction) -> StreamId {
-        self.client
-            .open(direction)
-            .unwrap()
-            .expect("the limit of the server allows the stream")
-    }
-}
-
-/// Gives the `len` bytes of the test data to `stream` of `connection` from `offset`, in regions of
-/// `piece` bytes, as many as the stream takes, with the end after the last byte. Gives the new
-/// offset.
-fn feed(connection: &mut Connection, stream: StreamId, mut offset: usize, len: usize, piece: usize) -> usize {
-    for _ in 0..STREAM_REGIONS_MAX {
-        if offset == len {
-            break;
-        }
-        let part = piece.min(len - offset);
-        if connection
-            .send(stream, region(offset, part), offset + part == len)
-            .is_err()
-        {
-            break;
-        }
-        offset += part;
-    }
-    offset
 }
 
 /// Sends the test data of each stream of `streams`, from the offset with it up to `len` bytes,

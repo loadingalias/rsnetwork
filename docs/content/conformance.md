@@ -5,6 +5,8 @@ require. It also checks that the result stays the same when the bytes arrive in 
 transport accepts only part of the output, and when requests come pipelined. One suite qualifies
 the core and each binding, so no binding needs a test platform of its own.
 
+The [QUIC conformance suite](quic-conformance.md) has its own page.
+
 rsnetwork is in development and has no release.
 
 ## Run the suite
