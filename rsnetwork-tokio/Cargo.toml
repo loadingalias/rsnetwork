@@ -22,5 +22,10 @@ socket2 = "0.6.5"
 # The tests run each case on a current-thread and on a multi-thread runtime.
 tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
 
+# The endpoint of the HTTP/2 interop runs with independent peers (`tests/h2/run.sh`).
+[[example]]
+name = "h2_interop"
+path = "tests/h2/interop.rs"
+
 [lints]
 workspace = true
