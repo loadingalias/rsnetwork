@@ -166,7 +166,7 @@ Each request has its own `Stream`. The stream keeps its place from its request u
 | `collect(stream, now, &mut region)` | Collects the whole body into one region, whose free capacity bounds it: `Collect::Complete(trailers)`, `Collect::TooLarge`, `Collect::Interrupted(outcome)`, or `Collect::More` while bytes are still to come |
 | `respond(stream, &response, now)` | `true`: the response head went out. `false`: the transport still holds the regions of the heads before |
 | `write(stream, &data, now)`, `finish(stream, now)` | The response body, with no copy, and its end. A call that finds no room drives the connection one time: over TLS, only a drive seals the plaintext that waits. When there is still no room, the call refuses with `Kind::Overload`: send the output, and call again |
-| `finish_with_trailers(stream, &fields, now)` | Ends the body with a trailer section. `false` as for `respond`. On HTTP/1.1, only a body of unknown length, in chunks, has trailers |
+| `finish_with_trailers(stream, &fields, now)` | Ends the body with a trailer section. `false` while the transport holds the regions of the heads before, while the output queue is still full after one drive, or, on HTTP/2, while the chunk before waits for the output: send the output, and call again. A section larger than `head.head_bytes` refuses at once with `Kind::Overload`. On HTTP/1.1, only a body of unknown length, in chunks, has trailers |
 | `cancel(stream)` | Ends the exchange: see [cancel](#cancel) |
 | `close(stream)` | Ends the handler of the stream, and frees its place. A response that is not finished is cancelled |
 | `delivery(stream)` | How much of the response the transport accepted: see [delivery](#delivery) |

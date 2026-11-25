@@ -12,7 +12,7 @@ use crate::drive::{AckError, ActionId, Endpoint, Error, Inbound, Kind, Outbound,
 use crate::h1;
 use crate::h2::Role;
 use crate::h2::frame::ErrorCode;
-use crate::h2::message::{self, Answer, Refusal};
+use crate::h2::message::{self, Answer, CHUNK_WAITS, Refusal};
 use crate::h2::session::{Inflow, Session, Step};
 use crate::host::{Connection, Engine, Io, Wait};
 use crate::hpack::FieldLine;
@@ -20,7 +20,7 @@ use crate::link::{Link, earliest, queues};
 use crate::message::{ResponseHead, Stream};
 #[cfg(feature = "tls")]
 use crate::tls::{self, ClientConfig, Negotiated, Tls};
-use crate::value::{Method, Scheme};
+use crate::value::{Field, Method, Scheme};
 
 impl Engine for Session {
     type Event = Step;
@@ -341,7 +341,7 @@ impl Http2 {
         {
             return Err(misuse("the body passes the length of the request"));
         }
-        let index = self.chunk_sent(stream, index, now)?;
+        let index = self.chunk_sent(stream, index, now)?.ok_or(CHUNK_WAITS)?;
         let id = self.exchanges[index].id;
         let (session, outbound) = self.link.engine();
         session.connection().data(outbound, id, data.clone(), false)?;
@@ -362,6 +362,52 @@ impl Http2 {
         self.exchanges[index].out.finished = true;
         self.end_body(index)?;
         self.pump(now).map(drop)
+    }
+
+    /// Ends the request body of `stream` with `trailers`, in a HEADERS frame that ends the stream.
+    /// Gives `false` while the chunk before waits for the output, or while no head region or no
+    /// place of the output queue is free: send the output, and call again. Refuses with
+    /// [`Kind::Misuse`] when the body is shorter than the length of the request or a trailer is a
+    /// connection-specific field, and with [`Kind::Overload`] when the trailer section is larger
+    /// than the head region.
+    pub fn finish_with_trailers(
+        &mut self,
+        stream: Stream,
+        trailers: &[Field<'_>],
+        now: Instant,
+    ) -> Result<bool, Error> {
+        let (index, out) = self.body(stream, now)?;
+        if out.length.is_some_and(|length| out.written != length) {
+            return Err(misuse("the body is shorter than the length of the request"));
+        }
+        message::sendable(trailers)?;
+        // The trailers go after the chunk before, which can still wait for the output.
+        let Some(index) = self.chunk_sent(stream, index, now)? else {
+            return Ok(false);
+        };
+        let lines = message::lines(trailers);
+        let (session, _) = self.link.engine();
+        if session.connection().block_room(lines.clone()) > self.limits.head.head_bytes {
+            return Err(Error::new(
+                Kind::Overload,
+                "the trailer section is larger than the head region: give a larger head_bytes",
+            ));
+        }
+        let Ok(region) = self.heads.acquire() else {
+            return Ok(false);
+        };
+        let id = self.exchanges[index].id;
+        let (session, outbound) = self.link.engine();
+        match session.connection().headers(outbound, id, lines, true, region) {
+            Ok(()) => {}
+            Err(error) if error.kind() == Kind::Overload => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        let out = &mut self.exchanges[index].out;
+        out.finished = true;
+        out.ended = true;
+        self.pump(now)?;
+        Ok(true)
     }
 
     /// Queues the frame that ends the stream at `index`, after the application finished its body
@@ -592,19 +638,13 @@ impl Http2 {
 
     /// Waits for the `Event::Sent` of the chunk before, with one drive. Refuses with
     /// [`Kind::Overload`] while it waits.
-    fn chunk_sent(&mut self, stream: Stream, index: usize, now: Instant) -> Result<usize, Error> {
+    fn chunk_sent(&mut self, stream: Stream, index: usize, now: Instant) -> Result<Option<usize>, Error> {
         if !self.exchanges[index].out.chunk {
-            return Ok(index);
+            return Ok(Some(index));
         }
         self.pump(now)?;
         let (index, out) = self.body(stream, now)?;
-        if out.chunk {
-            return Err(Error::new(
-                Kind::Overload,
-                "the chunk before waits for the output: send the output, and write again",
-            ));
-        }
-        Ok(index)
+        Ok((!out.chunk).then_some(index))
     }
 
     /// Drives the connection until the body of `stream` has a part or its end for a read, or

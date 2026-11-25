@@ -31,6 +31,13 @@ pub(crate) enum Refusal {
 
 /// The fields that RFC 9113, section 8.2.2, forbids, because they are specific to a connection.
 /// `te` is allowed only with the value `trailers`.
+/// The refusal of a write while the chunk before waits for the output, which the vocabularies of
+/// both roles give.
+pub(crate) const CHUNK_WAITS: Error = Error::new(
+    Kind::Overload,
+    "the chunk before waits for the output: send the output, and write again",
+);
+
 const CONNECTION_FIELDS: [&[u8]; 5] = [
     b"connection",
     b"keep-alive",

@@ -136,17 +136,21 @@ to wait for:
 
 | Type | Calls that await | Calls that do not wait |
 | --- | --- | --- |
-| `client::Http1` | `send`, `write`, `finish`, `response`, `next`, `read_into`, `collect`, `close` | `delivered`, `cancel`, `negotiated`, `export` |
+| `client::Http1` | `send`, `write`, `finish`, `finish_with_trailers`, `response`, `next`, `read_into`, `collect`, `close` | `delivered`, `cancel`, `negotiated`, `export` |
 | `client::Http2` | `send`, `drive`, `close` | `negotiated`, `export` |
-| `client::Exchange` | `write`, `finish`, `response`, `next`, `read_into`, `collect` | `delivered` |
+| `client::Exchange` | `write`, `finish`, `finish_with_trailers`, `response`, `next`, `read_into`, `collect` | `delivered` |
 | `server::Http` | `request`, `close` | `shutdown` |
 | `server::Exchange` | `respond`, `write`, `finish`, `finish_with_trailers`, `next`, `read_into`, `collect` | `head`, `cancel`, `delivery`, `negotiated`, `export` |
 | `tls::Stream` | `handshake`, `read_into`, `next`, `write`, `close` | `written`, `sent`, `closure`, `export` |
 
 - A call gives its value when the core gives one. `read_into` never gives `Read::Wait`, and
   `collect` never gives `Collect::More`.
-- `write` and `finish` wait while the output has no room. On HTTP/2, `write` also waits while the
-  chunk before waits for the output.
+- `write`, `finish`, and `finish_with_trailers` wait while the output has no room. On HTTP/2,
+  `write` and `finish_with_trailers` also wait while the chunk before waits for the output. A
+  trailer section larger than `head.head_bytes` refuses at once with `Kind::Overload`.
+- The bytes of a connection move only inside its calls. When you drive a `server::Http` yourself,
+  a call of the connection after the finish of an exchange, such as the next `request`, moves the
+  rest of the response. A `Server` makes that call in the task of each connection.
 - After a call gives its value, the binding writes its output at once, with no wait.
 - `server::Http::request` gives each request on its own `server::Exchange`, or `None` when the
   connection takes no more requests: the client closed, the connection closes, or it ended. On

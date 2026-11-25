@@ -12,6 +12,7 @@ use rsnetwork::host::Io as _;
 use rsnetwork::message::{ResponseHead, Stream};
 use rsnetwork::time::Deadline;
 use rsnetwork::tls::{ExportError, Negotiated};
+use rsnetwork::value::Field;
 use tokio::net::TcpStream;
 
 use crate::shared::{Shared, Waits};
@@ -64,6 +65,15 @@ impl Http1 {
     /// Ends the request body. It waits while the output queue is full.
     pub async fn finish(&mut self) -> Result<(), Error> {
         let finished = self.socket.until(|client, now| queued(client.finish(now)));
+        finished.await?.ok_or(ENDED)
+    }
+
+    /// Ends the chunked request body with `trailers`, as [`finish`](Self::finish) does. Refuses
+    /// as [`Http1::finish_with_trailers`](rsnetwork::client::Http1::finish_with_trailers) does.
+    pub async fn finish_with_trailers(&mut self, trailers: &[Field<'_>]) -> Result<(), Error> {
+        let finished = self
+            .socket
+            .until(|client, now| Ok(client.finish_with_trailers(trailers, now)?.then_some(())));
         finished.await?.ok_or(ENDED)
     }
 
@@ -253,6 +263,16 @@ impl Exchange {
         let finished = self
             .shared
             .until(Waits::Stream(stream), |client, now| queued(client.finish(stream, now)));
+        finished.await?.ok_or(ENDED)
+    }
+
+    /// Ends the request body with `trailers`, as [`finish`](Self::finish) does. Refuses as
+    /// [`Http2::finish_with_trailers`](rsnetwork::client::Http2::finish_with_trailers) does.
+    pub async fn finish_with_trailers(&mut self, trailers: &[Field<'_>]) -> Result<(), Error> {
+        let stream = self.stream;
+        let finished = self.shared.until(Waits::Place(Some(stream)), |client, now| {
+            Ok(client.finish_with_trailers(stream, trailers, now)?.then_some(()))
+        });
         finished.await?.ok_or(ENDED)
     }
 

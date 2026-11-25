@@ -24,9 +24,9 @@ use std::time::Instant;
 use rsnetwork::body::{Collect, Outcome, Read};
 use rsnetwork::buffer::{Lease, WriteLoan};
 use rsnetwork::client::Request;
-use rsnetwork::drive::Kind;
+use rsnetwork::drive::{Error, Kind};
 use rsnetwork::server::{Closed, Delivery};
-use rsnetwork::value::{Authority, Method, Target};
+use rsnetwork::value::{Authority, Field, Method, Target};
 use rsnetwork_tokio::Clock;
 use rsnetwork_tokio::server::{Exchange, Report, Server};
 use support::{ALERT_RECORD, Held, Last, PATIENCE, Proxy, Transport, ok, on_each_runtime};
@@ -790,6 +790,177 @@ fn a_ping_and_settings_flood_from_a_peer_that_reads_late_gets_each_answer_in_its
             .filter(|&&(kind, flags, _)| kind == 0x4 && flags == 0x1)
             .count();
         assert_eq!(acknowledged as u64, PINGS + 1);
+        within(server.close(Clock.deadline(PATIENCE))).await;
+    });
+}
+
+/// The bytes of each body of the trailer test: four times the initial window of a stream, so each
+/// body waits for its reader before its end.
+const WINDOWS: usize = 4 * 65_535;
+
+/// The body of the trailer test: bytes in a pattern, so a byte out of its place shows.
+fn pattern() -> Vec<u8> {
+    (0..=250_u8).cycle().take(WINDOWS).collect()
+}
+
+/// What the handler of the trailer test learned.
+#[derive(Debug)]
+enum Seen {
+    /// The request body and its trailers.
+    Request(bool, Vec<(Vec<u8>, Vec<u8>)>),
+    /// Whether the call that ends the response with trailers waited at its first poll.
+    Waited(bool),
+}
+
+#[test]
+fn trailers_wait_for_the_chunk_before_them_and_follow_each_byte_in_each_direction() {
+    on_each_runtime(|| async {
+        for transport in [Transport::Plain, Transport::Tls] {
+            let (listener, address) = support::listener().await;
+            let reads = Arc::new(Notify::new());
+            let (seen, mut sees) = mpsc::unbounded_channel();
+            let handler = {
+                let reads = Arc::clone(&reads);
+                move |mut exchange: Exchange| {
+                    let (reads, seen) = (Arc::clone(&reads), seen.clone());
+                    async move {
+                        // The handler reads nothing until the request trailers wait.
+                        reads.notified().await;
+                        let mut region = WriteLoan::new(Vec::with_capacity(WINDOWS));
+                        let request = exchange.collect(&mut region).await?;
+                        let body = region.filled() == pattern();
+                        seen.send(Seen::Request(body, support::trailer_fields(&request)))
+                            .unwrap();
+                        exchange.respond(&ok(None)).await?;
+                        exchange.write(&Lease::from(pattern())).await?;
+                        // The client reads nothing yet, so the chunk waits for its window.
+                        let trailer = [Field::new(b"x-response", b"done").unwrap()];
+                        let mut finish = pin!(exchange.finish_with_trailers(&trailer));
+                        let finished = support::once(finish.as_mut()).await;
+                        seen.send(Seen::Waited(finished.is_none())).unwrap();
+                        match finished {
+                            Some(result) => result,
+                            None => finish.await,
+                        }
+                    }
+                }
+            };
+            let server = serve(transport, listener, handler);
+            let client = support::h2_client(transport, address).await;
+            let mut exchange = client
+                .send(&request(b"/trailers", None), Clock.deadline(PATIENCE))
+                .await
+                .unwrap();
+            exchange.write(&Lease::from(pattern())).await.unwrap();
+            // The server reads nothing yet, so the chunk waits for its window.
+            let trailer = [Field::new(b"x-request", b"done").unwrap()];
+            {
+                let mut finish = pin!(exchange.finish_with_trailers(&trailer));
+                let finished = support::once(finish.as_mut()).await;
+                assert!(
+                    finished.is_none(),
+                    "{transport:?}: the request trailers wait for the chunk before them: {finished:?}"
+                );
+                reads.notify_one();
+                within(finish).await.unwrap();
+            }
+            let Seen::Request(body, trailers) = within(sees.recv()).await.unwrap() else {
+                panic!("{transport:?}: the handler reports the request first");
+            };
+            assert!(body, "{transport:?}: each request byte arrives in its order");
+            assert_eq!(trailers, [(b"x-request".to_vec(), b"done".to_vec())], "{transport:?}");
+            within(exchange.response()).await.unwrap();
+            let waited = within(sees.recv()).await.unwrap();
+            assert!(
+                matches!(waited, Seen::Waited(true)),
+                "{transport:?}: the response trailers wait for the chunk before them: {waited:?}"
+            );
+            let mut region = WriteLoan::new(Vec::with_capacity(WINDOWS));
+            let response = within(exchange.collect(&mut region)).await.unwrap();
+            assert_eq!(region.filled(), pattern(), "{transport:?}");
+            assert_eq!(
+                support::trailer_fields(&response),
+                [(b"x-response".to_vec(), b"done".to_vec())],
+                "{transport:?}"
+            );
+            within(client.close()).await.unwrap();
+            let report = within(server.close(Clock.deadline(PATIENCE))).await;
+            assert_eq!(
+                report,
+                Report {
+                    accepted: 1,
+                    refused: 0,
+                    failed: 0,
+                    aborted: 0
+                },
+                "{transport:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_server_collects_a_request_body_longer_than_the_window_of_its_stream() {
+    on_each_runtime(|| async {
+        let (listener, address) = support::listener().await;
+        let handler = |mut exchange: Exchange| async move {
+            let mut region = WriteLoan::new(Vec::with_capacity(WINDOWS));
+            let collected = exchange.collect(&mut region).await?;
+            let complete = matches!(collected, Collect::Complete(None)) && region.filled() == pattern();
+            exchange.respond(&ok(Some(0))).await?;
+            // A handler that fails counts in the report of the close.
+            complete
+                .then_some(())
+                .ok_or(Error::new(Kind::Partial, "the collect did not give the whole body"))
+        };
+        let server = serve(Transport::Plain, listener, handler);
+        let client = support::h2_client(Transport::Plain, address).await;
+        let length = Some(WINDOWS as u64);
+        let mut exchange = client
+            .send(&request(b"/collect", length), Clock.deadline(PATIENCE))
+            .await
+            .unwrap();
+        exchange.write(&Lease::from(pattern())).await.unwrap();
+        exchange.finish().await.unwrap();
+        // The response comes only after the server collected each byte.
+        within(exchange.response()).await.unwrap();
+        within(client.close()).await.unwrap();
+        let report = within(server.close(Clock.deadline(PATIENCE))).await;
+        assert_eq!(
+            (report.accepted, report.failed),
+            (1, 0),
+            "the handler collected each byte"
+        );
+    });
+}
+
+/// A trailer section of six fields of 200 bytes: larger than the head region of 1024 bytes.
+fn long_trailers() -> Vec<Field<'static>> {
+    const VALUE: &[u8] = &[b'v'; 200];
+    (0..6).map(|_| Field::new(b"x-long", VALUE).unwrap()).collect()
+}
+
+#[test]
+fn a_trailer_section_larger_than_the_head_region_refuses_at_once_and_does_not_wait() {
+    on_each_runtime(|| async {
+        let (listener, address) = support::listener().await;
+        // The handler waits for a body that never ends, so the stream stays open.
+        let handler = |mut exchange: Exchange| async move {
+            let mut region = WriteLoan::new(Vec::with_capacity(64));
+            exchange.collect(&mut region).await.map(drop)
+        };
+        let server = serve(Transport::Plain, listener, handler);
+        let client = support::h2_client(Transport::Plain, address).await;
+        let mut exchange = client
+            .send(&request(b"/long", None), Clock.deadline(PATIENCE))
+            .await
+            .unwrap();
+        let refused = within(exchange.finish_with_trailers(&long_trailers()))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind(), Kind::Overload, "{refused:?}");
+        drop(exchange);
+        within(client.close()).await.unwrap();
         within(server.close(Clock.deadline(PATIENCE))).await;
     });
 }

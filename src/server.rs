@@ -404,17 +404,20 @@ impl Http {
         region: &mut WriteLoan<B>,
     ) -> Result<Collect, Error> {
         loop {
+            // The fill gives the credit of the bytes that the collect before took, so the check
+            // of the wait comes after it: else the peer waits for that credit, and this body for
+            // the peer.
             self.fill(stream, now)?;
+            if self.body_waits(stream) {
+                return Ok(Collect::More);
+            }
             let collect = match self.link.engine().0 {
                 Protocol::H2(_, h2) => h2.collect(stream, region)?,
-                Protocol::H1(_, h1) if h1.body.wants_data() => Collect::More,
                 Protocol::H1(_, h1) => h1.body.collect(region),
                 Protocol::Pending => return Err(not_open()),
             };
-            match collect {
-                Collect::More if self.body_waits(stream) => return Ok(Collect::More),
-                Collect::More => {}
-                collect => return Ok(collect),
+            if !matches!(collect, Collect::More) {
+                return Ok(collect);
             }
         }
     }
@@ -463,8 +466,10 @@ impl Http {
     }
 
     /// Ends the response body of `stream` with `trailers`, as [`finish`](Self::finish) does.
-    /// Gives `false` when the transport still holds the regions of the heads before: wait, and
-    /// call again. On HTTP/1.1, refuses with [`Kind::Misuse`] when the length of the response is
+    /// Gives `false` while the transport holds the regions of the heads before, while the output
+    /// queue is full, or, on HTTP/2, while the chunk before waits for the output: wait, and call
+    /// again. Refuses with [`Kind::Overload`] when the trailer section is larger than the head
+    /// region. On HTTP/1.1, refuses with [`Kind::Misuse`] when the length of the response is
     /// known: only chunks carry trailers.
     pub fn finish_with_trailers(
         &mut self,

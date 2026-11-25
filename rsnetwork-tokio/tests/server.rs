@@ -26,12 +26,16 @@ use std::time::Instant;
 
 use rsnetwork::body::{Outcome, Read};
 use rsnetwork::buffer::{Backing, Lease, WriteLoan};
+use rsnetwork::client::Request;
 use rsnetwork::drive::Kind;
 use rsnetwork::server::{self, Closed, Delivery, Linger, Response};
-use rsnetwork::value::Status;
+use rsnetwork::value::{Authority, Field, Method, Status, Target};
 use rsnetwork_tokio::Clock;
 use rsnetwork_tokio::server::{Exchange, Report, Server};
-use support::{ALERT_RECORD, HEAD_TIMEOUT, Held, Last, PATIENCE, Proxy, Transport, ok, on_each_runtime, read_to_end};
+use support::{
+    ALERT_RECORD, HEAD_TIMEOUT, Held, Last, PATIENCE, Proxy, Transport, ok, on_each_runtime, once, read_to_end,
+    trailer_fields,
+};
 use tokio::sync::{Notify, mpsc as channel, oneshot};
 
 /// A body larger than the socket buffers of loopback: 16 parts of 1 MiB.
@@ -366,5 +370,88 @@ fn over_tls_the_head_timeout_bounds_the_handshake() {
             "{closed:?}"
         );
         client.join().unwrap();
+    });
+}
+
+/// The most parts of 1 MiB that a sender writes before its output queue is full: more than the
+/// queue and the socket buffers of loopback hold, also when the kernel grows them.
+const PARTS_MAX: usize = 256;
+
+#[test]
+fn over_http1_trailers_wait_for_a_place_in_a_full_output_and_follow_each_byte_in_each_direction() {
+    on_each_runtime(|| async {
+        let (listener, address) = support::listener().await;
+        let (client_waited, server_reads) = oneshot::channel();
+        let (server_waited, client_reads) = oneshot::channel();
+        let serving = tokio::spawn(async move {
+            let mut server = support::server(Transport::Plain, &listener).await;
+            let mut exchange = server.request().await.unwrap().expect("a request");
+            let sent: usize = server_reads.await.unwrap();
+            let mut region = WriteLoan::new(Vec::with_capacity(PART * sent));
+            let request = exchange.collect(&mut region).await.unwrap();
+            assert_eq!(region.filled().len(), PART * sent);
+            assert!(region.filled().iter().all(|&byte| byte == b'c'));
+            exchange.respond(&ok(None)).await.unwrap();
+            // The client reads nothing, so a write waits when the output queue is full. A write
+            // that waits queued nothing.
+            let part = Lease::from(vec![b's'; PART]);
+            let mut parts = 0;
+            while let Some(written) = once(pin!(exchange.write(&part))).await {
+                written.unwrap();
+                parts += 1;
+                assert!(parts < PARTS_MAX, "the output queue of the server is never full");
+            }
+            let trailer = [Field::new(b"x-response", b"done").unwrap()];
+            let mut finish = pin!(exchange.finish_with_trailers(&trailer));
+            let finished = once(finish.as_mut()).await;
+            server_waited.send(parts).unwrap();
+            assert!(
+                finished.is_none(),
+                "the response trailers wait for a place in the full output queue: {finished:?}"
+            );
+            finish.await.unwrap();
+            // Bytes move only inside calls: the next request moves the rest of the response, and
+            // it ends at the close of the client.
+            assert!(server.request().await.unwrap().is_none());
+            trailer_fields(&request)
+        });
+
+        let mut client = support::client(Transport::Plain, address).await;
+        let request = Request {
+            method: Method::POST,
+            target: Target::new(b"/trailers").unwrap(),
+            authority: Authority::new(b"server.test").unwrap(),
+            fields: &[],
+            length: None,
+        };
+        client.send(&request, Clock.deadline(PATIENCE)).await.unwrap();
+        // The server reads nothing yet, so a write waits when the output queue is full.
+        let part = Lease::from(vec![b'c'; PART]);
+        let mut parts = 0;
+        while let Some(written) = once(pin!(client.write(&part))).await {
+            written.unwrap();
+            parts += 1;
+            assert!(parts < PARTS_MAX, "the output queue of the client is never full");
+        }
+        let trailer = [Field::new(b"x-request", b"done").unwrap()];
+        {
+            let mut finish = pin!(client.finish_with_trailers(&trailer));
+            let finished = once(finish.as_mut()).await;
+            client_waited.send(parts).unwrap();
+            assert!(
+                finished.is_none(),
+                "the request trailers wait for a place in the full output queue: {finished:?}"
+            );
+            finish.await.unwrap();
+        }
+        client.response().await.unwrap();
+        let sent = client_reads.await.unwrap();
+        let mut region = WriteLoan::new(Vec::with_capacity(PART * sent));
+        let response = client.collect(&mut region).await.unwrap();
+        assert_eq!(trailer_fields(&response), [(b"x-response".to_vec(), b"done".to_vec())]);
+        assert_eq!(region.filled().len(), PART * sent);
+        assert!(region.filled().iter().all(|&byte| byte == b's'));
+        client.close().await.unwrap();
+        assert_eq!(serving.await.unwrap(), [(b"x-request".to_vec(), b"done".to_vec())]);
     });
 }

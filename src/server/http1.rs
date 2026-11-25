@@ -259,16 +259,19 @@ impl Http {
         now: Instant,
     ) -> Result<bool, Error> {
         self.h1_responding(stream)?;
-        let queued = self.queue(now, |server| {
-            let Ok(region) = server.heads.acquire() else {
+        if self.h1_parts().1.free() == 0 {
+            // Over TLS, only a drive seals the plaintext into records and frees its queue.
+            self.pump(now)?;
+            if self.h1_parts().1.free() == 0 {
                 return Ok(false);
-            };
-            let (engine, outbound) = server.h1_parts();
-            engine.finish_with_trailers(outbound, trailers, region).map(|()| true)
-        })?;
-        if !queued {
-            return Ok(false);
+            }
         }
+        let Ok(region) = self.heads.acquire() else {
+            return Ok(false);
+        };
+        let (engine, outbound) = self.h1_parts();
+        // The queue has a place, so a refusal is final: the section is larger than the region.
+        engine.finish_with_trailers(outbound, trailers, region)?;
         self.h1_finished();
         self.pump(now)?;
         Ok(true)

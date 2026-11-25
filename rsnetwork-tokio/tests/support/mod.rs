@@ -2,8 +2,11 @@
 //! `tests/tls`, the two kinds of runtime, and a proxy that forwards whole TLS records.
 
 use core::alloc::Layout;
+use core::future::poll_fn;
 use core::net::SocketAddr;
 use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use core::pin::Pin;
+use core::task::Poll;
 use core::time::Duration;
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -11,6 +14,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
+use rsnetwork::body::Collect;
 use rsnetwork::buffer::Pool;
 use rsnetwork::capacity::Budget;
 use rsnetwork::client::{self, Request};
@@ -284,6 +288,28 @@ pub(crate) fn ok(length: Option<u64>) -> Response<'static> {
         fields: &[],
         length,
     }
+}
+
+/// Polls `call` one time, and gives its output, or `None` when it waits.
+pub(crate) async fn once<F: Future>(mut call: Pin<&mut F>) -> Option<F::Output> {
+    poll_fn(|cx| {
+        Poll::Ready(match call.as_mut().poll(cx) {
+            Poll::Ready(output) => Some(output),
+            Poll::Pending => None,
+        })
+    })
+    .await
+}
+
+/// The trailer fields of a complete body, as owned pairs.
+pub(crate) fn trailer_fields(collected: &Collect) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let Collect::Complete(Some(trailers)) = collected else {
+        panic!("the body is not complete with trailers: {collected:?}");
+    };
+    trailers
+        .fields()
+        .map(|field| (field.name().to_vec(), field.value().to_vec()))
+        .collect()
 }
 
 /// Runs `test` on a current-thread runtime and on a multi-thread runtime, each with I/O and time.

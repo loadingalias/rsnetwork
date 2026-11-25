@@ -258,6 +258,31 @@ impl Http1 {
         self.pump(now).map(drop)
     }
 
+    /// Ends the chunked request body with `trailers`. Gives `false` while the output queue is
+    /// full, or while the transport holds the region of the request head: send the output, and
+    /// call again. Refuses with [`Kind::Misuse`] when the request has a length, because only
+    /// chunks carry trailers, and with [`Kind::Overload`] when the trailer section is larger than
+    /// the head region.
+    pub fn finish_with_trailers(&mut self, trailers: &[Field<'_>], now: Instant) -> Result<bool, Error> {
+        self.live(now)?;
+        self.expire(now)?;
+        if self.link.engine().1.free() == 0 {
+            // Over TLS, only a drive seals the plaintext into records and frees its queue.
+            self.pump(now)?;
+            if self.link.engine().1.free() == 0 {
+                return Ok(false);
+            }
+        }
+        let Ok(region) = self.heads.acquire() else {
+            return Ok(false);
+        };
+        let (engine, outbound) = self.link.engine();
+        // The queue has a place, so a refusal is final: the section is larger than the region.
+        engine.finish_with_trailers(outbound, trailers, region)?;
+        self.pump(now)?;
+        Ok(true)
+    }
+
     /// Runs `queue`, which queues plaintext output and changes nothing when it refuses. Over TLS,
     /// only a drive seals the plaintext into records and frees its queue. So when `queue` refuses
     /// with [`Kind::Overload`], the connection drives one time, and `queue` runs again.

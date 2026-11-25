@@ -17,8 +17,8 @@ you drive the queues yourself.
 - A host that moves bytes between the socket and the client, and reads a monotonic clock.
 - `client::Limits`: the limits of the HTTP/1.1 response head (see [HTTP/1.1](http1.md#limits)),
   the HTTP/2 connection (see [HTTP/2](http2.md#settings)), the body, the turn limits, and the size
-  of each queue. `head.head_bytes` is also the size of the region of each request head, in each
-  version.
+  of each queue. `head.head_bytes` is also the size of the region of each request head and
+  trailer section, in each version.
 - A budget for each part of the connection: see [limits](limits.md).
 - Over TLS: a `tls::ClientConfig` and `tls::Limits`, as on the [TLS page](tls.md). The server must
   select ALPN `http/1.1` or no protocol.
@@ -126,6 +126,7 @@ decoded lines of their exact size on HTTP/2.
 | --- | --- |
 | `send(&request, deadline, now)` | `true`: the request went out. `false`: the connection cannot take it yet, for example while it drains a body before it. A request with the length `Some(0)` is complete at once |
 | `write(&data, now)`, `finish(now)` | The request body, with no copy, and its end, for the length `Some(n)`, or in chunks for `None`. A full output queue makes the call drive the connection one time: over TLS, only a drive seals the plaintext that waits. When the queue is still full, the call refuses with `Kind::Overload`: send the output, and call again |
+| `finish_with_trailers(&fields, now)` | Ends a body in chunks (the length `None`) with a trailer section. `true`: the end is in the output queue. `false`: the queue is still full after one drive, or the transport still holds the region of the request head: send the output, and call again. A request with a length refuses with `Kind::Misuse`, because only chunks carry trailers |
 | `response(now)` | The response head, or `None` before it. An informational (1xx) response does not count |
 | `read_into(now, &mut region)` | Copies the next body bytes into the free capacity of the region, or gives `Read::Done(outcome)` after the last byte |
 | `next(now)` | `body::Part::Data(view)`: the next body bytes as a view of the received region, with no copy. `Part::End(outcome)` at the end |
@@ -235,6 +236,7 @@ fn both(
 | Reuse | The connection carries new requests until the server sends GOAWAY or the connection ends. Then `send` refuses with `Kind::Misuse`: make a new client |
 | Not processed | A request above the last stream of a GOAWAY, or that the server resets with `REFUSED_STREAM`, ends with `Kind::Overload`: no handler ran for it, so send it again, on a new connection after a GOAWAY |
 | Write | Each stream holds one chunk of its body at a time. `write` refuses with `Kind::Overload` while the chunk before waits for the output: send the output, and write again. `finish` never waits: the end goes after the last chunk |
+| Trailers | `finish_with_trailers(stream, &fields, now)` ends the body with a trailer section: a HEADERS frame with END_STREAM, after the last chunk. `false` while the chunk before waits for the output, or while no head region or no place in the output queue is free: send the output, and call again. The rules of the request fields apply to the trailer fields. A body shorter than the length of the request refuses with `Kind::Misuse` |
 | Idle | `drive(now)` drives the connection when no call of an exchange runs: it answers the SETTINGS and PING of the server, sends the resets of `cancel`, and reads a GOAWAY. Call it each time that `wait()` says while you have no exchange to call, because a server ends a connection whose SETTINGS get no acknowledgement |
 | Close | `close(now)` ends each exchange in flight, and sends GOAWAY, and over TLS `close_notify` |
 | Changed streams | `changed(each)` gives `each` each stream whose exchange changed since the last call: its response head or a failure arrived, a part or the end of its body, its last chunk went to the output, its deadline came, or the connection ended. A binding that shares the connection among handles wakes only their handles |
@@ -254,6 +256,8 @@ rule ends its stream with `Kind::Malformed`, and a body whose DATA does not matc
 | A request while the response before has no head yet | `Misuse` | `the response of the request before has no head yet` |
 | A read before the head, or with no body in flight | `Misuse` | `read the response head first`, or `no response body waits` |
 | A request after the connection ended | `Misuse` | `the connection ended: make a new client` |
+| Trailers on HTTP/1.1 after a request with a length | `Misuse` | `only a chunked body has trailers` |
+| A trailer section larger than `head.head_bytes`. It refuses at once, and a wait would not help | `Overload` | `the head region has too little free capacity` on HTTP/1.1, `the trailer section is larger than the head region: give a larger head_bytes` on HTTP/2 |
 | A time or a deadline on another clock | `Misuse` | `the time is not on the clock of the client`, or `the deadline is not on the clock of the client` |
 | The server selected a protocol other than HTTP/1.1 over TLS | `Unsupported` | `the server selected a protocol other than HTTP/1.1` |
 | The server switched protocols (101, or a 2xx answer to CONNECT) | `Unsupported` | `the client does not switch protocols` |

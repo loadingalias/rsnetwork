@@ -21,11 +21,12 @@ use std::time::Instant;
 
 use rsnetwork::body::{Collect, Outcome, Part, Read};
 use rsnetwork::buffer::{Backing, Buffer as _, Lease, WriteLoan};
+use rsnetwork::client::Request;
 use rsnetwork::drive::{Inbound, Kind, Outbound};
 use rsnetwork::h1::{self, Framing, ServerEvent};
 use rsnetwork::host::{Connection, Io as _};
 use rsnetwork::tls::Tls;
-use rsnetwork::value::Status;
+use rsnetwork::value::{Authority, Field, Method, Status, Target};
 use rsnetwork_tokio::client::Http1;
 use rsnetwork_tokio::{Clock, Socket};
 use support::{ALERT_RECORD, Last, PATIENCE, Proxy, Transport, get, ok, on_each_runtime};
@@ -326,5 +327,29 @@ fn a_reset_ends_a_body_that_the_close_delimits_as_reset_not_complete() {
         assert!(matches!(end, Part::End(Outcome::Reset(None))), "TLS: {end:?}");
         drop(client);
         proxy.last_records();
+    });
+}
+
+#[test]
+fn a_trailer_section_larger_than_the_head_region_refuses_at_once_and_does_not_wait() {
+    on_each_runtime(|| async {
+        // The peer accepts the connection and reads nothing: the refusal needs no byte of it.
+        let (listener, address) = support::listener().await;
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let mut client = support::client(Transport::Plain, address).await;
+        let request = Request {
+            method: Method::POST,
+            target: Target::new(b"/long").unwrap(),
+            authority: Authority::new(b"server.test").unwrap(),
+            fields: &[],
+            length: None,
+        };
+        client.send(&request, Clock.deadline(PATIENCE)).await.unwrap();
+        const VALUE: &[u8] = &[b'v'; 200];
+        let trailers: Vec<_> = (0..6).map(|_| Field::new(b"x-long", VALUE).unwrap()).collect();
+        let finish = client.finish_with_trailers(&trailers);
+        let refused = tokio::time::timeout(PATIENCE, finish).await.unwrap().unwrap_err();
+        assert_eq!(refused.kind(), Kind::Overload, "{refused:?}");
+        drop(accept.await.unwrap());
     });
 }

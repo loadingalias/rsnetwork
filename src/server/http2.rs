@@ -18,7 +18,7 @@ use crate::body::{Collect, Outcome, Part, Read, Trailers};
 use crate::drive::{Error, Kind, Outbound};
 use crate::h1;
 use crate::h2::frame::ErrorCode;
-use crate::h2::message::{self, Refusal};
+use crate::h2::message::{self, CHUNK_WAITS, Refusal};
 use crate::h2::session::{Inflow, Session, Step};
 use crate::hpack::FieldLine;
 use crate::message::{RequestHead, Stream};
@@ -777,20 +777,14 @@ impl Http {
 
     /// Waits for the `Event::Sent` of the chunk before, with one drive. Refuses with
     /// [`Kind::Overload`] while it waits.
-    fn h2_chunk_sent(&mut self, stream: Stream, now: Instant) -> Result<(usize, Out), Error> {
+    fn h2_chunk_sent(&mut self, stream: Stream, now: Instant) -> Result<Option<usize>, Error> {
         let (index, out) = self.h2_body(stream)?;
         if !out.chunk {
-            return Ok((index, out));
+            return Ok(Some(index));
         }
         self.pump(now)?;
         let (index, out) = self.h2_body(stream)?;
-        if out.chunk {
-            return Err(Error::new(
-                Kind::Overload,
-                "the chunk before waits for the output: send the output, and write again",
-            ));
-        }
-        Ok((index, out))
+        Ok((!out.chunk).then_some(index))
     }
 
     pub(super) fn h2_write(&mut self, stream: Stream, data: &Lease, now: Instant) -> Result<(), Error> {
@@ -805,7 +799,7 @@ impl Http {
         {
             return Err(misuse("the body passes the length of the response"));
         }
-        let (index, _) = self.h2_chunk_sent(stream, now)?;
+        let index = self.h2_chunk_sent(stream, now)?.ok_or(CHUNK_WAITS)?;
         let id = self.h2().exchanges[index].id;
         // A chunk with bytes waits in its stream, so a full output queue cannot refuse it, and
         // no drive moves this exchange.
@@ -867,7 +861,10 @@ impl Http {
             return Err(misuse("the body is shorter than the length of the response"));
         }
         message::sendable(trailers)?;
-        let (index, _) = self.h2_chunk_sent(stream, now)?;
+        // The trailers go after the chunk before, which can still wait for the output.
+        let Some(index) = self.h2_chunk_sent(stream, now)? else {
+            return Ok(false);
+        };
         let id = self.h2().exchanges[index].id;
         let lines = message::lines(trailers);
         let (session, _) = self.h2_parts();
