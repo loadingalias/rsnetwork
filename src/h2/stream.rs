@@ -5,10 +5,15 @@
 //!
 //! The table holds each stream that is open or half-closed. Push is off, so only a client opens
 //! streams, with odd identifiers. A stream with no entry is idle when its identifier is even or
-//! above the highest identifier that the client used, and closed otherwise. A closed stream
-//! keeps no state, and each frame on it gets the minimal processing of section 5.1: its header
-//! block decodes and is discarded, its DATA counts toward the connection window and is
-//! discarded, and other frames change nothing.
+//! above the highest identifier that the client used, and closed otherwise. The last
+//! `SETTINGS_MAX_CONCURRENT_STREAMS` closed streams keep how they closed, which decides what a
+//! later DATA or HEADERS frame of the peer on them means (section 5.1): after a reset of the
+//! endpoint the frame is ignored, after a reset of the peer it is a stream error `STREAM_CLOSED`,
+//! and after the end of both sides it is a connection error `STREAM_CLOSED`. A header block on a
+//! closed stream that the record does not hold is a connection error `PROTOCOL_ERROR` (section
+//! 5.1.1), and DATA on it a connection error `STREAM_CLOSED`. An ignored header block decodes and
+//! is discarded, and ignored DATA counts toward the connection window. WINDOW_UPDATE and
+//! RST_STREAM on a closed stream change nothing (sections 5.1 and 6.9).
 //!
 //! A stream that a reset closed keeps only its identifier, which holds its slot: the open and the
 //! held streams together stay within the endpoint's `SETTINGS_MAX_CONCURRENT_STREAMS`. The slot is
@@ -43,6 +48,17 @@ const MAX: i64 = MAX_STREAM as i64;
 /// The most DATA bytes of one visit of the send scheduler: one frame of 16,384 bytes, the
 /// smallest `SETTINGS_MAX_FRAME_SIZE`, so each peer takes it. It is the DATA size of nghttp2.
 const QUANTUM: i64 = MIN_FRAME_SIZE as i64;
+
+/// How a stream closed (RFC 9113, section 5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Closed {
+    /// The endpoint reset it, so the frames that the peer sent before it read the reset come.
+    Ours,
+    /// The peer reset it.
+    Peer,
+    /// Both sides sent END_STREAM.
+    Ended,
+}
 
 /// The part of a message that one side of a stream sends next (RFC 9113, section 8.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +190,8 @@ pub(super) enum Section {
     Trailers,
     /// It is discarded: its stream is closed, or the endpoint ignores it after its GOAWAY.
     Discard,
-    /// The engine refuses the new stream with this code before it goes up.
+    /// The engine resets the stream with this code, with no event: a new stream before it goes
+    /// up, or a closed stream that has no exchange.
     Refuse(ErrorCode),
     /// The engine resets the stream with this code, a stream error (section 5.4.2).
     Reset(ErrorCode),
@@ -189,6 +206,9 @@ pub(super) enum Flow {
     Discard,
     /// It is discarded, and the engine resets the stream with this code.
     Reset(ErrorCode),
+    /// It is discarded, and the engine resets its closed stream with this code, with no event:
+    /// the stream has no exchange.
+    Refuse(ErrorCode),
 }
 
 /// The streams of one connection, and its flow-control windows.
@@ -199,7 +219,9 @@ pub(super) struct Streams {
     /// The streams that a reset ended, whose handlers did not end. Each keeps its slot until the
     /// application closes it, so a peer that resets streams starts no more handlers than the
     /// limit (CVE-2023-44487), also when it makes the endpoint reset them (CVE-2025-8671).
-    held: Vec<u32>,
+    held: Vec<(u32, Closed)>,
+    /// The last closed streams that no longer hold a slot, oldest first: at most `limit`.
+    closed: VecDeque<(u32, Closed)>,
     /// The streams whose chunk can go out, in the order of their next visit.
     ready: VecDeque<u32>,
     /// The streams whose chunk went out, in order, for their `Event::Sent`.
@@ -239,15 +261,23 @@ impl Streams {
         let limit = usize::try_from(local.max_concurrent_streams).unwrap_or(usize::MAX);
         let too_large = Error::new(Kind::Overload, "the stream table is too large");
         let bytes = Layout::array::<Stream>(limit)
-            .and_then(|table| Ok(table.extend(Layout::array::<u32>(limit)?.repeat(3)?.0)?.0.size()))
+            .and_then(|table| {
+                let rings = table.extend(Layout::array::<u32>(limit)?.repeat(2)?.0)?.0;
+                Ok(rings
+                    .extend(Layout::array::<(u32, Closed)>(limit)?.repeat(2)?.0)?
+                    .0
+                    .size())
+            })
             .map_err(|_| too_large)?;
         let charge = budget
             .reserve(u64::try_from(bytes).map_err(|_| too_large)?)
             .map_err(|_| Error::new(Kind::Overload, "the budget refused the stream table"))?;
         let (mut table, mut held, mut ready, mut sent) = (Vec::new(), Vec::new(), VecDeque::new(), VecDeque::new());
+        let mut closed = VecDeque::new();
         table
             .try_reserve_exact(limit)
             .and_then(|()| held.try_reserve_exact(limit))
+            .and_then(|()| closed.try_reserve_exact(limit))
             .and_then(|()| ready.try_reserve_exact(limit))
             .and_then(|()| sent.try_reserve_exact(limit))
             .map_err(|_| Error::new(Kind::Overload, "the memory for the stream table is not available"))?;
@@ -255,6 +285,7 @@ impl Streams {
             role,
             table,
             held,
+            closed,
             ready,
             sent,
             limit,
@@ -308,9 +339,10 @@ impl Streams {
         let stream = &self.table[index];
         if stream.sending == Part::Done && stream.receiving == Part::Done {
             if self.hold_done {
-                self.hold(index);
+                self.hold(index, Closed::Ended);
             } else {
-                self.remove(index);
+                let stream = self.remove(index);
+                self.record(stream.id, Closed::Ended);
             }
         }
     }
@@ -322,27 +354,50 @@ impl Streams {
 
     /// Whether stream `id` holds a slot until the application closes it.
     pub(super) fn is_held(&self, id: u32) -> bool {
-        self.held.contains(&id)
+        self.held.iter().any(|&(held, _)| held == id)
     }
 
     /// Ends the stream at `index` with a reset of the peer or of the endpoint. The stream is
     /// closed, and its slot stays held until the application closes it.
-    fn hold(&mut self, index: usize) {
+    fn hold(&mut self, index: usize, closed: Closed) {
         let stream = self.remove(index);
         assert!(
             self.table.len() + self.held.len() < self.limit,
             "the open and the held streams together fit in the limit"
         );
-        self.held.push(stream.id);
+        self.held.push((stream.id, closed));
+    }
+
+    /// Records how stream `id` closed, in place of the oldest record when the record is full.
+    fn record(&mut self, id: u32, closed: Closed) {
+        if self.closed.len() == self.limit {
+            self.closed.pop_front();
+        }
+        self.closed.push_back((id, closed));
+    }
+
+    /// How stream `id`, with no entry and not idle, closed, from its slot or from the record.
+    /// After a GOAWAY of the endpoint, a stream above its last stream is ignored as a reset of
+    /// the endpoint is (section 6.8).
+    fn closed(&self, id: u32) -> Option<Closed> {
+        if matches!(self.drain, Drain::Sent(last) if id > last) {
+            return Some(Closed::Ours);
+        }
+        self.held
+            .iter()
+            .chain(&self.closed)
+            .find(|&&(closed, _)| closed == id)
+            .map(|&(_, closed)| closed)
     }
 
     /// Frees the slot of stream `id`, which a reset ended, when its handler ended.
     pub(super) fn free(&mut self, id: u32) -> Result<(), Error> {
-        let index = self.held.iter().position(|&held| held == id).ok_or(Error::new(
+        let index = self.held.iter().position(|&(held, _)| held == id).ok_or(Error::new(
             Kind::Misuse,
             "the stream holds no slot: no reset ended it, or it was closed",
         ))?;
-        self.held.swap_remove(index);
+        let (id, closed) = self.held.swap_remove(index);
+        self.record(id, closed);
         Ok(())
     }
 
@@ -378,7 +433,7 @@ impl Streams {
                 stream.receiving = part;
                 self.close_done(index);
             }
-            None => self.hold(index),
+            None => self.hold(index, Closed::Ours),
         }
         Ok(section)
     }
@@ -399,15 +454,25 @@ impl Streams {
     /// Acts on a header block on a stream with no entry: a new stream of the client on a server,
     /// a closed stream, or an idle stream that the peer cannot open.
     fn open_remote(&mut self, id: u32, end_stream: bool, acknowledged: bool) -> Result<Section, Fault> {
-        if self.role == Role::Client || !self.idle(id) || id.is_multiple_of(2) {
-            return if self.idle(id) {
-                Err(Fault::peer(
+        if !self.idle(id) {
+            return match self.closed(id) {
+                Some(Closed::Ours) => Ok(Section::Discard),
+                Some(Closed::Peer) => Ok(Section::Refuse(ErrorCode::STREAM_CLOSED)),
+                Some(Closed::Ended) => Err(Fault::peer(
+                    ErrorCode::STREAM_CLOSED,
+                    "a header block came on a stream that both sides ended",
+                )),
+                None => Err(Fault::peer(
                     ErrorCode::PROTOCOL_ERROR,
-                    "a header block came on an idle stream that the peer cannot open",
-                ))
-            } else {
-                Ok(Section::Discard)
+                    "a header block came on a closed stream below the last stream of the peer",
+                )),
             };
+        }
+        if self.role == Role::Client || id.is_multiple_of(2) {
+            return Err(Fault::peer(
+                ErrorCode::PROTOCOL_ERROR,
+                "a header block came on an idle stream that the peer cannot open",
+            ));
         }
         // Section 5.1.1: each client stream below it that is still idle is now closed.
         self.highest = id;
@@ -419,6 +484,7 @@ impl Streams {
         // Section 5.1.2: a peer that knows the limit gets PROTOCOL_ERROR, and a peer that cannot
         // know it yet gets REFUSED_STREAM, which permits a retry. The rule of nghttp2 and Go.
         if self.table.len() >= self.limit {
+            self.record(id, Closed::Ours);
             return Ok(Section::Refuse(if acknowledged {
                 ErrorCode::PROTOCOL_ERROR
             } else {
@@ -460,7 +526,13 @@ impl Streams {
         }
         let mut grant = None;
         let verdict = match self.find(id) {
-            None => Flow::Discard,
+            None => match self.closed(id) {
+                Some(Closed::Ours) => Flow::Discard,
+                Some(Closed::Peer) => Flow::Refuse(ErrorCode::STREAM_CLOSED),
+                Some(Closed::Ended) | None => {
+                    return Err(Fault::peer(ErrorCode::STREAM_CLOSED, "DATA came on a closed stream"));
+                }
+            },
             Some(index) => {
                 let stream = &mut self.table[index];
                 let code = match stream.receiving {
@@ -473,7 +545,7 @@ impl Streams {
                 };
                 match code {
                     Some(code) => {
-                        self.hold(index);
+                        self.hold(index, Closed::Ours);
                         Flow::Reset(code)
                     }
                     None => {
@@ -525,7 +597,7 @@ impl Streams {
                 "RST_STREAM came on an idle stream",
             ));
         }
-        Ok(self.find(id).map(|index| self.hold(index)).is_some())
+        Ok(self.find(id).map(|index| self.hold(index, Closed::Peer)).is_some())
     }
 
     /// Acts on a WINDOW_UPDATE of `increment` on stream `id`, or on the connection for 0
@@ -555,7 +627,7 @@ impl Streams {
         };
         let stream = &mut self.table[index];
         if stream.window + increment > MAX {
-            self.hold(index);
+            self.hold(index, Closed::Ours);
             return Ok(Some(ErrorCode::FLOW_CONTROL_ERROR));
         }
         stream.window += increment;
@@ -572,7 +644,7 @@ impl Streams {
                 "WINDOW_UPDATE came on an idle stream",
             ));
         }
-        Ok(self.find(id).map(|index| self.hold(index)).is_some())
+        Ok(self.find(id).map(|index| self.hold(index, Closed::Ours)).is_some())
     }
 
     /// Applies the peer's `SETTINGS_INITIAL_WINDOW_SIZE` of `initial` at the end of a SETTINGS
@@ -866,9 +938,10 @@ impl Streams {
     pub(super) fn close(&mut self, id: u32) {
         if let Some(index) = self.find(id) {
             if self.hold_done {
-                self.hold(index);
+                self.hold(index, Closed::Ours);
             } else {
-                self.remove(index);
+                let stream = self.remove(index);
+                self.record(stream.id, Closed::Ours);
             }
         }
     }

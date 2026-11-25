@@ -1081,22 +1081,20 @@ fn priority(stream: u32) -> Vec<u8> {
 
 /// Each transition of the stream states of RFC 9113, sections 5.1 and 5.1.1, that frames of the
 /// peer cause, on a server and on a client. Each case gives the events, the output, and the end
-/// that the rule of its name requires. On a closed stream, each frame gets the minimal
-/// processing of section 5.1, which the lead decided for each closed stream (the rule of
-/// nghttp2): no error.
+/// that the rule of its name requires.
 #[test]
 fn each_stream_state_transition_gives_the_rfc_result() {
-    let protocol = || Err(ErrorCode::PROTOCOL_ERROR);
+    let protocol = || Err((0, ErrorCode::PROTOCOL_ERROR));
     let closed = ErrorCode::STREAM_CLOSED;
     let headers = |stream: u32, end_stream: bool| Seen::Headers(stream, end_stream, lines(&C31_LINES));
     // Each case: the rule, the role, the input, the events, and the RST_STREAM codes of the
-    // output, or the code of the GOAWAY that ends the connection.
+    // output, or the last stream and the code of the GOAWAY that ends the connection.
     type Case = (
         &'static str,
         Role,
         Vec<u8>,
         Vec<Seen>,
-        Result<Vec<(u32, ErrorCode)>, ErrorCode>,
+        Result<Vec<(u32, ErrorCode)>, (u32, ErrorCode)>,
     );
     let cases: Vec<Case> = vec![
         ("5.1 idle: DATA", Role::Server, data(1, false, b"x"), vec![], protocol()),
@@ -1154,7 +1152,7 @@ fn each_stream_state_transition_gives_the_rfc_result() {
             Ok(vec![]),
         ),
         (
-            "5.1 open to closed at RST_STREAM, and later frames on the closed stream change nothing",
+            "5.1 open to closed at RST_STREAM: later DATA is a STREAM_CLOSED stream error, and WINDOW_UPDATE, RST_STREAM, and PRIORITY change nothing",
             Role::Server,
             [
                 request(1, false),
@@ -1166,26 +1164,18 @@ fn each_stream_state_transition_gives_the_rfc_result() {
             ]
             .concat(),
             vec![headers(1, false), Seen::Reset(1, ErrorCode::CANCEL)],
-            Ok(vec![]),
+            Ok(vec![(1, closed)]),
         ),
         (
-            "5.1.1 a skipped stream is closed: its block decodes and is discarded",
+            "5.1.1 a stream below the last stream of the client is an unexpected identifier: PROTOCOL_ERROR",
             Role::Server,
-            [
-                frame(0x1, 0x5, 5, STATIC),
-                frame(0x1, 0x5, 3, INSERT),
-                frame(0x1, 0x5, 7, NEWEST),
-            ]
-            .concat(),
-            vec![
-                Seen::Headers(
-                    5,
-                    true,
-                    lines(&[(":method", "GET"), (":scheme", "http"), (":path", "/")]),
-                ),
-                Seen::Headers(7, true, lines(&[("x-a", "v")])),
-            ],
-            Ok(vec![]),
+            [frame(0x1, 0x5, 5, STATIC), frame(0x1, 0x5, 3, INSERT)].concat(),
+            vec![Seen::Headers(
+                5,
+                true,
+                lines(&[(":method", "GET"), (":scheme", "http"), (":path", "/")]),
+            )],
+            Err((5, ErrorCode::PROTOCOL_ERROR)),
         ),
         (
             "5.1 a client: HEADERS on an idle stream",
@@ -1217,17 +1207,17 @@ fn each_stream_state_transition_gives_the_rfc_result() {
                 let expected: Vec<u8> = resets.iter().flat_map(|&(stream, code)| rst(stream, code)).collect();
                 assert_eq!(sent, expected, "{rule}");
             }
-            Err(code) => {
+            Err((last, code)) => {
                 ended(progress, Kind::Malformed);
-                assert_eq!(sent, goaway(0, code), "{rule}");
+                assert_eq!(sent, goaway(last, code), "{rule}");
             }
         }
     }
 }
 
 /// The stream of a client goes from idle to half-closed (local) when its request has END_STREAM,
-/// and to closed when the response ends (RFC 9113, sections 5.1 and 8.8.1). A frame on the closed
-/// stream then changes nothing.
+/// and to closed when the response ends (RFC 9113, sections 5.1 and 8.8.1). DATA on the closed
+/// stream is then a connection error `STREAM_CLOSED`: a frame after END_STREAM (section 5.1).
 #[test]
 fn a_client_stream_closes_after_the_request_and_the_response_end() {
     let mut client = Peer::client();
@@ -1252,8 +1242,8 @@ fn a_client_stream_closes_after_the_request_and_the_response_end() {
     );
     client.sent();
     client.receive(&data(stream, false, b"late"));
-    assert_eq!(client.run(), (vec![], WAIT));
-    assert_eq!(client.sent(), b"");
+    ended(client.run().1, Kind::Malformed);
+    assert_eq!(client.sent(), goaway(0, ErrorCode::STREAM_CLOSED));
 }
 
 /// A stream that the connection refuses still decodes its header block, so the HPACK state stays

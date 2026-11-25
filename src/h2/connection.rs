@@ -1316,13 +1316,17 @@ impl Connection {
                 }
                 match flow {
                     Flow::Deliver => None,
-                    Flow::Discard | Flow::Reset(_) => {
+                    Flow::Discard | Flow::Reset(_) | Flow::Refuse(_) => {
                         // The rest of the frame, with its padding, is discarded with no copy.
                         let rest = variable + u32::from(fixed.padding());
                         self.read = Read::Body(*head, Fixed::Unknown, rest);
                         match flow {
                             Flow::Reset(code) => Some(self.reset_by_error(head.stream, code)),
-                            _ => None,
+                            Flow::Refuse(code) => {
+                                self.owed = Some(Owed::Reset(head.stream, code));
+                                None
+                            }
+                            Flow::Deliver | Flow::Discard => None,
                         }
                     }
                 }

@@ -214,29 +214,41 @@ for the join until the decode. When the budget cannot pay, the turn is
 Push is off, so only a client opens streams. A client stream has an odd identifier, larger than
 each stream that the client opened before (RFC 9113, section 5.1.1). A stream is idle until its
 first header section, open after it, half-closed when one side sent END_STREAM, and closed when
-both sides did or a side reset it (section 5.1). The connection keeps state only for open and
-half-closed streams.
+both sides did or a side reset it (section 5.1). The connection keeps the state of open and
+half-closed streams, and how each of the last `max_concurrent_streams` closed streams closed.
 
 | Frame of the peer | Idle stream | Open or half-closed (local) | Half-closed (remote) | Closed |
 | --- | --- | --- | --- | --- |
-| HEADERS | A server opens the stream. On a client, or on an even stream: connection error `PROTOCOL_ERROR` | A header section, or the trailer section | Stream error `STREAM_CLOSED` | Decoded and discarded |
-| DATA | Connection error `PROTOCOL_ERROR` | Goes up | Stream error `STREAM_CLOSED` | Counted toward the connection window, and discarded |
+| HEADERS | A server opens the stream. On a client, or on an even stream: connection error `PROTOCOL_ERROR` | A header section, or the trailer section | Stream error `STREAM_CLOSED` | See [closed streams](#closed-streams) |
+| DATA | Connection error `PROTOCOL_ERROR` | Goes up | Stream error `STREAM_CLOSED` | See [closed streams](#closed-streams) |
 | RST_STREAM | Connection error `PROTOCOL_ERROR` | The stream closes: `Reset` | The stream closes: `Reset` | Ignored |
 | WINDOW_UPDATE | Connection error `PROTOCOL_ERROR` | Applied, or ignored after your END_STREAM | Applied | Ignored |
 | PRIORITY | Ignored, and the stream stays idle | Ignored | Ignored | Ignored |
 
-When a client opens a stream, each idle stream below it closes. A HEADERS frame on such a skipped
-stream is a frame on a closed stream: it decodes and is discarded. The connection gives each frame
-on a closed stream this minimal processing (RFC 9113, section 5.1), the rule of nghttp2. Thus the
-frames that the peer sent before it read your RST_STREAM are not errors, and the connection keeps
-no state for a closed stream. The cost: a faulty client that sends a request on a lower stream
-than its last gets no response and no error, where section 5.1.1 permits `PROTOCOL_ERROR`.
+When a client opens a stream, each idle stream below it closes.
 
 A server takes at most `max_concurrent_streams` open streams of the peer. It refuses each new
 stream past the limit with RST_STREAM and no event. The code is `REFUSED_STREAM` before the peer
 acknowledges your settings, so the client can retry the request. After the acknowledgement, the
 peer knows the limit, and the code is `PROTOCOL_ERROR` (RFC 9113, section 5.1.2). This is the rule
 of nghttp2 and Go. The block of a refused stream still decodes.
+
+### Closed streams
+
+A DATA or HEADERS frame on a closed stream gets the result of how the stream closed (RFC 9113,
+section 5.1). A header block always decodes first, so the HPACK state stays in step.
+
+| The stream closed by | DATA or HEADERS of the peer after it |
+| --- | --- |
+| A reset of the connection, a refused stream, or a stream above the last stream of your GOAWAY | Ignored: the peer sent it before it read the reset or the GOAWAY. DATA counts toward the connection window |
+| A reset of the peer | Stream error `STREAM_CLOSED`: a RST_STREAM, and no event, because the stream has no exchange |
+| The end of both sides | Connection error `STREAM_CLOSED` |
+| None that the connection knows: a skipped stream below the last stream of the client, or a stream past the record | HEADERS: connection error `PROTOCOL_ERROR`, an unexpected stream identifier (section 5.1.1). DATA: connection error `STREAM_CLOSED` |
+
+The connection keeps how each of the last `max_concurrent_streams` closed streams closed, charged
+to the budget with the stream table. Section 5.1 permits an endpoint to limit the time in which
+it ignores the late frames of the peer. WINDOW_UPDATE and RST_STREAM on a closed stream change
+nothing: section 6.9 says that a WINDOW_UPDATE after END_STREAM is not an error.
 
 ### Handler slots
 
