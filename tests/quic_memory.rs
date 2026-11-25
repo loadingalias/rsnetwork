@@ -380,10 +380,10 @@ fn the_heap_of_each_end_of_a_quic_connection_stays_within_its_charges() {
             keys: (3, 3),
             ..Profile::new("a key update of the server")
         },
-        // About 12 KB of ALPN names, which the server keeps decoded while it chooses its
-        // configuration.
+        // About 40 KB of ALPN names: the client encodes them in a ClientHello whose vector grows,
+        // and the server keeps them decoded while it chooses its configuration.
         Profile {
-            names: 60,
+            names: 200,
             ..Profile::new("a large ClientHello")
         },
         // About 170 datagrams, which wait in the pages of the server out of order.

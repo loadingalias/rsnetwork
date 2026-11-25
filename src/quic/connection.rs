@@ -867,13 +867,16 @@ fn random_cid(random: &dyn rustls::crypto::SecureRandom, len: usize) -> Result<C
     ConnectionId::new(bytes).ok_or(Error::new(Kind::Misuse, "a QUIC connection ID has more than 20 bytes"))
 }
 
-/// The encoding of `parameters` in a vector of its exact size, charged to `credit`.
-/// The output charge that one rustls call reserves: the bytes that it can write, and the list
-/// entries of its messages.
+/// The output charge that one rustls call reserves: the bytes that it can write, with the growth
+/// of their vectors, and the list entries of its messages. rustls encodes each QUIC message into a
+/// vector that doubles its capacity as it grows, and the old and the new buffer are both alive
+/// while it grows. Thus a message of `n` bytes takes less than `3 * n` during the call, and its
+/// vector keeps less than `2 * n` after it, which [`Connection::settle_output`] charges.
 fn output(own: &Own) -> u64 {
-    own.flight() as u64 + EVENTS as u64 * crypto::ENTRY_BYTES
+    3 * own.flight() as u64 + EVENTS as u64 * crypto::ENTRY_BYTES
 }
 
+/// The encoding of `parameters` in a vector of its exact size, charged to `credit`.
 fn encode(parameters: &Parameters, credit: &mut Credit) -> Result<Vec<u8>, Error> {
     let len = parameters.encoded_len().ok_or(Error::new(
         Kind::Misuse,
