@@ -225,6 +225,8 @@ enum Alarm {
 struct Space {
     /// The keys of an Initial or Handshake space. The data space keeps its keys in [`OneRtt`].
     keys: Option<rustls::quic::Keys>,
+    /// The packets that `keys` sealed.
+    sealed: u64,
     receive: crypto::Receive,
     send: crypto::Send,
     /// The end of the CRYPTO data that arrived at this level.
@@ -245,6 +247,7 @@ impl Space {
     fn new(budget: &Budget, window: u64) -> Self {
         Self {
             keys: None,
+            sealed: 0,
             receive: crypto::Receive::new(budget),
             send: crypto::Send::new(budget),
             received: 0,
@@ -262,6 +265,7 @@ impl Space {
     fn install(&mut self, keys: impl FnOnce() -> rustls::quic::Keys) -> Result<(), Error> {
         self.credit.charge(KEYS_BYTES).map_err(|_| KEYS_REFUSED)?;
         self.keys = Some(keys());
+        self.sealed = 0;
         Ok(())
     }
 
@@ -380,8 +384,8 @@ struct OneRtt {
     sealed: u64,
     /// The number of the first packet that this end sealed in this phase.
     first_sent: Option<u64>,
-    /// The number of the first packet of the peer that opened in this phase.
-    first_received: Option<u64>,
+    /// The lowest and the highest number of the packets of the peer that opened in this phase.
+    received: Option<(u64, u64)>,
     /// The peer acknowledged a packet of this phase, so a later update is allowed.
     acknowledged: bool,
     /// A key update happened: each later one needs an acknowledgement of the current phase.
@@ -416,7 +420,7 @@ impl OneRtt {
             phase: false,
             sealed: 0,
             first_sent: None,
-            first_received: None,
+            received: None,
             acknowledged: false,
             updated: false,
             limit,
@@ -434,7 +438,7 @@ impl OneRtt {
         self.phase = !self.phase;
         self.sealed = 0;
         self.first_sent = None;
-        self.first_received = None;
+        self.received = None;
         self.acknowledged = false;
         self.updated = true;
     }
@@ -690,6 +694,10 @@ pub struct Connection {
     wait: Option<u64>,
     /// Work waits for the next call: a limit of a turn stopped it, or the call gave an event.
     more: bool,
+    /// The CRYPTO data on which the last rustls call made no progress: its level, its bytes in
+    /// order, and whether the call before it made none either. It stays across turns, so rustls
+    /// runs again only for more data, another level, or another state.
+    stall: Option<(Level, usize, bool)>,
     streams: Streams,
     /// The opened packet whose frames the engine reads, after a frame that gave an event.
     reading: Option<Reading>,
@@ -1076,6 +1084,7 @@ impl Connection {
             failures: 0,
             wait: None,
             more: false,
+            stall: None,
             streams: Streams::new(
                 side,
                 stream::Config {
@@ -2129,8 +2138,8 @@ impl Connection {
                 let space = &mut self.spaces[0];
                 space.history.discard(&mut self.paths);
                 space.retry.clear();
-                space.keys = None;
                 space.keys = Some(packet::initial_keys(scid, Side::Client));
+                space.sealed = 0;
                 space.send.rewind();
                 space.probe = false;
                 // The connection starts again, with the connection ID of the Retry packet.
@@ -2191,14 +2200,18 @@ impl Connection {
                     Err(_) => return Ok(()),
                 };
                 // A packet of the other phase is of the previous phase while the old key stays and
-                // no packet of this phase came before it, and else of the next phase (RFC 9001,
-                // section 6.3).
+                // its number is below each packet of this phase, and else of the next phase (RFC
+                // 9001, section 6.3). The next phase starts only above each packet of this phase.
                 let number = unmasked.number();
-                let old = keys.first_received.is_none_or(|first| number < first);
+                let (old, forward) = keys
+                    .received
+                    .map_or((true, true), |(low, high)| (number < low, number > high));
                 match (unmasked.key_phase() == keys.phase, &keys.previous) {
-                    (true, _) => unmasked.open(&*keys.remote.packet).map(|packet| (packet, false)),
-                    (false, Some((previous, _))) if old => unmasked.open(&**previous).map(|packet| (packet, false)),
-                    (false, _) => unmasked.open(&*keys.next.remote).map(|packet| (packet, true)),
+                    (true, _) => unmasked.open(&*keys.remote.packet).map(|packet| (packet, false, true)),
+                    (false, Some((previous, _))) if old => {
+                        unmasked.open(&**previous).map(|packet| (packet, false, true))
+                    }
+                    (false, _) => unmasked.open(&*keys.next.remote).map(|packet| (packet, true, forward)),
                 }
             }
             _ => {
@@ -2208,15 +2221,26 @@ impl Connection {
                 packet
                     .unmask(&*keys.remote.header, expected)
                     .and_then(|unmasked| unmasked.open(&*keys.remote.packet))
-                    .map(|packet| (packet, false))
+                    .map(|packet| (packet, false, true))
             }
         };
-        let (packet, updated) = match opened {
+        let (packet, updated, forward) = match opened {
             Ok(opened) => opened,
-            Err(OpenError::Authentication) => return self.authentication_failed(),
+            Err(OpenError::Authentication) => return self.authentication_failed(level),
             Err(OpenError::Short) => return Ok(()),
             Err(OpenError::Violation) => return Err(Failure::transport(ErrorCode::PROTOCOL_VIOLATION, 0, VIOLATION)),
         };
+        // The newer keys protect a packet below one of the older keys (RFC 9001, section 6.4).
+        if !forward {
+            return Err(Failure::transport(
+                ErrorCode::KEY_UPDATE_ERROR,
+                0,
+                Error::new(
+                    Kind::Malformed,
+                    "the QUIC peer protected a lower packet number with newer keys",
+                ),
+            ));
+        }
         let number = packet.number();
         if self.spaces[level as usize].ranges.seen(number) {
             return Ok(());
@@ -2238,7 +2262,10 @@ impl Connection {
             && let Some(keys) = &mut self.one_rtt
             && keys.phase == packet.key_phase()
         {
-            keys.first_received = Some(keys.first_received.map_or(number, |first| first.min(number)));
+            keys.received = Some(
+                keys.received
+                    .map_or((number, number), |(low, high)| (low.min(number), high.max(number))),
+            );
         }
         if !server && level == Level::Initial && self.initial_peer.is_none() {
             self.paths.active.remote_cid = scid;
@@ -2270,14 +2297,16 @@ impl Connection {
         Ok(())
     }
 
-    /// Counts a packet that failed authentication, and ends the connection at the integrity
-    /// limit of its suite (RFC 9001, section 6.6).
-    fn authentication_failed(&mut self) -> Result<(), Failure> {
+    /// Counts a packet of `level` that failed authentication. The packets of each level that
+    /// failed count together, and the connection ends past the integrity limit of the suite of
+    /// `level` (RFC 9001, section 6.6).
+    fn authentication_failed(&mut self, level: Level) -> Result<(), Failure> {
         self.failures = self.failures.saturating_add(1);
-        let limit = self
-            .one_rtt
-            .as_ref()
-            .map_or(u64::MAX, |keys| keys.remote.packet.integrity_limit());
+        let limit = match level {
+            Level::Data => self.one_rtt.as_ref().map(|keys| &keys.remote),
+            _ => self.spaces[level as usize].keys.as_ref().map(|keys| &keys.remote),
+        }
+        .map_or(u64::MAX, |remote| remote.packet.integrity_limit());
         if self.failures > limit {
             return Err(Failure::transport(
                 ErrorCode::AEAD_LIMIT_REACHED,
@@ -2586,7 +2615,6 @@ impl Connection {
     /// of the turn stops it, or the budget cannot pay for the next call.
     fn advance(&mut self, work: &mut Work) -> Result<(), Failure> {
         self.wait = None;
-        let mut stalled = false;
         loop {
             if matches!(self.tls, Tls::Failed) || self.ending.is_some() || self.outcome.is_some() {
                 return Ok(());
@@ -2598,7 +2626,7 @@ impl Connection {
                 Tls::Client(ClientHandshake::VerifyServerIdentity(_))
                     | Tls::Server(ServerHandshake::Accepted(_) | ServerHandshake::VerifyClientIdentity(_))
             );
-            if !ready && visible == 0 {
+            if !ready && (visible == 0 || self.stall == Some((level, visible, true))) {
                 return Ok(());
             }
             if work.reached(&self.limits.turn) {
@@ -2643,14 +2671,19 @@ impl Connection {
             self.keep_parameters()?;
             self.completed()?;
             // rustls reports what a call consumed by the next call at the latest, so a stall is two
-            // calls in a row that consume nothing, give no event, and keep the level: then the
-            // engine waits for the rest of a message.
+            // calls in a row on the same data that consume nothing, give no event, and keep the
+            // level: then the engine waits for the rest of a message. A limit of the turn can come
+            // between the two calls.
             let progress =
                 ready || events > 0 || self.read != level || self.spaces[level as usize].receive.consumed() != consumed;
             if progress {
-                stalled = false;
-            } else if core::mem::replace(&mut stalled, true) {
-                return Ok(());
+                self.stall = None;
+            } else {
+                let again = self.stall.is_some_and(|(at, bytes, _)| (at, bytes) == (level, visible));
+                self.stall = Some((level, visible, again));
+                if again {
+                    return Ok(());
+                }
             }
             // A level that rustls left must hold no more data (RFC 9001, section 4.1.3).
             for lower in Level::ALL.iter().take(self.read as usize) {
@@ -3179,11 +3212,25 @@ impl Connection {
         ))
     }
 
+    /// The packets that the keys of `level` sealed, and the most that they seal: for 1-RTT keys
+    /// the limit of [`OneRtt`], and for the keys of the handshake the confidentiality limit of
+    /// their suite (RFC 9001, section 6.6).
+    fn key_use(&self, level: Level) -> Option<(u64, u64)> {
+        match level {
+            Level::Data => self.one_rtt.as_ref().map(|keys| (keys.sealed, keys.limit)),
+            _ => {
+                let space = &self.spaces[level as usize];
+                let keys = space.keys.as_ref()?;
+                Some((space.sealed, keys.local.packet.confidentiality_limit()))
+            }
+        }
+    }
+
     /// Seals the packet of `builder`, which has the number `number` of `level`. Gives its bytes.
-    /// Refuses a 1-RTT packet past the limit of its key: this end then sends no packet more (RFC
-    /// 9001, section 6.6).
+    /// Refuses a packet past the limit of its key: this end then sends no packet more with it
+    /// (RFC 9001, section 6.6).
     fn seal(&mut self, level: Level, builder: Builder<'_>, number: u64) -> Result<usize, Failure> {
-        if level == Level::Data && self.one_rtt.as_ref().is_some_and(|keys| keys.sealed >= keys.limit) {
+        if self.key_use(level).is_some_and(|(sealed, limit)| sealed >= limit) {
             return Err(Failure::transport(
                 ErrorCode::AEAD_LIMIT_REACHED,
                 0,
@@ -3204,10 +3251,11 @@ impl Connection {
                 "the packet key refused to seal a QUIC packet",
             ))
         })?;
-        self.spaces[level as usize].next = number + 1;
-        if level == Level::Data
-            && let Some(keys) = &mut self.one_rtt
-        {
+        let space = &mut self.spaces[level as usize];
+        space.next = number + 1;
+        if level != Level::Data {
+            space.sealed += 1;
+        } else if let Some(keys) = &mut self.one_rtt {
             keys.sealed += 1;
             keys.first_sent.get_or_insert(number);
         }
@@ -3229,7 +3277,7 @@ impl Connection {
         SendAt { now, mark, .. }: SendAt,
     ) -> Result<Option<usize>, Failure> {
         let (number, number_len) = self.number(Level::Data)?;
-        self.key_limit(now)?;
+        self.key_limit(Level::Data, now)?;
         let header = Outgoing::OneRtt {
             dcid: &dcid,
             spin: false,
@@ -3354,8 +3402,8 @@ impl Connection {
         let (number, number_len) = self.number(level)?;
         let space = &self.spaces[level as usize];
         let admitted = space.probe || (admitted && self.paths.active.room() >= out.len() as u64);
-        if level == Level::Data && close.is_none() {
-            self.key_limit(now)?;
+        if close.is_none() {
+            self.key_limit(level, now)?;
         }
         let (dcid, scid) = (self.paths.active.remote_cid, self.initial_local);
         let header = match level {
@@ -3500,28 +3548,34 @@ impl Connection {
 
     /// Updates the 1-RTT keys of this end before the key seals the last packet of its limit
     /// (RFC 9001, sections 6 and 6.6). A key update needs a confirmed handshake. After the first
-    /// one, it also needs an acknowledgement of a packet of the current phase. Without them the
-    /// connection ends with AEAD_LIMIT_REACHED, and the last packet of the key carries that close.
-    fn key_limit(&mut self, now: Instant) -> Result<(), Failure> {
-        let Some(keys) = &self.one_rtt else {
-            return Ok(());
-        };
-        // The limit is at least 2.
-        if keys.sealed < keys.limit - 1 {
+    /// one, it also needs an acknowledgement of a packet of the current phase. Without them, and
+    /// for the keys of the handshake, which do not update, the connection ends with
+    /// AEAD_LIMIT_REACHED, and the last packet of the key carries that close.
+    fn key_limit(&mut self, level: Level, now: Instant) -> Result<(), Failure> {
+        if self
+            .key_use(level)
+            .is_none_or(|(sealed, limit)| sealed < limit.saturating_sub(1))
+        {
             return Ok(());
         }
-        if self.confirmed && (!keys.updated || keys.acknowledged) {
+        let keys = self.one_rtt.as_ref().filter(|_| level == Level::Data);
+        if let Some(keys) = keys
+            && self.confirmed
+            && (!keys.updated || keys.acknowledged)
+        {
             let until = after(now, 3 * self.pto())?;
             self.one_rtt.as_mut().expect("this space has 1-RTT keys").update(until);
             return Ok(());
         }
+        let reason = if level == Level::Data {
+            "the QUIC packet key reached its limit, and the peer did not acknowledge the last key update"
+        } else {
+            "the QUIC packet key of the handshake reached its limit"
+        };
         Err(Failure::transport(
             ErrorCode::AEAD_LIMIT_REACHED,
             0,
-            Error::new(
-                Kind::Overload,
-                "the QUIC packet key reached its limit, and the peer did not acknowledge the last key update",
-            ),
+            Error::new(Kind::Overload, reason),
         ))
     }
 }

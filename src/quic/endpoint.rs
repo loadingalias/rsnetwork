@@ -9,7 +9,8 @@ use core::net::SocketAddr;
 use core::num::NonZeroU64;
 use std::sync::Arc;
 
-pub use keys::EndpointKeys;
+use keys::Claim;
+pub use keys::{ENDPOINT_WORKERS_MAX, EndpointKeys};
 pub(super) use keys::{Proof, Token};
 use rstypes::capacity::{Budget, Permit};
 use rstypes::time::Instant;
@@ -139,6 +140,8 @@ pub struct Endpoint {
     handshakes: u16,
     resets: usize,
     _slots: Permit,
+    /// The worker number, which no other live endpoint of `keys` has.
+    _claim: Claim,
 }
 
 impl fmt::Debug for Endpoint {
@@ -152,6 +155,8 @@ impl fmt::Debug for Endpoint {
 impl Endpoint {
     /// Creates a listener. The endpoint budget pays for routing, connection objects, and temporary address proofs.
     /// Listener-issued connection IDs have 17 bytes. Share the keys between workers of this service.
+    /// Refuses with [`Kind::Misuse`] while another live endpoint of `keys` has `worker`, as
+    /// [`EndpointKeys`] says.
     pub fn new(
         config: &tls::ServerConfig,
         keys: Arc<EndpointKeys>,
@@ -166,6 +171,7 @@ impl Endpoint {
         {
             return Err(Error::new(Kind::Misuse, "invalid QUIC handshake admission limits"));
         }
+        let claim = keys.claim(worker)?;
         connection_limits.cid_bytes = keys::CID_BYTES;
         super::connection::check(&connection_limits)?;
         let stream = config.entropy.stream(b"quic-end");
@@ -196,6 +202,7 @@ impl Endpoint {
             handshakes: 0,
             resets: 0,
             _slots: storage,
+            _claim: claim,
         })
     }
 

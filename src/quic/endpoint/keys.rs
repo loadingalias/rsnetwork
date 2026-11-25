@@ -2,6 +2,7 @@
 
 use core::net::SocketAddr;
 use core::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rscrypto_rustls::quic::{
     AddressTokenKey, FirstOctet, LoadBalancerConfig, LoadBalancerKey, RotationId, StatelessResetKey,
@@ -18,9 +19,16 @@ pub(super) const CID_BYTES: usize = 17;
 const TOKEN_MAX: usize = 1 + 8 + 2 * (1 + ConnectionId::MAX) + AddressTokenKey::OVERHEAD;
 const RETRY: u8 = 1;
 const REPEAT: u8 = 2;
+/// The live endpoints of one set of keys, each with its own worker number.
+pub const ENDPOINT_WORKERS_MAX: usize = 1024;
 
 /// Keys shared by endpoints of one service. Keep them across endpoint replacement.
 /// A connection ID carries an eight-byte worker number and a unique eight-byte nonce.
+///
+/// At most one live [`Endpoint`](super::Endpoint) holds each worker number, because an endpoint
+/// sends a stateless reset for each connection ID of its worker that it does not know (RFC 9000,
+/// section 21.11). To replace an endpoint that keeps its connections while they drain, give the
+/// new one another worker number. To replace an endpoint that lost its state, drop it first.
 pub struct EndpointKeys {
     route: LoadBalancerConfig,
     reset: StatelessResetKey,
@@ -28,6 +36,25 @@ pub struct EndpointKeys {
     lookup: rscrypto::SecretBytes<32>,
     start: u64,
     issued: AtomicU64,
+    /// The worker number of each live endpoint, with room for [`ENDPOINT_WORKERS_MAX`].
+    workers: Mutex<Vec<u64>>,
+}
+
+/// The worker number of a live endpoint. It frees the number when it drops.
+pub(super) struct Claim {
+    keys: Arc<EndpointKeys>,
+    worker: u64,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut workers = self.keys.workers.lock().unwrap_or_else(PoisonError::into_inner);
+        let at = workers
+            .iter()
+            .position(|&worker| worker == self.worker)
+            .expect("a live claim holds its worker number");
+        workers.swap_remove(at);
+    }
 }
 
 impl core::fmt::Debug for EndpointKeys {
@@ -46,6 +73,10 @@ impl EndpointKeys {
             let key = LoadBalancerKey::generate(rng).map_err(|_| RANDOM)?;
             let mut start = [0; 8];
             rng.fill(&mut start).map_err(|_| RANDOM)?;
+            let mut workers = Vec::new();
+            workers
+                .try_reserve_exact(ENDPOINT_WORKERS_MAX)
+                .map_err(|_| Error::new(Kind::Overload, "the memory for the QUIC worker list is not available"))?;
             Ok(Self {
                 route: LoadBalancerConfig::new(rotation, 8, 8, FirstOctet::Random, key)
                     .expect("a worker number and nonce fill one AES block"),
@@ -54,7 +85,28 @@ impl EndpointKeys {
                 lookup: rscrypto::SecretBytes::try_fill_with(|b| rng.fill(b)).map_err(|_| RANDOM)?,
                 start: u64::from_be_bytes(start),
                 issued: AtomicU64::new(0),
+                workers: Mutex::new(workers),
             })
+        })
+    }
+
+    /// Claims `worker` for a new endpoint. Refuses while another live endpoint of these keys
+    /// holds it, or while [`ENDPOINT_WORKERS_MAX`] endpoints are live.
+    pub(super) fn claim(self: &Arc<Self>, worker: u64) -> Result<Claim, Error> {
+        let mut workers = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
+        if workers.contains(&worker) {
+            return Err(Error::new(
+                Kind::Misuse,
+                "a live QUIC endpoint of these keys has this worker number: drop it, or give another number",
+            ));
+        }
+        if workers.len() >= ENDPOINT_WORKERS_MAX {
+            return Err(Error::new(Kind::Overload, "the QUIC keys have the most live endpoints"));
+        }
+        workers.push(worker);
+        Ok(Claim {
+            keys: Arc::clone(self),
+            worker,
         })
     }
 

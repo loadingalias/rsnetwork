@@ -2,11 +2,12 @@
 //! to a new local address.
 
 use core::net::Ipv4Addr;
+use std::assert_matches;
 use std::sync::Arc;
 
 use super::{CA, CLIENT_PORT, Pair, SERVER, SERVER_PORT, at, budget, client_config, path, server_config};
 use rsnetwork::buffer::Backing;
-use rsnetwork::drive::Progress;
+use rsnetwork::drive::{Kind, Progress};
 use rsnetwork::quic::frame::Frame;
 use rsnetwork::quic::packet::{self, Builder, Datagrams, Header, Outgoing, Side};
 use rsnetwork::quic::params::{Parameters, PreferredAddress};
@@ -312,6 +313,8 @@ fn retired_connection_ids_leave_the_route_and_a_stateless_reset_drains_the_peer(
         endpoint.route(addr, &delayed, &mut reply, at(0)).unwrap(),
         Route::Reply(_)
     ));
+    // The listener loses its state, and a replacement takes its worker number.
+    drop(endpoint);
     let mut replacement = listener(&server, &keys, 2);
     client.ping();
     let packet = Pair::send(&mut client, at(0)).remove(0);
@@ -338,6 +341,29 @@ fn retired_connection_ids_leave_the_route_and_a_stateless_reset_drains_the_peer(
 }
 
 #[test]
+fn one_live_listener_holds_each_worker_and_a_listener_of_another_worker_resets_no_live_connection() {
+    let (config, server, keys) = configs();
+    let mut endpoint = listener(&server, &keys, 2);
+    let mut client = client(&config);
+    let addr = address(4301);
+    handshake(&mut endpoint, &mut client, addr);
+    // A second listener of the same worker would reset each connection of the first one.
+    let limits = EndpointLimits::default();
+    let second = Endpoint::new(&server, keys.clone(), 37, limits, Limits::DEFAULT, &budget());
+    assert_matches!(second, Err(error) if error.kind() == Kind::Misuse);
+    // A listener of another worker takes over while the first one drains: a packet of the live
+    // connection that reaches it gets no reset.
+    let mut next = Endpoint::new(&server, keys.clone(), 38, limits, Limits::DEFAULT, &budget()).unwrap();
+    client.ping();
+    let packet = Pair::send(&mut client, at(0)).remove(0);
+    let mut reply = [0; 1200];
+    assert_eq!(next.route(addr, &packet, &mut reply, at(0)).unwrap(), Route::Dropped);
+    // The first listener ends, and its worker number is free again.
+    drop(endpoint);
+    Endpoint::new(&server, keys, 37, limits, Limits::DEFAULT, &budget()).unwrap();
+}
+
+#[test]
 fn a_stateless_reset_stops_the_copies_of_the_close_of_a_closing_end() {
     let (config, server, keys) = configs();
     let mut endpoint = listener(&server, &keys, 2);
@@ -347,6 +373,14 @@ fn a_stateless_reset_stops_the_copies_of_the_close_of_a_closing_end() {
     // A datagram of the server that arrives late, and the reset of a listener that lost its state.
     client.ping();
     let ping = Pair::send(&mut client, at(0)).remove(0);
+    let late = endpoint
+        .with_connection(h, |c| {
+            Pair::give(c, ping.clone(), at(0));
+            Pair::send(c, at(0))
+        })
+        .unwrap();
+    assert!(!late.is_empty());
+    drop(endpoint);
     let mut reply = [0; 1200];
     let Route::Reply(n) = listener(&server, &keys, 2)
         .route(addr, &ping, &mut reply, at(0))
@@ -354,13 +388,6 @@ fn a_stateless_reset_stops_the_copies_of_the_close_of_a_closing_end() {
     else {
         panic!("a listener that lost state sends a reset")
     };
-    let late = endpoint
-        .with_connection(h, |c| {
-            Pair::give(c, ping, at(0));
-            Pair::send(c, at(0))
-        })
-        .unwrap();
-    assert!(!late.is_empty());
     client.close(7, at(0)).unwrap();
     assert_eq!(Pair::send(&mut client, at(0)).len(), 1);
     // The reset ends the copies of the frame: the client sends nothing more (RFC 9000, section

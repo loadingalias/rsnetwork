@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use rsnetwork::buffer::{Backing, Buffer as _};
 use rsnetwork::capacity::Budget;
-use rsnetwork::drive::{Blocked, Kind, Progress};
+use rsnetwork::drive::{Blocked, Kind, Progress, TurnLimits};
 use rsnetwork::quic::frame::{Direction, Frame};
 use rsnetwork::quic::packet::{self, Builder, Datagrams, Header, Keys, Kind as PacketKind, Outgoing, Side};
 use rsnetwork::quic::params::Parameters;
@@ -31,7 +31,7 @@ use rsnetwork::tls::{
 };
 use rustls::enums::ApplicationProtocol;
 use rustls::pki_types::ServerName;
-use rustls::quic::{ClientHandshake, KeyChange, QuicEvent, Version};
+use rustls::quic::{ClientHandshake, KeyChange, PacketKeySet, QuicEvent, Secrets, Version};
 use rustls::{RootCertStore, TlsInputBuffer as _, VecInput};
 
 const CA: &[u8] = include_bytes!("tls/ca.der");
@@ -68,6 +68,8 @@ struct Rogue {
     tls: Option<ClientHandshake>,
     events: Vec<QuicEvent>,
     keys: [Option<Keys>; 3],
+    /// The secrets of the 1-RTT phases after the first one.
+    next: Option<Secrets>,
     /// The CRYPTO bytes of the server at each level, in order, and their end.
     input: [VecInput; 3],
     received: [usize; 3],
@@ -121,6 +123,7 @@ impl Rogue {
             tls: Some(ClientHandshake::NeedsInput(needs)),
             events,
             keys: [Some(packet::initial_keys(&original, Side::Client)), None, None],
+            next: None,
             input: [VecInput::default(), VecInput::default(), VecInput::default()],
             received: [0; 3],
             output: [Vec::new(), Vec::new(), Vec::new()],
@@ -149,8 +152,9 @@ impl Rogue {
                     self.keys[1] = Some(keys);
                     (self.write, self.read) = (1, 1);
                 }
-                QuicEvent::KeyChange(KeyChange::OneRtt { keys, .. }) => {
+                QuicEvent::KeyChange(KeyChange::OneRtt { keys, next }) => {
                     self.keys[DATA] = Some(keys);
+                    self.next = Some(next);
                     self.write = DATA;
                 }
                 _ => panic!("an event of rustls that the harness does not know"),
@@ -160,6 +164,20 @@ impl Rogue {
 
     /// One packet of `level` with `frames`, in a datagram of its own.
     fn packet(&mut self, level: usize, frames: &[Frame<'_>]) -> Vec<u8> {
+        let number = self.numbers[level];
+        self.numbers[level] += 1;
+        self.packet_at(level, number, None, frames)
+    }
+
+    /// One packet of `level` with the number `number` and `frames`. With `phase`, a 1-RTT packet
+    /// has the key phase 1, and the packet key of that phase seals it.
+    fn packet_at(
+        &mut self,
+        level: usize,
+        number: u64,
+        phase: Option<&mut PacketKeySet>,
+        frames: &[Frame<'_>],
+    ) -> Vec<u8> {
         let mut out = vec![0; 1500];
         let (dcid, scid) = (self.server_cid, self.cid);
         let header = match level {
@@ -175,19 +193,26 @@ impl Rogue {
             _ => Outgoing::OneRtt {
                 dcid: &dcid,
                 spin: false,
-                key_phase: false,
+                key_phase: phase.is_some(),
             },
         };
-        let mut builder = Builder::new(&mut out, header, self.numbers[level], 4).unwrap();
-        self.numbers[level] += 1;
+        let mut builder = Builder::new(&mut out, header, number, 4).unwrap();
         for frame in frames {
             builder.frame(frame).unwrap();
         }
         if level == 0 {
             builder.pad_to(1200).unwrap();
         }
-        let len = builder.seal(&self.keys[level].as_ref().unwrap().local).unwrap();
-        out.truncate(len);
+        let keys = self.keys[level].as_mut().unwrap();
+        if let Some(next) = phase {
+            core::mem::swap(&mut keys.local.packet, &mut next.local);
+            let len = builder.seal(&keys.local).unwrap();
+            core::mem::swap(&mut keys.local.packet, &mut next.local);
+            out.truncate(len);
+        } else {
+            let len = builder.seal(&keys.local).unwrap();
+            out.truncate(len);
+        }
         out
     }
 
@@ -584,6 +609,64 @@ fn two_pieces_far_apart_on_a_stream_cost_only_their_pages_and_go_up_when_the_gap
     assert_eq!(server.reassembly_refused(), 0);
     let events = attack(&mut server, &mut rogue, &[stream(0, 0, b"a", false)]);
     assert_eq!(stream_bytes(&events), b"ab");
+}
+
+#[test]
+fn a_packet_with_newer_keys_below_a_packet_with_older_keys_closes_with_key_update_error() {
+    // Two packets of the first phase, with a gap between their numbers.
+    let start = |server: &mut Connection, rogue: &mut Rogue| {
+        let base = rogue.numbers[DATA];
+        for number in [base, base + 2] {
+            let datagram = rogue.packet_at(DATA, number, None, &[Frame::Ping]);
+            assert!(give(server, &datagram).is_empty());
+        }
+        rogue.numbers[DATA] = base + 3;
+        (base, rogue.next.as_mut().unwrap().next_packet_keys())
+    };
+    // A packet of the next phase above each packet of the first phase updates the keys.
+    let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
+    let (base, mut next) = start(&mut server, &mut rogue);
+    let datagram = rogue.packet_at(DATA, base + 3, Some(&mut next), &[Frame::Ping]);
+    assert!(give(&mut server, &datagram).is_empty());
+    let after = rogue.packet_at(DATA, base + 4, Some(&mut next), &[Frame::Ping]);
+    assert!(give(&mut server, &after).is_empty(), "the connection stays open");
+    // A packet of the next phase in the gap is an inversion.
+    let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
+    let (base, mut next) = start(&mut server, &mut rogue);
+    let datagram = rogue.packet_at(DATA, base + 1, Some(&mut next), &[Frame::Ping]);
+    let events = give(&mut server, &datagram);
+    assert_matches!(&events[..], [Event::Closed(Err(error))] if error.kind() == Kind::Malformed);
+    for datagram in sent(&mut server) {
+        rogue.receive(&datagram);
+    }
+    assert_eq!(rogue.closes, [(ErrorCode::KEY_UPDATE_ERROR.0, Some(0))]);
+}
+
+#[test]
+fn a_part_of_a_client_hello_waits_for_input_also_with_one_frame_for_each_turn() {
+    let limits = Limits {
+        turn: TurnLimits {
+            frames: 1,
+            ..Limits::DEFAULT.turn
+        },
+        ..Limits::DEFAULT
+    };
+    let budget = Budget::new(NonZeroU64::new(1 << 24).unwrap());
+    let config = server_config(&budget);
+    let mut rogue = Rogue::new(Parameters::default());
+    let hello = rogue.crypto(0);
+    assert_eq!(hello.len(), 2, "the ClientHello takes two datagrams");
+    let header = Header::parse(&hello[0], 0).unwrap();
+    let mut server = Connection::server(&config, &header, path(4301), limits, &budget, now()).unwrap();
+    // rustls cannot take a part of a message: the server waits for the rest, and reports no work.
+    assert!(give(&mut server, &hello[0]).is_empty());
+    assert_matches!(server.drive(now()).1.progress, Progress::Blocked(Blocked::Input));
+    // The rest arrives, and the handshake goes on.
+    assert!(give(&mut server, &hello[1]).is_empty());
+    for datagram in sent(&mut server) {
+        rogue.receive(&datagram);
+    }
+    assert!(rogue.keys[DATA].is_some(), "the client has its 1-RTT keys");
 }
 
 #[test]
