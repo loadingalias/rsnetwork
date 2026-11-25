@@ -589,6 +589,10 @@ impl Work {
 
     /// Counts one visit of an entry of the state, or gives `false` at a limit of `limits`: the
     /// visit then waits for the next turn.
+    #[cfg_attr(
+        not(feature = "tls"),
+        expect(dead_code, reason = "only the QUIC engine, which needs TLS, counts visits")
+    )]
     pub(crate) fn visit(&mut self, limits: &TurnLimits) -> bool {
         if self.reached(limits) {
             return false;

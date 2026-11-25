@@ -31,8 +31,8 @@ Usage: cargo xtask <command> [arguments]
 
 Commands
   fix [Cargo args]     Apply Clippy fixes, format, then fail on the lints that remain (local only)
-  check [Cargo args]   Check formatting, lints, rustdoc, and the protocol-only closure, and
-                       change no file (the CI gate)
+  check [Cargo args]   Check formatting, lints, rustdoc, the protocol-only build and its
+                       closure, and change no file (the CI gate)
   test [Nextest args]  Run the tests; with no arguments, also run the doctests
   model [--tlc-heap-mib=N --tlc-fp-mib=N] [model[/file]]...
                        Check the TLA+ models in models/; with no argument, every profile
@@ -260,7 +260,8 @@ impl Repo {
         )
     }
 
-    /// Checks formatting, lints, and rustdoc. It changes no file.
+    /// Checks formatting, lints, and rustdoc. It changes no file. The lints also run on the
+    /// protocol-only build of `rsnetwork`, which no other step compiles.
     fn check(&self, args: &[String]) -> Result<(), Failure> {
         let scope = scope(args);
         step("fmt --check", &mut self.cargo(&["fmt", "--all", "--check"]))?;
@@ -269,6 +270,18 @@ impl Repo {
             "clippy",
             self.cargo(&["clippy", "--locked", "--all-targets", "--quiet"])
                 .args(&scope),
+        )?;
+        step(
+            "clippy protocol-only",
+            &mut self.cargo(&[
+                "clippy",
+                "--locked",
+                "--package",
+                "rsnetwork",
+                "--lib",
+                "--no-default-features",
+                "--quiet",
+            ]),
         )?;
         step(
             "rustdoc",
