@@ -45,14 +45,14 @@ pub(super) enum Refused {
 
 /// Makes room for at least one more item in a vector or a queue that is full, of `len` items and
 /// `capacity` places of `item` bytes each: it charges the new places to `credit`, and then
-/// `reserve` allocates that many more.
+/// `reserve` allocates that many more. Gives the bytes that it charged.
 pub(super) fn grow(
     (len, capacity, item): (usize, usize, usize),
     credit: &mut Credit,
     reserve: impl FnOnce(usize) -> bool,
-) -> Result<(), Refused> {
+) -> Result<u64, Refused> {
     if len < capacity {
-        return Ok(());
+        return Ok(0);
     }
     let more = capacity.max(4);
     let bytes = (more * item) as u64;
@@ -62,7 +62,7 @@ pub(super) fn grow(
         assert!(refunded.is_ok(), "a credit refunds what it charged");
         return Err(Refused::Budget);
     }
-    Ok(())
+    Ok(bytes)
 }
 
 /// The offset of `offset` inside its page.
@@ -118,13 +118,13 @@ impl Page {
     }
 }
 
-/// The pages of one stream: the entry of each page from page `first`, or 0 for a page that holds
-/// nothing. An entry is the index of its page in the store, plus one.
+/// The pages of one stream, in the order of their offsets: the number of each page in the
+/// stream, and the index of its entry in the store. A gap between two pages has no entry, so its
+/// size costs no memory and no work.
 #[derive(Debug, Default)]
 pub(super) struct Reorder {
-    first: u64,
-    table: VecDeque<u32>,
-    /// The bytes of the table that the store charged.
+    pages: VecDeque<(u64, u32)>,
+    /// The bytes of `pages` that the store charged.
     charged: u64,
 }
 
@@ -143,7 +143,7 @@ pub(super) struct Reassembly {
     /// The most pages that hold data at one time.
     bound: u32,
     budget: Budget,
-    /// The charge of `pools`, of `pages`, and of the table of each stream.
+    /// The charge of `pools`, of `pages`, and of the page list of each stream.
     credit: Credit,
 }
 
@@ -186,53 +186,19 @@ impl Reassembly {
 
     /// The index of the page `number` of `reorder`, which it makes when the stream has none.
     fn entry(&mut self, reorder: &mut Reorder, number: u64) -> Result<usize, Refused> {
-        if reorder.table.is_empty() {
-            reorder.first = number;
-        }
-        let before = usize::try_from(reorder.first.saturating_sub(number)).map_err(|_| Refused::Bound)?;
-        let at = usize::try_from(number.saturating_sub(reorder.first)).map_err(|_| Refused::Bound)?;
-        let after = (at + 1).saturating_sub(reorder.table.len());
-        if before + after > 0 {
-            self.room(reorder, before + after)?;
-            (0..before).for_each(|_| reorder.table.push_front(0));
-            (0..after).for_each(|_| reorder.table.push_back(0));
-            reorder.first = reorder.first.min(number);
-        }
-        if reorder.table[at] == 0 {
-            let page = self.page().inspect_err(|_| self.trim(reorder))?;
-            reorder.table[at] = page + 1;
-        }
-        Ok(reorder.table[at] as usize - 1)
-    }
-
-    /// Makes room for `more` entries in the table of `reorder`, and charges its growth first.
-    fn room(&mut self, reorder: &mut Reorder, more: usize) -> Result<(), Refused> {
-        let table = &mut reorder.table;
-        let needed = table.len().checked_add(more).ok_or(Refused::Bound)?;
-        if needed <= table.capacity() {
-            return Ok(());
-        }
-        let target = needed.max(table.capacity().saturating_mul(2)).max(8);
-        let bytes = ((target - table.capacity()) * size_of::<u32>()) as u64;
-        self.credit.charge(bytes).map_err(|_| Refused::Budget)?;
-        if table.try_reserve_exact(target - table.len()).is_err() {
-            let refunded = self.credit.refund(bytes);
-            assert!(refunded.is_ok(), "a credit refunds what it charged");
-            return Err(Refused::Budget);
-        }
-        reorder.charged += bytes;
-        Ok(())
-    }
-
-    /// Takes away the entries at each end of the table of `reorder` that hold nothing.
-    fn trim(&mut self, reorder: &mut Reorder) {
-        while reorder.table.front() == Some(&0) {
-            reorder.table.pop_front();
-            reorder.first += 1;
-        }
-        while reorder.table.back() == Some(&0) {
-            reorder.table.pop_back();
-        }
+        let pages = &mut reorder.pages;
+        let at = match pages.binary_search_by_key(&number, |&(page, _)| page) {
+            Ok(at) => return Ok(pages[at].1 as usize),
+            Err(at) => at,
+        };
+        reorder.charged += grow(
+            (pages.len(), pages.capacity(), size_of::<(u64, u32)>()),
+            &mut self.credit,
+            |more| pages.try_reserve_exact(more).is_ok(),
+        )?;
+        let index = self.page()?;
+        reorder.pages.insert(at, (number, index));
+        Ok(index as usize)
     }
 
     /// Makes a page of zeros, and gives the index of its entry.
@@ -318,16 +284,13 @@ impl Reassembly {
     /// here, and gives the entry of the page of `next` when the stream has it.
     fn front(&mut self, reorder: &mut Reorder, next: u64) -> Option<u32> {
         let number = next / PAGE_OFFSET;
-        while reorder.first < number
-            && let Some(entry) = reorder.table.pop_front()
+        while let Some(&(page, index)) = reorder.pages.front()
+            && page < number
         {
-            reorder.first += 1;
-            if entry != 0 {
-                self.release(entry - 1);
-            }
+            reorder.pages.pop_front();
+            self.release(index);
         }
-        let entry = reorder.table.front().copied().filter(|_| reorder.first == number)?;
-        let index = entry.checked_sub(1)?;
+        let (_, index) = reorder.pages.front().copied().filter(|&(page, _)| page == number)?;
         let page = self.pages.get_mut(index as usize)?;
         let start = within(next);
         if start > page.at
@@ -345,14 +308,9 @@ impl Reassembly {
 
     /// Whether `reorder` holds the byte at `next`, the next byte of its stream in order.
     pub(super) fn ready(&mut self, reorder: &mut Reorder, next: u64) -> bool {
-        let ready = self
-            .front(reorder, next)
+        self.front(reorder, next)
             .and_then(|index| self.pages.get(index as usize))
-            .is_some_and(|page| page.run_end(within(next)) > within(next));
-        if !ready {
-            self.trim(reorder);
-        }
-        ready
+            .is_some_and(|page| page.run_end(within(next)) > within(next))
     }
 
     /// Takes the bytes of `reorder` from `next`, the next byte of its stream in order, up to the
@@ -367,10 +325,8 @@ impl Reassembly {
         }
         let (lease, rest) = page.backing.take()?.freeze_prefix(end - start).ok()?;
         if end == PAGE {
-            reorder.table.pop_front();
-            reorder.first += 1;
+            reorder.pages.pop_front();
             self.release(index);
-            self.trim(reorder);
         } else {
             page.backing = Some(rest);
             page.at = end;
@@ -378,12 +334,10 @@ impl Reassembly {
         Some(lease)
     }
 
-    /// Frees each page of `reorder`, and its table.
+    /// Frees each page of `reorder`, and its list.
     pub(super) fn clear(&mut self, reorder: &mut Reorder) {
-        for entry in core::mem::take(&mut reorder.table) {
-            if entry != 0 {
-                self.release(entry - 1);
-            }
+        for (_, index) in core::mem::take(&mut reorder.pages) {
+            self.release(index);
         }
         let refunded = self.credit.refund(core::mem::take(&mut reorder.charged));
         assert!(refunded.is_ok(), "a credit refunds what it charged");

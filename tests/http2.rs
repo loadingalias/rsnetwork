@@ -487,6 +487,64 @@ fn a_read_goes_on_when_its_drive_removes_a_stream_that_the_application_left() {
 }
 
 #[test]
+fn a_left_stream_whose_credit_finds_a_full_output_waits_and_its_credit_goes_back_later() {
+    // The least connection window, so the credit of an unread body of 40,000 bytes is due at its
+    // removal. An output of three places, the least, which requests fill.
+    let limits = client::Limits {
+        h2: h2::Limits {
+            connection_window: 65_535,
+            ..H2
+        },
+        queue: NonZeroUsize::new(3).unwrap(),
+        ..CLIENT_LIMITS
+    };
+    let mut pair = Pair {
+        client: client::Http2::plain(limits, clock(), &budget()).unwrap(),
+        server: Http::plain(SERVER_LIMITS, clock(), &budget()).unwrap(),
+    };
+    let a = pair.send(&get(b"/a"), later(), at(0));
+    let (stream, _) = pair.request(at(0));
+    pair.answer(stream, &[7; 40_000], at(0));
+    pair.response(a, at(0)).unwrap();
+    pair.server.close(stream);
+    let b = pair.send(&get(b"/b"), later(), at(0));
+    let mut sent = 0;
+    while pair.client.send(&get(b"/c"), later(), at(0)).unwrap().is_some() {
+        sent += 1;
+        assert!(sent < 3, "the output has three places");
+    }
+    // The answer to a PING of the server takes the last place.
+    let ping = [0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+    give(&mut pair.client, [ping, ping].concat());
+    pair.client.drive(at(0)).unwrap();
+    // The application leaves the first stream with its body unread. The drive cannot send the
+    // credit of that body, so it keeps the stream and returns.
+    pair.client.cancel(a);
+    pair.client.drive(at(0)).unwrap();
+    // The output drains, and the next drive sends the credit. The server sends a body as large as
+    // the connection window, and the client takes each byte of it before it reads one.
+    pair.transport(at(0));
+    let (stream, _) = pair.request(at(0));
+    for _ in 0..sent {
+        pair.request(at(0));
+    }
+    pair.answer(stream, &[9; 65_535], at(0));
+    pair.response(b, at(0)).unwrap();
+    // Only the output of the server moves, so no read of the client gives credit.
+    for _ in 0..4 {
+        assert!(pair.server.request(at(0)).unwrap().is_none());
+        let bytes = take(&mut pair.server);
+        give(&mut pair.client, bytes);
+    }
+    let mut region = WriteLoan::new(Vec::with_capacity(1 << 16));
+    assert_matches!(
+        pair.client.collect(b, at(0), &mut region).unwrap(),
+        Collect::Complete(None)
+    );
+    assert_eq!(region.filled().len(), 65_535);
+}
+
+#[test]
 fn a_write_goes_on_when_its_wait_for_the_chunk_before_removes_a_stream_that_the_server_closed() {
     let mut pair = Pair::plain();
     let a = pair.send(&get(b"/a"), later(), at(0));

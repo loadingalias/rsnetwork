@@ -231,7 +231,7 @@ fn both(
 | --- | --- |
 | Streams | The connection carries at most the smaller of its own and the server's `SETTINGS_MAX_CONCURRENT_STREAMS`. At the limit, `send` gives `None`: wait, and send again. A stream keeps its place until you `cancel` it, or until its exchange ended, you read the end, and a new request needs the place |
 | Deadline | The deadline of a request ends only its stream, with `RST_STREAM` and `CANCEL`, at the first drive after it, also when you do not call that stream. The connection goes on. `delivered(stream)` gives the part that arrived. Then `cancel(stream)` frees its place |
-| Cancel | `cancel(stream)` resets the stream with `CANCEL`, and the connection goes on. No body drains |
+| Cancel | `cancel(stream)` resets the stream with `CANCEL`, and the connection goes on. No body drains. The place of the stream, and the credit of its unread bytes, go back at the first drive with room in the output |
 | Reuse | The connection carries new requests until the server sends GOAWAY or the connection ends. Then `send` refuses with `Kind::Misuse`: make a new client |
 | Not processed | A request above the last stream of a GOAWAY, or that the server resets with `REFUSED_STREAM`, ends with `Kind::Overload`: no handler ran for it, so send it again, on a new connection after a GOAWAY |
 | Write | Each stream holds one chunk of its body at a time. `write` refuses with `Kind::Overload` while the chunk before waits for the output: send the output, and write again. `finish` never waits: the end goes after the last chunk |

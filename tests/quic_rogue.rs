@@ -1,8 +1,10 @@
 //! A server engine of the core against a client that breaks the rules of the streams: each
 //! frame past a window, a limit, a final size, or the direction of a stream closes the connection
-//! with its code of RFC 9000, section 20.1, and takes no memory (N305). The same client probes a
-//! path that the connection does not use, and moves between its frames (N307). It also gives a
-//! listener a connection ID whose reset token the test knows (N304).
+//! with its code of RFC 9000, section 20.1, and takes no memory (N305). Data out of order keeps
+//! the counts of its stream when the reassembly bound refuses a part of it, and a gap between its
+//! pieces costs no memory. The same client probes a path that the connection does not use, and
+//! moves between its frames (N307). It also gives a listener a connection ID whose reset token
+//! the test knows (N304).
 //!
 //! The client is a harness: rustls runs its handshake, and the packet layer of the core seals and
 //! opens its packets. It sends each frame that a test gives it, on a path with no loss.
@@ -524,6 +526,64 @@ fn a_frame_that_changes_a_final_size_closes_with_final_size_error() {
         final_size: 9,
     };
     refused(&mut server, &mut rogue, &[reset], ErrorCode::FINAL_SIZE_ERROR, 0x04);
+}
+
+/// The bytes of each [`Event::Stream`] in `events`, in order.
+fn stream_bytes(events: &[Event]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for event in events {
+        let Event::Stream { data, .. } = event else {
+            panic!("an event that is not stream data: {event:?}");
+        };
+        bytes.extend_from_slice(data.bytes());
+    }
+    bytes
+}
+
+#[test]
+fn a_frame_whose_second_page_the_reassembly_bound_refuses_counts_its_bytes_and_its_stream_can_stop() {
+    // The bound holds one page: a frame across two pages keeps its first page and is refused.
+    let limits = Limits {
+        reassembly_bytes_max: 4096,
+        ..Limits::DEFAULT
+    };
+    let (mut server, mut rogue) = pair(limits, true);
+    let bytes: Vec<u8> = (0..=u8::MAX).cycle().take(4200).collect();
+    assert!(attack(&mut server, &mut rogue, &[stream(0, 4000, &bytes[4000..], false)]).is_empty());
+    assert_eq!(server.reassembly_refused(), 1);
+    // The bytes before the gap arrive, and the kept page goes up after them.
+    let mut events = Vec::new();
+    for offset in (0..4000).step_by(1000) {
+        let frame = stream(0, offset as u64, &bytes[offset..offset + 1000], false);
+        events.extend(attack(&mut server, &mut rogue, &[frame]));
+    }
+    assert_eq!(stream_bytes(&events), bytes[..4096]);
+    let Event::Stream { stream: id, .. } = events[0] else {
+        panic!("the events are stream data");
+    };
+    // The application stops the stream: the bytes that did not go up drop.
+    server.stop(id, 7).unwrap();
+    for datagram in sent(&mut server) {
+        rogue.receive(&datagram);
+    }
+    assert!(rogue.closes.is_empty(), "the connection stays open");
+}
+
+#[test]
+fn two_pieces_far_apart_on_a_stream_cost_only_their_pages_and_go_up_when_the_gap_before_them_fills() {
+    // A gap of 64 GiB, whose cost for each page would pass the budget of 16 MiB.
+    let far = 1 << 36;
+    let limits = Limits {
+        stream_bytes_max: far + 1,
+        data_bytes_max: far + 1,
+        ..Limits::DEFAULT
+    };
+    let (mut server, mut rogue) = pair(limits, true);
+    assert!(attack(&mut server, &mut rogue, &[stream(0, 1, b"b", false)]).is_empty());
+    assert!(attack(&mut server, &mut rogue, &[stream(0, far, b"z", false)]).is_empty());
+    assert_eq!(server.reassembly_refused(), 0);
+    let events = attack(&mut server, &mut rogue, &[stream(0, 0, b"a", false)]);
+    assert_eq!(stream_bytes(&events), b"ab");
 }
 
 #[test]

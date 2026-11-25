@@ -315,11 +315,15 @@ impl Server {
     /// Closes the server: it stops the accepts, and each connection drains with `deadline`, as
     /// [`Http::shutdown`] says. Then it joins each task. At `deadline`, it aborts the tasks that
     /// did not end, for example a handler that waits for another future, and joins them too. So
-    /// when the close returns, no task of the server holds its state. Gives what the server did.
+    /// when the close returns, no task of the server holds its state. A close that drops before
+    /// it returns aborts each task, as a drop of the server does. Gives what the server did.
     pub async fn close(mut self, deadline: Deadline) -> Report {
         self.close.send_replace(Some(deadline));
-        let task = self.task.take().expect("the accept task is there until the close");
-        match task.await {
+        let task = self.task.as_mut().expect("the accept task is there until the close");
+        // The handle stays in the server until the join, so a drop of this future aborts the task.
+        let joined = task.await;
+        self.task = None;
+        match joined {
             Ok(report) => report,
             Err(error) => panic::resume_unwind(error.into_panic()),
         }

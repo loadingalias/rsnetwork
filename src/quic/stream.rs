@@ -968,15 +968,17 @@ impl Streams {
         let Some(recv) = &mut self.slots[slot].recv else {
             return Ok(None);
         };
-        let open = recv.state == Receiving::Open;
-        if open && offset > recv.next && !range.is_empty() {
-            let data = payload.bytes().get(range.clone()).unwrap_or_default();
-            self.reassembly.insert(&mut recv.reorder, offset, data)?;
-        }
+        // The counts come first: a refused insert keeps the bytes that it copied, and each byte
+        // that goes up later must be inside the window and the final size of the stream.
         recv.window.used += grown;
         self.window.used += grown;
         if fin {
             recv.final_size = Some(end);
+        }
+        let open = recv.state == Receiving::Open;
+        if open && offset > recv.next && !range.is_empty() {
+            let data = payload.bytes().get(range.clone()).unwrap_or_default();
+            self.reassembly.insert(&mut recv.reorder, offset, data)?;
         }
         if !open {
             // The bytes drop, so the peer gets their credit of the connection back.

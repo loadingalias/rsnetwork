@@ -661,10 +661,10 @@ impl Http2 {
                 exchange.reset = None;
             }
             exchange.ended |= !connection.is_open(id);
-            if exchange.left && exchange.ended {
-                self.remove(index)?;
-            } else {
+            if !(exchange.left && exchange.ended) {
                 index += 1;
+            } else if !self.remove(index)? {
+                return Ok(());
             }
         }
         Ok(())
@@ -678,13 +678,13 @@ impl Http2 {
         }) else {
             return Ok(false);
         };
-        self.remove(index)?;
-        Ok(true)
+        self.remove(index)
     }
 
     /// Removes the exchange at `index`, whose stream ended: the credit of its bytes goes back, and
-    /// its slot is free.
-    fn remove(&mut self, index: usize) -> Result<(), Error> {
+    /// its slot is free. Gives `false`, and keeps the exchange, when the output queue has no room
+    /// for that credit.
+    fn remove(&mut self, index: usize) -> Result<bool, Error> {
         let (session, outbound) = self.link.engine();
         let connection = session.connection();
         let exchange = &mut self.exchanges[index];
@@ -694,13 +694,13 @@ impl Http2 {
             && let Err(error) = connection.release(outbound, id, rest)
         {
             exchange.inflow.untake_credit(rest);
-            return room(error);
+            return room(error).map(|()| false);
         }
         if connection.is_held(id) {
             connection.close(id)?;
         }
         self.exchanges.remove(index);
-        Ok(())
+        Ok(true)
     }
 
     /// Drives the connection one time at `now`. Over TLS, a server that selected a protocol other

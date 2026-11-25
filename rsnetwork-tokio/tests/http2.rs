@@ -594,6 +594,40 @@ fn a_close_at_its_deadline_aborts_and_joins_each_handler_task_before_it_returns(
     });
 }
 
+#[test]
+fn a_close_that_the_caller_drops_aborts_each_task_of_the_server_as_a_drop_of_the_server_does() {
+    on_each_runtime(|| async {
+        // The close and the request have a deadline of one hour, so only an abort ends them soon.
+        let hour = Duration::from_secs(3600);
+        let before = tokio::runtime::Handle::current().metrics().num_alive_tasks();
+        let (listener, address) = support::listener().await;
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let handler = move |exchange: Exchange| {
+            let started = started.clone();
+            async move {
+                let _held = exchange;
+                started.send(()).unwrap();
+                core::future::pending().await
+            }
+        };
+        let server = serve(Transport::Plain, listener, handler);
+        let client = support::h2_client(Transport::Plain, address).await;
+        let waiting = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let mut exchange = client.send(&request(b"/", Some(0)), Clock.deadline(hour)).await?;
+                exchange.response().await.map(drop)
+            })
+        };
+        within(starts.recv()).await.unwrap();
+        let closing = tokio::time::timeout(Duration::from_millis(50), server.close(Clock.deadline(hour)));
+        assert!(closing.await.is_err(), "the close waits for its handler");
+        assert!(within(waiting).await.unwrap().is_err(), "the response did not come");
+        drop(client);
+        support::joined(before).await;
+    });
+}
+
 /// A raw HTTP/2 client: the connection preface with an empty SETTINGS frame, and then `frames`.
 /// A second thread reads each byte of the server until the end of its stream, and gives them.
 fn raw(address: core::net::SocketAddr, frames: Vec<u8>) -> thread::JoinHandle<Vec<u8>> {
