@@ -1704,7 +1704,8 @@ impl<E: Engine> Tls<E> {
     /// Moves the pending bytes of a full input region to a new one, which has room for the rest of
     /// their record. Refuses when no region of the limit can hold them.
     fn relocate(&mut self) -> Result<(), Error> {
-        let Some(region) = self.region.take() else {
+        // A refusal keeps the region, so no received byte is lost.
+        let Some(region) = &self.region else {
             return Ok(());
         };
         let pending = region.pending();
@@ -2172,7 +2173,14 @@ impl<E: Engine> Engine for Tls<E> {
         }
         if let Some(region) = &self.region {
             let pending = region.pending();
-            if region.room() < record_end(pending, &[]).saturating_sub(pending.len()).max(1) {
+            let end = record_end(pending, &[]);
+            if region.room() < end.saturating_sub(pending.len()).max(1) {
+                // A complete record that waits for a place in the inbound queue opens first, as
+                // in `take_queued`: the bytes after it go into a region of the host. Only the rest
+                // of a partial record moves.
+                if pending.len() >= end {
+                    return Ok(None);
+                }
                 self.relocate()?;
             }
         }

@@ -9,7 +9,7 @@ use std::assert_matches;
 use std::sync::Arc;
 
 use rsnetwork::body::{Outcome, Part};
-use rsnetwork::buffer::{Buffer as _, Lease};
+use rsnetwork::buffer::{Buffer as _, Lease, WriteLoan};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Ecn, Endpoint, Kind, Received, TurnLimits};
 use rsnetwork::host::Io as _;
@@ -83,6 +83,11 @@ fn identity((chain, key): (&[u8], &[u8])) -> Identity {
 /// A client and a server stream. With `mutual`, the server asks for a client certificate, and the
 /// client has one.
 fn pair(mutual: bool) -> (Stream, Stream) {
+    pair_with(mutual, LIMITS)
+}
+
+/// A client and a server stream, as [`pair`] makes them, with `limits` for the server.
+fn pair_with(mutual: bool, limits: StreamLimits) -> (Stream, Stream) {
     let roots = [CertificateDer::from(CA.to_vec())];
     let server = ServerConfig::new(ServerOptions {
         identity: identity(SERVER),
@@ -106,7 +111,7 @@ fn pair(mutual: bool) -> (Stream, Stream) {
     .unwrap();
     (
         Stream::connect(&client, "server.test", LIMITS, clock(), &budget()).unwrap(),
-        Stream::accept(&server, LIMITS, clock(), &budget()).unwrap(),
+        Stream::accept(&server, limits, clock(), &budget()).unwrap(),
     )
 }
 
@@ -287,4 +292,56 @@ fn a_received_region_larger_than_the_input_region_opens_in_turns() {
         read(&mut server, &mut bytes);
     }
     assert_eq!(bytes, data);
+}
+
+#[test]
+fn a_full_input_region_whose_records_wait_for_the_inbound_queue_lends_nothing_and_keeps_each_byte() {
+    // An inbound queue of one place, and an application that reads nothing yet: the first record
+    // fills the queue, and the records after it wait in the input region.
+    let limits = StreamLimits {
+        queue: NonZeroUsize::MIN,
+        ..LIMITS
+    };
+    let (mut client, mut server) = pair_with(false, limits);
+    run(&mut client, &mut server);
+    let data: Vec<u8> = (0..=250_u8).cycle().take(4 * RECORD).collect();
+    client.write(&Lease::from(data.clone()), at(0)).unwrap();
+    // A drive seals the plaintext that waits, so the client drives until it gives no output.
+    let mut wire = Vec::new();
+    loop {
+        client.drive(at(0)).unwrap();
+        let before = wire.len();
+        while let Some(output) = client.output() {
+            wire.extend_from_slice(output.region.bytes());
+            client.ack(output.id, output.region.initialized()).unwrap();
+        }
+        if wire.len() == before {
+            break;
+        }
+    }
+    assert_eq!(wire.len(), 4 * (5 + RECORD + 1 + 16), "four full records");
+    // The host receives into each region that the server lends, as a socket does, until the
+    // server lends none: its region is full of records that wait.
+    let mut sent = 0;
+    while sent < wire.len()
+        && let Some(region) = server.region().unwrap()
+    {
+        let mut loan = WriteLoan::new(region);
+        sent += loan.fill_from(&wire[sent..]);
+        server.received(loan.into_inner(), ENDPOINT, 1 << 20).unwrap();
+        server.drive(at(0)).unwrap();
+    }
+    assert!(sent < wire.len(), "the server lends no region while its records wait");
+    // The rest goes in a region of the host.
+    let rest = Received {
+        region: Lease::from(wire[sent..].to_vec()),
+        endpoint: ENDPOINT,
+        capacity: 1 << 20,
+    };
+    server.receive(rest).unwrap();
+    let mut bytes = Vec::new();
+    for _ in 0..16 {
+        read(&mut server, &mut bytes);
+    }
+    assert_eq!(bytes, data, "each byte arrives in its order");
 }

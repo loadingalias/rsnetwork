@@ -204,6 +204,10 @@ reaches the engine. While a region of the host waits after a partial record,
 `Connection::region()` gives `None`, and `Connection::received` gives the next region back. Drive
 the connection, and then give that region again.
 
+`Connection::region()` also gives `None` while its full input region holds a complete record that
+waits for a place in the inbound queue of the engine, for example while the application reads
+nothing. Receive into a region of the host: its bytes follow that record, and no record moves.
+
 ## Output regions of the host
 
 By default, the connection seals its records into its own output, charged to its budget. To send
