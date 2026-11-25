@@ -246,7 +246,9 @@ that runtime.
   `server::Http::shutdown` says: the exchanges in flight complete, and the client learns which
   requests the server did not process, as the [server](server.md#close) says. Then the close joins
   each task, also each handler task. At `deadline`, it aborts each task that did not end, for
-  example a handler that waits for another future.
+  example a handler that waits for another future, and joins it too. When `close` returns, no
+  handler runs and no task holds state of the server. A handler that blocks its thread delays
+  the close until it returns.
 - A server that drops before its close aborts each of its tasks, and each connection resets.
 
 `close` gives a `Report`:

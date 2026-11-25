@@ -29,7 +29,7 @@ use rsnetwork::server::{Closed, Delivery};
 use rsnetwork::value::{Authority, Method, Target};
 use rsnetwork_tokio::Clock;
 use rsnetwork_tokio::server::{Exchange, Report, Server};
-use support::{ALERT_RECORD, Last, PATIENCE, Proxy, Transport, ok, on_each_runtime};
+use support::{ALERT_RECORD, Held, Last, PATIENCE, Proxy, Transport, ok, on_each_runtime};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 /// The deadline of the exchanges whose peer stops.
@@ -473,11 +473,14 @@ fn a_close_of_the_server_drains_accepted_streams_refuses_new_ones_and_joins_each
         let (listener, address) = support::listener().await;
         let (started, mut starts) = mpsc::unbounded_channel();
         let proceed = Arc::new(Notify::new());
+        // Each handler holds a copy until it ends.
+        let alive = Arc::new(());
         let handler = {
-            let proceed = Arc::clone(&proceed);
+            let (proceed, alive) = (Arc::clone(&proceed), Arc::clone(&alive));
             move |mut exchange: Exchange| {
-                let (started, proceed) = (started.clone(), Arc::clone(&proceed));
+                let (started, proceed, alive) = (started.clone(), Arc::clone(&proceed), Arc::clone(&alive));
                 async move {
+                    let _alive = Held(alive);
                     let proceeding = proceed.notified();
                     started.send(()).unwrap();
                     proceeding.await;
@@ -525,6 +528,7 @@ fn a_close_of_the_server_drains_accepted_streams_refuses_new_ones_and_joins_each
             assert_eq!(body, b"ok");
         }
         let report = within(closing).await;
+        assert_eq!(Arc::strong_count(&alive), 1, "the close joined each handler task");
         assert_eq!(
             report,
             Report {
@@ -535,7 +539,57 @@ fn a_close_of_the_server_drains_accepted_streams_refuses_new_ones_and_joins_each
             }
         );
         drop(client);
-        // The close joined each task that the server spawned, also each handler task.
+        // The runtime released each task that the close joined.
+        support::joined(before).await;
+    });
+}
+
+#[test]
+fn a_close_at_its_deadline_aborts_and_joins_each_handler_task_before_it_returns() {
+    on_each_runtime(|| async {
+        let before = tokio::runtime::Handle::current().metrics().num_alive_tasks();
+        let (listener, address) = support::listener().await;
+        let (started, mut starts) = mpsc::unbounded_channel();
+        // The handler holds a copy and its exchange, and waits with no end.
+        let alive = Arc::new(());
+        let handler = {
+            let alive = Arc::clone(&alive);
+            move |exchange: Exchange| {
+                let (started, alive) = (started.clone(), Arc::clone(&alive));
+                async move {
+                    let _held = (Held(alive), exchange);
+                    started.send(()).unwrap();
+                    core::future::pending().await
+                }
+            }
+        };
+        let server = serve(Transport::Plain, listener, handler);
+        let client = support::h2_client(Transport::Plain, address).await;
+        let waiting = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let mut exchange = client.send(&request(b"/", Some(0)), Clock.deadline(PATIENCE)).await?;
+                exchange.response().await.map(drop)
+            })
+        };
+        within(starts.recv()).await.unwrap();
+        let report = within(server.close(Clock.deadline(Duration::from_millis(50)))).await;
+        assert_eq!(
+            Arc::strong_count(&alive),
+            1,
+            "the close joined the handler that it aborted"
+        );
+        assert_eq!(
+            report,
+            Report {
+                accepted: 1,
+                refused: 0,
+                failed: 0,
+                aborted: 1
+            }
+        );
+        assert!(within(waiting).await.unwrap().is_err(), "the response did not come");
+        drop(client);
         support::joined(before).await;
     });
 }

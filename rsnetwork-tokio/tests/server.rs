@@ -31,7 +31,7 @@ use rsnetwork::server::{self, Closed, Delivery, Linger, Response};
 use rsnetwork::value::Status;
 use rsnetwork_tokio::Clock;
 use rsnetwork_tokio::server::{Exchange, Report, Server};
-use support::{ALERT_RECORD, HEAD_TIMEOUT, Last, PATIENCE, Proxy, Transport, ok, on_each_runtime, read_to_end};
+use support::{ALERT_RECORD, HEAD_TIMEOUT, Held, Last, PATIENCE, Proxy, Transport, ok, on_each_runtime, read_to_end};
 use tokio::sync::{Notify, mpsc as channel, oneshot};
 
 /// A body larger than the socket buffers of loopback: 16 parts of 1 MiB.
@@ -131,11 +131,14 @@ fn a_close_drains_the_request_in_flight_refuses_the_one_that_the_handler_did_not
         let (listener, address) = support::listener().await;
         let (events, mut seen) = channel::unbounded_channel();
         let proceed = Arc::new(Notify::new());
+        // Each handler holds a copy until it ends.
+        let alive = Arc::new(());
         let handler = {
-            let (events, proceed) = (events.clone(), Arc::clone(&proceed));
+            let (events, proceed, alive) = (events.clone(), Arc::clone(&proceed), Arc::clone(&alive));
             move |mut exchange: Exchange| {
-                let (events, proceed) = (events.clone(), Arc::clone(&proceed));
+                let (events, proceed, alive) = (events.clone(), Arc::clone(&proceed), Arc::clone(&alive));
                 async move {
+                    let _alive = Held(alive);
                     exchange.respond(&ok(Some(2))).await?;
                     exchange.write(&Lease::from(&b"ok"[..])).await?;
                     exchange.finish().await?;
@@ -180,6 +183,7 @@ fn a_close_drains_the_request_in_flight_refuses_the_one_that_the_handler_did_not
         .await;
         proceed.notify_one();
         let report = closing.await;
+        assert_eq!(Arc::strong_count(&alive), 1, "the close joined each handler");
         assert_eq!(
             report,
             Report {
@@ -189,7 +193,7 @@ fn a_close_drains_the_request_in_flight_refuses_the_one_that_the_handler_did_not
                 aborted: 0
             }
         );
-        // The close joined each task that the server spawned.
+        // The runtime released each task that the close joined.
         support::joined(before).await;
         let bytes = pipelined.join().unwrap();
         let ok_end = bytes

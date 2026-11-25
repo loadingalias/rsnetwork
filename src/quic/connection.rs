@@ -1327,7 +1327,8 @@ impl Connection {
     /// connection sends the frame again when datagrams of the peer still arrive, and gives its
     /// terminal outcome, `Ok`, three probe timeouts later (RFC 9000, section 10.2.1). Before that,
     /// it ends when the frame is out, and the frame of an Initial or Handshake packet shows only
-    /// that the application closed.
+    /// that the application closed. A server that waits for the credit of its amplification limit
+    /// takes it from each datagram of the peer, and ends at the handshake deadline at the latest.
     ///
     /// Refuses with [`Kind::Misuse`] when `code` is above 2^62 - 1, and with the error of a
     /// connection that ended.
@@ -1715,7 +1716,7 @@ impl Connection {
                 break;
             };
             match next {
-                Ok(packet) if self.ending.is_some() => self.heard(&packet, &mut work),
+                Ok(packet) if self.ending.is_some() => self.heard(&packet, path, &mut work),
                 Ok(packet) => {
                     if let Err(failure) = self.packet(packet, path, &mut work, now, ecn) {
                         self.fail(failure, now);
@@ -1735,16 +1736,36 @@ impl Connection {
 
     /// Counts a datagram of the peer for a closing end, which reads no packet. A copy of the
     /// CONNECTION_CLOSE frame answers datagram 1, 2, 4, 8, and so on (RFC 9000, section 10.2.1).
-    fn heard(&mut self, packet: &packet::Protected<'_>, work: &mut Work) {
+    /// The datagram also pays for the frame on a path with no validation, so a server that waits
+    /// for its credit sends the frame (RFC 9000, section 10.2.3).
+    fn heard(&mut self, packet: &packet::Protected<'_>, path: Path, work: &mut Work) {
         work.add(packet.header().end(), 0);
-        if let Header::Protected { dcid, .. } = packet.header()
-            && packet.datagram().1
-            && self.ids.issued().contains(&Some(*dcid))
-            && let Some(ending) = &mut self.ending
-        {
+        let (bytes, first) = packet.datagram();
+        let Header::Protected { kind, dcid, .. } = *packet.header() else {
+            return;
+        };
+        if !first || !self.ours(kind, dcid) {
+            return;
+        }
+        // A client path has no amplification limit, so this counts only for a server.
+        if path == self.paths.active.addresses {
+            self.paths.received(path, bytes as u64);
+        }
+        if let Some(ending) = &mut self.ending {
             ending.heard = ending.heard.saturating_add(1);
             ending.send |= ending.close.is_some() && ending.heard.is_power_of_two();
         }
+    }
+
+    /// Whether a packet of `kind` to `dcid` is for this connection: its destination is a
+    /// connection ID that this end issued, or the first destination of the client while the
+    /// server has its Initial keys.
+    fn ours(&self, kind: PacketKind, dcid: ConnectionId) -> bool {
+        self.ids.issued().contains(&Some(dcid))
+            || (matches!(self.end, End::Server { .. })
+                && kind == PacketKind::Initial
+                && dcid == self.retry_cid.unwrap_or(self.original_cid)
+                && !self.spaces[0].discarded)
     }
 
     /// Runs the timers at `now`, and the work that waits: the events of the streams, the frames
@@ -2126,11 +2147,7 @@ impl Connection {
             return Ok(());
         };
         let server = matches!(self.end, End::Server { .. });
-        let ours = self.ids.issued().contains(&Some(dcid))
-            || (server
-                && kind == PacketKind::Initial
-                && dcid == self.retry_cid.unwrap_or(self.original_cid)
-                && !self.spaces[0].discarded);
+        let ours = self.ours(kind, dcid);
         let (bytes, first) = packet.datagram();
         // Each datagram counts one time, for the address that it came from. The active path counts
         // each datagram of the connection, also one that this end then discards (RFC 9000, section
@@ -3106,10 +3123,15 @@ impl Connection {
                     mark,
                     admitted: false,
                 };
-                match self.packet_out(level, &mut out[at..room], pad, Some(close), send) {
-                    Ok(Some(len)) => at += len,
-                    _ => break,
-                }
+                // The frame goes in one datagram with each level, or it waits: for the credit of
+                // that datagram, and at most to the deadline.
+                let Ok(Some(len)) = self.packet_out(level, &mut out[at..room], pad, Some(close), send) else {
+                    if self.paths.active.amplification_credit.is_some() {
+                        self.amplification_blocked();
+                    }
+                    return None;
+                };
+                at += len;
             }
             at
         };

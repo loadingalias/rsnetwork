@@ -309,3 +309,28 @@ fn the_window_holds_two_datagrams_when_the_datagram_size_of_the_path_grows() {
     controller.datagram_limit(2400);
     assert_eq!(controller.window, 4800);
 }
+
+#[test]
+fn a_timeout_that_also_loses_small_datagrams_ends_the_row_of_black_hole_timeouts() {
+    // A path that carries 1,452 bytes.
+    let mut mtu = Mtu::new(1452);
+    let size = mtu.next().expect("the first probe");
+    mtu.sent(size);
+    mtu.probe_acknowledged(size);
+    assert_eq!(mtu.size(), 1452);
+    // Three timeouts that lose only large datagrams, with an ordinary tail loss after each one.
+    // A tail loss loses datagrams of each size, so it ends the row (RFC 8899, section 4.3).
+    for _ in 0..3 {
+        mtu.timed_out();
+        mtu.lost(true);
+        mtu.timed_out();
+        mtu.lost(false);
+    }
+    assert_eq!(mtu.size(), 1452, "separate losses of large datagrams are no black hole");
+    // Three in a row are one.
+    for _ in 0..3 {
+        mtu.timed_out();
+        mtu.lost(true);
+    }
+    assert_eq!((mtu.size(), mtu.next()), (1200, None));
+}

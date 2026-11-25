@@ -296,11 +296,23 @@ pub(crate) fn on_each_runtime<F: Future<Output = ()>>(test: impl Fn() -> F) {
     }
 }
 
-/// Checks that the runtime has `tasks` alive tasks again, after a close that joined each task of
-/// a server. A current-thread runtime releases a task before the task that joined it runs, so
-/// its count is exact. A multi-thread runtime wakes the join handle of a task before it releases
-/// the task, as the `rt_metrics` test of Tokio states, so its count can still hold a joined task
-/// for a moment. There, a task that does not end keeps the count, and the wait ends in a failure.
+/// A copy of an `Arc` that a handler holds until its future drops. Its drop takes 20 ms, as the
+/// release of a resource of a handler can. So a close that does not join the handler returns
+/// before the copy is gone.
+pub(crate) struct Held(pub(crate) Arc<()>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Checks that the runtime has `tasks` alive tasks again: it released each task that the close of
+/// a server joined. This does not prove the join. A guard that each handler holds proves it at
+/// the return of the close. A current-thread runtime releases a task before the task that joined
+/// it runs, so its count is exact. A multi-thread runtime wakes the join handle of a task before
+/// it releases the task, as the `rt_metrics` test of Tokio states, so the check waits for the
+/// count, at most [`PATIENCE`].
 pub(crate) async fn joined(tasks: usize) {
     let runtime = Handle::current();
     let metrics = runtime.metrics();

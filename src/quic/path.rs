@@ -201,13 +201,19 @@ impl Mtu {
     /// One loss detection lost datagrams of the path, and `large` tells whether each of them
     /// had more than 1,200 bytes. After a probe timeout, a loss of only such datagrams is the
     /// sign of a path that now drops them (RFC 8899, section 4.3). At [`BLACK_HOLE_TIMEOUTS`]
-    /// in a row, the path returns to 1,200 bytes and its search ends.
+    /// in a row, the path returns to 1,200 bytes and its search ends. A timeout that also lost a
+    /// datagram of 1,200 bytes or fewer ends the row: that loss is no sign of the size.
     pub(super) fn lost(&mut self, large: bool) {
-        if core::mem::take(&mut self.timeout) && large && self.size > DATAGRAM_MIN {
-            self.black_hole += 1;
-            if self.black_hole == BLACK_HOLE_TIMEOUTS {
-                *self = Self::new(DATAGRAM_MIN);
-            }
+        if !core::mem::take(&mut self.timeout) || self.size == DATAGRAM_MIN {
+            return;
+        }
+        if !large {
+            self.black_hole = 0;
+            return;
+        }
+        self.black_hole += 1;
+        if self.black_hole == BLACK_HOLE_TIMEOUTS {
+            *self = Self::new(DATAGRAM_MIN);
         }
     }
 }

@@ -65,7 +65,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::crypto::kx::SupportedKxGroup;
 use rustls::crypto::{Credentials, Identity as Chain, SelectedCredential, SingleCredential};
 use rustls::enums::ApplicationProtocol;
-use rustls::error::{AlertDescription, CertificateError, PeerMisbehaved};
+use rustls::error::{AlertDescription, CertificateError, InvalidMessage, PeerMisbehaved};
 use rustls::kernel::KernelConnection;
 use rustls::pki_types::ServerName;
 use rustls::server::{
@@ -2304,6 +2304,11 @@ pub(crate) fn refused(error: &rustls::Error) -> Error {
         rustls::Error::FailedToGetCurrentTime | rustls::Error::FailedToGetRandomBytes => {
             Error::new(Kind::Unsupported, "the wall clock or the entropy source failed")
         }
+        // TLS permits a longer message: the limit is the one of rustls, so of this end.
+        rustls::Error::InvalidMessage(InvalidMessage::HandshakePayloadTooLarge) => Error::new(
+            Kind::Overload,
+            "a TLS handshake message of the peer passed the limit of 65,535 bytes",
+        ),
         _ => Error::new(Kind::Malformed, "the peer sent TLS bytes that the protocol forbids"),
     }
 }

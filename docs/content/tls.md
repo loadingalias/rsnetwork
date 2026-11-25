@@ -328,6 +328,7 @@ layer. Send the rest of the output before the release.
 | The transport ended before the handshake completed | `Partial` | `the transport ended before the TLS handshake completed` |
 | The transport ended inside a record | `Partial` | `the transport ended inside a TLS record` |
 | A handshake message, for example a certificate chain, is larger than `input_bytes` | `Overload` | `a TLS message is larger than the input region` |
+| A handshake message is larger than 65,535 bytes, the limit of rustls. The peer gets the alert `decode_error` | `Overload` | `a TLS handshake message of the peer passed the limit of 65,535 bytes` |
 | The peer sent bytes that TLS forbids during the handshake | `Malformed` | `the peer sent TLS bytes that the protocol forbids` |
 | A handshake message after the handshake is larger than `input_bytes` | `Overload` | `a TLS handshake message is larger than the input region` |
 | The peer ended the connection with another error alert | `Malformed` | `the peer ended the TLS connection with an alert` |

@@ -16,7 +16,7 @@ use rsnetwork::drive::{Error, Kind, Progress};
 use rsnetwork::quic::frame::Frame;
 use rsnetwork::quic::packet::{self, Builder, Datagrams, Header, Kind as PacketKind, Outgoing, Side};
 use rsnetwork::quic::params::{Migration, ParameterError, Parameters, PreferredAddress, Sender};
-use rsnetwork::quic::{CRYPTO_BUFFER_BYTES_MAX, Connection, ConnectionId, Limits, Path};
+use rsnetwork::quic::{CRYPTO_BUFFER_BYTES_MAX, Connection, ConnectionId, ErrorCode, Limits, Path, PeerClose};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
     Authentication, CertificateDer, ClientConfig, ClientOptions, Entropy, Group, Handshake, Identity, PrivateKeyDer,
@@ -402,6 +402,46 @@ fn a_chain_inside_the_crypto_bound_completes_out_of_order() {
     );
     pair.run(at(0), Order::HandshakeReversed);
     assert!(pair.client.is_confirmed(), "a chain inside the bound completes");
+}
+
+#[test]
+fn a_chain_past_the_crypto_bound_refuses_at_both_ends_with_the_tls_alert_of_the_client() {
+    // Its Certificate message passes the limit of rustls, which is the CRYPTO bound. The flight
+    // arrives in order inside the window of the server, so rustls refuses the message, and not
+    // the CRYPTO buffer.
+    let past = [MLDSA_INTERMEDIATE; 13];
+    assert!(past.len() * MLDSA_INTERMEDIATE.len() > CRYPTO_BUFFER_BYTES_MAX);
+    let mut pair = Pair::new(
+        &client_config(MLDSA_CA, Resumption::Off),
+        server_config(MLDSA65, &past, Resumption::Off),
+        (Limits::DEFAULT, Limits::DEFAULT),
+    );
+    pair.run(at(0), Order::Sent);
+    let client = terminal(pair.client_outcome(at(0)))
+        .expect("the client ended")
+        .unwrap_err();
+    assert_eq!(
+        (client.kind(), client.reason()),
+        (
+            Kind::Overload,
+            "a TLS handshake message of the peer passed the limit of 65,535 bytes"
+        )
+    );
+    // The client sent the alert decode_error of rustls on the CRYPTO frame (RFC 9001, section 4.8).
+    let server = terminal(pair.server().drive(at(0)).1.progress)
+        .expect("the close ended the server")
+        .unwrap_err();
+    assert_eq!(
+        (server.kind(), server.reason()),
+        (Kind::Malformed, "the peer ended the TLS connection with an alert")
+    );
+    assert_eq!(
+        pair.server().peer_close(),
+        Some(PeerClose::Transport {
+            code: ErrorCode(0x100 + 50),
+            frame_type: 0x06,
+        })
+    );
 }
 
 #[test]

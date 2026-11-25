@@ -314,7 +314,8 @@ impl Server {
 
     /// Closes the server: it stops the accepts, and each connection drains with `deadline`, as
     /// [`Http::shutdown`] says. Then it joins each task. At `deadline`, it aborts the tasks that
-    /// did not end, for example a handler that waits for another future. Gives what the server did.
+    /// did not end, for example a handler that waits for another future, and joins them too. So
+    /// when the close returns, no task of the server holds its state. Gives what the server did.
     pub async fn close(mut self, deadline: Deadline) -> Report {
         self.close.send_replace(Some(deadline));
         let task = self.task.take().expect("the accept task is there until the close");
@@ -337,7 +338,7 @@ impl Drop for Server {
 /// An event of the accept task.
 enum Event {
     Accepted(io::Result<(TcpStream, core::net::SocketAddr)>),
-    Ended(Result<bool, JoinError>),
+    Ended(Result<Ended, JoinError>),
     /// The signal changed, or its server dropped (`false`).
     Close(bool),
 }
@@ -358,7 +359,7 @@ where
     let mut tasks = JoinSet::new();
     let mut report = Report::default();
     let mut pause: Option<tokio::time::Instant> = None;
-    let deadline = loop {
+    loop {
         let event = {
             let mut changed = pin!(signal.changed());
             let mut paused = pin!(pause.map(tokio::time::sleep_until));
@@ -388,9 +389,8 @@ where
         pause = None;
         match event {
             Event::Close(true) => {
-                let deadline = *signal.borrow();
-                if let Some(deadline) = deadline {
-                    break deadline;
+                if signal.borrow().is_some() {
+                    break;
                 }
             }
             // A dropped server aborts this task: its tasks abort with the set.
@@ -408,28 +408,14 @@ where
                 pause = tokio::time::Instant::now().checked_add(ACCEPT_PAUSE);
             }
         }
-    };
-    // No more accepts: the listener closes, and each connection saw the signal in its wait.
-    drop(listener);
-    let mut ends = pin!(tokio::time::sleep_until(Clock.tokio(deadline)));
-    loop {
-        let ended = poll_fn(|cx| match tasks.poll_join_next(cx) {
-            Poll::Ready(ended) => Poll::Ready(Some(ended)),
-            Poll::Pending => ends.as_mut().poll(cx).map(|()| None),
-        })
-        .await;
-        match ended {
-            Some(Some(ended)) => record(&mut report, ended),
-            Some(None) => return report,
-            None => {
-                tasks.abort_all();
-                while let Some(ended) = tasks.join_next().await {
-                    record(&mut report, ended);
-                }
-                return report;
-            }
-        }
     }
+    // No more accepts: the listener closes, and each connection saw the signal in its wait. Each
+    // connection ends by the deadline, after its handlers.
+    drop(listener);
+    while let Some(ended) = tasks.join_next().await {
+        record(&mut report, ended);
+    }
+    report
 }
 
 /// The connection of `stream`, with a server of `make`. Gives `None` when the socket or `make`
@@ -450,16 +436,76 @@ enum Next {
     Close(bool),
 }
 
+/// How the task of a connection ended.
+enum Ended {
+    /// The connection and each of its handlers ended with no error.
+    Served,
+    /// The connection or a handler ended with an error, or a handler panicked.
+    Failed,
+    /// The deadline of the close of the server came first.
+    Aborted,
+}
+
+/// Serves the connection of `socket` until the deadline of the close of the server. At that
+/// deadline, the connection drops with its HTTP/1.1 handler, and each HTTP/2 handler aborts.
+/// The task ends after each handler ended, so no handler outlives the close.
+async fn run<H, F>(socket: Socket<Core>, handler: Arc<H>, signal: watch::Receiver<Option<Deadline>>) -> Ended
+where
+    H: Fn(Exchange) -> F,
+    F: Future<Output = Result<(), Error>> + Send + 'static,
+{
+    let mut handlers = JoinSet::new();
+    let served = {
+        let mut served = pin!(serve(socket, handler, signal.clone(), &mut handlers));
+        let mut expired = pin!(expiry(signal));
+        poll_fn(|cx| {
+            if let Poll::Ready(clean) = served.as_mut().poll(cx) {
+                return Poll::Ready(Some(clean));
+            }
+            expired.as_mut().poll(cx).map(|()| None)
+        })
+        .await
+    };
+    match served {
+        Some(true) => Ended::Served,
+        Some(false) => Ended::Failed,
+        None => {
+            handlers.abort_all();
+            while handlers.join_next().await.is_some() {}
+            Ended::Aborted
+        }
+    }
+}
+
+/// Waits for the deadline of the close of the server, which `signal` gives. A server that drops
+/// gives no deadline: its accept task then aborts this task.
+async fn expiry(mut signal: watch::Receiver<Option<Deadline>>) {
+    let deadline = signal
+        .wait_for(Option::is_some)
+        .await
+        .ok()
+        .and_then(|deadline| *deadline);
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(Clock.tokio(deadline)).await,
+        None => core::future::pending().await,
+    }
+}
+
 /// Serves the connection of `socket`: it runs `handler` for each request, and then drives the
-/// rest of the connection. The close of the server, which `signal` gives, starts its shutdown.
-/// Gives whether the connection and each handler ended with no error.
-async fn run<H, F>(socket: Socket<Core>, handler: Arc<H>, mut signal: watch::Receiver<Option<Deadline>>) -> bool
+/// rest of the connection. Each HTTP/2 handler is a task of `handlers`. The close of the server,
+/// which `signal` gives, starts its shutdown. Gives whether the connection and each handler ended
+/// with no error.
+async fn serve<H, F>(
+    socket: Socket<Core>,
+    handler: Arc<H>,
+    mut signal: watch::Receiver<Option<Deadline>>,
+    handlers: &mut JoinSet<Result<(), Error>>,
+) -> bool
 where
     H: Fn(Exchange) -> F,
     F: Future<Output = Result<(), Error>> + Send + 'static,
 {
     let mut connection = Http::bind(socket);
-    let mut handlers = JoinSet::new();
     let (mut failed, mut closing) = (false, false);
     loop {
         let next = {
@@ -524,12 +570,11 @@ fn shutdown(connection: &Http, deadline: Option<Deadline>) {
     }
 }
 
-/// Adds the end of a connection task to `report`.
-fn record(report: &mut Report, ended: Result<bool, JoinError>) {
+/// Adds the end of a connection task to `report`. A task that panicked failed.
+fn record(report: &mut Report, ended: Result<Ended, JoinError>) {
     match ended {
-        Ok(true) => {}
-        Ok(false) => report.failed = report.failed.saturating_add(1),
-        Err(error) if error.is_cancelled() => report.aborted = report.aborted.saturating_add(1),
-        Err(_) => report.failed = report.failed.saturating_add(1),
+        Ok(Ended::Served) => {}
+        Ok(Ended::Aborted) => report.aborted = report.aborted.saturating_add(1),
+        Ok(Ended::Failed) | Err(_) => report.failed = report.failed.saturating_add(1),
     }
 }

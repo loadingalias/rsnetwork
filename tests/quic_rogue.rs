@@ -601,12 +601,30 @@ fn a_server_reads_no_1_rtt_packet_before_its_handshake_completes() {
 #[test]
 fn crypto_data_past_the_buffer_bound_of_its_level_closes_with_crypto_buffer_exceeded() {
     let (mut server, mut rogue) = pair(Limits::DEFAULT, false);
-    // One byte at the first offset past the bound: no memory holds the bytes before it.
-    let far = Frame::Crypto {
+    // A Handshake flight with no first byte: the server keeps each byte after the gap, up to the
+    // bound, and rustls reads none of them.
+    let data = [0x16; 1000];
+    let mut offset = 1;
+    while offset < CRYPTO_BUFFER_BYTES_MAX {
+        let len = data.len().min(CRYPTO_BUFFER_BYTES_MAX - offset);
+        let piece = Frame::Crypto {
+            offset: offset as u64,
+            data: &data[..len],
+        };
+        let datagram = rogue.packet(1, &[piece]);
+        assert!(give(&mut server, &datagram).is_empty());
+        offset += len;
+    }
+    for datagram in sent(&mut server) {
+        rogue.receive(&datagram);
+    }
+    assert!(rogue.closes.is_empty(), "the bytes inside the bound wait for the gap");
+    // The next byte passes the bound.
+    let past = Frame::Crypto {
         offset: CRYPTO_BUFFER_BYTES_MAX as u64,
         data: b"x",
     };
-    let datagram = rogue.packet(1, &[far]);
+    let datagram = rogue.packet(1, &[past]);
     assert!(give(&mut server, &datagram).is_empty());
     for datagram in sent(&mut server) {
         rogue.receive(&datagram);
@@ -1020,4 +1038,43 @@ fn each_challenge_has_new_data_and_the_answer_to_an_earlier_one_validates_the_pa
     assert!(server.receive(&mut datagrams, moved, at).0.is_none());
     assert!(server.address_validated());
     assert_eq!(server.path(), moved);
+}
+
+#[test]
+fn a_server_that_closes_before_its_handshake_completes_sends_its_close_when_a_datagram_pays_for_it() {
+    // The deadlines leave the time for the probes that spend the credit.
+    let limits = Limits {
+        idle_timeout: None,
+        handshake_timeout: Duration::from_secs(600),
+        ..Limits::DEFAULT
+    };
+    let (mut server, mut rogue) = pair(limits, false);
+    let home = server.path();
+    // The client gets nothing more: the probes of the server spend its amplification credit.
+    let mut at = now();
+    for _ in 0..8 {
+        if server.recovery().amplification_blocked_round_trips > 0 {
+            break;
+        }
+        at = server.drive(at).1.deadline.expect("a probe timer").instant();
+        server.drive(at);
+        sent_to_at(&mut server, home, at);
+    }
+    assert!(server.recovery().amplification_blocked_round_trips > 0);
+    server.close(7, at).unwrap();
+    assert!(
+        sent_to_at(&mut server, home, at).is_empty(),
+        "the Initial close needs 1,200 bytes"
+    );
+    assert_eq!(server.drive(at).1.progress, Progress::Blocked(Blocked::Input));
+    // A datagram of the client pays for the close (RFC 9000, section 10.2.3), and the server ends
+    // when it is out, because the handshake is not confirmed.
+    let ping = rogue.packet(0, &[Frame::Ping]);
+    assert!(give_at(&mut server, home, &ping, at).is_empty());
+    for datagram in sent_to_at(&mut server, home, at) {
+        rogue.receive(&datagram);
+    }
+    let shown = (ErrorCode::APPLICATION_ERROR.0, Some(0));
+    assert_eq!(rogue.closes, [shown, shown, (7, None)]);
+    assert_eq!(server.drive(at).1.progress, Progress::Terminal(Ok(())));
 }
