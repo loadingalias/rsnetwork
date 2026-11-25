@@ -177,8 +177,8 @@ pub struct Closed {
     pub cleanup: Option<Error>,
 }
 
-/// The engine of a server connection: the version that ALPN or the limits selected, or none yet,
-/// while the TLS handshake runs.
+/// The engine of a server connection and the exchanges that run on it: the version that ALPN or
+/// the limits selected, or none yet, while the TLS handshake runs.
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
@@ -193,8 +193,8 @@ pub(crate) enum Protocol {
         )
     )]
     Pending,
-    H1(h1::Server),
-    H2(Session),
+    H1(h1::Server, H1),
+    H2(Session, H2),
 }
 
 /// An event of a [`Protocol`].
@@ -217,11 +217,11 @@ impl Engine for Protocol {
                     deadline: None,
                 },
             ),
-            Self::H1(server) => {
+            Self::H1(server, _) => {
                 let (event, turn) = server.drive(inbound, outbound, now);
                 (event.map(Event::H1), turn)
             }
-            Self::H2(session) => {
+            Self::H2(session, _) => {
                 let (step, turn) = session.drive(inbound, outbound, now);
                 (step.map(Event::H2), turn)
             }
@@ -231,22 +231,6 @@ impl Engine for Protocol {
     fn timed(&self) -> bool {
         true
     }
-}
-
-/// The exchanges of the selected version.
-#[derive(Debug)]
-enum Exchanges {
-    /// The TLS handshake runs.
-    #[cfg_attr(
-        not(feature = "tls"),
-        expect(
-            dead_code,
-            reason = "only a TLS connection selects its version after the construction"
-        )
-    )]
-    Pending,
-    H1(H1),
-    H2(H2),
 }
 
 /// The linger after the last output.
@@ -269,7 +253,6 @@ pub struct Http {
     clock: ClockDomain,
     limits: Limits,
     budget: Budget,
-    exchanges: Exchanges,
     /// The deadline of the TLS handshake, from the first call.
     handshake: Option<Deadline>,
     /// The TLS handshake completed, or the connection has no TLS.
@@ -293,30 +276,15 @@ impl Http {
     pub fn plain(limits: Limits, clock: ClockDomain, budget: &Budget) -> Result<Self, Error> {
         let heads = heads(&limits, budget)?;
         let (inbound, mut outbound) = queues(limits.queue, budget)?;
-        let (engine, exchanges) = match limits.cleartext {
-            Cleartext::Http1 => (
-                Protocol::H1(h1_engine(&limits, &outbound, budget)?),
-                Exchanges::H1(H1::new()),
-            ),
-            Cleartext::Http2 => (
-                Protocol::H2(Session::new(
-                    Role::Server,
-                    limits.h2,
-                    limits.turn,
-                    &mut outbound,
-                    budget,
-                )?),
-                Exchanges::H2(H2::new(&limits, budget)?),
+        let engine = match limits.cleartext {
+            Cleartext::Http1 => Protocol::H1(h1_engine(&limits, &outbound, budget)?, H1::new()),
+            Cleartext::Http2 => Protocol::H2(
+                Session::new(Role::Server, limits.h2, limits.turn, &mut outbound, budget)?,
+                H2::new(&limits, budget)?,
             ),
         };
         let connection = Connection::new(engine, inbound, outbound, Some(clock))?;
-        Ok(Self::new(
-            Link::Plain(connection),
-            heads,
-            (clock, limits, budget),
-            exchanges,
-            true,
-        ))
+        Ok(Self::new(Link::Plain(connection), heads, (clock, limits, budget), true))
     }
 
     /// Makes a server connection over TLS, with `config`. ALPN selects the version: `h2` for
@@ -337,20 +305,13 @@ impl Http {
         let tls = Tls::server(config, Protocol::Pending, (inbound, outbound), tls, budget)?;
         let (inbound, outbound) = queues(limits.queue, budget)?;
         let connection = Connection::new(tls, inbound, outbound, Some(clock))?;
-        Ok(Self::new(
-            Link::Tls(connection),
-            heads,
-            (clock, limits, budget),
-            Exchanges::Pending,
-            false,
-        ))
+        Ok(Self::new(Link::Tls(connection), heads, (clock, limits, budget), false))
     }
 
     fn new(
         link: Link<Protocol>,
         heads: Pool,
         (clock, limits, budget): (ClockDomain, Limits, &Budget),
-        exchanges: Exchanges,
         secure: bool,
     ) -> Self {
         Self {
@@ -359,7 +320,6 @@ impl Http {
             clock,
             limits,
             budget: budget.clone(),
-            exchanges,
             handshake: None,
             secure,
             shutdown: None,
@@ -383,10 +343,10 @@ impl Http {
         self.check(now)?;
         self.tick(now);
         while !self.closed {
-            let next = match self.exchanges {
-                Exchanges::Pending => None,
-                Exchanges::H1(_) => self.h1_next(now)?,
-                Exchanges::H2(_) => self.h2_next(),
+            let next = match self.link.engine_ref() {
+                Protocol::Pending => None,
+                Protocol::H1(..) => self.h1_next(now)?,
+                Protocol::H2(..) => self.h2_next(),
             };
             if next.is_some() {
                 return Ok(next);
@@ -410,10 +370,10 @@ impl Http {
         region: &mut WriteLoan<B>,
     ) -> Result<Read<'_>, Error> {
         self.fill(stream, now)?;
-        let read = match &mut self.exchanges {
-            Exchanges::H2(h2) => h2.read_into(stream, region)?,
-            Exchanges::H1(h1) => h1.body.read_into(region),
-            Exchanges::Pending => return Err(not_open()),
+        let read = match self.link.engine().0 {
+            Protocol::H2(_, h2) => h2.read_into(stream, region)?,
+            Protocol::H1(_, h1) => h1.body.read_into(region),
+            Protocol::Pending => return Err(not_open()),
         };
         Ok(read)
     }
@@ -423,13 +383,13 @@ impl Http {
     /// [`wait`](Self::wait) says, and call again. Refuses as [`read_into`](Self::read_into) does.
     pub fn next(&mut self, stream: Stream, now: Instant) -> Result<Option<Part>, Error> {
         self.fill(stream, now)?;
-        match &mut self.exchanges {
-            Exchanges::H2(h2) => h2.next(stream),
-            Exchanges::H1(h1) => Ok(match h1.body.take() {
+        match self.link.engine().0 {
+            Protocol::H2(_, h2) => h2.next(stream),
+            Protocol::H1(_, h1) => Ok(match h1.body.take() {
                 Some(data) => Some(Part::Data(data)),
                 None => h1.body.outcome().cloned().map(Part::End),
             }),
-            Exchanges::Pending => Err(not_open()),
+            Protocol::Pending => Err(not_open()),
         }
     }
 
@@ -445,11 +405,11 @@ impl Http {
     ) -> Result<Collect, Error> {
         loop {
             self.fill(stream, now)?;
-            let collect = match &mut self.exchanges {
-                Exchanges::H2(h2) => h2.collect(stream, region)?,
-                Exchanges::H1(h1) if h1.body.wants_data() => Collect::More,
-                Exchanges::H1(h1) => h1.body.collect(region),
-                Exchanges::Pending => return Err(not_open()),
+            let collect = match self.link.engine().0 {
+                Protocol::H2(_, h2) => h2.collect(stream, region)?,
+                Protocol::H1(_, h1) if h1.body.wants_data() => Collect::More,
+                Protocol::H1(_, h1) => h1.body.collect(region),
+                Protocol::Pending => return Err(not_open()),
             };
             match collect {
                 Collect::More if self.body_waits(stream) => return Ok(Collect::More),
@@ -471,10 +431,10 @@ impl Http {
     /// not change the protocol.
     pub fn respond(&mut self, stream: Stream, response: &Response<'_>, now: Instant) -> Result<bool, Error> {
         self.writable(now)?;
-        match self.exchanges {
-            Exchanges::H1(_) => self.h1_respond(stream, response, now),
-            Exchanges::H2(_) => self.h2_respond(stream, response, now),
-            Exchanges::Pending => Err(not_open()),
+        match self.link.engine_ref() {
+            Protocol::H1(..) => self.h1_respond(stream, response, now),
+            Protocol::H2(..) => self.h2_respond(stream, response, now),
+            Protocol::Pending => Err(not_open()),
         }
     }
 
@@ -483,10 +443,10 @@ impl Http {
     /// output first, and with [`Kind::Misuse`] when `data` passes the length of the response.
     pub fn write(&mut self, stream: Stream, data: &Lease, now: Instant) -> Result<(), Error> {
         self.writable(now)?;
-        match self.exchanges {
-            Exchanges::H1(_) => self.h1_write(stream, data, now),
-            Exchanges::H2(_) => self.h2_write(stream, data, now),
-            Exchanges::Pending => Err(not_open()),
+        match self.link.engine_ref() {
+            Protocol::H1(..) => self.h1_write(stream, data, now),
+            Protocol::H2(..) => self.h2_write(stream, data, now),
+            Protocol::Pending => Err(not_open()),
         }
     }
 
@@ -495,10 +455,10 @@ impl Http {
     /// with [`Kind::Misuse`] when the body is shorter than the length of the response.
     pub fn finish(&mut self, stream: Stream, now: Instant) -> Result<(), Error> {
         self.writable(now)?;
-        match self.exchanges {
-            Exchanges::H1(_) => self.h1_finish(stream, now),
-            Exchanges::H2(_) => self.h2_finish(stream, now),
-            Exchanges::Pending => Err(not_open()),
+        match self.link.engine_ref() {
+            Protocol::H1(..) => self.h1_finish(stream, now),
+            Protocol::H2(..) => self.h2_finish(stream, now),
+            Protocol::Pending => Err(not_open()),
         }
     }
 
@@ -513,10 +473,10 @@ impl Http {
         now: Instant,
     ) -> Result<bool, Error> {
         self.writable(now)?;
-        match self.exchanges {
-            Exchanges::H1(_) => self.h1_finish_with_trailers(stream, trailers, now),
-            Exchanges::H2(_) => self.h2_finish_with_trailers(stream, trailers, now),
-            Exchanges::Pending => Err(not_open()),
+        match self.link.engine_ref() {
+            Protocol::H1(..) => self.h1_finish_with_trailers(stream, trailers, now),
+            Protocol::H2(..) => self.h2_finish_with_trailers(stream, trailers, now),
+            Protocol::Pending => Err(not_open()),
         }
     }
 
@@ -525,10 +485,10 @@ impl Http {
     /// HTTP/1.1, the connection closes after the bytes that it queued, and it ends with
     /// [`Kind::Cancelled`]. Close the stream after it.
     pub fn cancel(&mut self, stream: Stream) {
-        match self.exchanges {
-            Exchanges::H1(_) => self.h1_cancel(stream),
-            Exchanges::H2(_) => self.h2_cancel(stream),
-            Exchanges::Pending => {}
+        match self.link.engine_ref() {
+            Protocol::H1(..) => self.h1_cancel(stream),
+            Protocol::H2(..) => self.h2_cancel(stream),
+            Protocol::Pending => {}
         }
     }
 
@@ -537,20 +497,20 @@ impl Http {
     /// for the stream on HTTP/2, and the stream frees its place for a new request. On HTTP/1.1,
     /// the delivery stays until the next request.
     pub fn close(&mut self, stream: Stream) {
-        match self.exchanges {
-            Exchanges::H1(_) => self.h1_close(stream),
-            Exchanges::H2(_) => self.h2_close(stream),
-            Exchanges::Pending => {}
+        match self.link.engine_ref() {
+            Protocol::H1(..) => self.h1_close(stream),
+            Protocol::H2(..) => self.h2_close(stream),
+            Protocol::Pending => {}
         }
     }
 
     /// How much of the response of `stream` the transport accepted, or `None` before its
     /// response, and for a stream that the server does not know.
     pub fn delivery(&self, stream: Stream) -> Option<Delivery> {
-        match &self.exchanges {
-            Exchanges::H1(h1) => h1.delivery(stream, self.link.accepted()),
-            Exchanges::H2(h2) => h2.delivery(stream),
-            Exchanges::Pending => None,
+        match self.link.engine_ref() {
+            Protocol::H1(_, h1) => h1.delivery(stream, self.link.accepted()),
+            Protocol::H2(_, h2) => h2.delivery(stream),
+            Protocol::Pending => None,
         }
     }
 
@@ -573,11 +533,11 @@ impl Http {
             return Err(misuse("the deadline is not on the clock of the server"));
         }
         self.shutdown = earliest(self.shutdown, Some(deadline));
-        match self.exchanges {
-            Exchanges::H1(_) => self.h1_shutdown(now),
-            Exchanges::H2(_) => self.h2_shutdown(now),
+        match self.link.engine_ref() {
+            Protocol::H1(..) => self.h1_shutdown(now),
+            Protocol::H2(..) => self.h2_shutdown(now),
             // The selection after the handshake starts the shutdown of the version.
-            Exchanges::Pending => self.request(now).map(drop),
+            Protocol::Pending => self.request(now).map(drop),
         }
     }
 
@@ -587,10 +547,10 @@ impl Http {
     /// each stream that it gives, and no other. The end of the connection, when
     /// [`wait`](Self::wait) gives [`Wait::Ended`] or [`Wait::Linger`], changes each stream.
     pub fn changed(&mut self, each: impl FnMut(Stream)) {
-        match &mut self.exchanges {
-            Exchanges::H1(h1) => h1.changed(each),
-            Exchanges::H2(h2) => h2.changed(each),
-            Exchanges::Pending => {}
+        match self.link.engine().0 {
+            Protocol::H1(_, h1) => h1.changed(each),
+            Protocol::H2(_, h2) => h2.changed(each),
+            Protocol::Pending => {}
         }
     }
 
@@ -610,7 +570,7 @@ impl Http {
 
     /// Selects the version after the TLS handshake. Gives whether it selected one.
     fn select(&mut self, now: Instant) -> Result<bool, Error> {
-        if !matches!(self.exchanges, Exchanges::Pending) {
+        if !matches!(self.link.engine_ref(), Protocol::Pending) {
             return Ok(false);
         }
         #[cfg(feature = "tls")]
@@ -636,11 +596,11 @@ impl Http {
             let (engine, outbound) = self.link.engine();
             let made = if h2 {
                 Session::new(Role::Server, limits.h2, limits.turn, outbound, &budget)
-                    .and_then(|session| Ok((Protocol::H2(session), Exchanges::H2(H2::new(&limits, &budget)?))))
+                    .and_then(|session| Ok(Protocol::H2(session, H2::new(&limits, &budget)?)))
             } else {
-                h1_engine(&limits, outbound, &budget).map(|server| (Protocol::H1(server), Exchanges::H1(H1::new())))
+                h1_engine(&limits, outbound, &budget).map(|server| Protocol::H1(server, H1::new()))
             };
-            let (protocol, exchanges) = match made {
+            let protocol = match made {
                 Ok(made) => made,
                 Err(error) => {
                     self.fail(error);
@@ -649,12 +609,11 @@ impl Http {
                 }
             };
             *engine = protocol;
-            self.exchanges = exchanges;
             if self.shutdown.is_some() {
-                match self.exchanges {
-                    Exchanges::H1(_) => self.h1_shutdown(now)?,
-                    Exchanges::H2(_) => self.h2_shutdown(now)?,
-                    Exchanges::Pending => {}
+                match self.link.engine_ref() {
+                    Protocol::H1(..) => self.h1_shutdown(now)?,
+                    Protocol::H2(..) => self.h2_shutdown(now)?,
+                    Protocol::Pending => {}
                 }
             }
             Ok(true)
@@ -689,10 +648,10 @@ impl Http {
     fn fill(&mut self, stream: Stream, now: Instant) -> Result<(), Error> {
         self.check(now)?;
         self.tick(now);
-        match self.exchanges {
-            Exchanges::H1(_) => self.h1_accept(stream)?,
-            Exchanges::H2(_) => self.h2_feed(stream)?,
-            Exchanges::Pending => return Err(not_open()),
+        match self.link.engine_ref() {
+            Protocol::H1(..) => self.h1_accept(stream)?,
+            Protocol::H2(..) => self.h2_feed(stream)?,
+            Protocol::Pending => return Err(not_open()),
         }
         while self.body_waits(stream) {
             if !self.pump(now)? {
@@ -704,10 +663,10 @@ impl Http {
 
     /// Whether the body of `stream` has no part and no end for a read.
     fn body_waits(&self, stream: Stream) -> bool {
-        match &self.exchanges {
-            Exchanges::H1(h1) => h1.body.wants_data(),
-            Exchanges::H2(h2) => h2.body_waits(stream),
-            Exchanges::Pending => false,
+        match self.link.engine_ref() {
+            Protocol::H1(_, h1) => h1.body.wants_data(),
+            Protocol::H2(_, h2) => h2.body_waits(stream),
+            Protocol::Pending => false,
         }
     }
 
@@ -730,10 +689,10 @@ impl Http {
         if self.lingering.is_some() || (self.closed && !self.reset) {
             return Ok(false);
         }
-        match self.exchanges {
-            Exchanges::H1(_) => self.h1_before_drive(),
-            Exchanges::H2(_) => self.h2_before_drive()?,
-            Exchanges::Pending => {}
+        match self.link.engine_ref() {
+            Protocol::H1(..) => self.h1_before_drive(),
+            Protocol::H2(..) => self.h2_before_drive()?,
+            Protocol::Pending => {}
         }
         let event = self.link.drive(now)?;
         if let Wait::Ended(Err(error)) = self.link.wait() {
@@ -755,7 +714,7 @@ impl Http {
 
     /// The engine ended: each stream that it carried ends with it.
     fn engine_ended(&mut self) {
-        if let Exchanges::H2(_) = self.exchanges {
+        if let Protocol::H2(..) = self.link.engine_ref() {
             self.h2_engine_ended();
         }
     }
@@ -787,17 +746,17 @@ impl Http {
                 "the shutdown deadline came before the connection closed",
             );
             self.cleanup.get_or_insert(error);
-            match self.exchanges {
-                Exchanges::H1(_) => self.h1_expire(error),
-                Exchanges::H2(_) => self.h2_expire(error),
-                Exchanges::Pending => {}
+            match self.link.engine_ref() {
+                Protocol::H1(..) => self.h1_expire(error),
+                Protocol::H2(..) => self.h2_expire(error),
+                Protocol::Pending => {}
             }
             self.lingering = None;
             self.closed = true;
         } else if reached(self.lingering.map(|lingering| lingering.deadline)) {
             self.lingering = None;
             self.closed = true;
-        } else if let Exchanges::H2(_) = self.exchanges {
+        } else if let Protocol::H2(..) = self.link.engine_ref() {
             self.h2_idle(now);
         }
     }
@@ -839,10 +798,10 @@ impl Http {
     fn fail(&mut self, error: Error) {
         self.failure.get_or_insert(error);
         let accepted = self.link.accepted();
-        match &mut self.exchanges {
-            Exchanges::H1(h1) => h1.fail(error, accepted),
-            Exchanges::H2(h2) => h2.fail(error),
-            Exchanges::Pending => {}
+        match self.link.engine().0 {
+            Protocol::H1(_, h1) => h1.fail(error, accepted),
+            Protocol::H2(_, h2) => h2.fail(error),
+            Protocol::Pending => {}
         }
     }
 
@@ -852,18 +811,18 @@ impl Http {
 
     /// Whether the version has work for the next call with no wait.
     fn ready(&self) -> bool {
-        match &self.exchanges {
-            Exchanges::H1(h1) => h1.next.is_some() && h1.delivered(self.link.accepted()),
-            Exchanges::H2(h2) => h2.ready(),
-            Exchanges::Pending => false,
+        match self.link.engine_ref() {
+            Protocol::H1(_, h1) => h1.next.is_some() && h1.delivered(self.link.accepted()),
+            Protocol::H2(_, h2) => h2.ready(),
+            Protocol::Pending => false,
         }
     }
 
     /// The deadline of the version: of an HTTP/2 connection with no stream.
     fn version_deadline(&self) -> Option<Deadline> {
-        match &self.exchanges {
-            Exchanges::H2(h2) => h2.idle,
-            Exchanges::H1(_) | Exchanges::Pending => None,
+        match self.link.engine_ref() {
+            Protocol::H2(_, h2) => h2.idle,
+            Protocol::H1(..) | Protocol::Pending => None,
         }
     }
 }
@@ -948,10 +907,10 @@ impl Io for Http {
         self.link.reset();
         if !quiet {
             let error = Error::new(Kind::Partial, "the transport failed before the connection closed");
-            let busy = match &self.exchanges {
-                Exchanges::H1(h1) => h1.busy(self.link.accepted()),
-                Exchanges::H2(h2) => h2.busy(),
-                Exchanges::Pending => false,
+            let busy = match self.link.engine_ref() {
+                Protocol::H1(_, h1) => h1.busy(self.link.accepted()),
+                Protocol::H2(_, h2) => h2.busy(),
+                Protocol::Pending => false,
             };
             if busy {
                 self.fail(error);
@@ -959,7 +918,7 @@ impl Io for Http {
                 // The output of a connection that ended did not go.
                 self.cleanup.get_or_insert(error);
             }
-            if let Exchanges::H2(h2) = &mut self.exchanges {
+            if let Protocol::H2(_, h2) = self.link.engine().0 {
                 h2.reset_bodies();
             }
         }
@@ -981,7 +940,7 @@ impl Io for Http {
     /// On HTTP/2, it counts the accepted bytes into the delivery of each stream.
     fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
         self.link.ack(id, accepted)?;
-        if let Exchanges::H2(_) = self.exchanges {
+        if let Protocol::H2(..) = self.link.engine_ref() {
             self.h2_accepted();
         }
         Ok(())

@@ -3,7 +3,7 @@
 use rstypes::buffer::Lease;
 use rstypes::time::Instant;
 
-use super::{Delivery, Exchanges, Http, Protocol, Response, misuse};
+use super::{Delivery, Http, Protocol, Response, misuse};
 use crate::body::{Consumer, Outcome};
 use crate::drive::{Accepted, Error, Kind, Outbound};
 use crate::h1::{self, Framing, RetainedRequest, ServerEvent};
@@ -34,7 +34,7 @@ struct Track {
 
 /// The exchanges of an HTTP/1.1 connection.
 #[derive(Debug)]
-pub(super) struct H1 {
+pub(crate) struct H1 {
     state: State,
     /// A request head that came while the response before it went out.
     pub(super) next: Option<RetainedRequest>,
@@ -121,13 +121,14 @@ impl H1 {
 }
 
 impl Http {
+    /// The exchanges of the connection.
     #[expect(
         clippy::unreachable,
-        reason = "`Http` calls the HTTP/1.1 exchanges only when its exchanges are `Exchanges::H1`"
+        reason = "`Http` calls an HTTP/1.1 method only after it matched `Protocol::H1`"
     )]
     fn h1(&mut self) -> &mut H1 {
-        match &mut self.exchanges {
-            Exchanges::H1(h1) => h1,
+        match self.link.engine().0 {
+            Protocol::H1(_, h1) => h1,
             _ => unreachable!("an HTTP/1.1 call comes only on an HTTP/1.1 connection"),
         }
     }
@@ -135,12 +136,12 @@ impl Http {
     /// The engine and the plaintext output queue.
     #[expect(
         clippy::unreachable,
-        reason = "`Exchanges::H1` and `Protocol::H1` start together, at the construction or at the selection"
+        reason = "`Http` calls an HTTP/1.1 method only after it matched `Protocol::H1`"
     )]
     fn h1_parts(&mut self) -> (&mut h1::Server, &mut Outbound) {
         match self.link.engine() {
-            (Protocol::H1(server), outbound) => (server, outbound),
-            _ => unreachable!("the HTTP/1.1 exchanges run on the HTTP/1.1 engine"),
+            (Protocol::H1(server, _), outbound) => (server, outbound),
+            _ => unreachable!("an HTTP/1.1 call comes only on an HTTP/1.1 connection"),
         }
     }
 

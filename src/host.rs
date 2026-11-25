@@ -383,7 +383,6 @@ impl<E: Engine> Connection<E> {
     }
 
     /// The engine, for a look at its state.
-    #[cfg(feature = "tls")]
     pub(crate) fn engine(&self) -> &E {
         &self.engine
     }

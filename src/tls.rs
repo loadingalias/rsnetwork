@@ -1523,6 +1523,11 @@ impl<E: Engine> Tls<E> {
         (&mut self.engine, &mut self.outbound)
     }
 
+    /// The inner engine, for a look at its state.
+    pub(crate) const fn engine(&self) -> &E {
+        &self.engine
+    }
+
     /// What the handshake negotiated, or `None` before it completed.
     pub fn negotiated(&self) -> Option<Negotiated<'_>> {
         self.facts.as_ref().map(Facts::negotiated)

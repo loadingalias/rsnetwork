@@ -51,6 +51,15 @@ impl<E: Engine> Link<E> {
         }
     }
 
+    /// The engine, for a look at its state.
+    pub(crate) fn engine_ref(&self) -> &E {
+        match self {
+            Self::Plain(connection) => connection.engine(),
+            #[cfg(feature = "tls")]
+            Self::Tls(connection) => connection.engine().engine(),
+        }
+    }
+
     /// Drives the connection one time at `now`.
     pub(crate) fn drive(&mut self, now: Instant) -> Result<Option<E::Event>, Error> {
         each!(self, connection => connection.drive(Some(now)))

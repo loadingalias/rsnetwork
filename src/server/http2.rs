@@ -13,7 +13,7 @@ use rstypes::buffer::{Buffer as _, BufferMut, Lease, WriteLoan};
 use rstypes::capacity::{Budget, Permit};
 use rstypes::time::{Deadline, Instant};
 
-use super::{Delivery, Exchanges, Http, Limits, Protocol, Response, misuse, not_open};
+use super::{Delivery, Http, Limits, Protocol, Response, misuse, not_open};
 use crate::body::{Collect, Outcome, Part, Read, Trailers};
 use crate::drive::{Error, Kind, Outbound};
 use crate::h1;
@@ -128,7 +128,7 @@ impl Exchange {
 
 /// The streams of an HTTP/2 connection.
 #[derive(Debug)]
-pub(super) struct H2 {
+pub(crate) struct H2 {
     /// In the order of their requests.
     exchanges: Vec<Exchange>,
     _charge: Permit,
@@ -280,13 +280,14 @@ impl H2 {
 }
 
 impl Http {
+    /// The streams of the connection.
     #[expect(
         clippy::unreachable,
-        reason = "`Http` calls the HTTP/2 streams only when its exchanges are `Exchanges::H2`"
+        reason = "`Http` calls an HTTP/2 method only after it matched `Protocol::H2`"
     )]
     fn h2(&mut self) -> &mut H2 {
-        match &mut self.exchanges {
-            Exchanges::H2(h2) => h2,
+        match self.link.engine().0 {
+            Protocol::H2(_, h2) => h2,
             _ => unreachable!("an HTTP/2 call comes only on an HTTP/2 connection"),
         }
     }
@@ -294,12 +295,12 @@ impl Http {
     /// The engine and the plaintext output queue.
     #[expect(
         clippy::unreachable,
-        reason = "`Exchanges::H2` and `Protocol::H2` start together, at the construction or at the selection"
+        reason = "`Http` calls an HTTP/2 method only after it matched `Protocol::H2`"
     )]
     fn h2_parts(&mut self) -> (&mut Session, &mut Outbound) {
         match self.link.engine() {
-            (Protocol::H2(session), outbound) => (session, outbound),
-            _ => unreachable!("the HTTP/2 streams run on the HTTP/2 engine"),
+            (Protocol::H2(session, _), outbound) => (session, outbound),
+            _ => unreachable!("an HTTP/2 call comes only on an HTTP/2 connection"),
         }
     }
 
