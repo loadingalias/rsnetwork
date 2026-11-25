@@ -487,6 +487,50 @@ fn a_read_goes_on_when_its_drive_removes_a_stream_that_the_application_left() {
 }
 
 #[test]
+fn a_write_goes_on_when_its_wait_for_the_chunk_before_removes_a_stream_that_the_server_closed() {
+    let mut pair = Pair::plain();
+    let a = pair.send(&get(b"/a"), later(), at(0));
+    let b = pair.send(&get(b"/b"), later(), at(0));
+    let (first, _) = pair.request(at(0));
+    let (second, _) = pair.request(at(0));
+    // The first chunk of the second stream is one byte larger than the window of the stream.
+    let chunk = vec![7; 4 * FRAME];
+    assert!(
+        pair.server
+            .respond(second, &ok(Some(chunk.len() as u64 + 1)), at(0))
+            .unwrap()
+    );
+    pair.server.write(second, &Lease::from(chunk.clone()), at(0)).unwrap();
+    // The client reads the whole answer of the first stream, and then the server leaves it.
+    pair.answer(first, b"one", at(0));
+    pair.response(a, at(0)).unwrap();
+    assert_matches!(pair.collect(a, at(0)), (body, Collect::Complete(None)) if body == b"one");
+    pair.server.close(first);
+    // The wait for the chunk before drives, and that drive removes the first stream.
+    let last = Lease::from(&b"!"[..]);
+    assert_matches!(pair.server.write(second, &last, at(0)), Err(error) if error.kind() == Kind::Overload);
+    pair.response(b, at(0)).unwrap();
+    let mut region = WriteLoan::new(Vec::with_capacity(chunk.len() + 1));
+    for _ in 0..16 {
+        match pair.client.collect(b, at(0), &mut region).unwrap() {
+            Collect::More => {}
+            other => panic!("the body ends after its last byte: {other:?}"),
+        }
+        if pair.server.write(second, &last, at(0)).is_ok() {
+            break;
+        }
+        pair.transport(at(0));
+    }
+    pair.server.finish(second, at(0)).unwrap();
+    pair.transport(at(0));
+    assert_matches!(
+        pair.client.collect(b, at(0), &mut region).unwrap(),
+        Collect::Complete(None)
+    );
+    assert_eq!(region.filled(), [chunk.as_slice(), b"!"].concat());
+}
+
+#[test]
 fn a_slow_body_meets_its_deadline_on_its_stream_and_the_connection_goes_on() {
     let mut pair = Pair::plain();
     let slow = pair.send(&get(b"/slow"), Deadline::at(at(1_000)), at(0));

@@ -22,6 +22,7 @@ use super::{ConnectionId, VARINT_MAX, Writer, varint_len};
 use crate::drive::{Ecn, Error, Kind};
 
 pub(super) const NO_ROOM: Error = Error::new(Kind::Overload, "the budget refused QUIC recovery state");
+const PATHS_SPENT: Error = Error::new(Kind::Overload, "the QUIC connection used each of its path tags");
 const GRANULARITY: Duration = Duration::from_millis(1);
 const INITIAL_RTT: Duration = Duration::from_millis(333);
 const PACKET_THRESHOLD: u64 = 3;
@@ -695,13 +696,12 @@ impl Paths {
     }
 
     /// Makes `next` the active path, and gives the path before it. No packet that went out
-    /// before counts for `next`.
-    pub(super) fn switch(&mut self, mut next: PathState) -> PathState {
+    /// before counts for `next`. Refuses with [`Kind::Overload`] after 2^32 - 2 changes, so no
+    /// tag comes again. A side flow can keep a packet of a tag until the flow ends.
+    pub(super) fn switch(&mut self, mut next: PathState) -> Result<PathState, Error> {
         next.id = self.next;
-        // Only the live packets hold a tag, and the last paths sent them, so a tag that comes
-        // again after 2^32 paths meets no packet of its first use.
-        self.next = self.next.wrapping_add(1);
-        self.activate(next)
+        self.next = self.next.checked_add(1).ok_or(PATHS_SPENT)?;
+        Ok(self.activate(next))
     }
 
     /// Makes `next` the active path: a new path, or the fallback path of a validation that

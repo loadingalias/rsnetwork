@@ -7,8 +7,8 @@ use std::time::Instant;
 use rstypes::capacity::Budget;
 
 use super::Table;
-use crate::quic::ConnectionId;
 use crate::quic::endpoint::Key;
+use crate::quic::{ConnectionId, Path};
 
 /// A production route lookup for each CID. The result is the elapsed nanoseconds for one pass.
 fn elapsed(table: &Table<Key, usize>, ids: &[Key]) -> u128 {
@@ -23,14 +23,15 @@ fn elapsed(table: &Table<Key, usize>, ids: &[Key]) -> u128 {
 fn chosen_initial_ids_keep_lookup_work_bounded_and_change_placement_with_the_endpoint_key() {
     const COUNT: usize = 1024;
     let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 443));
+    let path = Path { local: peer, peer };
     let mut chosen = Vec::with_capacity(COUNT);
     let mut random = Vec::with_capacity(COUNT);
     for i in 0..COUNT {
         let mut id = [0x42; 16];
         id[8..].copy_from_slice(&(i as u64).to_be_bytes());
-        chosen.push(Key::Initial(peer, ConnectionId::new(&id).unwrap()));
+        chosen.push(Key::Initial(path, ConnectionId::new(&id).unwrap()));
         let digest = rscrypto::Sha256::digest(&(i as u64).to_be_bytes());
-        random.push(Key::Initial(peer, ConnectionId::new(&digest[..16]).unwrap()));
+        random.push(Key::Initial(path, ConnectionId::new(&digest[..16]).unwrap()));
     }
     let budget = Budget::new(NonZeroU64::new(1 << 21).unwrap());
     let build = |ids: &[Key], seed: u8| {

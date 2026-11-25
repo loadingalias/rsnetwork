@@ -806,16 +806,11 @@ impl Http {
         }
         let (index, _) = self.h2_chunk_sent(stream, now)?;
         let id = self.h2().exchanges[index].id;
-        self.queue(now, |server| {
-            let (session, outbound) = server.h2_parts();
-            session.connection().data(outbound, id, data.clone(), false)
-        })?;
-        // A full queue drives the connection, and a drive can remove a stream that the
-        // application closed, so the place of this stream can change.
-        let h2 = self.h2();
-        if let Some(index) = h2.find(stream)
-            && let Some(out) = &mut h2.exchanges[index].out
-        {
+        // A chunk with bytes waits in its stream, so a full output queue cannot refuse it, and
+        // no drive moves this exchange.
+        let (session, outbound) = self.h2_parts();
+        session.connection().data(outbound, id, data.clone(), false)?;
+        if let Some(out) = &mut self.h2().exchanges[index].out {
             out.written += len;
             out.chunk = true;
         }

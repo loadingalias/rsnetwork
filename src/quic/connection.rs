@@ -1218,7 +1218,7 @@ impl Connection {
     ///
     /// Refuses with [`Kind::Misuse`] on a server, before the handshake is confirmed, and for
     /// another address of the server. Refuses with [`Kind::Unsupported`] when the server
-    /// disabled migration.
+    /// disabled migration, and with [`Kind::Overload`] after 2^32 - 2 changes of path.
     pub fn migrate(&mut self, path: Path, now: Instant) -> Result<bool, Error> {
         self.live()?;
         self.check_clock(now)?;
@@ -1268,7 +1268,7 @@ impl Connection {
         let mut next = old.next(path, remote_cid, self.datagram_top(), self.limits.congestion_control);
         next.amplification_credit = server.then(|| self.paths.take_credit(path));
         let until = self.validation_end(now)?;
-        let old = self.paths.switch(next);
+        let old = self.paths.switch(next)?;
         match &mut self.paths.validation {
             // The path that the connection leaves had no validation: the fallback path stays.
             Some(validation) => validation.restart(until),
@@ -2139,7 +2139,7 @@ impl Connection {
                     *scid,
                     self.limits.datagram_bytes_max,
                     self.limits.congestion_control,
-                ));
+                ))?;
                 self.initial_token = Some(token);
                 self.retry_cid = Some(*scid);
                 self.validation_at = now;

@@ -1443,7 +1443,8 @@ impl Streams {
         Some(fit(room.min(peer).saturating_sub(1), usize::MAX))
     }
 
-    /// Queues `data` as one unreliable datagram, for a packet with `room` bytes for its frames.
+    /// Drops and counts each queued unreliable datagram that a packet with `room` bytes for its
+    /// frames cannot carry.
     pub(super) fn resize_unreliable(&mut self, room: usize) {
         let Some(max) = self.unreliable_room(room) else { return };
         self.unreliable.retain(|data| {
@@ -1456,6 +1457,7 @@ impl Streams {
         });
     }
 
+    /// Queues `data` as one unreliable datagram, for a packet with `room` bytes for its frames.
     pub(super) fn unreliable(&mut self, data: Lease, room: usize) -> Result<(), Error> {
         if !self.active {
             return Err(Error::new(Kind::Misuse, "the QUIC handshake is not complete"));

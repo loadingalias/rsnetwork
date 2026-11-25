@@ -203,9 +203,9 @@ struct Pair {
     seen: SocketAddr,
     /// The datagrams that the server sent to another address.
     elsewhere: Vec<(Path, Vec<u8>)>,
-    /// The largest datagram that the path carries: it drops each larger one, and counts it.
+    /// The largest datagram that the path carries: it drops each larger one, and keeps it.
     path_bytes: usize,
-    dropped: usize,
+    dropped: Vec<Vec<u8>>,
     /// The largest datagram of the client that the path carried.
     largest: usize,
 }
@@ -262,7 +262,7 @@ impl Pair {
             seen: client_address(4301),
             elsewhere: Vec::new(),
             path_bytes,
-            dropped: 0,
+            dropped: Vec::new(),
             largest: 0,
         };
         pair.run(|_| true);
@@ -284,7 +284,7 @@ impl Pair {
             self.at_client.take(&mut self.client, events, &releases);
             for datagram in &to_server {
                 if datagram.len() > self.path_bytes {
-                    self.dropped += 1;
+                    self.dropped.push(datagram.clone());
                     continue;
                 }
                 self.largest = self.largest.max(datagram.len());
@@ -1411,7 +1411,6 @@ fn an_unreliable_datagram_that_waits_drops_with_its_count_when_the_path_returns_
     pair.run_until(now(), |pair| pair.at_server.complete(stream, 5000));
     // The datagrams that waited do not fit a path of 1,200 bytes. They dropped, so the stream
     // went on, and a new one of this size refuses.
-    assert!(pair.client.unreliable_dropped() > 0);
     assert!(pair.client.unreliable_room().is_some_and(|room| room < 1200));
     assert_matches!(
         pair.client
@@ -1423,6 +1422,17 @@ fn an_unreliable_datagram_that_waits_drops_with_its_count_when_the_path_returns_
         pair.at_server.other.is_empty(),
         "the path carried no datagram of 1,300 bytes"
     );
+    // The server opens the packets that the path dropped. Each datagram that did not leave the
+    // client is in the count.
+    let mut left = 0;
+    for datagram in &pair.dropped {
+        for event in give(&mut pair.server, datagram) {
+            assert_matches!(event, Event::Unreliable(data) if data.bytes() == region(0, 1300).bytes());
+            left += 1;
+        }
+    }
+    assert!(left > 0, "the client sent datagrams before the path changed");
+    assert_eq!(pair.client.unreliable_dropped(), 30 - left);
 }
 
 /// A server with a window above the initial one, which an attacker moves: a copy of a datagram
@@ -1521,7 +1531,8 @@ fn the_search_finds_the_datagram_size_of_the_path_and_a_lost_probe_is_no_congest
     }
     // At most three probes of each size, and at most six sizes: the top, and then each half of
     // the 252 bytes above 1,200 down to a step of 20 bytes.
-    assert!((1..=18).contains(&pair.dropped), "{} probes were lost", pair.dropped);
+    let lost = pair.dropped.len();
+    assert!((1..=18).contains(&lost), "{lost} probes were lost");
     let recovery = pair.client.recovery();
     assert_eq!(recovery.packets_lost, 0);
     assert!(recovery.congestion_window >= INITIAL_WINDOW);
@@ -1701,5 +1712,5 @@ fn the_search_starts_on_an_idle_path_whose_limit_is_above_the_window() {
     }
     // Each probe has at most two datagrams of the size before it, which each window holds. Thus
     // the search reaches the limit, and loses no probe.
-    assert_eq!((pair.largest, pair.dropped), (13_000, 0));
+    assert_eq!((pair.largest, pair.dropped.len()), (13_000, 0));
 }

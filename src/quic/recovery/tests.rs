@@ -9,7 +9,7 @@ use rstypes::time::{ClockDomain, Instant, Suspend};
 use core::net::{Ipv4Addr, SocketAddr};
 
 use super::{
-    Ack, CongestionControl, ConnectionId, Controller, Duration, Ecn, Frame, History, Mtu, Path, PathState, Paths,
+    Ack, CongestionControl, ConnectionId, Controller, Duration, Ecn, Frame, History, Kind, Mtu, Path, PathState, Paths,
     Record, Records, Sent, Settlement, Validation,
 };
 
@@ -42,7 +42,7 @@ fn migrate(paths: &mut Paths, rtt: Duration) {
         .active
         .next(route(2), ConnectionId::EMPTY, 1200, CongestionControl::Cubic);
     next.sample(rtt, Duration::ZERO, at(0));
-    let fallback = paths.switch(next);
+    let fallback = paths.switch(next).unwrap();
     paths.validation = Some(Validation::new(fallback, at(60_000), false));
 }
 
@@ -104,6 +104,20 @@ fn an_acknowledgement_of_a_packet_of_the_path_that_the_connection_left_is_no_fee
         "the mark is on the packet of the first path"
     );
     assert_eq!(paths.validation.unwrap().fallback.stats().bytes_in_flight, 0);
+}
+
+#[test]
+fn a_connection_that_used_each_path_tag_refuses_a_new_path_and_stays_on_its_path() {
+    let budget = Budget::new(NonZeroU64::new(1 << 16).unwrap());
+    let mut paths = connection(&budget, Duration::from_millis(20));
+    // A side flow can keep a packet of the first path until its end. A tag that comes again
+    // after the last one would give that packet to another path.
+    paths.next = u32::MAX;
+    let next = paths
+        .active
+        .next(route(2), ConnectionId::EMPTY, 1200, CongestionControl::Cubic);
+    assert_eq!(paths.switch(next).map(drop).unwrap_err().kind(), Kind::Overload);
+    assert_eq!(paths.active.addresses, route(1));
 }
 
 #[test]

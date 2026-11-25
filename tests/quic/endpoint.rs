@@ -252,6 +252,34 @@ fn full_handshake_admission_still_routes_an_established_connection_and_releases_
 }
 
 #[test]
+fn initials_from_one_peer_address_to_two_local_addresses_start_two_connections() {
+    let (config, server, keys) = configs();
+    let mut endpoint = listener(&server, &keys, 2);
+    // A second address of the listener gets the same Initial: the same peer and connection ID.
+    let first = address(4301);
+    let second = Path {
+        local: (Ipv4Addr::new(127, 0, 0, 2), SERVER_PORT).into(),
+        ..first
+    };
+    let packet = Pair::send(&mut client(&config), at(0)).remove(0);
+    let mut reply = [0; 1200];
+    let mut handles = Vec::new();
+    for path in [first, second] {
+        let Route::Accepted(h) = endpoint.route(path, &packet, &mut reply, at(0)).unwrap() else {
+            panic!("each local address starts its own connection")
+        };
+        handles.push(h);
+    }
+    assert_ne!(handles[0], handles[1]);
+    for (path, h) in [first, second].into_iter().zip(handles) {
+        assert_eq!(
+            endpoint.route(path, &packet, &mut reply, at(0)).unwrap(),
+            Route::Existing(h)
+        );
+    }
+}
+
+#[test]
 fn retired_connection_ids_leave_the_route_and_a_stateless_reset_drains_the_peer() {
     let (config, server, keys) = configs();
     let mut endpoint = listener(&server, &keys, 2);

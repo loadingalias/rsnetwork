@@ -96,7 +96,7 @@ impl Issuer {
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 enum Key {
     Local(ConnectionId),
-    Initial(SocketAddr, ConnectionId),
+    Initial(Path, ConnectionId),
     Reset(SocketAddr, [u8; 16]),
 }
 
@@ -256,7 +256,7 @@ impl Endpoint {
             }
             return Ok(Route::Dropped);
         }
-        if let Some(h) = self.routes.get(&Key::Initial(peer, dcid)) {
+        if let Some(h) = self.routes.get(&Key::Initial(path, dcid)) {
             return Ok(Route::Existing(h));
         }
         let Some(index) = self.free.filter(|_| self.handshakes < self.limits.handshakes_max) else {
@@ -316,14 +316,14 @@ impl Endpoint {
             );
         }
         assert!(
-            self.routes.insert(Key::Initial(peer, dcid), handle),
+            self.routes.insert(Key::Initial(path, dcid), handle),
             "an existing Initial alias routes before admission"
         );
         self.free = slot.free;
         self.handshakes += 1;
         slot.entry = Some(Registered {
             connection,
-            initial: Some(Key::Initial(peer, dcid)),
+            initial: Some(Key::Initial(path, dcid)),
             ids,
             resets: [None; RESET_ROUTES],
             _storage: storage,
