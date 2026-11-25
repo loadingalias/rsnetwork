@@ -1,6 +1,7 @@
 //! Drive one QUIC connection from a nonblocking UDP socket and the host clock.
 
 use core::net::SocketAddr;
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::io;
 use std::net::UdpSocket;
@@ -127,7 +128,7 @@ pub(super) fn run(
         for _ in 0..SEND_BATCH {
             let len = match unsent {
                 Some(len) => len,
-                None => match connection.transmit(&mut output, now())? {
+                None => match connection.transmit(&mut output, NonZeroUsize::MIN, now())? {
                     Some(sent) => sent.len,
                     None => break,
                 },

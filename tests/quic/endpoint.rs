@@ -2,6 +2,7 @@
 //! to a new local address.
 
 use core::net::Ipv4Addr;
+use core::num::NonZeroUsize;
 use std::assert_matches;
 use std::sync::Arc;
 
@@ -457,7 +458,7 @@ fn routed(connection: &mut Connection) -> Vec<(Path, Vec<u8>)> {
     let mut datagrams = Vec::new();
     let mut out = vec![0; 1500];
     for _ in 0..64 {
-        match connection.transmit(&mut out, at(0)).unwrap() {
+        match connection.transmit(&mut out, NonZeroUsize::MIN, at(0)).unwrap() {
             Some(sent) => datagrams.push((sent.path, out[..sent.len].to_vec())),
             None => return datagrams,
         }

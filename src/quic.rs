@@ -31,6 +31,9 @@
 //!   Select NewReno with [`Limits::congestion_control`]. Parent and side datagrams share the window and the pacer.
 //!   [`Connection::recovery`] reports the window, bytes in flight, round-trip time, and ECN feedback.
 //!   Drive the connection at its deadline to send paced packets and loss probes.
+//! - **Batches.** [`Connection::transmit`] builds a batch of datagrams of one size for one path,
+//!   up to the segment limit of the host, for one send with segmentation offload (GSO, USO). The
+//!   pacer lets about 1 ms of the rate of the path leave in one batch.
 //!   A host with ECN metadata uses [`Connection::transmit_ecn`] and [`packet::Datagrams::with_ecn`].
 //! - **Parameters.** [`params::Parameters`] writes and checks the transport parameters of each end
 //!   (RFC 9000, section 18).

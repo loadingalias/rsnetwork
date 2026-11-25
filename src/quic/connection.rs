@@ -4,7 +4,7 @@
 //!
 //! A host drives a [`Connection`] in calls: [`Connection::receive`] with each received region,
 //! [`Connection::drive`] at its deadline, and then [`Connection::transmit`] until it gives no
-//! datagram. Each call returns at once: the engine does no I/O and keeps no thread.
+//! batch of datagrams. Each call returns at once: the engine does no I/O and keeps no thread.
 //!
 //! After the handshake, the application opens streams, gives them regions to send, and takes the
 //! [`Event`]s of the peer: `receive` and `drive` give one event for each call, so call them again
@@ -25,6 +25,7 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::mem::size_of;
 use core::net::SocketAddr;
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -596,15 +597,33 @@ impl PeerClose {
     }
 }
 
-/// The length, the IP ECN codepoint, and the path of one outgoing UDP datagram.
+/// A batch of outgoing UDP datagrams for one path, with one IP ECN codepoint: the datagrams are
+/// `out[..len].chunks(segment_bytes)`. A host with segmentation offload (GSO, USO) sends the batch
+/// in one call, with `segment_bytes` as its segment size. Each other host sends each chunk as one
+/// datagram. When the host accepts only the first datagrams of a batch, it sends the chunks that
+/// remain later. It never sends a part of the batch that does not start at a chunk as one datagram.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Transmission {
     /// The initialized prefix of the output buffer.
     pub len: usize,
-    /// The codepoint for the host to apply to this datagram.
+    /// The bytes of each datagram except the last, which can have fewer.
+    pub segment_bytes: usize,
+    /// The codepoint for the host to apply to each datagram.
     pub ecn: Ecn,
-    /// Send the datagram from `path.local` to `path.peer`.
+    /// Send each datagram from `path.local` to `path.peer`.
     pub path: Path,
+}
+
+impl Transmission {
+    /// A batch of one datagram.
+    const fn one(len: usize, ecn: Ecn, path: Path) -> Self {
+        Self {
+            len,
+            segment_bytes: len,
+            ecn,
+            path,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2977,31 +2996,51 @@ impl Connection {
         }
     }
 
-    /// Builds an unmarked datagram at the start of `out`. Gives its length and its path, or `None`
-    /// when no datagram can leave now. Call it until it gives `None`. The datagram has at most
+    /// Builds a batch of at most `segments` unmarked datagrams at the start of `out`. Gives the
+    /// batch, or `None` when no datagram can leave now. Call it until it gives `None`. A host with
+    /// no segmentation offload asks for one segment. Each datagram has at most
     /// [`Limits::datagram_bytes_max`] bytes. A client Initial or an ack-eliciting server Initial
-    /// needs at least 1,200.
+    /// needs at least 1,200. A batch holds what the window and the pacer allow now: about 1 ms of
+    /// the rate of the path. It also ends where `out` has no room for one more datagram.
     ///
     /// Refuses with [`Kind::Misuse`] when `out` has fewer bytes than
     /// [`Limits::datagram_bytes_max`].
-    pub fn transmit(&mut self, out: &mut [u8], now: Instant) -> Result<Option<Transmission>, Error> {
-        self.transmit_mark(out, now, Ecn::NotEct)
+    pub fn transmit(
+        &mut self,
+        out: &mut [u8],
+        segments: NonZeroUsize,
+        now: Instant,
+    ) -> Result<Option<Transmission>, Error> {
+        self.transmit_mark(out, segments.get(), now, Ecn::NotEct)
     }
 
-    /// Builds a datagram for a host that can set its IP ECN codepoint. Apply the returned mark to that datagram.
-    /// Supply the received mark with [`Datagrams::with_ecn`]. A host without send metadata uses [`transmit`](Self::transmit).
-    /// After `None`, call [`drive`](Self::drive) to get the next deadline.
-    pub fn transmit_ecn(&mut self, out: &mut [u8], now: Instant) -> Result<Option<Transmission>, Error> {
+    /// Builds a batch for a host that can set its IP ECN codepoint. Apply the returned mark to
+    /// each datagram of the batch. Supply the received mark with [`Datagrams::with_ecn`]. A host
+    /// without send metadata uses [`transmit`](Self::transmit). After `None`, call
+    /// [`drive`](Self::drive) to get the next deadline.
+    pub fn transmit_ecn(
+        &mut self,
+        out: &mut [u8],
+        segments: NonZeroUsize,
+        now: Instant,
+    ) -> Result<Option<Transmission>, Error> {
         self.check_clock(now)?;
-        let ecn = self.paths.active.mark(now);
-        let sent = self.transmit_mark(out, now, ecn)?;
+        let (ecn, marks) = self.paths.active.mark(now);
+        let sent = self.transmit_mark(out, segments.get().min(marks), now, ecn)?;
         if let Some(sent) = sent {
-            self.paths.active.marked(sent.ecn, now);
+            let datagrams = sent.len.div_ceil(sent.segment_bytes);
+            self.paths.active.marked(sent.ecn, datagrams, now);
         }
         Ok(sent)
     }
 
-    fn transmit_mark(&mut self, out: &mut [u8], now: Instant, mark: Ecn) -> Result<Option<Transmission>, Error> {
+    fn transmit_mark(
+        &mut self,
+        out: &mut [u8],
+        segments: usize,
+        now: Instant,
+        mark: Ecn,
+    ) -> Result<Option<Transmission>, Error> {
         self.check_clock(now)?;
         if out.len() < self.limits.datagram_bytes_max {
             return Err(Error::new(
@@ -3019,7 +3058,7 @@ impl Connection {
         };
         if self.ending.is_none() {
             self.fit();
-            match self.build(out, send) {
+            match self.build(out, segments, send) {
                 Ok(sent) => return Ok(sent),
                 Err(failure) => self.fail(failure, now),
             }
@@ -3027,18 +3066,43 @@ impl Connection {
         Ok(self.closing(out, send))
     }
 
-    /// Builds the next datagram of a live connection: for a path that does not carry the
-    /// connection, then a probe of the datagram size, and then the packets that wait.
-    fn build(&mut self, out: &mut [u8], send: SendAt) -> Result<Option<Transmission>, Failure> {
+    /// Builds the next batch of a live connection, of at most `segments` datagrams. A datagram for
+    /// a path that does not carry the connection, and then a probe of the datagram size, go
+    /// alone. Then the datagrams of the packets that wait follow each other: each one except the
+    /// last has the datagram size of the active path.
+    fn build(&mut self, out: &mut [u8], segments: usize, send: SendAt) -> Result<Option<Transmission>, Failure> {
         if let Some((len, path)) = self.off_path(out, send)? {
-            let ecn = Ecn::NotEct;
-            return Ok(Some(Transmission { len, ecn, path }));
+            return Ok(Some(Transmission::one(len, Ecn::NotEct, path)));
         }
         let (path, ecn) = (self.paths.active.addresses, send.mark);
         if let Some(len) = self.size_probe(out, send)? {
-            return Ok(Some(Transmission { len, ecn, path }));
+            return Ok(Some(Transmission::one(len, ecn, path)));
         }
-        let room = self.room();
+        let segment = self.room();
+        let mut at = 0;
+        for _ in 0..segments {
+            let Some(rest) = out.get_mut(at..at + segment) else {
+                break;
+            };
+            let Some(len) = self.next(rest, send)? else {
+                break;
+            };
+            at += len;
+            if len < segment {
+                break;
+            }
+        }
+        Ok((at > 0).then_some(Transmission {
+            len: at,
+            segment_bytes: at.min(segment),
+            ecn,
+            path,
+        }))
+    }
+
+    /// Builds one datagram of the packets that wait into `out`, and charges it to the active path.
+    fn next(&mut self, out: &mut [u8], send: SendAt) -> Result<Option<usize>, Failure> {
+        let room = self.room().min(out.len());
         let pad = self.spaces[0].keys.is_some() && (self.spaces[0].probe || self.has_data(Level::Initial));
         if self.paths.active.amplification_credit.is_some() && (room == 0 || (pad && room < DATAGRAM_MIN)) {
             self.amplification_blocked();
@@ -3052,7 +3116,7 @@ impl Connection {
             return Ok(None);
         };
         self.paths.active.charge(len as u64);
-        Ok(Some(Transmission { len, ecn, path }))
+        Ok(Some(len))
     }
 
     /// The bytes of the next datagram to the active path: its datagram size, and what the
@@ -3234,11 +3298,7 @@ impl Connection {
         }
         let path = &mut self.paths.active;
         path.charge(len as u64);
-        (len > 0).then_some(Transmission {
-            len,
-            ecn: mark,
-            path: path.addresses,
-        })
+        (len > 0).then_some(Transmission::one(len, mark, path.addresses))
     }
 
     /// The number of the next packet of `level`, and the bytes of its encoding.

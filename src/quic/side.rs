@@ -144,7 +144,7 @@ impl Flows {
             return Ok(None);
         }
         let number = space.next;
-        let ecn = path.mark(now);
+        let (ecn, _) = path.mark(now);
         space.history.insert(
             paths,
             Sent {
@@ -158,7 +158,7 @@ impl Flows {
         )?;
         space.history.ect_sent += u64::from(ecn == Ecn::Ect0);
         paths.active.charge(bytes);
-        paths.active.marked(ecn, now);
+        paths.active.marked(ecn, 1, now);
         space.next += 1;
         self.waiting -= usize::from(core::mem::take(&mut space.waiting));
         if self.oldest.is_none_or(|(_, oldest)| oldest == id) {

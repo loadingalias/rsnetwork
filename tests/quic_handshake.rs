@@ -169,7 +169,7 @@ impl Pair {
         let mut datagrams = Vec::new();
         let mut out = vec![0; 65_527];
         for _ in 0..512 {
-            match connection.transmit(&mut out, now).unwrap() {
+            match connection.transmit(&mut out, NonZeroUsize::MIN, now).unwrap() {
                 Some(sent) => {
                     datagrams.push(out[..sent.len].to_vec());
                 }
@@ -490,7 +490,7 @@ fn an_idle_connection_reaches_its_idle_deadline_with_no_peer_traffic() {
         "the QUIC connection was idle past its timeout"
     );
     assert_eq!(
-        client.transmit(&mut [0; 1500], at(5_000)),
+        client.transmit(&mut [0; 1500], NonZeroUsize::MIN, at(5_000)),
         Ok(None),
         "an idle end sends nothing"
     );

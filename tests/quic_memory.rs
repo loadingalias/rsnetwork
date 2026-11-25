@@ -155,7 +155,7 @@ fn send(owner: usize, connection: &mut Connection) -> Vec<Vec<u8>> {
     let mut datagrams = Vec::new();
     for _ in 0..512 {
         let mut out = vec![0; 1500];
-        match owned(owner, || connection.transmit(&mut out, now())).unwrap() {
+        match owned(owner, || connection.transmit(&mut out, NonZeroUsize::MIN, now())).unwrap() {
             Some(sent) => {
                 out.truncate(sent.len);
                 datagrams.push(out);
@@ -452,7 +452,11 @@ fn a_client_or_server_that_the_budget_refuses_allocates_nothing() {
     let mut client =
         Connection::client(&config, "server.test", path(4301, 443), Limits::DEFAULT, &budget, now()).unwrap();
     let mut out = vec![0; 1500];
-    let len = client.transmit(&mut out, now()).unwrap().unwrap().len;
+    let len = client
+        .transmit(&mut out, NonZeroUsize::MIN, now())
+        .unwrap()
+        .unwrap()
+        .len;
     let header = Header::parse(&out[..len], 0).unwrap();
     let server = ServerConfig::new(ServerOptions {
         identity: Identity {

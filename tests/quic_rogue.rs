@@ -11,7 +11,7 @@
 //! opens its packets. It sends each frame that a test gives it, on a path with no loss.
 
 use core::net::{Ipv4Addr, SocketAddr};
-use core::num::NonZeroU64;
+use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
 use std::assert_matches;
 use std::sync::Arc;
@@ -327,7 +327,7 @@ fn routed(connection: &mut Connection) -> Vec<(Path, Vec<u8>)> {
     let mut datagrams = Vec::new();
     for _ in 0..64 {
         let mut out = vec![0; 1500];
-        match connection.transmit(&mut out, now()).unwrap() {
+        match connection.transmit(&mut out, NonZeroUsize::MIN, now()).unwrap() {
             Some(sent) => {
                 out.truncate(sent.len);
                 datagrams.push((sent.path, out));
@@ -1155,7 +1155,7 @@ fn sent_to_at(server: &mut Connection, to: Path, at: Instant) -> Vec<Vec<u8>> {
     let mut datagrams = Vec::new();
     let mut out = vec![0; 1500];
     for _ in 0..64 {
-        match server.transmit(&mut out, at).unwrap() {
+        match server.transmit(&mut out, NonZeroUsize::MIN, at).unwrap() {
             Some(sent) if sent.path == to => datagrams.push(out[..sent.len].to_vec()),
             Some(_) => {}
             None => return datagrams,

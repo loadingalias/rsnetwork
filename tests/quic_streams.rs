@@ -1,11 +1,12 @@
 //! The streams of a QUIC connection between two engines of the core: flow control that follows
 //! the consumer, data out of order under its bound, the outcomes of a stream, the send order, the
 //! stream credit, and unreliable datagrams (N305; RFC 9000, sections 2 to 4, and RFC 9221). Then
-//! the delivery of packets (N306, N320), and the paths and the close of a connection (N307; RFC
-//! 9000, sections 8.2, 9, 10.2, and 14, and RFC 8899).
+//! the delivery of packets (N306, N320), the paths and the close of a connection (N307; RFC
+//! 9000, sections 8.2, 9, 10.2, and 14, and RFC 8899), and the batches for segmentation offload
+//! (N308). Each end sends in batches of up to 64 datagrams, as a host with GSO does.
 
 use core::net::{Ipv4Addr, SocketAddr};
-use core::num::NonZeroU64;
+use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
 use std::assert_matches;
 use std::collections::BTreeMap;
@@ -92,18 +93,22 @@ fn sent_at(connection: &mut Connection, at: Instant) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Each datagram that `connection` sends at `at`, with its path. The output has room for the
-/// largest datagram limit of a test.
+/// The segments of one send with segmentation offload on Linux (GSO).
+const SEGMENTS: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+
+/// Each datagram that `connection` sends at `at`, with its path, from batches of at most
+/// [`SEGMENTS`] datagrams in 64 KB, as a host with segmentation offload sends them.
 fn routed_at(connection: &mut Connection, at: Instant) -> Vec<(Path, Vec<u8>)> {
     let mut datagrams = Vec::new();
-    let mut out = vec![0; 16_384];
+    let mut out = vec![0; 65_536];
     for _ in 0..8192 {
-        match connection.transmit(&mut out, at).unwrap() {
-            Some(sent) => datagrams.push((sent.path, out[..sent.len].to_vec())),
-            None => return datagrams,
-        }
+        let Some(sent) = connection.transmit(&mut out, SEGMENTS, at).unwrap() else {
+            return datagrams;
+        };
+        let batch = out[..sent.len].chunks(sent.segment_bytes);
+        datagrams.extend(batch.map(|datagram| (sent.path, datagram.to_vec())));
     }
-    panic!("a connection sends at most 8,192 datagrams at once");
+    panic!("a connection sends at most 8,192 batches at once");
 }
 
 /// Gives `datagram` to `connection` in a region of its own, and gives the events of the call.
@@ -123,7 +128,20 @@ fn give_marked(connection: &mut Connection, datagram: &[u8], at: Instant, mark: 
 /// Gives `datagram` to `connection` as a datagram that arrived on `path`.
 fn give_on(connection: &mut Connection, path: Path, datagram: &[u8], at: Instant, mark: Ecn) -> Vec<Event> {
     let len = connection.local_cid().as_bytes().len();
-    let mut datagrams = Datagrams::new(Backing::from(datagram.to_vec()), None, len).with_ecn(mark);
+    let datagrams = Datagrams::new(Backing::from(datagram.to_vec()), None, len).with_ecn(mark);
+    receive(connection, path, datagrams, at)
+}
+
+/// Gives `region` to `connection` as one receive of datagrams of `segment` bytes each, as
+/// receive offload (GRO) gives the datagrams of one send with segmentation offload.
+fn give_segments(connection: &mut Connection, region: &[u8], segment: usize, at: Instant) -> Vec<Event> {
+    let len = connection.local_cid().as_bytes().len();
+    let datagrams = Datagrams::new(Backing::from(region.to_vec()), NonZeroUsize::new(segment), len);
+    let path = connection.path();
+    receive(connection, path, datagrams, at)
+}
+
+fn receive(connection: &mut Connection, path: Path, mut datagrams: Datagrams, at: Instant) -> Vec<Event> {
     let mut events = Vec::new();
     for _ in 0..8192 {
         match connection.receive(&mut datagrams, path, at) {
@@ -1139,7 +1157,7 @@ fn the_declared_reordering_interval_preserves_goodput_and_delivers_each_datagram
                 .unwrap();
             let len = pair
                 .client
-                .transmit(&mut out, at)
+                .transmit(&mut out, NonZeroUsize::MIN, at)
                 .unwrap()
                 .expect("the offered packet fits the path")
                 .len;
@@ -1243,7 +1261,11 @@ fn a_valid_ce_mark_reduces_cubic_once_and_a_cleared_mark_disables_ecn() {
         (30, Ecn::NotEct, 8400, EcnState::Failed),
     ] {
         pair.client.ping();
-        let packet = pair.client.transmit_ecn(&mut out, ms(sent)).unwrap().unwrap();
+        let packet = pair
+            .client
+            .transmit_ecn(&mut out, NonZeroUsize::MIN, ms(sent))
+            .unwrap()
+            .unwrap();
         assert_eq!(packet.ecn, Ecn::Ect0);
         give_marked(&mut pair.server, &out[..packet.len], ms(sent + 1), observed);
         for ack in sent_at(&mut pair.server, ms(sent + 1)) {
@@ -1256,7 +1278,11 @@ fn a_valid_ce_mark_reduces_cubic_once_and_a_cleared_mark_disables_ecn() {
     assert_eq!(pair.client.recovery().ecn_counts.ce, 1);
     pair.client.ping();
     assert_eq!(
-        pair.client.transmit_ecn(&mut out, ms(40)).unwrap().unwrap().ecn,
+        pair.client
+            .transmit_ecn(&mut out, NonZeroUsize::MIN, ms(40))
+            .unwrap()
+            .unwrap()
+            .ecn,
         Ecn::NotEct
     );
 }
@@ -1292,14 +1318,133 @@ fn each_datagram_in_a_full_window_leaves_at_its_pacing_deadline() {
         }
         if index < 9 {
             let deadline = pair.client.drive(at).1.deadline.unwrap().instant();
-            // One full packet every 10 ms, with at most 1 ms of batching.
-            assert_eq!(deadline, ms(900 + (index + 1) * 10 - 1));
-            let early = Instant::new(deadline.domain(), deadline.as_nanos() - 1);
+            // One full packet every 10 ms. The deadline is its departure, and batching sends it at
+            // most 1 ms early.
+            assert_eq!(deadline, ms(900 + (index + 1) * 10));
+            let early = Instant::new(deadline.domain(), deadline.as_nanos() - 1_000_001);
             assert!(sent_at(&mut pair.client, early).is_empty());
             at = deadline;
         }
     }
     assert_eq!(pair.client.recovery().bytes_in_flight, 12_000);
+}
+
+/// The STREAM events of `events` that carry bytes.
+fn data_events(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, Event::Stream { data, .. } if data.initialized() > 0))
+        .count()
+}
+
+#[test]
+fn each_datagram_of_a_batch_opens_alone_and_the_unsent_rest_arrives_in_its_segments() {
+    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    let stream = pair.server.open(Direction::Unidirectional).unwrap().unwrap();
+    pair.server.send(stream, region(0, 30_000), true).unwrap();
+    let mut out = vec![0; 65_536];
+    let batch = pair.server.transmit(&mut out, SEGMENTS, now()).unwrap().unwrap();
+    assert_eq!(
+        batch.segment_bytes, 1200,
+        "each datagram but the last has the datagram size"
+    );
+    let datagrams: Vec<&[u8]> = out[..batch.len].chunks(batch.segment_bytes).collect();
+    assert!(
+        datagrams.len() >= 4,
+        "the window takes a batch of {} datagrams",
+        datagrams.len()
+    );
+    // The host accepts the first two datagrams, and each one opens alone.
+    for datagram in &datagrams[..2] {
+        let events = give(&mut pair.client, datagram);
+        assert_eq!(data_events(&events), 1, "one packet of the stream in each datagram");
+        pair.at_client.take(&mut pair.client, events, |_| true);
+    }
+    // Later the host sends the rest from the third datagram, with the same segment size.
+    let rest = &out[2 * batch.segment_bytes..batch.len];
+    let events = give_segments(&mut pair.client, rest, batch.segment_bytes, ms(1));
+    assert_eq!(data_events(&events), datagrams.len() - 2);
+    pair.at_client.take(&mut pair.client, events, |_| true);
+    pair.run_at(ms(1), |_| true);
+    assert!(pair.at_client.complete(stream, 30_000));
+}
+
+#[test]
+fn a_datagram_shorter_than_its_segment_ends_its_batch() {
+    let limits = Limits {
+        unreliable_bytes_max: Some(4 * 700),
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(limits, limits);
+    // Two frames of 700 bytes do not fit in one packet, so each packet is short.
+    for value in 0..4_u8 {
+        pair.client.send_unreliable(Lease::from(vec![value; 700])).unwrap();
+    }
+    let mut out = vec![0; 65_536];
+    let mut arrived = Vec::new();
+    while let Some(batch) = pair.client.transmit(&mut out, SEGMENTS, now()).unwrap() {
+        for datagram in out[..batch.len].chunks(batch.segment_bytes) {
+            for event in give(&mut pair.server, datagram) {
+                let Event::Unreliable(data) = event else {
+                    panic!("an unreliable datagram")
+                };
+                arrived.push(data.bytes()[0]);
+            }
+        }
+    }
+    assert_eq!(arrived, [0, 1, 2, 3]);
+}
+
+#[test]
+fn a_batch_holds_one_millisecond_of_the_pacing_rate_and_the_next_waits_for_its_departure() {
+    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    pair.client.ping();
+    let ping = sent_at(&mut pair.client, ms(10));
+    give_at(&mut pair.server, &ping[0], ms(26));
+    for ack in sent_at(&mut pair.server, ms(26)) {
+        give_at(&mut pair.client, &ack, ms(42));
+    }
+    // The 32 ms sample after a zero-tick handshake gives a 4 ms smoothed RTT: a window of
+    // 12,000 bytes paces one datagram of 1,200 bytes every 0.4 ms.
+    assert_eq!(pair.client.recovery().smoothed_rtt, Some(Duration::from_millis(4)));
+    let stream = pair.open(Direction::Unidirectional);
+    pair.client.send(stream, region(0, 18_000), true).unwrap();
+    let mut out = vec![0; 65_536];
+    let mut at = ms(100);
+    for _ in 0..3 {
+        // The departures at 0, 0.4, and 0.8 ms are inside 1 ms of batching. The one at 1.2 ms waits.
+        let batch = pair.client.transmit(&mut out, SEGMENTS, at).unwrap().unwrap();
+        assert_eq!((batch.len, batch.segment_bytes), (3 * 1200, 1200));
+        assert_eq!(pair.client.transmit(&mut out, SEGMENTS, at).unwrap(), None);
+        let deadline = pair.client.drive(at).1.deadline.unwrap().instant();
+        assert_eq!(deadline, at.checked_add(Duration::from_micros(1200)).unwrap());
+        at = deadline;
+    }
+}
+
+#[test]
+fn a_large_window_fills_a_batch_to_the_segment_limit_of_the_host() {
+    let mut pair = Pair::new(Limits::DEFAULT, Limits::DEFAULT);
+    pair.download(now(), 1 << 20);
+    let window = pair.server.recovery().congestion_window;
+    assert!(window >= 72 * 1200, "the download grew the window to {window} bytes");
+    let us = |value: u64| now().checked_add(Duration::from_micros(value)).unwrap();
+    pair.server.ping();
+    let ping = sent_at(&mut pair.server, us(10_000));
+    give_at(&mut pair.client, &ping[0], us(10_400));
+    for ack in sent_at(&mut pair.client, us(10_400)) {
+        give_at(&mut pair.server, &ack, us(10_800));
+    }
+    // 1 ms at this rate is more than 64 datagrams, and more than the initial window.
+    assert_eq!(pair.server.recovery().smoothed_rtt, Some(Duration::from_micros(100)));
+    let stream = pair.server.open(Direction::Unidirectional).unwrap().unwrap();
+    pair.server.send(stream, region(0, 72 * 1200), true).unwrap();
+    let mut out = vec![0; 64 * 1200];
+    for segments in [64, 8] {
+        let segments = NonZeroUsize::new(segments).unwrap();
+        let batch = pair.server.transmit(&mut out, segments, us(11_000)).unwrap().unwrap();
+        assert_eq!((batch.len, batch.segment_bytes), (segments.get() * 1200, 1200));
+    }
 }
 
 /// What the parent sends between the two side datagrams that a run of losses spans.

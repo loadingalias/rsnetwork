@@ -26,6 +26,8 @@ const PATHS_SPENT: Error = Error::new(Kind::Overload, "the QUIC connection used 
 const GRANULARITY: Duration = Duration::from_millis(1);
 const INITIAL_RTT: Duration = Duration::from_millis(333);
 const PACKET_THRESHOLD: u64 = 3;
+/// The marked datagrams that test the ECN of a path (RFC 9000, section 13.4.2.1).
+const TRIAL_DATAGRAMS: u8 = 10;
 
 /// The delivery state of the current path. Byte counts include QUIC headers and packet protection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,8 +198,10 @@ impl PathState {
             .unwrap_or(u64::MAX)
     }
 
-    /// Allow one millisecond of batching, up to the initial window. Before the first RTT,
-    /// the initial flight can leave together (RFC 9002, section 7.7).
+    /// Allow one millisecond of batching at the pacing rate, so a batch for segmentation offload
+    /// grows with the rate of the path, as a TSO burst of TCP does. A refused sender waits for the
+    /// departure itself, so its next batch holds that millisecond again. Before the first RTT, the
+    /// initial flight can leave together (RFC 9002, section 7.7).
     pub(super) fn paced(&mut self, bytes: u64, now: Instant) -> Result<bool, Error> {
         if self.pacing_wait.is_some_and(|at| at.as_nanos() <= now.as_nanos()) {
             self.pacing_wait = None;
@@ -205,15 +209,14 @@ impl PathState {
         if bytes > self.room() {
             return Ok(false);
         }
-        let initial = (10 * self.controller.datagram).min((2 * self.controller.datagram).max(14_720));
-        let allowance = self.interval_ns(initial.saturating_sub(bytes));
         let allowance = if self.minimum.is_some() {
-            allowance.min(1_000_000)
+            1_000_000
         } else {
-            allowance
+            let initial = (10 * self.controller.datagram).min((2 * self.controller.datagram).max(14_720));
+            self.interval_ns(initial.saturating_sub(bytes))
         };
-        let wait = self.departure.saturating_sub(now.as_nanos()).saturating_sub(allowance);
-        if wait == 0 || self.smoothed.is_zero() {
+        let wait = self.departure.saturating_sub(now.as_nanos());
+        if wait <= allowance || self.smoothed.is_zero() {
             return Ok(true);
         }
         let at = now
@@ -238,7 +241,9 @@ impl PathState {
         }
     }
 
-    pub(super) fn mark(&mut self, now: Instant) -> Ecn {
+    /// The mark of the next datagrams, and how many of them can take it: during the test of the
+    /// path, only the trial datagrams that remain.
+    pub(super) fn mark(&mut self, now: Instant) -> (Ecn, usize) {
         if self.ecn == EcnState::Testing
             && self.first_mark.is_some_and(|first| {
                 u128::from(now.as_nanos().saturating_sub(first.as_nanos()))
@@ -248,17 +253,19 @@ impl PathState {
             self.ecn = EcnState::Unknown;
         }
         match self.ecn {
-            EcnState::Capable => Ecn::Ect0,
-            EcnState::Testing => Ecn::Ect0,
-            _ => Ecn::NotEct,
+            EcnState::Capable => (Ecn::Ect0, usize::MAX),
+            EcnState::Testing => (Ecn::Ect0, usize::from(TRIAL_DATAGRAMS - self.trial_datagrams)),
+            _ => (Ecn::NotEct, usize::MAX),
         }
     }
 
-    pub(super) fn marked(&mut self, mark: Ecn, now: Instant) {
+    /// Counts `datagrams` that left with `mark`, at most the trial datagrams that remain.
+    pub(super) fn marked(&mut self, mark: Ecn, datagrams: usize, now: Instant) {
         if mark == Ecn::Ect0 && self.ecn == EcnState::Testing {
             self.first_mark.get_or_insert(now);
-            self.trial_datagrams += 1;
-            if self.trial_datagrams == 10 {
+            let left = TRIAL_DATAGRAMS - self.trial_datagrams;
+            self.trial_datagrams += u8::try_from(datagrams).unwrap_or(left).min(left);
+            if self.trial_datagrams == TRIAL_DATAGRAMS {
                 self.ecn = EcnState::Unknown;
             }
         }
