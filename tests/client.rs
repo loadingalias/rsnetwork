@@ -51,6 +51,7 @@ const BODY: BodyLimits = BodyLimits {
 const TURN: TurnLimits = TurnLimits {
     bytes: 1 << 20,
     frames: 1 << 10,
+    visits: 1 << 12,
 };
 
 /// The HTTP/2 limits, which an HTTP/1.1 client does not use.

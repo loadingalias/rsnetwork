@@ -42,7 +42,7 @@
 //! // recommends at least 100 concurrent streams. A header list of 16 KiB costs lines of 32 KiB.
 //! let settings = Settings { max_concurrent_streams: 100, max_header_list_size: 16 * 1024, ..Settings::INITIAL };
 //! let limits = Limits { settings, work: 64 * 1024, encoder_table_bytes: 4096, connection_window: 1 << 20 };
-//! let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
+//! let turn = TurnLimits { bytes: 256 * 1024, frames: 1024, visits: 4096 };
 //! // The server sends its SETTINGS frame, and a WINDOW_UPDATE that raises the connection window.
 //! let mut server = Connection::new(Role::Server, limits, turn, &mut outbound, &budget)?;
 //! let mut lines = Lines::new(server.header_limits(), &budget)?;

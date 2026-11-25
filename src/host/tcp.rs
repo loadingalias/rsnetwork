@@ -118,7 +118,7 @@ impl Socket for TcpStream {
 /// };
 /// let settings = h2::Settings { max_concurrent_streams: 100, max_header_list_size: 16 * 1024, ..h2::Settings::INITIAL };
 /// let h2 = h2::Limits { settings, work: 64 * 1024, encoder_table_bytes: 4096, connection_window: 1 << 20 };
-/// let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
+/// let turn = TurnLimits { bytes: 256 * 1024, frames: 1024, visits: 4096 };
 /// let queue = NonZeroUsize::new(16).expect("not zero");
 /// let linger = Linger { time: Duration::from_secs(5), bytes: 64 * 1024 };
 /// let budget = Budget::new(NonZeroU64::new(1 << 22).expect("not zero"));

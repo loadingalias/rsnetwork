@@ -46,7 +46,7 @@ fn ask(
     query: &[u8],
     mut host: impl FnMut(&mut Stream) -> Instant,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
+    let turn = TurnLimits { bytes: 256 * 1024, frames: 1024, visits: 4096 };
     let limits = StreamLimits {
         tls: Limits { input_bytes: 32 * 1024, key_records_max: u64::MAX, turn },
         queue: NonZeroUsize::new(16).expect("not zero"),

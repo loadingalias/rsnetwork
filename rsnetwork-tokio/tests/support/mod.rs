@@ -72,6 +72,7 @@ pub(crate) const H2: h2::Limits = h2::Limits {
 pub(crate) const TURN: TurnLimits = TurnLimits {
     bytes: 1 << 20,
     frames: 1 << 10,
+    visits: 1 << 12,
 };
 
 pub(crate) const QUEUE: NonZeroUsize = NonZeroUsize::new(32).unwrap();

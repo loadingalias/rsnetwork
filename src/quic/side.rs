@@ -9,7 +9,15 @@ use super::VARINT_MAX;
 use super::frame::Ack;
 use super::reassembly::grow;
 use super::recovery::{History, NO_ROOM, Paths, Records, Sent};
-use crate::drive::{Ecn, Error, Kind};
+use crate::drive::{Ecn, Error, Kind, TurnLimits, Work};
+
+/// The limits of the work of a call of the side flow API, which is no drive turn: the walk of
+/// an acknowledgement costs one visit for each packet that it settles or passes.
+const CALL: TurnLimits = TurnLimits {
+    bytes: u64::MAX,
+    frames: usize::MAX,
+    visits: usize::MAX,
+};
 
 /// A side-flow packet number space on the connection that opened it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -41,6 +49,16 @@ pub(super) struct Flows {
     last_probe: Option<Instant>,
     pub(super) notify_probe: Option<SideFlow>,
     waiting: usize,
+    sweep: Option<Sweep>,
+}
+
+/// A timer sweep that a limit of a turn stopped: the next flow, and the earliest loss time and
+/// the oldest probe start of the flows before it.
+#[derive(Clone, Copy, Default)]
+struct Sweep {
+    next: usize,
+    deadline: Option<Instant>,
+    oldest: Option<(Instant, SideFlow)>,
 }
 
 impl Flows {
@@ -55,6 +73,7 @@ impl Flows {
             last_probe: None,
             notify_probe: None,
             waiting: 0,
+            sweep: None,
         }
     }
 
@@ -89,6 +108,7 @@ impl Flows {
     pub(super) fn close(&mut self, id: SideFlow, paths: &mut Paths) -> Result<(), Error> {
         let index = self.index(id)?;
         let mut space = self.spaces.remove(index);
+        self.sweep = None;
         self.waiting -= usize::from(space.waiting);
         space.history.discard(paths);
         if self.notify_probe == Some(id) {
@@ -170,9 +190,13 @@ impl Flows {
             ));
         }
         paths.active.controller.limited(now, limited);
-        let acked = space.history.ack(ack, paths, now, delay, |_| {})?;
+        let work = &mut Work::default();
+        let acked = space
+            .history
+            .ack(ack, paths, now, delay, (work, &CALL), |_| {})?
+            .expect("a call has no visit limit");
         let delivered = acked.eliciting;
-        let congestion = space.history.detect(paths, now, |_| Ok(()))?;
+        let congestion = space.history.detect(paths, now, (work, &CALL), |_| Ok(()))?;
         paths.active.acknowledged(acked, now, limited && !congestion);
         if let Some(at) = space.history.loss_time
             && self.deadline.is_none_or(|old| old.as_nanos() > at.as_nanos())
@@ -226,19 +250,42 @@ impl Flows {
             .min_by_key(|at| at.as_nanos());
     }
 
-    pub(super) fn timers(&mut self, paths: &mut Paths, now: Instant) -> Result<(), Error> {
-        if self.deadline.is_some_and(|at| at.as_nanos() <= now.as_nanos()) {
-            for space in &mut self.spaces {
-                if space
-                    .history
-                    .loss_time
-                    .is_some_and(|at| at.as_nanos() <= now.as_nanos())
-                {
-                    space.history.detect(paths, now, |_| Ok(()))?;
-                }
-            }
-            self.refresh();
+    /// Runs the loss scan of each flow that is due, and finds the next deadline and the oldest
+    /// probe start on the way. A limit of the turn can stop the sweep: the deadline is then due at
+    /// once, and the next sweep goes on from that flow.
+    pub(super) fn timers(
+        &mut self,
+        paths: &mut Paths,
+        now: Instant,
+        (work, limits): (&mut Work, &TurnLimits),
+    ) -> Result<(), Error> {
+        if !self.deadline.is_some_and(|at| at.as_nanos() <= now.as_nanos()) {
+            return Ok(());
         }
+        let mut sweep = self.sweep.take().unwrap_or_default();
+        let due = |history: &History| history.loss_time.is_some_and(|at| at.as_nanos() <= now.as_nanos());
+        while let Some(space) = self.spaces.get_mut(sweep.next) {
+            // A scan that a limit stopped is due at once, so the sweep stops at its flow.
+            let stopped = !work.visit(limits) || {
+                if due(&space.history) {
+                    space.history.detect(paths, now, (work, limits), |_| Ok(()))?;
+                }
+                due(&space.history)
+            };
+            if stopped {
+                self.sweep = Some(sweep);
+                self.deadline = Some(now);
+                return Ok(());
+            }
+            sweep.deadline = super::connection::earlier(sweep.deadline, space.history.loss_time);
+            if let Some(at) = space.history.pto_start()
+                && sweep.oldest.is_none_or(|(first, _)| at.as_nanos() < first.as_nanos())
+            {
+                sweep.oldest = Some((at, space.id));
+            }
+            sweep.next += 1;
+        }
+        (self.deadline, self.oldest) = (sweep.deadline, sweep.oldest);
         Ok(())
     }
 }

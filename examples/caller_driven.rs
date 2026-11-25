@@ -43,6 +43,7 @@ const BODY: BodyLimits = BodyLimits {
 const TURN: TurnLimits = TurnLimits {
     bytes: 256 * 1024,
     frames: 1024,
+    visits: 4096,
 };
 
 /// The bytes of one part of a large body. Each send queues a view of one part, with no copy.

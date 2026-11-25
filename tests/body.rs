@@ -36,6 +36,7 @@ const BODY: BodyLimits = BodyLimits {
 const TURN: TurnLimits = TurnLimits {
     bytes: 1 << 20,
     frames: 1 << 10,
+    visits: 1 << 12,
 };
 
 /// The time of the host, which the tests keep at the start of their clock.

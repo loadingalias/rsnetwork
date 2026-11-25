@@ -52,6 +52,7 @@ const BODY: BodyLimits = BodyLimits {
 const TURN: TurnLimits = TurnLimits {
     bytes: 1 << 20,
     frames: 1 << 10,
+    visits: 1 << 12,
 };
 
 /// The linger: at most 1 second and 1000 bytes.

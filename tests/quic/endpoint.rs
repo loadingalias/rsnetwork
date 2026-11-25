@@ -12,7 +12,8 @@ use rsnetwork::quic::frame::Frame;
 use rsnetwork::quic::packet::{self, Builder, Datagrams, Header, Outgoing, Side};
 use rsnetwork::quic::params::{Parameters, PreferredAddress};
 use rsnetwork::quic::{
-    Connection, ConnectionId, Endpoint, EndpointKeys, EndpointLimits, Handle, Limits, Path, PeerClose, Route,
+    Connection, ConnectionId, Endpoint, EndpointKeys, EndpointLimits, Handle, Limits, Path, PeerClose,
+    REDEEMED_BYTES_DEFAULT, Route,
 };
 use rsnetwork::tls::{ClientConfig, Resumption, ServerConfig};
 
@@ -23,7 +24,7 @@ fn address(port: u16) -> Path {
 
 fn configs() -> (ClientConfig, ServerConfig, Arc<EndpointKeys>) {
     let config = server_config(SERVER, &[], Resumption::Off);
-    let keys = Arc::new(EndpointKeys::generate(&config, 2).unwrap());
+    let keys = Arc::new(EndpointKeys::generate(&config, 2, REDEEMED_BYTES_DEFAULT).unwrap());
     (client_config(CA, Resumption::Off), config, keys)
 }
 
@@ -46,6 +47,8 @@ struct Admission {
     handle: Handle,
     validated: bool,
     retries: usize,
+    /// The datagram of the client that the listener accepted.
+    accepted: Vec<u8>,
 }
 
 fn handshake(endpoint: &mut Endpoint, client: &mut Connection, addr: Path) -> Admission {
@@ -59,7 +62,8 @@ fn handshake(endpoint: &mut Endpoint, client: &mut Connection, addr: Path) -> Ad
             let handle = match endpoint.route(addr, &packet, &mut reply, at(0)).unwrap() {
                 Route::Accepted(h) => {
                     assert!(admission.is_none());
-                    admission = Some((h, endpoint.with_connection(h, |c| c.address_validated()).unwrap()));
+                    let validated = endpoint.with_connection(h, |c| c.address_validated()).unwrap();
+                    admission = Some((h, validated, packet.clone()));
                     h
                 }
                 Route::Existing(h) => h,
@@ -75,14 +79,15 @@ fn handshake(endpoint: &mut Endpoint, client: &mut Connection, addr: Path) -> Ad
                 .with_connection(handle, |c| Pair::give(c, packet, at(0)))
                 .unwrap();
         }
-        if let Some((handle, validated)) = admission {
-            let flight = endpoint.with_connection(handle, |c| Pair::send(c, at(0))).unwrap();
+        if let Some((handle, validated, accepted)) = &admission {
+            let flight = endpoint.with_connection(*handle, |c| Pair::send(c, at(0))).unwrap();
             if !moved && flight.is_empty() {
                 assert!(client.is_confirmed());
                 return Admission {
-                    handle,
-                    validated,
+                    handle: *handle,
+                    validated: *validated,
                     retries,
+                    accepted: accepted.clone(),
                 };
             }
             for packet in flight {
@@ -133,6 +138,44 @@ fn retry_validates_the_first_address_and_new_token_validates_a_repeat_connection
             .kind(),
         rsnetwork::drive::Kind::Misuse
     );
+}
+
+#[test]
+fn each_address_token_validates_one_handshake_and_a_copy_gets_normal_validation() {
+    // Each listener asks each client for an address proof. The second listener is another worker
+    // of the same service.
+    let (config, server, keys) = configs();
+    let mut endpoint = listener(&server, &keys, 0);
+    let mut first = client(&config);
+    let retried = handshake(&mut endpoint, &mut first, address(4301));
+    assert!(retried.validated && retried.retries > 0);
+    let mut second = client(&config);
+    second.use_address_token(first.take_address_token().unwrap()).unwrap();
+    let repeated = handshake(&mut endpoint, &mut second, address(4302));
+    assert!(repeated.validated && repeated.retries == 0);
+    // A copy of the Initial with the Retry token, after its handshake: an invalid Retry token
+    // drops (RFC 9000, section 8.1.3).
+    let mut reply = [0; 1200];
+    assert_eq!(
+        endpoint
+            .route(address(4301), &retried.accepted, &mut reply, at(0))
+            .unwrap(),
+        Route::Dropped
+    );
+    // A copy of the Initial with the NEW_TOKEN token, from another port, at the other worker:
+    // that worker asks for a proof again.
+    let limits = EndpointLimits {
+        retry_at: 0,
+        ..EndpointLimits::default()
+    };
+    let mut other = Endpoint::new(&server, keys, 38, limits, Limits::DEFAULT, &budget()).unwrap();
+    let route = other
+        .route(address(4303), &repeated.accepted, &mut reply, at(0))
+        .unwrap();
+    let Route::Reply(len) = route else {
+        panic!("a copy of a token gets a Retry, not {route:?}");
+    };
+    assert_matches!(Header::parse(&reply[..len], 0), Ok(Header::Retry { .. }));
 }
 
 #[test]

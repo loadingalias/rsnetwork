@@ -36,6 +36,7 @@ const BODY: BodyLimits = BodyLimits {
 const TURN: TurnLimits = TurnLimits {
     bytes: 1 << 20,
     frames: 1 << 10,
+    visits: 1 << 12,
 };
 
 const CLOCK: ClockDomain = ClockDomain::new(1, Suspend::Pauses);

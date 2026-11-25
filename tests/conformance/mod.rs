@@ -837,6 +837,7 @@ pub(crate) const BODY: BodyLimits = BodyLimits {
 pub(crate) const TURN: TurnLimits = TurnLimits {
     bytes: 1 << 20,
     frames: 1 << 10,
+    visits: 1 << 12,
 };
 
 pub(crate) const CLOCK: ClockDomain = ClockDomain::new(1, Suspend::Pauses);

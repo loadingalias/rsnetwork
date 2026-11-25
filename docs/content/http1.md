@@ -54,7 +54,7 @@ let body = BodyLimits {
 };
 let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
 let queue = NonZeroUsize::new(16).expect("not zero");
-let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
+let turn = TurnLimits { bytes: 256 * 1024, frames: 1024, visits: 4096 };
 let (mut inbound, mut outbound) = (Inbound::new(queue, &budget)?, Outbound::new(queue, &budget)?);
 let mut server = Server::new(limits, body, turn, &outbound, &budget)?;
 // The time of the host, on its monotonic clock. The engine waits 30 seconds for a head.

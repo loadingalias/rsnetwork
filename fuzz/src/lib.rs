@@ -82,7 +82,11 @@ pub const BODY: BodyLimits = BodyLimits {
 };
 
 /// Small turn limits, so that a body of a few chunks stops at a limit and continues.
-pub const TURN: TurnLimits = TurnLimits { bytes: 256, frames: 4 };
+pub const TURN: TurnLimits = TurnLimits {
+    bytes: 256,
+    frames: 4,
+    visits: 64,
+};
 
 /// The largest section that an engine joins or copies: a head or a trailer section. The limits
 /// page permits one charged join of it.

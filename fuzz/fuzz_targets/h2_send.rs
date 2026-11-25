@@ -46,7 +46,11 @@ const BODIES: [usize; 4] = [1, 1000, 20_000, 70_000];
 const CUTS: [usize; 8] = [1, 2, 3, 7, 16, 64, 512, 4096];
 
 /// Small turns, so that a turn stops at a limit inside the input.
-const TURN: TurnLimits = TurnLimits { bytes: 512, frames: 4 };
+const TURN: TurnLimits = TurnLimits {
+    bytes: 512,
+    frames: 4,
+    visits: 64,
+};
 
 /// The work limit of a header block.
 const WORK: usize = 16 * 1024;

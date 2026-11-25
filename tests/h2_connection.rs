@@ -29,6 +29,7 @@ const NOW: Option<Instant> = Some(Instant::new(CLOCK, 0));
 const TURN: TurnLimits = TurnLimits {
     bytes: 1 << 20,
     frames: 1 << 10,
+    visits: 1 << 12,
 };
 
 const ENDPOINT: Endpoint = Endpoint {
@@ -956,6 +957,7 @@ fn a_turn_stops_at_its_frame_limit() {
     let turn = TurnLimits {
         bytes: 1 << 20,
         frames: 3,
+        visits: 3,
     };
     let mut server = Connection::new(Role::Server, LIMITS, turn, &mut outbound, &budget).expect("the budget pays");
     let mut lines = Lines::new(server.header_limits(), &budget).expect("the budget pays");

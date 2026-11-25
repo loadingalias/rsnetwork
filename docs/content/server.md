@@ -45,7 +45,7 @@ use rsnetwork::time::{ClockDomain, Suspend};
 use rsnetwork::tls::{Limits as TlsLimits, ServerConfig};
 
 fn server(config: &ServerConfig) -> Result<Http, Box<dyn std::error::Error>> {
-    let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
+    let turn = TurnLimits { bytes: 256 * 1024, frames: 1024, visits: 4096 };
     let settings = h2::Settings { max_concurrent_streams: 100, max_header_list_size: 16 * 1024, ..h2::Settings::INITIAL };
     let limits = Limits {
         head: h1::Limits { head_bytes: 8 * 1024, fields: 64, name_bytes: 64, value_bytes: 4 * 1024 },

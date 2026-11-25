@@ -69,7 +69,9 @@ mod stream;
 pub use congestion::CongestionControl;
 pub use connection::{AddressToken, Connection, Limits, PeerClose, Transmission};
 pub use crypto::CRYPTO_BUFFER_BYTES_MAX;
-pub use endpoint::{ENDPOINT_WORKERS_MAX, Endpoint, EndpointKeys, EndpointLimits, Handle, Route};
+pub use endpoint::{
+    ENDPOINT_WORKERS_MAX, Endpoint, EndpointKeys, EndpointLimits, Handle, REDEEMED_BYTES_DEFAULT, Route,
+};
 pub use path::Path;
 pub use recovery::{EcnState, RecoveryStats};
 pub use side::{SideDatagram, SideFlow};

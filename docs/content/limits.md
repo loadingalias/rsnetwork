@@ -87,12 +87,15 @@ One drive call is one turn. `TurnLimits` bounds the work of each turn:
 | --- | --- |
 | `bytes` | The received bytes that the turn reads: framing, body bytes, and bytes that a drain discards |
 | `frames` | The frames that the turn decodes, for example the chunks of an HTTP/1.1 body or the frames of an HTTP/2 connection |
+| `visits` | The entries of its state that the turn visits: on a QUIC connection, the sent packets that an ACK walks or a loss scan checks, the side flows of a loss timer, and the streams whose notices it clears. HTTP/1.1, HTTP/2, and TLS engines count none |
 
 The engine counts its work in each turn. At a limit, it stops between two steps, and the turn gives
 `Progress::Pending`: work remains, so drive the engine again with no wait for input. Between the
 two drives, your host can serve other connections. An event ends a turn at once. A head or a
 trailer section that the engine starts to read in a turn ends in that turn, because its own limit
 bounds it. Each turn makes at least one step, so a small limit slows an engine but cannot stop it.
+An ACK or a scan that a QUIC connection stops at `visits` goes on in the next turn: give the same
+received region again, as for each turn that gives `Progress::Pending`.
 
 ## Slow peers
 

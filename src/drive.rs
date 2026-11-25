@@ -566,6 +566,10 @@ pub struct TurnLimits {
     pub bytes: u64,
     /// The most frames that one turn decodes, for example the chunks of an HTTP/1.1 body.
     pub frames: usize,
+    /// The most entries of its state that one turn visits, for example the sent packets that an
+    /// ACK walks, or the streams whose notices it clears. An engine that keeps no such state
+    /// visits none.
+    pub visits: usize,
 }
 
 /// The work of an engine in one turn.
@@ -573,6 +577,7 @@ pub struct TurnLimits {
 pub(crate) struct Work {
     bytes: u64,
     frames: usize,
+    visits: usize,
 }
 
 impl Work {
@@ -582,9 +587,20 @@ impl Work {
         self.frames = self.frames.saturating_add(frames);
     }
 
-    /// Whether the work reached a limit of `limits`.
+    /// Counts one visit of an entry of the state, or gives `false` at a limit of `limits`: the
+    /// visit then waits for the next turn.
+    pub(crate) fn visit(&mut self, limits: &TurnLimits) -> bool {
+        if self.reached(limits) {
+            return false;
+        }
+        self.visits += 1;
+        true
+    }
+
+    /// Whether the work reached a limit of `limits`. A turn makes at least one visit, and an engine
+    /// that keeps no such state counts none.
     pub(crate) fn reached(&self, limits: &TurnLimits) -> bool {
-        self.bytes >= limits.bytes || self.frames >= limits.frames
+        self.bytes >= limits.bytes || self.frames >= limits.frames || self.visits >= limits.visits.max(1)
     }
 }
 

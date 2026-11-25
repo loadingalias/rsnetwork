@@ -37,7 +37,7 @@
 //!     trailer_bytes: 4 * 1024,
 //!     trailer_fields: 16,
 //! };
-//! let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
+//! let turn = TurnLimits { bytes: 256 * 1024, frames: 1024, visits: 4096 };
 //! let budget = Budget::new(NonZeroU64::new(1 << 20).expect("not zero"));
 //! let queue = NonZeroUsize::new(16).expect("not zero");
 //! let (inbound, outbound) = (Inbound::new(queue, &budget)?, Outbound::new(queue, &budget)?);

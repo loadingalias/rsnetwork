@@ -126,7 +126,7 @@ fn serve(
     // One connection: the HTTP/1.1 engine with its plaintext queues, inside `Tls`, inside the
     // host connection with its ciphertext queues.
     let queue = NonZeroUsize::new(16).expect("not zero");
-    let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
+    let turn = TurnLimits { bytes: 256 * 1024, frames: 1024, visits: 4096 };
     let head = HeadLimits { head_bytes: 8 * 1024, fields: 64, name_bytes: 64, value_bytes: 4 * 1024 };
     let body = BodyLimits {
         body_bytes: 1 << 20,

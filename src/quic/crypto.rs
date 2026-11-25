@@ -193,7 +193,14 @@ struct Message {
     remaining: usize,
 }
 
+/// The memory of the entry of one message in its list. A message adds one entry at most.
+pub(super) const ENTRY_BYTES: u64 = size_of::<Message>() as u64;
+
 /// The CRYPTO messages of one level until their acknowledgement or the discard of its keys.
+///
+/// The list takes no charge of its own: the connection charges [`bytes`](Self::bytes) to the
+/// output of its rustls calls. A message comes from a call, so its charge is the one that the
+/// call reserved, and no new charge can fail after rustls wrote the message.
 #[derive(Debug)]
 pub(super) struct Send {
     messages: VecDeque<Message>,
@@ -201,21 +208,22 @@ pub(super) struct Send {
     next: u64,
     /// The stream offset after the last message.
     end: u64,
-    credit: Credit,
+    /// The capacity of the bytes of the messages that wait.
+    held: u64,
 }
 
 impl Send {
-    pub(super) fn new(budget: &Budget) -> Self {
+    pub(super) const fn new() -> Self {
         Self {
             messages: VecDeque::new(),
             next: 0,
             end: 0,
-            credit: budget.credit(0),
+            held: 0,
         }
     }
 
-    /// Queues `message` after the others, and charges its memory. Refuses when the budget cannot
-    /// pay: the message then drops.
+    /// Queues `message` after the others. Refuses when the allocator gives no entry: the message
+    /// then drops.
     pub(super) fn push(&mut self, message: Vec<u8>) -> Result<(), Refused> {
         if message.is_empty() {
             return Ok(());
@@ -226,23 +234,21 @@ impl Send {
             .checked_add(remaining as u64)
             .filter(|end| *end <= super::VARINT_MAX)
             .ok_or(Refused::Bound)?;
-        let messages = &mut self.messages;
-        super::reassembly::grow(
-            (messages.len(), messages.capacity(), size_of::<Message>()),
-            &mut self.credit,
-            |n| messages.try_reserve_exact(n).is_ok(),
-        )
-        .map_err(|_| Refused::Budget)?;
-        self.credit
-            .charge(message.capacity() as u64)
-            .map_err(|_| Refused::Budget)?;
-        messages.push_back(Message {
+        // The list grows by one entry, so the entries of one call stay within its reservation.
+        self.messages.try_reserve_exact(1).map_err(|_| Refused::Budget)?;
+        self.held += message.capacity() as u64;
+        self.messages.push_back(Message {
             start,
             bytes: message,
             remaining,
         });
         self.end = end;
         Ok(())
+    }
+
+    /// The memory of the messages that wait and of their list.
+    pub(super) fn bytes(&self) -> u64 {
+        self.messages.capacity() as u64 * ENTRY_BYTES + self.held
     }
 
     /// Whether bytes wait to be sent.
@@ -271,20 +277,21 @@ impl Send {
         (len > 0).then(|| &bytes[..len])
     }
 
-    pub(super) fn acknowledged(&mut self, offset: u64, len: usize) {
+    /// Takes the acknowledgement of `len` bytes at `offset`, and gives the bytes of the message
+    /// that it completed, which leave [`bytes`](Self::bytes).
+    pub(super) fn acknowledged(&mut self, offset: u64, len: usize) -> u64 {
         let at = self.messages.partition_point(|message| message.start <= offset) - 1;
         let message = &mut self.messages[at];
         message.remaining -= len;
-        if message.remaining == 0 {
-            let bytes = message.bytes.capacity();
-            message.bytes = Vec::new();
-            self.credit
-                .refund(bytes as u64)
-                .expect("a CRYPTO message owns its charge");
-            while self.messages.front().is_some_and(|m| m.remaining == 0) {
-                self.messages.pop_front();
-            }
+        if message.remaining > 0 {
+            return 0;
         }
+        let bytes = core::mem::take(&mut message.bytes).capacity() as u64;
+        self.held -= bytes;
+        while self.messages.front().is_some_and(|m| m.remaining == 0) {
+            self.messages.pop_front();
+        }
+        bytes
     }
 
     /// Marks `len` more bytes as sent.

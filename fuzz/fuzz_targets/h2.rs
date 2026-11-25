@@ -44,7 +44,11 @@ const TABLES: [u32; 4] = [0, 256, 4096, 65_536];
 const CUTS: [usize; 8] = [1, 2, 3, 7, 16, 64, 512, 4096];
 
 /// Small turns, so that a turn stops at a limit inside the input.
-const TURN: TurnLimits = TurnLimits { bytes: 512, frames: 4 };
+const TURN: TurnLimits = TurnLimits {
+    bytes: 512,
+    frames: 4,
+    visits: 64,
+};
 
 /// The time of the host, which stays at the start of its clock. The settings timeout never ends
 /// a run.

@@ -4,10 +4,12 @@
 //! - **State.** Before rustls starts, a connection charges the state that its configuration
 //!   fixes: the key shares, the transcript, and the key schedule.
 //! - **Calls.** Before each rustls call, it also charges the working memory of the call: a part
-//!   for its own chain, and a factor times the bytes that rustls can read. After the call, it
-//!   keeps a bound of the chain of the peer that rustls can keep, and gives the rest back. The
-//!   output has its own charge: before a call, the growth of the bytes that the call can write,
-//!   and after the call, its capacity.
+//!   for its own chain, and a factor times the bytes that rustls can read. A QUIC call in a state
+//!   that holds a message, to choose a configuration or to check an identity, counts the bytes of
+//!   that message. After the call, it keeps a bound of the chain of the peer that rustls can keep,
+//!   and the transport parameters of a QUIC peer, and gives the rest back. The output has its own
+//!   charge: before a call, the growth of the bytes that the call can write, and after the call,
+//!   its capacity.
 //! - **Kernel.** At the hand-off, the charge drops to the state of the kernel connection and its
 //!   exporter, and on a client to the exact size of the chain that rustls keeps for its tickets.
 //! - **Sessions.** The stores of a configuration charge each session to the budget of the
@@ -273,6 +275,8 @@ pub(crate) struct Held {
     chain: u64,
     /// What the stores gave to rustls, until the hand-off.
     sessions: u64,
+    /// The transport parameters of a QUIC peer, which rustls keeps until the connection ends.
+    parameters: u64,
 }
 
 impl Held {
@@ -293,6 +297,7 @@ impl Held {
             transcript: cost.transcript,
             chain: 0,
             sessions: 0,
+            parameters: 0,
         })
     }
 
@@ -301,11 +306,18 @@ impl Held {
         self.credit.charge(work).map_err(|_| work)
     }
 
+    /// Keeps the `bytes` of the transport parameters of a QUIC peer that rustls holds, from the
+    /// working memory of the last call: call it before [`after`](Self::after). The parameters
+    /// come from bytes that the call read, so the charge of the call holds them.
+    pub(crate) fn keep_parameters(&mut self, bytes: u64) {
+        self.parameters = self.parameters.max(bytes);
+    }
+
     /// Gives back the working memory of a call that read `visible` bytes and sent `own`, and keeps
     /// the bound of what rustls can keep.
     pub(crate) fn after(&mut self, visible: usize, own: &Own) {
         self.chain = self.chain.max(self.kept.saturating_mul(visible as u64));
-        self.keep(self.state + self.transcript(own) + self.chain + self.sessions);
+        self.keep(self.state + self.transcript(own) + self.chain + self.sessions + self.parameters);
     }
 
     /// After the last call of the handshake that sent `own`: rustls keeps two copies of the chain
@@ -313,7 +325,7 @@ impl Held {
     /// hand-off. The hand-off copies `evidence` bytes of the end-entity certificate before it
     /// drops them.
     pub(crate) fn finished(&mut self, peer: u64, evidence: u64, own: &Own) {
-        self.keep(self.state + self.transcript(own) + 2 * peer + evidence + self.sessions);
+        self.keep(self.state + self.transcript(own) + 2 * peer + evidence + self.sessions + self.parameters);
     }
 
     /// The transcript for client authentication: a copy of what this end sends.

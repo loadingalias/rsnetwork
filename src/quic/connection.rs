@@ -51,7 +51,7 @@ use super::recovery::{self, DataRange, History, Output, PathState, Paths, Receiv
 use super::stream::{self, Event, Priority, Stop, StreamId, Streams};
 use super::{CongestionControl, ConnectionId, ErrorCode, VARINT_MAX};
 use crate::drive::{Blocked, Ecn, Error, Kind, Progress, Turn, TurnLimits, Work};
-use crate::tls::memory::{self, ClientStore, Cost, Held, Owns};
+use crate::tls::memory::{self, ClientStore, Cost, Held, Own, Owns};
 use crate::tls::{self, Facts, Negotiated};
 
 /// The limits of a QUIC connection, which the caller sets. [`Limits::DEFAULT`] has the default of
@@ -116,8 +116,9 @@ pub struct Limits {
     pub packets_per_second: u32,
     /// The time a packet can arrive out of order at that rate.
     pub reordering_time: Duration,
-    /// The work of one call: the received bytes and the frames that it reads, and the rustls
-    /// calls that it makes, each counted as a frame.
+    /// The work of one call: the received bytes and the frames that it reads, the rustls calls
+    /// that it makes, each counted as a frame, and the sent packets, side flows, and streams that
+    /// it visits. Each limit is at least 1.
     pub turn: TurnLimits,
 }
 
@@ -147,6 +148,7 @@ impl Limits {
         turn: TurnLimits {
             bytes: 1 << 20,
             frames: 4096,
+            visits: 16 * 1024,
         },
     };
 }
@@ -179,6 +181,10 @@ const CRYPTO_FRAME_HEAD: usize = 1 + 8 + 4;
 const COALESCED_ROOM: usize = 1 + 4 + 2 * (1 + ConnectionId::MAX) + 4 + 4 + packet::TAG + 1 + 8 + 8 + 1;
 /// The memory of the keys of one level: two packet keys and two header keys of the provider.
 const KEYS_BYTES: u64 = 2 * memory::RECORD_KEY + 2 * memory::HEADER_KEY;
+/// The keys of each level that a connection charges before rustls starts: one set for the Initial
+/// and Handshake levels, and for the data space the keys of this phase, the keys of the next
+/// one, the secrets, and a previous key. So no key that rustls gives arrives with no charge.
+const LEVEL_KEYS: [u64; 3] = [KEYS_BYTES, KEYS_BYTES, 3 * KEYS_BYTES];
 /// The events of one rustls call that the engine keeps room for: a flight of the server, its key
 /// changes, and its session tickets.
 const EVENTS: usize = 16;
@@ -240,6 +246,8 @@ struct Space {
     probe: bool,
     /// The keys are gone: each later packet of the space drops.
     discarded: bool,
+    /// The charge of the keys of the level, which the connection takes before rustls starts, and
+    /// of the lost ranges in `retry`.
     credit: Credit,
 }
 
@@ -249,7 +257,7 @@ impl Space {
             keys: None,
             sealed: 0,
             receive: crypto::Receive::new(budget),
-            send: crypto::Send::new(budget),
+            send: crypto::Send::new(),
             received: 0,
             next: 0,
             ranges: Received::new(window, budget),
@@ -261,12 +269,10 @@ impl Space {
         }
     }
 
-    /// Installs the keys that `keys` makes, after their charge, so a refusal allocates nothing.
-    fn install(&mut self, keys: impl FnOnce() -> rustls::quic::Keys) -> Result<(), Error> {
-        self.credit.charge(KEYS_BYTES).map_err(|_| KEYS_REFUSED)?;
-        self.keys = Some(keys());
+    /// Installs `keys`. Their charge is in `credit` from the start of the connection.
+    fn install(&mut self, keys: rustls::quic::Keys) {
+        self.keys = Some(keys);
         self.sealed = 0;
-        Ok(())
     }
 
     /// Drops the keys and the CRYPTO streams of the space (RFC 9001, section 4.9).
@@ -392,8 +398,6 @@ struct OneRtt {
     updated: bool,
     /// The most packets that one key seals.
     limit: u64,
-    /// The charge of the keys, which returns when they drop.
-    _charge: Credit,
 }
 
 impl fmt::Debug for OneRtt {
@@ -406,12 +410,11 @@ impl fmt::Debug for OneRtt {
 }
 
 impl OneRtt {
-    fn new(keys: rustls::quic::Keys, mut secrets: Secrets, limit: u64, budget: &Budget) -> Result<Self, Error> {
-        let mut credit = budget.credit(0);
-        // The keys of this phase, the keys of the next one, the secrets, and a previous key.
-        credit.charge(3 * KEYS_BYTES).map_err(|_| KEYS_REFUSED)?;
+    /// The keys of the first phase. Their charge is in the credit of the data space from the start
+    /// of the connection.
+    fn new(keys: rustls::quic::Keys, mut secrets: Secrets, limit: u64) -> Self {
         let limit = limit.min(keys.local.packet.confidentiality_limit());
-        Ok(Self {
+        Self {
             local: keys.local,
             remote: keys.remote,
             previous: None,
@@ -424,8 +427,7 @@ impl OneRtt {
             acknowledged: false,
             updated: false,
             limit,
-            _charge: credit,
-        })
+        }
     }
 
     /// Moves both directions to the next phase. The old packet key of the peer stays until
@@ -454,6 +456,31 @@ enum Tls {
     ServerDone(rustls::Connection<ServerSide, rustls::quic::Quic>),
     /// A rustls call failed, and took the state.
     Failed,
+}
+
+impl Tls {
+    /// The state holds a message and waits for a call with no input: the choice of a
+    /// configuration, or the check of an identity.
+    const fn ready(&self) -> bool {
+        matches!(
+            self,
+            Self::Client(ClientHandshake::VerifyServerIdentity(_))
+                | Self::Server(ServerHandshake::Accepted(_) | ServerHandshake::VerifyClientIdentity(_))
+        )
+    }
+
+    /// The bytes of the transport parameters of the peer that rustls keeps, or 0 before they
+    /// show.
+    fn parameters_bytes(&self) -> u64 {
+        let parameters = match self {
+            Self::Client(ClientHandshake::NeedsInput(needs)) => needs.quic_transport_parameters(),
+            Self::Server(ServerHandshake::NeedsInput(needs)) => needs.quic_transport_parameters(),
+            Self::ClientDone(connection) => connection.quic_transport_parameters(),
+            Self::ServerDone(connection) => connection.quic_transport_parameters(),
+            _ => None,
+        };
+        parameters.map_or(0, |parameters| parameters.len() as u64)
+    }
 }
 
 /// The end of a client or a server: its configuration.
@@ -624,12 +651,11 @@ pub struct Connection {
     held: Held,
     cost: Cost,
     own: Arc<Owns>,
-    /// The charge of what one rustls call can write.
+    /// The charge of the output of rustls: the room of its events, what the next call can
+    /// write, and the CRYPTO messages that wait for their acknowledgement.
     output: Credit,
-    /// The charge of the parts that rustls keeps: the transport parameters of each end.
+    /// The charge of the transport parameters of this end, which rustls keeps.
     kept: Credit,
-    /// The transport parameters of the peer are charged.
-    parameters_kept: bool,
     events: Vec<QuicEvent>,
     spaces: [Space; 3],
     paths: Paths,
@@ -698,6 +724,9 @@ pub struct Connection {
     /// order, and whether the call before it made none either. It stays across turns, so rustls
     /// runs again only for more data, another level, or another state.
     stall: Option<(Level, usize, bool)>,
+    /// The CRYPTO bytes of the message that rustls holds for its next call, in a state that
+    /// chooses a configuration or checks an identity.
+    message: usize,
     streams: Streams,
     /// The opened packet whose frames the engine reads, after a frame that gave an event.
     reading: Option<Reading>,
@@ -770,7 +799,7 @@ fn reached(deadline: Option<Instant>, now: Instant) -> Result<bool, Error> {
 }
 
 /// The earlier of two instants of one clock.
-fn earlier(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+pub(super) fn earlier(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
     match (a, b) {
         (Some(a), Some(b)) => Some(if b.compare(a) == Ok(Ordering::Less) { b } else { a }),
         (a, None) => a,
@@ -799,6 +828,7 @@ pub(super) fn check(limits: &Limits) -> Result<(), Error> {
         || limits.handshake_timeout.is_zero()
         || limits.turn.bytes == 0
         || limits.turn.frames == 0
+        || limits.turn.visits == 0
         || limits.idle_timeout.is_some_and(|timeout| timeout.is_zero())
         || limits.data_bytes_max.max(limits.stream_bytes_max) > VARINT_MAX
         || limits.streams_bidi_max.max(limits.streams_uni_max) > STREAMS_MAX
@@ -819,6 +849,12 @@ fn random_cid(random: &dyn rustls::crypto::SecureRandom, len: usize) -> Result<C
 }
 
 /// The encoding of `parameters` in a vector of its exact size, charged to `credit`.
+/// The output charge that one rustls call reserves: the bytes that it can write, and the list
+/// entries of its messages.
+fn output(own: &Own) -> u64 {
+    own.flight() as u64 + EVENTS as u64 * crypto::ENTRY_BYTES
+}
+
 fn encode(parameters: &Parameters, credit: &mut Credit) -> Result<Vec<u8>, Error> {
     let len = parameters.encoded_len().ok_or(Error::new(
         Kind::Misuse,
@@ -895,7 +931,7 @@ impl Connection {
             budget,
             now,
         )?;
-        connection.spaces[Level::Initial as usize].install(|| packet::initial_keys(&original_cid, Side::Client))?;
+        connection.spaces[Level::Initial as usize].install(packet::initial_keys(&original_cid, Side::Client));
         let parameters = encode(&connection.parameters(), &mut connection.kept)?;
         // The connection keeps the name after the charges, and the ClientHello carries it.
         let name = name.to_owned();
@@ -988,7 +1024,7 @@ impl Connection {
             }
         }
         connection.initial_peer = Some(scid);
-        connection.spaces[Level::Initial as usize].install(|| packet::initial_keys(&dcid, Side::Server))?;
+        connection.spaces[Level::Initial as usize].install(packet::initial_keys(&dcid, Side::Server));
         let parameters = encode(&connection.parameters(), &mut connection.kept)?;
         if let End::Server { parameters: slot, .. } = &mut connection.end {
             *slot = Some(parameters);
@@ -1022,6 +1058,10 @@ impl Connection {
             .map_err(|_| OUTPUT_REFUSED)?;
         let mut events = Vec::new();
         events.try_reserve_exact(EVENTS).map_err(|_| OUTPUT_REFUSED)?;
+        let mut spaces: [Space; 3] = core::array::from_fn(|_| Space::new(budget, window));
+        for (space, keys) in spaces.iter_mut().zip(LEVEL_KEYS) {
+            space.credit.charge(keys).map_err(|_| KEYS_REFUSED)?;
+        }
         let idle = limits.idle_timeout;
         if let Some(timeout) = idle {
             after(now, timeout.max(3 * PTO_INITIAL))?;
@@ -1042,9 +1082,8 @@ impl Connection {
             own,
             output,
             kept: budget.credit(0),
-            parameters_kept: false,
             events,
-            spaces: core::array::from_fn(|_| Space::new(budget, window)),
+            spaces,
             paths: Paths::new(active, budget),
             answers: [None; 2],
             fitted: usize::MAX,
@@ -1085,6 +1124,7 @@ impl Connection {
             wait: None,
             more: false,
             stall: None,
+            message: 0,
             streams: Streams::new(
                 side,
                 stream::Config {
@@ -1594,7 +1634,8 @@ impl Connection {
     /// protocol: the regions that wait drop, and the peer gets a RESET_STREAM frame.
     ///
     /// Refuses with [`Kind::Misuse`] when the stream is not open, only receives, or was reset
-    /// before, and when `code` is above 2^62 - 1.
+    /// before, when the peer acknowledged each byte and the end, and when `code` is above
+    /// 2^62 - 1.
     pub fn reset(&mut self, stream: StreamId, code: u64) -> Result<(), Error> {
         self.live()?;
         self.streams.reset(stream, code)
@@ -1705,7 +1746,7 @@ impl Connection {
     pub fn receive(&mut self, datagrams: &mut Datagrams, path: Path, now: Instant) -> (Option<Event>, Turn) {
         let mut work = Work::default();
         self.more = false;
-        if let Err(error) = self.timers(now) {
+        if let Err(error) = self.timers(now, &mut work) {
             self.outcome = Some(Err(error));
         }
         loop {
@@ -1785,10 +1826,12 @@ impl Connection {
     pub fn drive(&mut self, now: Instant) -> (Option<Event>, Turn) {
         let mut work = Work::default();
         self.more = false;
-        if let Err(error) = self.timers(now) {
+        if let Err(error) = self.timers(now, &mut work) {
             self.outcome = Some(Err(error));
         }
         let event = self.next_event(&mut work, now);
+        // A scan that a limit of the turn stopped goes on in the next turn.
+        self.more |= work.reached(&self.limits.turn);
         (event, self.turn())
     }
 
@@ -1813,7 +1856,7 @@ impl Connection {
             }
             let event = self
                 .streams
-                .event()
+                .event(work, &self.limits.turn)
                 .map_or_else(|| self.frames(work), |event| Ok(Some(event)));
             match event {
                 Ok(Some(event)) => {
@@ -1948,7 +1991,7 @@ impl Connection {
     /// 10.1), and at the end of its closing or draining period. Drops the old key of the peer at
     /// its deadline, and leaves a path that gave no answer in the time of its validation. When the
     /// peer gave no connection ID for the path before that one, the connection ends there.
-    fn timers(&mut self, now: Instant) -> Result<(), Error> {
+    fn timers(&mut self, now: Instant, work: &mut Work) -> Result<(), Error> {
         if self.outcome.is_some() {
             return Ok(());
         }
@@ -1989,9 +2032,9 @@ impl Connection {
         {
             match alarm {
                 Alarm::Loss(level) => {
-                    self.detect_loss(level, now)?;
+                    self.detect_loss(level, now, work)?;
                 }
-                Alarm::SideLoss => self.sides.timers(&mut self.paths, now)?,
+                Alarm::SideLoss => self.sides.timers(&mut self.paths, now, (work, &self.limits.turn))?,
                 Alarm::Probe(level) => self.probe(level),
                 Alarm::SideProbe(flow) => {
                     self.sides.probe(flow, now);
@@ -2031,7 +2074,9 @@ impl Connection {
         })
     }
 
-    fn acknowledge(&mut self, level: Level, ack: &Ack<'_>, now: Instant) -> Result<(), Failure> {
+    /// Takes an ACK frame of `level`. Gives `false` when a limit of the turn stopped its walk: give
+    /// the same frame in the next turn.
+    fn acknowledge(&mut self, level: Level, ack: &Ack<'_>, now: Instant, work: &mut Work) -> Result<bool, Failure> {
         let space = &self.spaces[level as usize];
         if ack.largest >= space.next {
             return Err(Failure::transport(
@@ -2052,13 +2097,20 @@ impl Connection {
         let limited = self.limited();
         self.paths.active.controller.limited(now, limited);
         let space = &mut self.spaces[level as usize];
-        let acked = space
+        let turn = (&mut *work, &self.limits.turn);
+        let Some(acked) = space
             .history
-            .ack(ack, &mut self.paths, now, delay, |record| match record {
-                Record::Range(DataRange::Crypto { offset, len }) => space.send.acknowledged(offset, len),
+            .ack(ack, &mut self.paths, now, delay, turn, |record| match record {
+                Record::Range(DataRange::Crypto { offset, len }) => {
+                    let refunded = self.output.refund(space.send.acknowledged(offset, len));
+                    assert!(refunded.is_ok(), "the output charge holds each CRYPTO message");
+                }
                 record @ (Record::RetireId(_) | Record::NewToken) => self.ids.acknowledged(record),
                 other => self.streams.acknowledged(other),
-            })?;
+            })?
+        else {
+            return Ok(false);
+        };
         if acked.eliciting {
             space.probe = false;
             self.validation_at = now;
@@ -2066,33 +2118,35 @@ impl Connection {
                 self.paths.active.backoff = 0;
             }
         }
-        let congestion = self.detect_loss(level, now)?;
+        let congestion = self.detect_loss(level, now, work)?;
         self.paths.active.acknowledged(acked, now, limited && !congestion);
-        Ok(())
+        Ok(true)
     }
 
-    fn detect_loss(&mut self, level: Level, now: Instant) -> Result<bool, Error> {
+    fn detect_loss(&mut self, level: Level, now: Instant, work: &mut Work) -> Result<bool, Error> {
         let space = &mut self.spaces[level as usize];
-        space.history.detect(&mut self.paths, now, |record| {
-            match record {
-                record @ (Record::IssueId(_) | Record::RetireId(_) | Record::NewToken) => self.ids.lost(record),
-                // The recovery layer takes these records.
-                Record::Mtu(_) | Record::Challenge => {}
-                Record::HandshakeDone => self.handshake_done = true,
-                Record::Limit(_) | Record::Control(_, _) => self.streams.lost_control(record),
-                Record::Range(range) => {
-                    let retry = &mut space.retry;
-                    super::reassembly::grow(
-                        (retry.len(), retry.capacity(), size_of::<DataRange>()),
-                        &mut space.credit,
-                        |n| retry.try_reserve_exact(n).is_ok(),
-                    )
-                    .map_err(|_| recovery::NO_ROOM)?;
-                    retry.push_back(range);
+        space
+            .history
+            .detect(&mut self.paths, now, (work, &self.limits.turn), |record| {
+                match record {
+                    record @ (Record::IssueId(_) | Record::RetireId(_) | Record::NewToken) => self.ids.lost(record),
+                    // The recovery layer takes these records.
+                    Record::Mtu(_) | Record::Challenge => {}
+                    Record::HandshakeDone => self.handshake_done = true,
+                    Record::Limit(_) | Record::Control(_, _) => self.streams.lost_control(record),
+                    Record::Range(range) => {
+                        let retry = &mut space.retry;
+                        super::reassembly::grow(
+                            (retry.len(), retry.capacity(), size_of::<DataRange>()),
+                            &mut space.credit,
+                            |n| retry.try_reserve_exact(n).is_ok(),
+                        )
+                        .map_err(|_| recovery::NO_ROOM)?;
+                        retry.push_back(range);
+                    }
                 }
-            }
-            Ok(())
-        })
+                Ok(())
+            })
     }
 
     /// Opens one packet, which arrived on `path`, and reads its frames.
@@ -2383,7 +2437,14 @@ impl Connection {
             let taken = match frame {
                 Frame::Padding { .. } | Frame::Ping => Ok(None),
                 Frame::Ack(ack) => {
-                    self.acknowledge(level, &ack, reading.received_at)?;
+                    if !self.acknowledge(level, &ack, reading.received_at, work)? {
+                        // A limit of the turn stopped the walk of the frame: the next turn reads
+                        // the frame again, and the walk goes on.
+                        reading.at = start;
+                        self.reading = Some(reading);
+                        self.more = true;
+                        return Ok(None);
+                    }
                     Ok(None)
                 }
                 Frame::Crypto { offset, data } => {
@@ -2596,6 +2657,8 @@ impl Connection {
         let space = &mut self.spaces[level as usize];
         space.history.discard(&mut self.paths);
         self.paths.active.backoff = 0;
+        let refunded = self.output.refund(space.send.bytes());
+        assert!(refunded.is_ok(), "the output charge holds each CRYPTO message");
         space.discard(&self.budget, self.window);
     }
 
@@ -2621,11 +2684,7 @@ impl Connection {
             }
             let level = self.read;
             let visible = self.spaces[level as usize].receive.ordered();
-            let ready = matches!(
-                self.tls,
-                Tls::Client(ClientHandshake::VerifyServerIdentity(_))
-                    | Tls::Server(ServerHandshake::Accepted(_) | ServerHandshake::VerifyClientIdentity(_))
-            );
+            let ready = self.tls.ready();
             if !ready && (visible == 0 || self.stall == Some((level, visible, true))) {
                 return Ok(());
             }
@@ -2634,11 +2693,13 @@ impl Connection {
                 return Ok(());
             }
             let own = self.own.get();
-            if let Err(units) = self.held.charge(own.work(self.cost.read, visible)) {
+            // A call in a state that holds a message works on that message too.
+            let bytes = if ready { visible.max(self.message) } else { visible };
+            if let Err(units) = self.held.charge(own.work(self.cost.read, bytes)) {
                 self.wait = Some(units);
                 return Ok(());
             }
-            if let Err(units) = self.output.charge(own.flight() as u64).map_err(|_| own.flight() as u64) {
+            if let Err(units) = self.output.charge(output(&own)).map_err(|_| output(&own)) {
                 self.held.after(0, &own);
                 self.wait = Some(units);
                 return Ok(());
@@ -2660,15 +2721,20 @@ impl Connection {
                 Some(ticket) => memory::ticket(ticket, || tls::scoped(stream, step)),
                 None => memory::handshake(held, output, || tls::scoped(stream, step)),
             };
-            // The messages and the keys of the call are charged before the reservations of the
-            // call return, so each byte that rustls gave stays charged.
+            // Each part of the call that stays takes its charge from the reservations of the call,
+            // or had it before: the keys from the start, the messages from the output charge, and
+            // the transport parameters of the peer from the working memory. So no charge can fail
+            // after rustls ran.
             let events = self.events.len();
             let taken = self.take_events();
             self.settle_output()?;
-            self.held.after(visible, &own);
+            if let Ok(tls) = &next {
+                self.held.keep_parameters(tls.parameters_bytes());
+                self.message = if tls.ready() { bytes } else { 0 };
+            }
+            self.held.after(bytes, &own);
             self.tls = next.map_err(|error| Failure::tls(&error))?;
             taken?;
-            self.keep_parameters()?;
             self.completed()?;
             // rustls reports what a call consumed by the next call at the latest, so a stall is two
             // calls in a row on the same data that consume nothing, give no event, and keep the
@@ -2750,7 +2816,7 @@ impl Connection {
     fn call(&mut self, f: impl FnOnce(&mut Vec<QuicEvent>) -> Result<Tls, rustls::Error>) -> Result<Tls, Failure> {
         let own = self.own.get();
         self.output
-            .charge(own.flight() as u64)
+            .charge(output(&own))
             .map_err(|_| Failure::local(OUTPUT_REFUSED))?;
         let (held, output, stream, events) = (&mut self.held, &mut self.output, self.stream.as_ref(), &mut self.events);
         let started = memory::handshake(held, output, || tls::scoped(stream, || f(events)));
@@ -2761,15 +2827,21 @@ impl Connection {
         taken.map(|()| started)
     }
 
-    /// Gives back the charge of the output of a call: each message that it wrote is charged to
-    /// the CRYPTO stream that sends it.
+    /// Settles the output charge after a call: it keeps the room of the events and each CRYPTO
+    /// message that waits, and gives back the rest of the reservation of the call.
     fn settle_output(&mut self) -> Result<(), Failure> {
-        let charged = self
-            .output
-            .charged()
-            .saturating_sub((EVENTS * size_of::<QuicEvent>()) as u64);
-        let refunded = self.output.refund(charged);
-        assert!(refunded.is_ok(), "a credit refunds at most its charged units");
+        let kept =
+            (EVENTS * size_of::<QuicEvent>()) as u64 + self.spaces.iter().map(|space| space.send.bytes()).sum::<u64>();
+        let charged = self.output.charged();
+        if let Some(rest) = charged.checked_sub(kept) {
+            let refunded = self.output.refund(rest);
+            assert!(refunded.is_ok(), "a credit refunds at most its charged units");
+        } else {
+            // Only a call that wrote past the bound of its reservation gets here.
+            self.output
+                .charge(kept - charged)
+                .map_err(|_| Failure::local(OUTPUT_REFUSED))?;
+        }
         if self.events.capacity() > EVENTS {
             return Err(Failure::local(Error::new(
                 Kind::Unsupported,
@@ -2789,16 +2861,12 @@ impl Connection {
                     .push(message)
                     .map_err(|_| Failure::local(OUTPUT_REFUSED))?,
                 QuicEvent::KeyChange(KeyChange::Handshake { keys }) => {
-                    self.spaces[Level::Handshake as usize]
-                        .install(|| keys)
-                        .map_err(Failure::local)?;
+                    self.spaces[Level::Handshake as usize].install(keys);
                     self.write = Level::Handshake;
                     self.read = Level::Handshake;
                 }
                 QuicEvent::KeyChange(KeyChange::OneRtt { keys, next }) => {
-                    self.one_rtt = Some(
-                        OneRtt::new(keys, next, self.limits.key_packets_max, &self.budget).map_err(Failure::local)?,
-                    );
+                    self.one_rtt = Some(OneRtt::new(keys, next, self.limits.key_packets_max));
                     self.write = Level::Data;
                 }
                 _ => {
@@ -2808,30 +2876,6 @@ impl Connection {
                     )));
                 }
             }
-        }
-        Ok(())
-    }
-
-    /// Charges the transport parameters of the peer, which rustls keeps, when they arrive.
-    fn keep_parameters(&mut self) -> Result<(), Failure> {
-        if self.parameters_kept {
-            return Ok(());
-        }
-        let len = match &self.tls {
-            Tls::Client(ClientHandshake::NeedsInput(needs)) => needs.quic_transport_parameters().map(<[u8]>::len),
-            Tls::Server(ServerHandshake::NeedsInput(needs)) => needs.quic_transport_parameters().map(<[u8]>::len),
-            Tls::ClientDone(connection) => connection.quic_transport_parameters().map(<[u8]>::len),
-            Tls::ServerDone(connection) => connection.quic_transport_parameters().map(<[u8]>::len),
-            _ => None,
-        };
-        if let Some(len) = len {
-            self.kept.charge(len as u64).map_err(|_| {
-                Failure::local(Error::new(
-                    Kind::Overload,
-                    "the budget refused the transport parameters of the peer",
-                ))
-            })?;
-            self.parameters_kept = true;
         }
         Ok(())
     }
@@ -3081,6 +3125,11 @@ impl Connection {
 
     /// Builds a datagram of the packets that wait, at most one for each level.
     fn datagram(&mut self, out: &mut [u8], now: Instant, mark: Ecn) -> Result<Option<usize>, Failure> {
+        // Only an ACK settles a bare ACK, so bare ACKs that waited one probe timeout send a PING,
+        // which brings one (RFC 9000, section 13.2.4).
+        if self.one_rtt.is_some() && self.spaces[Level::Data as usize].history.stale(&self.paths, now) {
+            self.ping = true;
+        }
         let data = Level::ALL.into_iter().any(|level| self.has_data(level));
         let path = &mut self.paths.active;
         let admitted = data && path.paced(out.len() as u64, now)?;
@@ -3517,10 +3566,14 @@ impl Connection {
         let len = self.seal(level, builder, number)?;
         self.sent_to(self.paths.active.addresses.peer, dcid);
         self.spaces[level as usize].history.ect_sent += u64::from(mark == Ecn::Ect0);
-        // A later bare ACK can be the largest number in an ACK that also covers a live elicitor.
-        if close.is_none() && (in_flight || self.spaces[level as usize].history.pto_start().is_some()) {
+        // A bare ACK has a record of no bytes too: a later ACK of its space that covers it shows
+        // that the path delivered between the packets around it, so a loss run across it breaks
+        // only then (RFC 9002, section 7.6.2). It can also be the largest number in an ACK that
+        // covers a live elicitor. Bare ACKs back to back share one record, and a record that
+        // waits too long gets a PING into the next packet of its space.
+        let space = &mut self.spaces[level as usize];
+        if close.is_none() && (in_flight || !space.history.extend(&mut self.paths, number, now, mark)) {
             let bytes = if in_flight { len as u64 } else { 0 };
-            let space = &mut self.spaces[level as usize];
             space.history.insert(
                 &mut self.paths,
                 Sent {
@@ -3540,8 +3593,6 @@ impl Connection {
                     self.last_activity = now;
                 }
             }
-        } else {
-            self.paths.untracked();
         }
         Ok(Some(len))
     }

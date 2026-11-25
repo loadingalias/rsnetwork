@@ -32,7 +32,7 @@ use super::params::Parameters;
 use super::reassembly::{Reassembly, Refused, Reorder, grow};
 use super::recovery::{DataRange, Output, Record};
 use super::{ErrorCode, VARINT_MAX, varint_len};
-use crate::drive::{Error, Kind};
+use crate::drive::{Error, Kind, TurnLimits, Work};
 
 /// The regions of one stream that wait to go out at one time. Give the next region after
 /// [`Event::Sent`].
@@ -149,7 +149,8 @@ pub enum Event {
         code: u64,
     },
     /// STOP_SENDING: the peer reads no more of a stream. The connection reset the direction of
-    /// this end with the same code, and dropped the regions that waited.
+    /// this end with the same code, and dropped the regions that waited. A STOP_SENDING frame
+    /// after the peer acknowledged each byte and the end gives no event: the delivery is complete.
     Stopped {
         /// The stream.
         stream: StreamId,
@@ -373,6 +374,14 @@ struct Send {
     regions: usize,
     state: Sending,
     priority: Priority,
+}
+
+impl Send {
+    /// The peer acknowledged each byte and the end: the terminal state Data Recvd (RFC 9000,
+    /// section 3.1). An acknowledged end alone is not enough while earlier bytes wait.
+    const fn delivered(&self) -> bool {
+        self.held == NONE && matches!(self.state, Sending::Finished)
+    }
 }
 
 /// One stream of the table, or a free entry.
@@ -877,13 +886,10 @@ impl Streams {
             Receiving::Stopped(_) => recv.final_size.is_some(),
             Receiving::Ended | Receiving::Reset(_) => true,
         });
-        let sent = stream.send.as_ref().is_none_or(|send| {
-            send.held == NONE
-                && matches!(
-                    send.state,
-                    Sending::Finished | Sending::Reset { acknowledged: true, .. }
-                )
-        });
+        let sent = stream
+            .send
+            .as_ref()
+            .is_none_or(|send| send.delivered() || matches!(send.state, Sending::Reset { acknowledged: true, .. }));
         if !(stream.live && stream.closed && received && sent && stream.linked == 0 && stream.control == 0) {
             return;
         }
@@ -1069,13 +1075,13 @@ impl Streams {
         Ok(())
     }
 
-    /// Resets the send direction of stream `slot` with `code`, and gives whether it was not reset
-    /// before.
+    /// Resets the send direction of stream `slot` with `code`, unless it was reset before or the
+    /// peer has each byte and the end. Gives whether it reset the direction.
     fn abandon(&mut self, slot: usize, code: u64, stopped: bool) -> bool {
         let Some(send) = &mut self.slots[slot].send else {
             return false;
         };
-        if matches!(send.state, Sending::Reset { .. }) {
+        if matches!(send.state, Sending::Reset { .. }) || send.delivered() {
             return false;
         }
         send.state = Sending::Reset {
@@ -1150,8 +1156,9 @@ impl Streams {
         Ok(payload.view(range).map(Event::Unreliable))
     }
 
-    /// The next event that waits.
-    pub(super) fn event(&mut self) -> Option<Event> {
+    /// The next event that waits. Each stream that the scan visits counts in `work`: at a limit of
+    /// `limits`, the scan gives `None`, and goes on in the next turn.
+    pub(super) fn event(&mut self, work: &mut Work, limits: &TurnLimits) -> Option<Event> {
         for (direction, name) in [Direction::Bidirectional, Direction::Unidirectional]
             .into_iter()
             .enumerate()
@@ -1162,7 +1169,10 @@ impl Streams {
         }
         loop {
             let slot = self.fifo[list::NOTIFY][0] as usize;
-            let stream = self.slots.get_mut(slot)?;
+            if self.slots.get(slot).is_none() || !work.visit(limits) {
+                return None;
+            }
+            let stream = &mut self.slots[slot];
             let id = stream.id;
             if stream.notify & notify::READABLE != 0
                 && let Some(recv) = &mut stream.recv
@@ -1206,7 +1216,7 @@ impl Streams {
                 return Some(Event::Acknowledged {
                     stream: id,
                     offset,
-                    end: send.held == NONE && send.state == Sending::Finished,
+                    end: send.delivered(),
                 });
             }
             stream.notify = 0;
@@ -1337,9 +1347,17 @@ impl Streams {
         if code > VARINT_MAX {
             return Err(Error::new(Kind::Misuse, "an error code is at most 2^62 - 1"));
         }
-        match self.slots[slot].send.as_ref().map(|send| send.state) {
+        match self.slots[slot]
+            .send
+            .as_ref()
+            .map(|send| (send.state, send.delivered()))
+        {
             None => Err(Error::new(Kind::Misuse, "the QUIC stream only receives")),
-            Some(Sending::Reset { .. }) => Err(Error::new(Kind::Misuse, "the QUIC stream was reset before")),
+            Some((Sending::Reset { .. }, _)) => Err(Error::new(Kind::Misuse, "the QUIC stream was reset before")),
+            Some((_, true)) => Err(Error::new(
+                Kind::Misuse,
+                "the peer acknowledged each byte and the end of the QUIC stream",
+            )),
             Some(_) => {
                 self.abandon(slot, code, false);
                 Ok(())

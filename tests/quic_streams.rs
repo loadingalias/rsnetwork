@@ -13,11 +13,12 @@ use std::sync::Arc;
 
 use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
-use rsnetwork::drive::{Ecn, Kind, Progress};
+use rsnetwork::drive::{Ecn, Kind, Progress, TurnLimits};
 use rsnetwork::quic::frame::{Ack, Direction, Frame};
 use rsnetwork::quic::packet::{Datagrams, Header};
 use rsnetwork::quic::{
-    CongestionControl, Connection, EcnState, Event, Limits, Path, PeerClose, Priority, STREAM_REGIONS_MAX, StreamId,
+    CongestionControl, Connection, EcnState, Event, Limits, Path, PeerClose, Priority, RecoveryStats,
+    STREAM_REGIONS_MAX, StreamId,
 };
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
@@ -208,6 +209,8 @@ struct Pair {
     dropped: Vec<Vec<u8>>,
     /// The largest datagram of the client that the path carried.
     largest: usize,
+    /// The budget of the client connection.
+    client_budget: Budget,
 }
 
 impl Pair {
@@ -245,8 +248,9 @@ impl Pair {
             local: client_address(4301),
             peer: SERVER_ADDRESS,
         };
+        let client_budget = budget();
         let mut client_end =
-            Connection::client(&client_config, "server.test", route, client, &budget(), now()).unwrap();
+            Connection::client(&client_config, "server.test", route, client, &client_budget, now()).unwrap();
         let first = sent(&mut client_end);
         let header = Header::parse(&first[0], 0).unwrap();
         let route = from_server(client_address(4301));
@@ -264,6 +268,7 @@ impl Pair {
             path_bytes,
             dropped: Vec::new(),
             largest: 0,
+            client_budget,
         };
         pair.run(|_| true);
         assert!(pair.client.is_confirmed() && pair.server.is_confirmed());
@@ -774,6 +779,144 @@ fn paced_flight(connection: &mut Connection, mut at: Instant, count: usize) -> V
     panic!("the pacer did not release the requested flight");
 }
 
+/// The client sends its first flight of 10 packets, and the server gets the last `delivered` of
+/// them and acknowledges them in one ACK. The client takes the ACK in turns of `visits` visits.
+/// Gives the recovery state after the ACK, and the turns that had more work.
+fn acknowledged_flight(visits: usize, delivered: usize) -> (RecoveryStats, usize) {
+    let limits = Limits {
+        turn: TurnLimits {
+            visits,
+            ..Limits::DEFAULT.turn
+        },
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(limits, Limits::DEFAULT);
+    let stream = pair.open(Direction::Unidirectional);
+    pair.client.send(stream, region(0, 64 * 1024), true).unwrap();
+    let flight = sent_at(&mut pair.client, ms(10));
+    assert_eq!(flight.len(), 10);
+    for packet in &flight[10 - delivered..] {
+        give_at(&mut pair.server, packet, ms(14));
+    }
+    let ack = sent_at(&mut pair.server, ms(16));
+    assert_eq!(ack.len(), 1, "one ACK frame covers the packets");
+    let len = pair.client.local_cid().as_bytes().len();
+    let mut datagrams = Datagrams::new(Backing::from(ack[0].clone()), None, len);
+    let path = pair.client.path();
+    let mut pending = 0;
+    for _ in 0..64 {
+        match pair.client.receive(&mut datagrams, path, ms(20)) {
+            (Some(_), _) => {}
+            (None, turn) if turn.progress == Progress::Pending => pending += 1,
+            (None, _) => return (pair.client.recovery(), pending),
+        }
+    }
+    panic!("an ACK of 10 packets ends in 64 turns");
+}
+
+#[test]
+fn an_ack_and_its_loss_scan_stay_within_the_visits_of_a_turn_and_end_as_with_no_limit() {
+    // All ten packets arrive, so the ACK walks ten. Or the last three arrive, so the loss scan
+    // declares the other seven lost (RFC 9002, section 6.1.1). Each turn of four visits stops
+    // with more work, and the next turn goes on with no new datagram.
+    for delivered in [10, 3] {
+        let (limited, pending) = acknowledged_flight(4, delivered);
+        let (reference, _) = acknowledged_flight(Limits::DEFAULT.turn.visits, delivered);
+        assert_eq!(limited, reference, "{delivered} delivered");
+        assert_eq!(reference.packets_lost, 10 - delivered as u64);
+        // Each of the ten packets costs a visit, so the ACK takes three turns at least.
+        assert!(pending >= 2, "{delivered} delivered: {pending} turns had more work");
+    }
+}
+
+/// Twelve side flows each send two datagrams, and their feedback acknowledges the second one, so
+/// the first one waits for the time threshold. The client then drives at that deadline in turns
+/// of `visits` visits. Gives the recovery state after the drives, and the turns that had more work.
+fn side_losses(visits: usize) -> (RecoveryStats, usize) {
+    let limits = Limits {
+        side_flows_max: 12,
+        turn: TurnLimits {
+            visits,
+            ..Limits::DEFAULT.turn
+        },
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(limits, Limits::DEFAULT);
+    let flows: Vec<_> = (0..12).map(|_| pair.client.open_side_flow().unwrap()).collect();
+    for &flow in &flows {
+        for _ in 0..2 {
+            pair.client.admit_side(flow, 100, ms(1)).unwrap().unwrap();
+        }
+        pair.client
+            .acknowledge_side(flow, &feedback(&[2, 1, 0, 0, 0]), ms(2))
+            .unwrap();
+    }
+    let mut at = pair.client.drive(ms(2)).1.deadline.unwrap().instant();
+    let mut pending = 0;
+    for _ in 0..64 {
+        match pair.client.drive(at) {
+            (Some(_), _) => {}
+            (None, turn) if turn.progress == Progress::Pending => pending += 1,
+            (None, _) if pair.client.recovery().packets_lost < 12 => {
+                at = pair.client.drive(at).1.deadline.unwrap().instant();
+            }
+            (None, _) => return (pair.client.recovery(), pending),
+        }
+    }
+    panic!("the side losses end in 64 drives");
+}
+
+#[test]
+fn the_loss_timer_of_many_side_flows_stays_within_the_visits_of_a_turn_and_ends_as_with_no_limit() {
+    let (limited, pending) = side_losses(4);
+    let (reference, _) = side_losses(Limits::DEFAULT.turn.visits);
+    assert_eq!(limited, reference);
+    assert_eq!(reference.packets_lost, 12);
+    // Each of the twelve flows costs a visit, so the sweep takes three turns at least.
+    assert!(pending >= 2, "{pending} turns had more work");
+}
+
+/// The client sends on 30 streams, and resets each one before it reads their notices. Gives the
+/// events of its drives in turns of `visits` visits, and the turns that had more work.
+fn reset_streams(visits: usize) -> (Vec<Event>, usize) {
+    let limits = Limits {
+        turn: TurnLimits {
+            visits,
+            ..Limits::DEFAULT.turn
+        },
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(limits, Limits::DEFAULT);
+    let streams: Vec<_> = (0..30).map(|_| pair.open(Direction::Unidirectional)).collect();
+    for &stream in &streams {
+        pair.client.send(stream, region(0, 10), false).unwrap();
+    }
+    assert!(!sent_at(&mut pair.client, ms(1)).is_empty());
+    for &stream in &streams {
+        pair.client.reset(stream, 3).unwrap();
+    }
+    let (mut events, mut pending) = (Vec::new(), 0);
+    for _ in 0..64 {
+        match pair.client.drive(ms(1)) {
+            (Some(event), _) => events.push(event),
+            (None, turn) if turn.progress == Progress::Pending => pending += 1,
+            (None, _) => return (events, pending),
+        }
+    }
+    panic!("the notices of 30 streams clear in 64 drives");
+}
+
+#[test]
+fn the_notices_of_many_reset_streams_clear_within_the_visits_of_a_turn() {
+    // A reset drops the notice that the regions of a stream are in a packet. The notice list
+    // still holds each stream, and the drives clear them with no event.
+    let (limited, pending) = reset_streams(4);
+    let (reference, _) = reset_streams(Limits::DEFAULT.turn.visits);
+    assert!(limited.is_empty() && reference.is_empty());
+    // Each of the thirty streams costs a visit, so the drives take eight turns at least.
+    assert!(pending >= 7, "{pending} turns had more work");
+}
+
 #[test]
 fn newreno_grows_on_delivery_and_halves_once_for_packet_and_time_threshold_losses() {
     let mut pair = Pair::new(
@@ -1159,9 +1302,27 @@ fn each_datagram_in_a_full_window_leaves_at_its_pacing_deadline() {
     assert_eq!(pair.client.recovery().bytes_in_flight, 12_000);
 }
 
+/// What the parent sends between the two side datagrams that a run of losses spans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Between {
+    Nothing,
+    /// A PING that the server acknowledges.
+    Ping,
+    /// A bare ACK that never reaches the server.
+    LostAck,
+    /// A bare ACK that the server acknowledges with a later PING of the client, after the run.
+    AcknowledgedAck,
+}
+
 #[test]
-fn persistent_congestion_spans_side_flows_and_a_delivered_parent_packet_breaks_the_run() {
-    for delivered in [false, true] {
+fn persistent_congestion_spans_side_flows_and_only_a_delivered_parent_packet_breaks_the_run() {
+    // RFC 9002, section 7.6.2: no packet that went out between the two losses is acknowledged.
+    for (between, window) in [
+        (Between::Nothing, 2400),
+        (Between::Ping, 8400),
+        (Between::LostAck, 2400),
+        (Between::AcknowledgedAck, 8400),
+    ] {
         let limits = Limits {
             side_flows_max: 2,
             ..Limits::DEFAULT
@@ -1170,15 +1331,38 @@ fn persistent_congestion_spans_side_flows_and_a_delivered_parent_packet_breaks_t
         let first = pair.client.open_side_flow().unwrap();
         let second = pair.client.open_side_flow().unwrap();
         pair.client.admit_side(first, 1200, ms(1)).unwrap().unwrap();
-        if delivered {
-            pair.client.ping();
-            let ping = sent_at(&mut pair.client, ms(40));
-            give_at(&mut pair.server, &ping[0], ms(40));
-            for ack in sent_at(&mut pair.server, ms(40)) {
-                give_at(&mut pair.client, &ack, ms(40));
+        let mut bare = Vec::new();
+        match between {
+            Between::Nothing => {}
+            Between::Ping => {
+                pair.client.ping();
+                let ping = sent_at(&mut pair.client, ms(40));
+                give_at(&mut pair.server, &ping[0], ms(40));
+                for ack in sent_at(&mut pair.server, ms(40)) {
+                    give_at(&mut pair.client, &ack, ms(40));
+                }
+            }
+            // Before the probe timeout of the first side datagram, so the client sends only its ACK.
+            Between::LostAck | Between::AcknowledgedAck => {
+                pair.server.ping();
+                for ping in sent_at(&mut pair.server, ms(10)) {
+                    give_at(&mut pair.client, &ping, ms(10));
+                }
+                bare = sent_at(&mut pair.client, ms(10));
+                assert_eq!(bare.len(), 1, "the client acknowledges the PING");
             }
         }
         pair.client.admit_side(second, 1200, ms(100)).unwrap().unwrap();
+        if between == Between::AcknowledgedAck {
+            give_at(&mut pair.server, &bare[0], ms(10));
+            pair.client.ping();
+            for ping in sent_at(&mut pair.client, ms(100)) {
+                give_at(&mut pair.server, &ping, ms(100));
+            }
+            for ack in sent_at(&mut pair.server, ms(100)) {
+                give_at(&mut pair.client, &ack, ms(100));
+            }
+        }
         for space in [second, first] {
             for _ in 0..3 {
                 pair.client.admit_side(space, 1200, ms(101)).unwrap().unwrap();
@@ -1189,9 +1373,44 @@ fn persistent_congestion_spans_side_flows_and_a_delivered_parent_packet_breaks_t
             pair.client.acknowledge_side(space, &ack, ms(102)).unwrap();
         }
         let path = pair.client.recovery();
-        assert_eq!(path.packets_lost, 2);
-        assert_eq!(path.congestion_window, if delivered { 8400 } else { 2400 });
+        assert_eq!((path.packets_lost, path.congestion_window), (2, window), "{between:?}");
     }
+}
+
+#[test]
+fn bare_acks_between_side_datagrams_keep_bounded_memory() {
+    // The server sends only PINGs, so the client sends only ACKs on the parent, between its side
+    // datagrams. A record of bare ACKs that waited one probe timeout gets a PING into the next
+    // packet, and the ACK of the server settles the records (RFC 9000, section 13.2.4).
+    let limits = Limits {
+        side_flows_max: 1,
+        ..Limits::DEFAULT
+    };
+    let mut pair = Pair::new(limits, Limits::DEFAULT);
+    let flow = pair.client.open_side_flow().unwrap();
+    let mut used = Vec::new();
+    for round in 0..400_u64 {
+        let at = ms(1 + 5 * round);
+        pair.server.ping();
+        for ping in sent_at(&mut pair.server, at) {
+            give_at(&mut pair.client, &ping, at);
+        }
+        for ack in sent_at(&mut pair.client, at) {
+            give_at(&mut pair.server, &ack, at);
+        }
+        let number = pair.client.admit_side(flow, 100, at).unwrap().unwrap().number;
+        // An ACK of this datagram alone: a two-byte varint of its number.
+        let [high, low] = u16::try_from(number).unwrap().to_be_bytes();
+        let ack = [2, 0x40 | high, low, 0, 0, 0];
+        pair.client.acknowledge_side(flow, &feedback(&ack), at).unwrap();
+        if round % 100 == 99 {
+            used.push(pair.client_budget.bound() - pair.client_budget.available());
+        }
+    }
+    assert!(
+        used.windows(2).all(|pair| pair[1] <= pair[0]),
+        "the client memory grew: {used:?}"
+    );
 }
 
 #[test]
@@ -1408,7 +1627,7 @@ fn an_unreliable_datagram_that_waits_drops_with_its_count_when_the_path_returns_
     }
     let stream = pair.open(Direction::Bidirectional);
     pair.client.send(stream, region(0, 5000), true).unwrap();
-    pair.run_until(now(), |pair| pair.at_server.complete(stream, 5000));
+    let done = pair.run_until(now(), |pair| pair.at_server.complete(stream, 5000));
     // The datagrams that waited do not fit a path of 1,200 bytes. They dropped, so the stream
     // went on, and a new one of this size refuses.
     assert!(pair.client.unreliable_room().is_some_and(|room| room < 1200));
@@ -1422,11 +1641,11 @@ fn an_unreliable_datagram_that_waits_drops_with_its_count_when_the_path_returns_
         pair.at_server.other.is_empty(),
         "the path carried no datagram of 1,300 bytes"
     );
-    // The server opens the packets that the path dropped. Each datagram that did not leave the
-    // client is in the count.
+    // The server opens the packets that the path dropped, after the run. Each datagram that did
+    // not leave the client is in the count.
     let mut left = 0;
     for datagram in &pair.dropped {
-        for event in give(&mut pair.server, datagram) {
+        for event in give_at(&mut pair.server, datagram, done) {
             assert_matches!(event, Event::Unreliable(data) if data.bytes() == region(0, 1300).bytes());
             left += 1;
         }

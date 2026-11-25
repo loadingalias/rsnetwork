@@ -1,7 +1,9 @@
 //! The memory of a QUIC connection against its charges: at each allocation, the live heap of each
 //! end stays within the charges of its budgets, in the handshake and with stream data out of order
 //! (N303, N305, [NET Resource and Progress Bounds]). A stream limit costs no memory for the
-//! streams that are not in use.
+//! streams that are not in use. A rustls call keeps what it gives with the charges that it
+//! reserved, so capacity that another owner of the budget takes while it runs fails no handshake
+//! (N116).
 
 mod counting;
 
@@ -10,12 +12,13 @@ use counting::allocations;
 use core::cell::{Cell, RefCell};
 use core::net::{Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::time::Duration;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rsnetwork::buffer::{Backing, Lease};
-use rsnetwork::capacity::Budget;
-use rsnetwork::drive::Kind;
+use rsnetwork::capacity::{Budget, Permit};
+use rsnetwork::drive::{Blocked, Kind, Progress};
 use rsnetwork::quic::frame::Direction;
 use rsnetwork::quic::packet::{Datagrams, Header, Kind as PacketKind};
 use rsnetwork::quic::{Connection, Event, Limits, Path};
@@ -117,6 +120,8 @@ struct Profile {
     stream_bytes: usize,
     /// The streams of each direction that each end lets its peer open.
     streams: u64,
+    /// The ALPN names of 200 bytes that the client offers before `h3`, for a large ClientHello.
+    names: usize,
 }
 
 impl Profile {
@@ -132,6 +137,7 @@ impl Profile {
             keys: (u64::MAX, 0),
             stream_bytes: 0,
             streams: 100,
+            names: 0,
         }
     }
 }
@@ -210,13 +216,18 @@ fn run(profile: &Profile) -> ([u64; 2], Vec<Option<Handshake>>, [u64; 2]) {
     EXCESS.set([0; 2]);
     BUDGETS.with_borrow_mut(|budgets| budgets.iter_mut().for_each(Vec::clear));
     let ((leaf, key), chain, root) = (profile.leaf, &profile.chain, profile.root);
+    let names: Vec<Vec<u8>> = (0..profile.names)
+        .map(|at| [vec![b'x'; 199], vec![u8::try_from(at).unwrap()]].concat())
+        .collect();
+    let mut protocols: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+    protocols.push(b"h3");
     // The configurations belong to the application: only the sessions of their stores are
     // charged, to their own budgets.
     let client_config = {
         ClientConfig::new(ClientOptions {
             roots: &[certificate(root)],
             identity: None,
-            protocols: &[b"h3"],
+            protocols: &protocols,
             resumption: profile.resumption,
             budget: &budget(CLIENT_END),
             clock: Arc::new(At(VALID)),
@@ -369,6 +380,12 @@ fn the_heap_of_each_end_of_a_quic_connection_stays_within_its_charges() {
             keys: (3, 3),
             ..Profile::new("a key update of the server")
         },
+        // About 12 KB of ALPN names, which the server keeps decoded while it chooses its
+        // configuration.
+        Profile {
+            names: 60,
+            ..Profile::new("a large ClientHello")
+        },
         // About 170 datagrams, which wait in the pages of the server out of order.
         Profile {
             stream_bytes: 200 * 1024,
@@ -453,4 +470,144 @@ fn a_client_or_server_that_the_budget_refuses_allocates_nothing() {
     let (refused, count) =
         allocations(|| Connection::server(&server, &header, path(443, 4301), Limits::DEFAULT, &small, now()).map(drop));
     assert_eq!((refused.map_err(|error| error.kind()), count), (Err(Kind::Overload), 0));
+}
+
+/// A wall clock that shares the budget of its end with another owner: at each read while it is
+/// armed, the owner takes each free unit, as another connection of the budget can while rustls
+/// runs. rustls reads the clock to check a certificate and the age of a ticket.
+#[derive(Debug)]
+struct Taking {
+    budget: Budget,
+    armed: AtomicBool,
+    taken: Mutex<Vec<Permit>>,
+    /// The reads that took units.
+    reads: AtomicUsize,
+}
+
+impl Taking {
+    fn new(budget: &Budget) -> Arc<Self> {
+        Arc::new(Self {
+            budget: budget.clone(),
+            armed: AtomicBool::new(false),
+            taken: Mutex::new(Vec::new()),
+            reads: AtomicUsize::new(0),
+        })
+    }
+
+    /// The other owner gives its units back.
+    fn give_back(&self) {
+        self.taken.lock().unwrap().clear();
+    }
+}
+
+impl TimeProvider for Taking {
+    fn current_time(&self) -> Option<UnixTime> {
+        let free = self.budget.available();
+        if self.armed.load(Ordering::Relaxed) && free > 0 {
+            self.taken.lock().unwrap().push(self.budget.reserve(free).unwrap());
+            self.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(UnixTime::since_unix_epoch(Duration::from_secs(VALID)))
+    }
+}
+
+/// Gives `datagram` to `connection`, then gives the units of the other owner back, and drives
+/// the connection while it has work or waits for capacity.
+fn give_shared(connection: &mut Connection, datagram: Vec<u8>, other: &Taking) {
+    let len = connection.local_cid().as_bytes().len();
+    let mut datagrams = Datagrams::new(Backing::from(datagram), None, len);
+    let path = connection.path();
+    while connection.receive(&mut datagrams, path, now()).0.is_some() {}
+    other.give_back();
+    for _ in 0..64 {
+        match connection.drive(now()) {
+            (Some(_), _) => {}
+            (None, turn)
+                if matches!(
+                    turn.progress,
+                    Progress::Pending | Progress::Blocked(Blocked::Capacity(_))
+                ) => {}
+            (None, _) => return,
+        }
+    }
+    panic!("a connection drives at most 64 times after a datagram");
+}
+
+#[test]
+fn capacity_that_another_owner_takes_while_rustls_runs_fails_no_handshake() {
+    // Each end shares its budget with an owner that takes each free unit while rustls reads the
+    // clock, so the call has only the charges that it reserved before it ran. In the first
+    // connection, the client is squeezed when it checks the certificate of the server. In the
+    // second, the server is squeezed when it checks the ticket age in the ClientHello, up to its
+    // first flight. A session that a squeezed connection cannot pay for stays in its store.
+    let (client_budget, server_budget) = (budget(CLIENT_END), budget(SERVER_END));
+    let (client_clock, server_clock) = (Taking::new(&client_budget), Taking::new(&server_budget));
+    let sessions = Resumption::Process(NonZeroUsize::new(8).unwrap());
+    let client_config = ClientConfig::new(ClientOptions {
+        roots: &[certificate(CA)],
+        identity: None,
+        protocols: &[b"h3"],
+        resumption: sessions,
+        budget: &Budget::new(NonZeroU64::new(1 << 20).unwrap()),
+        clock: client_clock.clone(),
+        entropy: Entropy::System,
+    })
+    .unwrap();
+    let server_config = ServerConfig::new(ServerOptions {
+        identity: Identity {
+            chain: vec![certificate(SERVER.0)],
+            key: PrivateKeyDer::try_from(SERVER.1.to_vec()).unwrap(),
+        },
+        client_roots: None,
+        protocols: &[b"h3"],
+        resumption: sessions,
+        budget: &Budget::new(NonZeroU64::new(1 << 20).unwrap()),
+        clock: server_clock.clone(),
+        entropy: Entropy::System,
+    })
+    .unwrap();
+    for squeezed in [&client_clock, &server_clock] {
+        let mut client = Connection::client(
+            &client_config,
+            "server.test",
+            path(4301, 443),
+            Limits::DEFAULT,
+            &client_budget,
+            now(),
+        )
+        .unwrap();
+        squeezed.armed.store(true, Ordering::Relaxed);
+        let mut server: Option<Connection> = None;
+        for _ in 0..64 {
+            let to_server = send(CLIENT_END, &mut client);
+            let to_client = server
+                .as_mut()
+                .map(|server| send(SERVER_END, server))
+                .unwrap_or_default();
+            if to_server.is_empty() && to_client.is_empty() {
+                break;
+            }
+            if !to_client.is_empty() {
+                server_clock.armed.store(false, Ordering::Relaxed);
+            }
+            for datagram in to_server {
+                let server = server.get_or_insert_with(|| {
+                    let header = Header::parse(&datagram, 0).unwrap();
+                    let route = path(443, 4301);
+                    Connection::server(&server_config, &header, route, Limits::DEFAULT, &server_budget, now()).unwrap()
+                });
+                give_shared(server, datagram, &server_clock);
+            }
+            for datagram in to_client {
+                give_shared(&mut client, datagram, &client_clock);
+            }
+        }
+        squeezed.armed.store(false, Ordering::Relaxed);
+        let server = server.expect("the client reached the server");
+        assert!(client.is_confirmed() && server.is_confirmed());
+        assert!(
+            squeezed.reads.swap(0, Ordering::Relaxed) > 0,
+            "the owner took the free units"
+        );
+    }
 }

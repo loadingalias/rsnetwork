@@ -36,6 +36,7 @@ const LIMITS: StreamLimits = StreamLimits {
         turn: TurnLimits {
             bytes: 1 << 20,
             frames: 1 << 10,
+            visits: 1 << 12,
         },
     },
     queue: NonZeroUsize::new(16).unwrap(),

@@ -10,7 +10,7 @@ use core::num::NonZeroU64;
 use std::sync::Arc;
 
 use keys::Claim;
-pub use keys::{ENDPOINT_WORKERS_MAX, EndpointKeys};
+pub use keys::{ENDPOINT_WORKERS_MAX, EndpointKeys, REDEEMED_BYTES_DEFAULT};
 pub(super) use keys::{Proof, Token};
 use rstypes::capacity::{Budget, Permit};
 use rstypes::time::Instant;

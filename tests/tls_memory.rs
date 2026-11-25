@@ -60,6 +60,7 @@ const BODY_LIMITS: BodyLimits = BodyLimits {
 const TURN: TurnLimits = TurnLimits {
     bytes: 1 << 20,
     frames: 1 << 10,
+    visits: 1 << 12,
 };
 
 /// An input region that holds the largest Certificate message of the profiles.

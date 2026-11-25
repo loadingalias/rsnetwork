@@ -73,6 +73,7 @@ fn a_slow_peer_retains_one_charged_head_and_is_refused_at_its_limit() {
     let turn = TurnLimits {
         bytes: 1 << 20,
         frames: 1 << 10,
+        visits: 1 << 12,
     };
     let mut server = Server::new(LIMITS, BODY, turn, &outbound, &budget).unwrap();
     let admitted = budget.available();
@@ -113,6 +114,7 @@ fn a_turn_with_more_work_than_its_limit_stops_and_reports_the_rest() {
     let turn = TurnLimits {
         bytes: 1 << 20,
         frames: 10,
+        visits: 10,
     };
     let mut server = Server::new(LIMITS, BODY, turn, &outbound, &budget).unwrap();
     inbound
@@ -162,7 +164,11 @@ fn a_turn_with_more_work_than_its_limit_stops_and_reports_the_rest() {
 
     // Eight regions of 10 bytes of a body that the engine drains, with 30 bytes in each turn: three
     // regions, three more, and then the last two and a wait for the rest of the body.
-    let turn = TurnLimits { bytes: 30, frames: 10 };
+    let turn = TurnLimits {
+        bytes: 30,
+        frames: 10,
+        visits: 10,
+    };
     let (mut inbound, mut outbound) = queues();
     let mut server = Server::new(LIMITS, BODY, turn, &outbound, &budget).unwrap();
     inbound
@@ -194,7 +200,11 @@ fn a_refused_admission_is_an_overload_and_allocates_nothing() {
     let poor = Budget::new(NonZeroU64::new(1).unwrap());
     let limit = NonZeroUsize::new(8).unwrap();
     let (_, outbound) = queues();
-    let turn = TurnLimits { bytes: 1, frames: 1 };
+    let turn = TurnLimits {
+        bytes: 1,
+        frames: 1,
+        visits: 1,
+    };
     let (kinds, count) = allocations(|| {
         [
             Inbound::new(limit, &poor).err().map(|error| error.kind()),
@@ -217,6 +227,7 @@ fn empty_lines_before_a_request_line_count_against_the_head_limit() {
     let turn = TurnLimits {
         bytes: 1 << 20,
         frames: 1 << 10,
+        visits: 1 << 12,
     };
     // A request head of `bytes` bytes after one empty line.
     let after_an_empty_line = |bytes: usize| {

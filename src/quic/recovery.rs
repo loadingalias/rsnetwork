@@ -19,7 +19,7 @@ use super::path::{Mtu, Path, Validation};
 use super::reassembly::grow;
 use super::stream::StreamId;
 use super::{ConnectionId, VARINT_MAX, Writer, varint_len};
-use crate::drive::{Ecn, Error, Kind};
+use crate::drive::{Ecn, Error, Kind, TurnLimits, Work};
 
 pub(super) const NO_ROOM: Error = Error::new(Kind::Overload, "the budget refused QUIC recovery state");
 const PATHS_SPENT: Error = Error::new(Kind::Overload, "the QUIC connection used each of its path tags");
@@ -543,6 +543,9 @@ pub(super) struct Sent {
 /// Slots in send order. Removal unlinks two neighbors. The next insertion reuses the free slot.
 struct Slot {
     packet: Option<Sent>,
+    /// The number of the last packet of the slot. Bare ACKs that leave back to back share one
+    /// slot, from the number of the packet through this one.
+    through: u64,
     previous: usize,
     next: usize,
     path_previous: usize,
@@ -555,6 +558,9 @@ struct Slot {
 }
 
 const NONE: usize = usize::MAX;
+/// The live slots of bare ACKs that a loss run goes past on each side when a packet settles. Past
+/// them, the run waits for those slots to settle, which a PING brings (RFC 9000, section 13.2.4).
+const BARE_PAST_MAX: usize = 16;
 
 /// Geometric blocks keep existing slots in place during growth. The directory has at most one
 /// entry per bit of a slot index. A new block initializes only the slot being inserted.
@@ -630,6 +636,11 @@ impl Gap {
         broken: true,
     };
 
+    /// No settled packet in the gap is a loss of a run or a delivery.
+    const fn is_empty(self) -> bool {
+        self.prefix_end.is_none() && self.suffix_start.is_none() && !self.broken
+    }
+
     fn join(self, right: Self) -> Self {
         Self {
             prefix_end: if self.broken {
@@ -666,6 +677,44 @@ impl Store {
             tail: Gap::default(),
             credit: budget.credit(0),
         }
+    }
+
+    /// Slot `at`, when it holds live bare ACKs of the path `path`. A loss run goes past them
+    /// until an ACK covers one of them.
+    fn bare(&self, at: usize, path: u32) -> Option<&Slot> {
+        self.slots
+            .get(at)
+            .filter(|slot| slot.path == path && slot.packet.as_ref().is_some_and(|packet| packet.bytes == 0))
+    }
+
+    /// The start of the loss run that ends at the right of `gap`, past the live bare ACKs of
+    /// `path` from the slot `left` back.
+    fn run_start(&self, mut gap: Gap, mut left: usize, path: u32) -> Option<u64> {
+        let mut start = gap.suffix_start;
+        for _ in 0..BARE_PAST_MAX {
+            let Some(slot) = self.bare(left, path).filter(|_| !gap.broken) else {
+                break;
+            };
+            gap = slot.gap;
+            start = gap.suffix_start.or(start);
+            left = slot.path_previous;
+        }
+        start
+    }
+
+    /// The end of the loss run that starts at the left of `gap`, past the live bare ACKs of `path`
+    /// from the slot `right` on.
+    fn run_end(&self, mut gap: Gap, mut right: usize, path: u32) -> Option<u64> {
+        let mut end = gap.prefix_end;
+        for _ in 0..BARE_PAST_MAX {
+            let Some(slot) = self.bare(right, path).filter(|_| !gap.broken) else {
+                break;
+            };
+            right = slot.path_next;
+            gap = self.slots.get(right).map_or(self.tail, |next| next.gap);
+            end = gap.prefix_end.or(end);
+        }
+        end
     }
 }
 
@@ -708,17 +757,12 @@ impl Paths {
     /// ended. Gives the path before it. A loss run does not continue from one path to the next.
     /// The credit of a path with no validation stays with its address.
     pub(super) fn activate(&mut self, next: PathState) -> PathState {
-        self.untracked();
+        self.store.tail = self.store.tail.join(Gap::BARRIER);
         let old = core::mem::replace(&mut self.active, next);
         if let Some(credit) = old.amplification_credit {
             self.off_path = Some((old.addresses, credit));
         }
         old
-    }
-
-    /// A packet went out with no delivery state: it stands between its neighbors in send order.
-    pub(super) fn untracked(&mut self) {
-        self.store.tail = self.store.tail.join(Gap::BARRIER);
     }
 
     /// Counts a datagram of `bytes` bytes that came on `path`. A path with no validation gets
@@ -816,6 +860,40 @@ pub(super) struct History {
     pub(super) loss_time: Option<Instant>,
     pub(super) ect_sent: u64,
     feedback: EcnCounts,
+    /// A live packet near the largest acknowledged number, where the walk of the next ACK
+    /// starts, or `NONE`.
+    near: usize,
+    /// The ACK frame and the loss scan that a limit of a turn stopped.
+    walk: Option<Walk>,
+    scan: Option<Scan>,
+}
+
+/// The walk of an ACK frame that a limit of a turn stopped: where it goes on, and what it found.
+#[derive(Clone, Copy)]
+struct Walk {
+    /// The range of the frame, counted from the largest, and the packet where the walk goes on.
+    range: usize,
+    at: usize,
+    /// The walk reached the newest packet at or below the largest number of the frame.
+    located: bool,
+    /// The frame raised the largest acknowledged number.
+    advances: bool,
+    eliciting: bool,
+    grow_by: u64,
+    marked: u64,
+    elsewhere: u64,
+    sample: Option<Instant>,
+    round: Option<u64>,
+}
+
+/// A loss scan that a limit of a turn stopped: the packet where it goes on, the earliest time
+/// threshold of the packets before it that wait, and whether each datagram that the active path
+/// lost in it is above the base size.
+#[derive(Clone, Copy)]
+struct Scan {
+    at: usize,
+    waiting: Option<Instant>,
+    large: Option<bool>,
 }
 
 impl History {
@@ -830,6 +908,9 @@ impl History {
             loss_time: None,
             ect_sent: 0,
             feedback: EcnCounts::default(),
+            near: NONE,
+            walk: None,
+            scan: None,
         }
     }
 
@@ -838,10 +919,11 @@ impl History {
     }
 
     pub(super) fn insert(&mut self, paths: &mut Paths, packet: Sent) -> Result<(), Error> {
-        let (bytes, eliciting, time) = (packet.bytes, packet.eliciting, packet.time);
+        let (number, bytes, eliciting, time) = (packet.number, packet.bytes, packet.eliciting, packet.time);
         let (store, path) = (&mut paths.store, &mut paths.active);
         let slot = Slot {
             packet: Some(packet),
+            through: number,
             previous: self.last,
             next: NONE,
             path_previous: store.last,
@@ -878,6 +960,44 @@ impl History {
         Ok(())
     }
 
+    /// Adds the bare ACK `number`, which left at `now` with `mark`, to the slot of the bare ACKs
+    /// before it, and gives whether it could: the slot is the last packet of the path, no packet
+    /// settled after it, and the space has no live ack-eliciting packet, so the slot gives no
+    /// round-trip sample.
+    pub(super) fn extend(&mut self, paths: &mut Paths, number: u64, now: Instant, mark: Ecn) -> bool {
+        let store = &mut paths.store;
+        if self.elicitors > 0 || self.last != store.last || !store.tail.is_empty() {
+            return false;
+        }
+        let Some(slot) = store.slots.get_mut(self.last) else {
+            return false;
+        };
+        let Some(packet) = slot
+            .packet
+            .as_mut()
+            .filter(|packet| packet.bytes == 0 && packet.mark == mark)
+        else {
+            return false;
+        };
+        slot.through = number;
+        packet.time = now;
+        true
+    }
+
+    /// Whether the oldest packet of the space waited one probe timeout for an ACK, and no
+    /// ack-eliciting packet of the space can bring one. Only an ACK settles a bare ACK, so the
+    /// next packet then elicits one (RFC 9000, section 13.2.4).
+    pub(super) fn stale(&self, paths: &Paths, now: Instant) -> bool {
+        let pto = paths.active.pto(paths.active.ack_delay_max);
+        self.elicitors == 0
+            && paths
+                .store
+                .slots
+                .get(self.first)
+                .and_then(|slot| slot.packet.as_ref())
+                .is_some_and(|packet| now.duration_since(packet.time).is_ok_and(|age| age >= pto))
+    }
+
     /// Takes a packet out of the store. Only the path that sent it counts its bytes and its loss.
     fn remove(&mut self, paths: &mut Paths, at: usize, reason: Settlement) -> Sent {
         let Paths {
@@ -892,6 +1012,16 @@ impl History {
         let (left, right, gap, sampled) = (slot.path_previous, slot.path_next, slot.gap, slot.sampled);
         let sender = slot.path;
         store.free = at;
+        // A walk goes to older packets, and a scan to newer ones.
+        if self.near == at {
+            self.near = previous;
+        }
+        if let Some(walk) = self.walk.as_mut().filter(|walk| walk.at == at) {
+            walk.at = previous;
+        }
+        if let Some(scan) = self.scan.as_mut().filter(|scan| scan.at == at) {
+            scan.at = next;
+        }
         if let Some(before) = store.slots.get_mut(previous) {
             before.next = next;
         } else {
@@ -905,13 +1035,6 @@ impl History {
         if let Some(before) = store.slots.get_mut(left) {
             before.path_next = right;
         }
-        let after = if let Some(after) = store.slots.get_mut(right) {
-            after.path_previous = left;
-            &mut after.gap
-        } else {
-            store.last = left;
-            &mut store.tail
-        };
         let mut middle = Gap::BARRIER;
         let mut span = None;
         if sender == path.id && matches!(reason, Settlement::Lost) {
@@ -921,10 +1044,19 @@ impl History {
                 suffix_start: time,
                 broken: false,
             };
-            if let (Some(first), Some(last)) = (gap.suffix_start.or(time), after.prefix_end.or(time)) {
+            let after = store.slots.get(right).map_or(store.tail, |after| after.gap);
+            let first = store.run_start(gap, left, path.id).or(time);
+            if let (Some(first), Some(last)) = (first, store.run_end(after, right, path.id).or(time)) {
                 span = Some((first, last));
             }
         }
+        let after = if let Some(after) = store.slots.get_mut(right) {
+            after.path_previous = left;
+            &mut after.gap
+        } else {
+            store.last = left;
+            &mut store.tail
+        };
         *after = gap.join(middle).join(*after);
         self.bytes -= packet.bytes;
         self.elicitors -= usize::from(packet.eliciting);
@@ -950,6 +1082,7 @@ impl History {
         while self.first != NONE {
             self.remove(paths, self.first, Settlement::Discarded);
         }
+        (self.walk, self.scan) = (None, None);
     }
 
     /// Checks the ECN counts of an ACK frame for the active path `path`. `marked` of its marked
@@ -997,61 +1130,98 @@ impl History {
         here > 0 && sent.is_some_and(|sent| path.controller.congestion(sent, now))
     }
 
-    /// Walks the ranges and the live packets together, once. A gap in packet numbers costs no work.
-    /// A packet of another path gives the active path no round-trip sample, no growth, no
-    /// congestion mark, and no sign that the path delivers.
+    /// Walks the ranges and the live packets together, once, from the newest packet at or below
+    /// the largest number of the frame: the packets that left after it cost no work, and a gap in
+    /// packet numbers costs none either. A packet of another path gives the active path no
+    /// round-trip sample, no growth, no congestion mark, and no sign that the path delivers.
+    /// Gives `None` when a limit of the turn stopped the walk: give the same frame in the next
+    /// turn, and the walk goes on.
     pub(super) fn ack(
         &mut self,
         ack: &Ack<'_>,
         paths: &mut Paths,
         now: Instant,
         delay: Duration,
+        (work, limits): (&mut Work, &TurnLimits),
         mut delivered: impl FnMut(Record),
-    ) -> Result<Acked, Error> {
-        let advances = self.largest.is_none_or(|old| ack.largest > old);
-        self.largest = Some(self.largest.map_or(ack.largest, |old| old.max(ack.largest)));
-        if paths
-            .store
-            .slots
-            .get(self.first)
-            .and_then(|slot| slot.packet.as_ref())
-            .is_none_or(|first| first.number > ack.largest)
+    ) -> Result<Option<Acked>, Error> {
+        let mut walk = if let Some(walk) = self.walk.take() {
+            walk
+        } else {
+            let advances = self.largest.is_none_or(|old| ack.largest > old);
+            self.largest = Some(self.largest.map_or(ack.largest, |old| old.max(ack.largest)));
+            if paths
+                .store
+                .slots
+                .get(self.first)
+                .and_then(|slot| slot.packet.as_ref())
+                .is_none_or(|first| first.number > ack.largest)
+            {
+                return Ok(Some(Acked::default()));
+            }
+            Walk {
+                range: 0,
+                at: if self.near == NONE { self.first } else { self.near },
+                located: false,
+                advances,
+                eliciting: false,
+                grow_by: 0,
+                marked: 0,
+                elsewhere: 0,
+                sample: None,
+                round: None,
+            }
+        };
+        while !walk.located
+            && let Some(slot) = paths.store.slots.get(walk.at)
         {
-            return Ok(Acked::default());
+            if !work.visit(limits) {
+                self.walk = Some(walk);
+                return Ok(None);
+            }
+            let newer = paths.store.slots.get(slot.next).and_then(|next| next.packet.as_ref());
+            if slot.packet.as_ref().is_some_and(|packet| packet.number > ack.largest) {
+                walk.at = slot.previous;
+            } else if newer.is_some_and(|next| next.number <= ack.largest) {
+                walk.at = slot.next;
+            } else {
+                walk.located = true;
+            }
         }
-        let mut at = self.last;
-        let mut eliciting = false;
-        let mut grow_by = 0;
-        let (mut marked, mut elsewhere) = (0, 0);
-        let mut sample = None;
-        let mut round = None;
-        for range in ack.ranges() {
-            while let Some(slot) = paths.store.slots.get(at) {
+        for (index, range) in ack.ranges().enumerate().skip(walk.range) {
+            walk.range = index;
+            while let Some(slot) = paths.store.slots.get(walk.at) {
+                if !work.visit(limits) {
+                    self.walk = Some(walk);
+                    return Ok(None);
+                }
                 let packet = slot.packet.as_ref().expect("the send list links live packets");
-                if packet.number < *range.start() {
+                if slot.through < *range.start() {
                     break;
                 }
                 let previous = slot.previous;
+                // A slot of bare ACKs is delivered when the range covers one of them.
                 if packet.number <= *range.end() {
-                    let (sent_round, sender) = (slot.round, slot.path);
+                    let (sent_round, sender, through) = (slot.round, slot.path, slot.through);
                     let current = sender == paths.active.id;
-                    let packet = self.remove(paths, at, Settlement::Delivered);
+                    let packet = self.remove(paths, walk.at, Settlement::Delivered);
                     let path = &mut paths.active;
+                    let marks = u64::from(packet.mark == Ecn::Ect0) * (through - packet.number + 1);
                     if current {
-                        eliciting |= packet.eliciting;
-                        marked += u64::from(packet.mark == Ecn::Ect0);
+                        walk.eliciting |= packet.eliciting;
+                        walk.marked += marks;
                         if path.controller.can_grow(packet.time) {
-                            grow_by += packet.bytes;
+                            walk.grow_by += packet.bytes;
                         }
-                        if packet.number == ack.largest {
-                            sample = Some(packet.time);
-                            round = Some(sent_round);
+                        if (packet.number..=through).contains(&ack.largest) {
+                            walk.sample = Some(packet.time);
+                            walk.round = Some(sent_round);
                         }
                         if packet.bytes > DATAGRAM_MIN as u64 {
                             path.mtu.large_acknowledged();
                         }
                     } else {
-                        elsewhere += u64::from(packet.mark == Ecn::Ect0);
+                        walk.elsewhere += marks;
                     }
                     for record in packet.records.iter() {
                         match record {
@@ -1067,12 +1237,23 @@ impl History {
                         }
                     }
                 }
-                at = previous;
+                walk.at = previous;
             }
-            if at == NONE {
+            if walk.at == NONE {
                 break;
             }
         }
+        self.near = walk.at;
+        let Walk {
+            advances,
+            eliciting,
+            mut grow_by,
+            marked,
+            elsewhere,
+            sample,
+            round,
+            ..
+        } = walk;
         let path = &mut paths.active;
         if eliciting && let Some(sent) = sample {
             path.sample(
@@ -1084,40 +1265,46 @@ impl History {
         if advances && self.validate_ecn(path, ack.ecn, (marked, elsewhere), sample, now) {
             grow_by = 0;
         }
-        Ok(Acked {
+        Ok(Some(Acked {
             eliciting,
             bytes: grow_by,
             round: round.filter(|_| eliciting),
-        })
+        }))
     }
 
     /// Stops at the first packet of the active path below both loss thresholds. Each later packet
     /// is newer. A packet of another path waits for the time threshold of its own path. An
     /// acknowledgement that came on a faster path is no sign of its loss. Only a packet of the
-    /// active path is a sign of congestion on it.
+    /// active path is a sign of congestion on it. A limit of the turn can stop the scan: the loss
+    /// timer of the space is then due at once, and the next scan goes on from there.
     pub(super) fn detect(
         &mut self,
         paths: &mut Paths,
         now: Instant,
+        (work, limits): (&mut Work, &TurnLimits),
         mut lost: impl FnMut(Record) -> Result<(), Error>,
     ) -> Result<bool, Error> {
-        self.loss_time = None;
         let previous_collapse = paths.active.collapsed;
         let mut congestion = false;
-        // Whether each datagram that the active path lost here is above the base size.
-        let mut large = None;
-        let mut at = self.first;
+        let Scan {
+            mut at,
+            mut waiting,
+            mut large,
+        } = self.scan.take().unwrap_or(Scan {
+            at: self.first,
+            waiting: None,
+            large: None,
+        });
         while let Some(slot) = paths.store.slots.get(at)
             && let Some(packet) = slot.packet.as_ref()
         {
-            let (next, sender) = (slot.next, slot.path);
-            // A bare ACK below no acknowledged number has no remaining RTT or loss evidence.
-            if at == self.first && packet.bytes == 0 && self.largest.is_none_or(|largest| largest < packet.number) {
-                self.remove(paths, at, Settlement::Discarded);
-                at = next;
-                continue;
+            if !work.visit(limits) {
+                self.scan = Some(Scan { at, waiting, large });
+                self.loss_time = Some(now);
+                return Ok(congestion || previous_collapse != paths.active.collapsed);
             }
-            let Some(largest) = self.largest.filter(|largest| *largest >= packet.number) else {
+            let (next, sender, through) = (slot.next, slot.path, slot.through);
+            let Some(largest) = self.largest.filter(|largest| *largest >= through) else {
                 break;
             };
             let current = sender == paths.active.id;
@@ -1125,10 +1312,10 @@ impl History {
                 .time
                 .checked_add(paths.loss_delay(sender))
                 .map_err(|_| super::connection::CLOCK)?;
-            let reordered = current && largest - packet.number >= PACKET_THRESHOLD;
+            let reordered = current && largest - through >= PACKET_THRESHOLD;
             if !reordered && now.as_nanos() < due.as_nanos() {
-                if self.loss_time.is_none_or(|first| due.as_nanos() < first.as_nanos()) {
-                    self.loss_time = Some(due);
+                if waiting.is_none_or(|first| due.as_nanos() < first.as_nanos()) {
+                    waiting = Some(due);
                 }
                 // Each later packet is newer. Only a packet of the fallback path has another
                 // delay, and each of them went out before the active path sent.
@@ -1162,6 +1349,7 @@ impl History {
                 }
             }
         }
+        self.loss_time = waiting;
         if let Some(large) = large {
             paths.active.mtu.lost(large);
         }

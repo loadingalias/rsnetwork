@@ -61,7 +61,7 @@ let body = BodyLimits {
     trailer_bytes: 4 * 1024,
     trailer_fields: 16,
 };
-let turn = TurnLimits { bytes: 256 * 1024, frames: 1024 };
+let turn = TurnLimits { bytes: 256 * 1024, frames: 1024, visits: 4096 };
 let queue = NonZeroUsize::new(16).expect("not zero");
 let linger = Linger { time: Duration::from_secs(5), bytes: 64 * 1024 };
 let head_timeout = Some(Duration::from_secs(30));

@@ -60,6 +60,7 @@ const BODY: BodyLimits = BodyLimits {
 const TURN: TurnLimits = TurnLimits {
     bytes: 1 << 20,
     frames: 1 << 10,
+    visits: 1 << 12,
 };
 
 const QUEUE: NonZeroUsize = NonZeroUsize::new(16).unwrap();

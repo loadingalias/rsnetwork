@@ -1,6 +1,7 @@
 //! A server engine of the core against a client that breaks the rules of the streams: each
 //! frame past a window, a limit, a final size, or the direction of a stream closes the connection
-//! with its code of RFC 9000, section 20.1, and takes no memory (N305). Data out of order keeps
+//! with its code of RFC 9000, section 20.1, and takes no memory (N305). A stop after the client
+//! acknowledged each byte of a stream and its end changes nothing. Data out of order keeps
 //! the counts of its stream when the reassembly bound refuses a part of it, and a gap between its
 //! pieces costs no memory. The same client probes a path that the connection does not use, and
 //! moves between its frames (N307). It also gives a listener a connection ID whose reset token
@@ -15,7 +16,7 @@ use core::time::Duration;
 use std::assert_matches;
 use std::sync::Arc;
 
-use rsnetwork::buffer::{Backing, Buffer as _};
+use rsnetwork::buffer::{Backing, Buffer as _, Lease};
 use rsnetwork::capacity::Budget;
 use rsnetwork::drive::{Blocked, Kind, Progress, TurnLimits};
 use rsnetwork::quic::frame::{Direction, Frame};
@@ -23,7 +24,7 @@ use rsnetwork::quic::packet::{self, Builder, Datagrams, Header, Keys, Kind as Pa
 use rsnetwork::quic::params::Parameters;
 use rsnetwork::quic::{
     CRYPTO_BUFFER_BYTES_MAX, Connection, ConnectionId, Endpoint, EndpointKeys, EndpointLimits, ErrorCode, Event,
-    Handle, Limits, Path, Route,
+    Handle, Limits, Path, REDEEMED_BYTES_DEFAULT, Route,
 };
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
@@ -727,6 +728,59 @@ fn an_unreliable_datagram_that_the_server_did_not_offer_to_take_closes_the_conne
 }
 
 #[test]
+fn a_stop_after_the_peer_acknowledged_each_byte_and_the_end_keeps_the_complete_delivery() {
+    // The client acknowledges both packets of a stream, or only the packet with its end. In the
+    // same packet, it stops the stream (RFC 9000, section 3.1).
+    for each in [true, false] {
+        let (mut server, mut rogue) = pair(Limits::DEFAULT, true);
+        assert_eq!(server.open(Direction::Unidirectional).unwrap(), None);
+        let credit = Frame::MaxStreams {
+            direction: Direction::Unidirectional,
+            max: 1,
+        };
+        assert_matches!(
+            attack(&mut server, &mut rogue, &[credit])[..],
+            [Event::Openable(Direction::Unidirectional)]
+        );
+        let stream = server.open(Direction::Unidirectional).unwrap().unwrap();
+        let window = Frame::MaxStreamData {
+            stream: stream.get(),
+            max: 20,
+        };
+        assert!(attack(&mut server, &mut rogue, &[window]).is_empty());
+        let mut numbers = [0; 2];
+        for (number, (byte, end)) in numbers.iter_mut().zip([(1, false), (2, true)]) {
+            server.send(stream, Lease::from(vec![byte; 10]), end).unwrap();
+            for datagram in sent(&mut server) {
+                rogue.receive(&datagram);
+            }
+            *number = rogue.expected[DATA] - 1;
+        }
+        let low = if each { numbers[0] } else { numbers[1] };
+        let wire = [
+            0x02,
+            u8::try_from(numbers[1]).unwrap(),
+            0,
+            0,
+            u8::try_from(numbers[1] - low).unwrap(),
+        ];
+        let ack = Frame::parse(&wire).unwrap().0;
+        let stop = Frame::StopSending {
+            stream: stream.get(),
+            code: 5,
+        };
+        let events = attack(&mut server, &mut rogue, &[ack, stop]);
+        if each {
+            assert_matches!(events[..], [Event::Sent { .. }, Event::Acknowledged { stream: id, offset: 20, end: true }] if id == stream);
+            assert_matches!(server.reset(stream, 6).map_err(|error| error.kind()), Err(Kind::Misuse));
+        } else {
+            // The first bytes still wait for an ACK: the stop resets the stream.
+            assert_matches!(events[..], [.., Event::Stopped { stream: id, code: 5 }] if id == stream);
+        }
+    }
+}
+
+#[test]
 fn a_server_reads_no_1_rtt_packet_before_its_handshake_completes() {
     // The client has its 1-RTT keys, and the server did not see its Finished message.
     let (mut server, mut rogue) = pair(Limits::DEFAULT, false);
@@ -872,7 +926,7 @@ fn a_datagram_from_a_new_address_pays_for_three_times_its_bytes_one_time() {
 fn listened() -> (Endpoint, Handle, Rogue) {
     let budget = Budget::new(NonZeroU64::new(1 << 24).unwrap());
     let config = server_config(&budget);
-    let keys = Arc::new(EndpointKeys::generate(&config, 0).unwrap());
+    let keys = Arc::new(EndpointKeys::generate(&config, 0, REDEEMED_BYTES_DEFAULT).unwrap());
     let limits = EndpointLimits {
         connections_max: 4,
         handshakes_max: 2,

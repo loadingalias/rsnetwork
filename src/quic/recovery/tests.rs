@@ -10,7 +10,14 @@ use core::net::{Ipv4Addr, SocketAddr};
 
 use super::{
     Ack, CongestionControl, ConnectionId, Controller, Duration, Ecn, Frame, History, Kind, Mtu, Path, PathState, Paths,
-    Record, Records, Sent, Settlement, Validation,
+    Record, Records, Sent, Settlement, TurnLimits, Validation, Work,
+};
+
+/// The work limits of a test call, which no limit stops.
+const UNBOUNDED: TurnLimits = TurnLimits {
+    bytes: u64::MAX,
+    frames: usize::MAX,
+    visits: usize::MAX,
 };
 
 fn at(ms: u64) -> Instant {
@@ -89,9 +96,11 @@ fn an_acknowledgement_of_a_packet_of_the_path_that_the_connection_left_is_no_fee
             &mut paths,
             at(40),
             Duration::ZERO,
+            (&mut Work::default(), &UNBOUNDED),
             |_| {},
         )
-        .unwrap();
+        .unwrap()
+        .expect("no limit stops the walk");
     let path = paths.active.stats();
     assert!(!acked.eliciting, "no ack-eliciting packet of the new path arrived");
     assert_eq!(
@@ -134,16 +143,27 @@ fn a_packet_of_the_path_that_the_connection_left_is_lost_at_the_time_threshold_o
     // The acknowledgement of packets 2 to 4 comes on the fast path, before the answer for packet 0
     // can come from the slow one. Packet 1 is three packets below the largest on its own path.
     history
-        .ack(&ack(&[2, 4, 0, 0, 2]), &mut paths, at(20), Duration::ZERO, |_| {})
+        .ack(
+            &ack(&[2, 4, 0, 0, 2]),
+            &mut paths,
+            at(20),
+            Duration::ZERO,
+            (&mut Work::default(), &UNBOUNDED),
+            |_| {},
+        )
         .unwrap();
-    history.detect(&mut paths, at(20), |_| Ok(())).unwrap();
+    history
+        .detect(&mut paths, at(20), (&mut Work::default(), &UNBOUNDED), |_| Ok(()))
+        .unwrap();
     let fallback = |paths: &Paths| paths.validation.as_ref().unwrap().fallback.stats().bytes_in_flight;
     assert_eq!(paths.active.stats().packets_lost, 1, "packet 1, behind packet 0");
     assert_eq!(fallback(&paths), 1200, "packet 0 waits for the round trip of its path");
     // Nine eighths of 100 ms after packet 0 left (RFC 9002, section 6.1.2).
     let due = at(0).checked_add(Duration::from_micros(112_500)).unwrap();
     assert_eq!(history.loss_time, Some(due));
-    history.detect(&mut paths, due, |_| Ok(())).unwrap();
+    history
+        .detect(&mut paths, due, (&mut Work::default(), &UNBOUNDED), |_| Ok(()))
+        .unwrap();
     assert_eq!(fallback(&paths), 0);
     assert_eq!(
         paths.active.stats().packets_lost,
@@ -162,18 +182,36 @@ fn a_loss_run_of_the_path_that_the_connection_left_does_not_join_a_loss_on_the_n
     history.insert(&mut paths, packet(0, at(1), Ecn::NotEct)).unwrap();
     history.insert(&mut paths, packet(1, at(2), Ecn::NotEct)).unwrap();
     history
-        .ack(&ack(&[2, 5, 0, 0, 0]), &mut paths, at(3), Duration::ZERO, |_| {})
+        .ack(
+            &ack(&[2, 5, 0, 0, 0]),
+            &mut paths,
+            at(3),
+            Duration::ZERO,
+            (&mut Work::default(), &UNBOUNDED),
+            |_| {},
+        )
         .unwrap();
-    history.detect(&mut paths, at(3), |_| Ok(())).unwrap();
+    history
+        .detect(&mut paths, at(3), (&mut Work::default(), &UNBOUNDED), |_| Ok(()))
+        .unwrap();
     assert_eq!(paths.active.stats().packets_lost, 2);
     // One second later, the new path loses its first packet. That is one loss, and no persistent
     // congestion: persistent congestion needs a run of losses on one path (RFC 9002, section 7.6).
     migrate(&mut paths, rtt);
     history.insert(&mut paths, packet(6, at(1000), Ecn::NotEct)).unwrap();
     history
-        .ack(&ack(&[2, 9, 0, 0, 0]), &mut paths, at(1001), Duration::ZERO, |_| {})
+        .ack(
+            &ack(&[2, 9, 0, 0, 0]),
+            &mut paths,
+            at(1001),
+            Duration::ZERO,
+            (&mut Work::default(), &UNBOUNDED),
+            |_| {},
+        )
         .unwrap();
-    history.detect(&mut paths, at(1001), |_| Ok(())).unwrap();
+    history
+        .detect(&mut paths, at(1001), (&mut Work::default(), &UNBOUNDED), |_| Ok(()))
+        .unwrap();
     let path = paths.active.stats();
     assert_eq!((path.packets_lost, path.congestion_window), (1, 8400));
 }
@@ -300,9 +338,18 @@ fn a_probe_of_the_datagram_size_settles_on_its_path_after_the_connection_left_th
         migrate(&mut paths, rtt);
         let acked: &[u8] = if delivered { &[2, 0, 0, 0, 0] } else { &[2, 5, 0, 0, 0] };
         history
-            .ack(&ack(acked), &mut paths, at(5), Duration::ZERO, |_| {})
+            .ack(
+                &ack(acked),
+                &mut paths,
+                at(5),
+                Duration::ZERO,
+                (&mut Work::default(), &UNBOUNDED),
+                |_| {},
+            )
             .unwrap();
-        history.detect(&mut paths, at(1000), |_| Ok(())).unwrap();
+        history
+            .detect(&mut paths, at(1000), (&mut Work::default(), &UNBOUNDED), |_| Ok(()))
+            .unwrap();
         // The search of that path goes on when the connection returns: no probe waits with no end.
         let mtu = paths.validation.as_ref().unwrap().fallback.mtu;
         if delivered {
