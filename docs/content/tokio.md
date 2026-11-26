@@ -138,9 +138,9 @@ to wait for:
 | --- | --- | --- |
 | `client::Http1` | `send`, `write`, `finish`, `finish_with_trailers`, `response`, `next`, `read_into`, `collect`, `close` | `delivered`, `cancel`, `negotiated`, `export` |
 | `client::Http2` | `send`, `drive`, `close` | `negotiated`, `export` |
-| `client::Exchange` | `write`, `finish`, `finish_with_trailers`, `response`, `next`, `read_into`, `collect` | `delivered` |
+| `client::Exchange` | `write`, `finish`, `finish_with_trailers`, `response`, `next`, `read_into`, `collect`, `prioritize` | `delivered` |
 | `server::Http` | `request`, `close` | `shutdown` |
-| `server::Exchange` | `respond`, `write`, `finish`, `finish_with_trailers`, `next`, `read_into`, `collect` | `head`, `cancel`, `delivery`, `negotiated`, `export` |
+| `server::Exchange` | `respond`, `write`, `finish`, `finish_with_trailers`, `next`, `read_into`, `collect` | `head`, `cancel`, `prioritize`, `delivery`, `negotiated`, `export` |
 | `tls::Stream` | `handshake`, `read_into`, `next`, `write`, `close` | `written`, `sent`, `closure`, `export` |
 
 - A call gives its value when the core gives one. `read_into` never gives `Read::Wait`, and
@@ -148,6 +148,9 @@ to wait for:
 - `write`, `finish`, and `finish_with_trailers` wait while the output has no room. On HTTP/2,
   `write` and `finish_with_trailers` also wait while the chunk before waits for the output. A
   trailer section larger than `head.head_bytes` refuses at once with `Kind::Overload`.
+- `prioritize(priority)` sets the priority of a response (RFC 9218): on a client exchange it sends
+  a PRIORITY_UPDATE, and waits while the output has no room. On a server exchange it does not
+  wait. See [multiplexing](multiplexing.md#set-the-priority-of-a-response).
 - The bytes of a connection move only inside its calls. When you drive a `server::Http` yourself,
   a call of the connection after the finish of an exchange, such as the next `request`, moves the
   rest of the response. A `Server` makes that call in the task of each connection.

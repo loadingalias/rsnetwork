@@ -67,6 +67,7 @@ use crate::h2::{self, Role};
 use crate::host::{Connection, Engine, Io, Wait};
 use crate::link::{Link, earliest, queues};
 use crate::message::{RequestHead, Stream};
+use crate::priority::Priority;
 #[cfg(feature = "tls")]
 use crate::tls::{self, Negotiated, ServerConfig, Tls};
 use crate::value::{Field, Status};
@@ -494,6 +495,16 @@ impl Http {
             Protocol::H1(..) => self.h1_cancel(stream),
             Protocol::H2(..) => self.h2_cancel(stream),
             Protocol::Pending => {}
+        }
+    }
+
+    /// Gives the response of `stream` the priority `priority` (RFC 9218, section 8). On HTTP/2,
+    /// the send scheduler orders the stream by it from the next frame, and a later PRIORITY_UPDATE
+    /// of the client changes it again: the latest signal wins. HTTP/1.1 carries one stream at a
+    /// time, so there it changes nothing, and neither does it for a stream whose response ended.
+    pub fn prioritize(&mut self, stream: Stream, priority: Priority) {
+        if let Protocol::H2(..) = self.link.engine_ref() {
+            self.h2_prioritize(stream, priority);
         }
     }
 

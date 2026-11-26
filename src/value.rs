@@ -501,6 +501,8 @@ pub enum InvalidValue {
     Authority,
     /// The scheme is not a letter and then letters, digits, `+`, `-`, and `.`.
     Scheme,
+    /// The urgency of a priority is not in 0 to 7.
+    Urgency,
 }
 
 impl fmt::Display for InvalidValue {
@@ -512,6 +514,7 @@ impl fmt::Display for InvalidValue {
             Self::Field => "the field name is not a token, or the field value has a forbidden byte",
             Self::Authority => "the authority is not a host and an optional port",
             Self::Scheme => "the scheme has a forbidden character",
+            Self::Urgency => "the urgency is not in 0 to 7",
         })
     }
 }

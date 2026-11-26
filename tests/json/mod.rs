@@ -1,11 +1,15 @@
-//! A JSON reader for the test data of `tests/hpack-test-case`: objects, arrays, strings, integers,
-//! and `null`. It panics on input that is not JSON, because the data is fixed.
+//! A JSON reader for the test data of `tests/hpack-test-case` and `tests/structured-field-tests`:
+//! objects, arrays, strings, numbers with no exponent, booleans, and `null`. It panics on input
+//! that is not JSON, because the data is fixed.
 
 /// One JSON value. A string is its bytes in UTF-8. An object keeps the order of its members.
 #[derive(Debug)]
 pub(crate) enum Json {
     Null,
-    Number(u64),
+    Bool(bool),
+    Integer(i64),
+    /// A number with a fraction, whose value no test reads.
+    Decimal,
     String(Vec<u8>),
     Array(Vec<Json>),
     Object(Vec<(Vec<u8>, Json)>),
@@ -80,13 +84,29 @@ impl Reader<'_> {
                 self.expect(b"null");
                 Json::Null
             }
+            b't' => {
+                self.expect(b"true");
+                Json::Bool(true)
+            }
+            b'f' => {
+                self.expect(b"false");
+                Json::Bool(false)
+            }
             _ => {
                 let start = self.at;
-                while self.text.get(self.at).is_some_and(u8::is_ascii_digit) {
+                while self
+                    .text
+                    .get(self.at)
+                    .is_some_and(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'.'))
+                {
                     self.at += 1;
                 }
-                let digits = core::str::from_utf8(&self.text[start..self.at]).expect("ASCII digits");
-                Json::Number(digits.parse().expect("an integer"))
+                let text = &self.text[start..self.at];
+                if text.contains(&b'.') {
+                    return Json::Decimal;
+                }
+                let digits = core::str::from_utf8(text).expect("ASCII digits");
+                Json::Integer(digits.parse().expect("an integer"))
             }
         }
     }
@@ -121,8 +141,16 @@ impl Reader<'_> {
                     b'u' => {
                         let hex = core::str::from_utf8(&self.text[self.at..self.at + 4]).expect("hex digits");
                         self.at += 4;
-                        let code = u32::from_str_radix(hex, 16).expect("hex digits");
-                        let char = char::from_u32(code).expect("a scalar value, with no surrogate");
+                        let mut code = u32::from_str_radix(hex, 16).expect("hex digits");
+                        if (0xd800..0xdc00).contains(&code) {
+                            // A high surrogate: its low surrogate follows.
+                            self.expect(b"\\u");
+                            let hex = core::str::from_utf8(&self.text[self.at..self.at + 4]).expect("hex digits");
+                            self.at += 4;
+                            let low = u32::from_str_radix(hex, 16).expect("hex digits");
+                            code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                        }
+                        let char = char::from_u32(code).expect("a scalar value");
                         bytes.extend_from_slice(char.encode_utf8(&mut [0; 4]).as_bytes());
                     }
                     escape => bytes.push(match escape {

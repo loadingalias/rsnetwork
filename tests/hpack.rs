@@ -2,6 +2,7 @@
 //! allocation, the bounds of a block, and the sensitive-field rule.
 
 mod counting;
+#[expect(dead_code, reason = "the HPACK data has no boolean")]
 mod json;
 
 use core::assert_matches;
@@ -441,7 +442,7 @@ fn table_bytes(story: &Json) -> usize {
     cases
         .iter()
         .filter_map(|case| match case.get("header_table_size") {
-            Some(Json::Number(size)) => Some(usize::try_from(*size).expect("a table size")),
+            Some(Json::Integer(size)) => Some(usize::try_from(*size).expect("a table size")),
             _ => None,
         })
         .fold(4096, usize::max)

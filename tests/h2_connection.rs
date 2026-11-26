@@ -1,8 +1,9 @@
 //! The contracts of the HTTP/2 engine: the preface, SETTINGS and their acknowledgement, PING,
 //! GOAWAY and drain, header blocks across CONTINUATION frames, each connection error with its RFC
-//! 9113 code, frames that parse in place, the stream states, flow control at both levels, and the
-//! bounds of floods. Each expected byte, code, and count comes from RFC 9113, RFC 7541, or a
-//! declared limit, as each test states, not from the code under test.
+//! 9113 code, frames that parse in place, the stream states, flow control at both levels, the
+//! bounds of floods, and the priorities of RFC 9218. Each expected byte, code, and count comes from
+//! RFC 9113, RFC 7541, RFC 9218, or a declared limit, as each test states, not from the code under
+//! test.
 
 use core::assert_matches;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -15,6 +16,7 @@ use rsnetwork::drive::{Blocked, Ecn, Endpoint, Inbound, Kind, Outbound, Progress
 use rsnetwork::h2::frame::{ErrorCode, PREFACE};
 use rsnetwork::h2::{Connection, Event, Limits, Role, Settings};
 use rsnetwork::hpack::{Block, FieldLine, Lines};
+use rsnetwork::priority::{Priority, Urgency};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 
 mod counting;
@@ -293,14 +295,20 @@ impl Peer {
 
     /// Opens a stream of a client with the lines of RFC 7541, C.3.1.
     fn open(&mut self, end_stream: bool) -> u32 {
+        self.open_with(&[], end_stream)
+    }
+
+    /// Opens a stream of a client with the lines of RFC 7541, C.3.1, and then `extra`.
+    fn open_with(&mut self, extra: &[FieldLine<'_>], end_stream: bool) -> u32 {
         let lines = C31_LINES.map(|(name, value)| FieldLine {
             name: name.as_bytes(),
             value: value.as_bytes(),
             never_indexed: false,
         });
         let region = Backing::from(Vec::with_capacity(256));
+        let lines = lines.into_iter().chain(extra.iter().copied());
         self.connection
-            .open(&mut self.outbound, lines.into_iter(), end_stream, region)
+            .open(&mut self.outbound, lines, end_stream, region)
             .expect("the connection opens the stream")
     }
 
@@ -379,18 +387,26 @@ fn ended(progress: Progress, kind: Kind) {
 
 /// A client preface is the 24 bytes of RFC 9113, section 3.4, and a SETTINGS frame that sets
 /// `SETTINGS_ENABLE_PUSH` to 0, so a server never pushes (RFC 9113, section 8.4). A server
-/// preface is one SETTINGS frame. Each lists the settings that differ from their initial values.
+/// preface is one SETTINGS frame. Each lists the settings that differ from their initial values,
+/// and then `SETTINGS_NO_RFC7540_PRIORITIES` 1 in the first SETTINGS frame (RFC 9218, section
+/// 2.1).
 #[test]
 fn each_preface_has_its_settings_and_a_client_disables_push() {
     let mut client = Peer::new(Role::Client, LIMITS);
     // SETTINGS_MAX_CONCURRENT_STREAMS (0x3) 100, SETTINGS_MAX_HEADER_LIST_SIZE (0x6) 16384, then
-    // SETTINGS_ENABLE_PUSH (0x2) 0.
+    // SETTINGS_ENABLE_PUSH (0x2) 0, then SETTINGS_NO_RFC7540_PRIORITIES (0x9) 1.
     let settings = b"\x00\x03\x00\x00\x00\x64\x00\x06\x00\x00\x40\x00";
+    let priorities = b"\x00\x09\x00\x00\x00\x01";
     assert_eq!(
         client.sent(),
         [
             &b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..],
-            &frame(0x4, 0, 0, &[&settings[..], b"\x00\x02\x00\x00\x00\x00"].concat()),
+            &frame(
+                0x4,
+                0,
+                0,
+                &[&settings[..], b"\x00\x02\x00\x00\x00\x00", priorities].concat()
+            ),
         ]
         .concat()
     );
@@ -405,7 +421,11 @@ fn each_preface_has_its_settings_and_a_client_disables_push() {
     );
     assert_eq!(
         server.sent(),
-        [frame(0x4, 0, 0, settings), window_update(0, (1 << 20) - 65_535)].concat()
+        [
+            frame(0x4, 0, 0, &[&settings[..], priorities].concat()),
+            window_update(0, (1 << 20) - 65_535)
+        ]
+        .concat()
     );
 }
 
@@ -1009,8 +1029,8 @@ fn a_large_header_block_goes_out_as_continuation_frames() {
         .expect("the region and the queue have room");
     assert_eq!(stream, 1, "the first stream of a client (RFC 9113, section 5.1.1)");
     let output = client.sent();
-    // After the client preface and its SETTINGS frame of 3 settings: each frame of the block.
-    let mut at = PREFACE.len() + 9 + 18;
+    // After the client preface and its SETTINGS frame of 4 settings: each frame of the block.
+    let mut at = PREFACE.len() + 9 + 24;
     let mut kinds = Vec::new();
     while let Some(&[l0, l1, l2, kind, flags]) = output.get(at..at + 5).and_then(|bytes| bytes.first_chunk()) {
         let length = u32::from_be_bytes([0, l0, l1, l2]);
@@ -1760,7 +1780,8 @@ fn an_answer_flood_from_a_peer_that_does_not_read_stops_at_the_output_queue() {
 }
 
 /// Each control flood at line rate, from a peer that reads each answer (RFC 9113, section 10.5):
-/// 10,000 frames of one kind. The empty frames are the flood of CVE-2019-9518. Each frame counts
+/// 10,000 frames of one kind. The empty frames are the flood of CVE-2019-9518. A PRIORITY_UPDATE
+/// of an idle stream takes the place of the update before it (RFC 9218, section 7). Each frame counts
 /// toward the frame limit of the turn, 1024. An event ends the turn, and an answer that the output
 /// queue of 64 entries has no room for ends it too. The flood keeps its state at the charges of
 /// `new`: it allocates nothing and charges nothing. Each PING and SETTINGS frame gets its answer,
@@ -1772,7 +1793,7 @@ fn each_control_flood_keeps_the_charges_of_new_and_the_frame_limit_of_each_turn(
     let settings = frame(0x4, 0, 0, b"\x00\x04\x00\x00\xff\xff");
     let pong = frame(0x6, 0x1, 0, b"12345678");
     // Each flood: its frame, the most frames of one turn, and the answer to each frame.
-    let floods: [(&str, Vec<u8>, usize, &[u8]); 7] = [
+    let floods: [(&str, Vec<u8>, usize, &[u8]); 10] = [
         ("PING", ping, 65, &pong),
         ("SETTINGS", settings, 1, SETTINGS_ACK),
         ("WINDOW_UPDATE on the connection", window_update(0, 1), 1024, b""),
@@ -1780,6 +1801,24 @@ fn each_control_flood_keeps_the_charges_of_new_and_the_frame_limit_of_each_turn(
         ("PRIORITY on an idle stream", priority(5), 1024, b""),
         ("empty DATA on an open stream", data(3, false, b""), 1024, b""),
         ("a frame of an unknown type", frame(0xfa, 0, 0, b""), 1024, b""),
+        (
+            "PRIORITY_UPDATE of an open stream",
+            priority_update(3, b"u=1, i"),
+            1024,
+            b"",
+        ),
+        (
+            "PRIORITY_UPDATE of an idle stream",
+            priority_update(5, b"u=1"),
+            1024,
+            b"",
+        ),
+        (
+            "PRIORITY_UPDATE that does not parse",
+            priority_update(3, b"u=1,"),
+            1024,
+            b"",
+        ),
     ];
     for (flood, bytes, most, answer) in floods {
         let mut server = Peer::acknowledged(LIMITS);
@@ -2082,6 +2121,12 @@ impl Multiplex {
     /// The consumer of the bodies has a connection window of `connection_window`, and each stream
     /// a window of 65,535, the initial value of RFC 9113.
     fn new(bodies: Bodies, connection_window: u32) -> Self {
+        Self::with_priorities(bodies, connection_window, |_| None)
+    }
+
+    /// As [`new`](Self::new), with the `priority` field of `priority(stream)` in each request
+    /// that has one.
+    fn with_priorities(bodies: Bodies, connection_window: u32, priority: impl Fn(u32) -> Option<Priority>) -> Self {
         let receiver = Limits {
             connection_window,
             ..LIMITS
@@ -2104,7 +2149,19 @@ impl Multiplex {
             round: 0,
         };
         for n in 0..STREAMS {
-            let stream = multiplex.client.open(bodies == Bodies::Responses);
+            let id = u32::try_from(2 * n + 1).expect("a stream");
+            let stream = match priority(id) {
+                Some(priority) => {
+                    let field = priority.field();
+                    let line = FieldLine {
+                        name: field.name(),
+                        value: field.value(),
+                        never_indexed: false,
+                    };
+                    multiplex.client.open_with(&[line], bodies == Bodies::Responses)
+                }
+                None => multiplex.client.open(bodies == Bodies::Responses),
+            };
             assert_eq!(stream as usize, 2 * n + 1);
             if bodies == Bodies::Requests {
                 let chunk = multiplex.chunk(stream);
@@ -2235,8 +2292,9 @@ fn carry(from: &mut Peer, to: &mut Peer) -> Vec<u8> {
 /// - Each other stream ends at the rate of the link within 2%: by the round in which the link has
 ///   carried the DATA frames of all streams, each payload with its 9-byte header in frames of at
 ///   most 16,384 bytes.
-/// - The sender visits the streams in turn, one DATA frame for each visit (round-robin, the
-///   lead's rule): between two frames of a stream, no other stream sends two.
+/// - Between two DATA frames of a stream, no other stream sends two: a client sends its request
+///   bodies in turn, one DATA frame for each visit, and a server sends the responses of requests
+///   with no priority one at a time, in the order of their streams (RFC 9218, section 10).
 ///
 /// A scheduler with one shared queue of chunks waits behind the chunk of stream 1, and the other
 /// streams never end.
@@ -2330,6 +2388,343 @@ fn a_stalled_consumer_that_holds_the_connection_window_stops_the_others_until_it
         assert!(
             !multiplex.ended[1..].contains(&None),
             "{canceller:?}: each other body ends"
+        );
+    }
+}
+
+/// A PRIORITY_UPDATE (RFC 9218, figure 1): on stream 0, the prioritized stream, and the value.
+fn priority_update(prioritized: u32, value: &[u8]) -> Vec<u8> {
+    frame(0x10, 0, 0, &[&prioritized.to_be_bytes()[..], value].concat())
+}
+
+/// A request on `stream` with the block of RFC 7541, C.3.1, and a `priority` field line for each
+/// of `values`, as literals with no indexing and a new name (RFC 7541, section 6.2.2).
+fn prioritized(stream: u32, values: &[&[u8]]) -> Vec<u8> {
+    let mut block = C31.to_vec();
+    for value in values {
+        block.extend_from_slice(b"\x00\x08priority");
+        block.push(u8::try_from(value.len()).expect("a short value"));
+        block.extend_from_slice(value);
+    }
+    frame(0x1, 0x5, stream, &block)
+}
+
+/// The body of each response of the priority tests: 3 DATA frames of 16,384 bytes.
+const FRAMES: usize = 3;
+
+/// The streams of the DATA frames of a server, in their order. It reads `input`: a connection
+/// window of 1 MiB, and then requests and frames. It answers each request with a body of
+/// [`FRAMES`] frames, and then reads `later` before its next drive sends the bodies.
+fn order(input: &[Vec<u8>], later: &[u8]) -> Vec<u32> {
+    let mut server = Peer::server();
+    server.receive(&[window_update(0, (1 << 20) - 65_535), input.concat()].concat());
+    let (events, progress) = server.run();
+    assert_eq!(progress, WAIT);
+    let streams: Vec<u32> = events
+        .iter()
+        .filter_map(|event| match *event {
+            Seen::Headers(stream, ..) => Some(stream),
+            _ => None,
+        })
+        .collect();
+    server.sent();
+    for &stream in &streams {
+        assert_eq!(server.section(stream, ":status", "200", false), Ok(()));
+        assert_eq!(server.send(stream, &[b'x'; FRAMES * 16_384], true), Ok(()));
+    }
+    if !later.is_empty() {
+        server.receive(later);
+    }
+    assert_eq!(server.run().1, WAIT);
+    frames(&server.sent())
+        .into_iter()
+        .filter(|(kind, ..)| *kind == 0x0)
+        .map(|(_, stream, payload)| {
+            assert_eq!(payload.len(), 16_384, "stream {stream}");
+            stream
+        })
+        .collect()
+}
+
+/// Each of `streams`, [`FRAMES`] times: one stream after the other.
+fn one_by_one(streams: &[u32]) -> Vec<u32> {
+    streams.iter().flat_map(|&stream| [stream; FRAMES]).collect()
+}
+
+/// A server sends the responses of a higher urgency first, the incremental responses of one
+/// urgency in turn, one frame each, and the others one at a time, in the order of their streams
+/// (RFC 9218, section 10). The responses that are not incremental share one turn with each
+/// incremental response of their urgency, so neither starves (the decision of N212). A request
+/// with no signal has urgency 3 and is not incremental (section 4). A value that does not parse,
+/// and a parameter out of its range, keep the defaults, and the lines of one field are one value
+/// (RFC 9651, section 4.2). Each response is ready before the first frame goes, so only the
+/// scheduler decides the order.
+#[test]
+fn responses_go_by_urgency_and_share_the_connection_only_when_incremental() {
+    let cases = [
+        (
+            "a higher urgency first",
+            vec![prioritized(1, &[b"u=5"]), prioritized(3, &[b"u=1"])],
+            one_by_one(&[3, 1]),
+        ),
+        (
+            "two incremental responses in turn",
+            vec![prioritized(1, &[b"u=3, i"]), prioritized(3, &[b"i"])],
+            [1, 3].repeat(FRAMES),
+        ),
+        (
+            "two responses of requests with no signal in order",
+            vec![request(1, true), request(3, true)],
+            one_by_one(&[1, 3]),
+        ),
+        (
+            "the others of an urgency share one turn",
+            vec![request(1, true), prioritized(3, &[b"i"]), request(5, true)],
+            [[1, 3].repeat(FRAMES), vec![5; FRAMES]].concat(),
+        ),
+        (
+            "a value that does not parse",
+            vec![request(1, true), prioritized(3, &[b"u=0,"])],
+            one_by_one(&[1, 3]),
+        ),
+        (
+            "an urgency out of its range",
+            vec![request(1, true), prioritized(3, &[b"u=8"])],
+            one_by_one(&[1, 3]),
+        ),
+        (
+            "two lines of one field",
+            vec![prioritized(1, &[b"i"]), prioritized(3, &[b"u=1", b"i"])],
+            one_by_one(&[3, 1]),
+        ),
+        (
+            "two lines of one field that do not join",
+            vec![request(1, true), prioritized(3, &[b"u=1", b""])],
+            one_by_one(&[1, 3]),
+        ),
+    ];
+    for (case, input, expected) in cases {
+        assert_eq!(order(&input, b""), expected, "{case}");
+    }
+}
+
+/// A PRIORITY_UPDATE changes the order of a stream whose response waits, and the update of an
+/// idle stream applies when the stream opens, also over its `priority` field (RFC 9218, section
+/// 7). The update before the request of stream 5 and the update of stream 3 each come before the
+/// first frame of the bodies.
+#[test]
+fn a_priority_update_changes_the_order_of_a_waiting_response() {
+    let both = [request(1, true), request(3, true)];
+    assert_eq!(order(&both, &priority_update(3, b"u=0")), one_by_one(&[3, 1]));
+    // The latest signal wins: the update moves stream 3 back after the urgency of its field.
+    let input = [request(1, true), prioritized(3, &[b"u=0"])];
+    assert_eq!(order(&input, &priority_update(3, b"u=6")), one_by_one(&[1, 3]));
+    let early = [
+        priority_update(5, b"u=0"),
+        request(1, true),
+        request(3, true),
+        prioritized(5, &[b"u=7"]),
+    ];
+    assert_eq!(order(&early, b""), one_by_one(&[5, 1, 3]));
+    // An update that does not parse changes nothing.
+    assert_eq!(order(&both, &priority_update(3, b"u=0;")), one_by_one(&[1, 3]));
+}
+
+/// The application of a server chooses the priority of a response, and the scheduler orders the
+/// stream by it from the next frame (RFC 9218, section 8). A client asks for a priority with
+/// PRIORITY_UPDATE instead, and a server sends none.
+#[test]
+fn the_application_of_a_server_chooses_a_priority() {
+    let mut server = Peer::server();
+    server.receive(&[request(1, true), request(3, true)].concat());
+    assert_eq!(server.run().0.len(), 2, "two requests");
+    server.sent();
+    let urgent = Priority {
+        urgency: Urgency::HIGHEST,
+        incremental: false,
+    };
+    for stream in [1, 3] {
+        assert_eq!(server.section(stream, ":status", "200", false), Ok(()));
+        assert_eq!(server.send(stream, &[b'x'; 16_384], true), Ok(()));
+    }
+    assert_eq!(
+        server.connection.prioritize(3, urgent).map_err(|error| error.kind()),
+        Ok(())
+    );
+    assert_eq!(server.run().1, WAIT);
+    let sent = server.sent();
+    let order: Vec<u32> = frames(&sent)
+        .iter()
+        .filter(|frame| frame.0 == 0x0)
+        .map(|frame| frame.1)
+        .collect();
+    assert_eq!(order, [3, 1]);
+    let refused = server.connection.prioritize(5, urgent).map_err(|error| error.kind());
+    assert_eq!(refused, Err(Kind::Misuse), "a stream that is not open");
+    let refused = server.connection.priority_update(&mut server.outbound, 1, urgent);
+    assert_eq!(refused.map_err(|error| error.kind()), Err(Kind::Misuse), "a server");
+    let mut client = Peer::client();
+    let stream = client.open(true);
+    let refused = client
+        .connection
+        .prioritize(stream, urgent)
+        .map_err(|error| error.kind());
+    assert_eq!(refused, Err(Kind::Misuse), "a client");
+}
+
+/// A client sends PRIORITY_UPDATE (RFC 9218, figure 1) for an open stream before the SETTINGS of
+/// the server, and after a SETTINGS frame with `SETTINGS_NO_RFC7540_PRIORITIES` 1. After SETTINGS
+/// with no such setting, it sends none, because the server ignores it (section 2.1.1).
+#[test]
+fn a_client_sends_priority_update_only_to_a_server_that_uses_it() {
+    let incremental = Priority {
+        urgency: Urgency::new(5).unwrap(),
+        incremental: true,
+    };
+    let update = priority_update(1, b"u=5, i");
+    let uses = frame(0x4, 0, 0, b"\x00\x09\x00\x00\x00\x01");
+    let cases = [
+        ("before the SETTINGS of the server", None, update.clone()),
+        ("after SETTINGS_NO_RFC7540_PRIORITIES 1", Some(uses), update),
+        (
+            "after SETTINGS with no such setting",
+            Some(EMPTY_SETTINGS.to_vec()),
+            Vec::new(),
+        ),
+    ];
+    for (case, settings, expected) in cases {
+        let mut client = Peer::new(Role::Client, LIMITS);
+        if let Some(settings) = settings {
+            client.receive(&settings);
+            assert_eq!(client.run().1, WAIT, "{case}");
+        }
+        let stream = client.open(false);
+        client.sent();
+        let sent = client
+            .connection
+            .priority_update(&mut client.outbound, stream, incremental);
+        assert_eq!(sent.map_err(|error| error.kind()), Ok(()), "{case}");
+        assert_eq!(client.sent(), expected, "{case}");
+    }
+    let mut client = Peer::client();
+    let refused = client.connection.priority_update(&mut client.outbound, 1, incremental);
+    assert_eq!(
+        refused.map_err(|error| error.kind()),
+        Err(Kind::Misuse),
+        "a stream that is not open"
+    );
+}
+
+/// Each PRIORITY_UPDATE or SETTINGS frame that breaks a rule of RFC 9218 ends the connection with
+/// a GOAWAY of the code that the rule names, or of FRAME_SIZE_ERROR for a frame too short for its
+/// fields (RFC 9113, section 4.2). Push is off, so an even stream is a push stream in the idle
+/// state. A change of `SETTINGS_NO_RFC7540_PRIORITIES` is an error, as nghttp2 makes it (the
+/// decision of N212). Each case follows a valid client preface.
+#[test]
+fn each_frame_that_breaks_rfc_9218_ends_the_connection_with_its_code() {
+    let protocol = ErrorCode::PROTOCOL_ERROR;
+    let uses = |value: u8| frame(0x4, 0, 0, &[0, 0x9, 0, 0, 0, value]);
+    let cases: [(&str, Vec<u8>, ErrorCode); 6] = [
+        (
+            "7.1 PRIORITY_UPDATE on stream 1",
+            frame(0x10, 0, 1, b"\x00\x00\x00\x01u=1"),
+            protocol,
+        ),
+        (
+            "7.1 PRIORITY_UPDATE of 3 bytes",
+            frame(0x10, 0, 0, b"\x00\x00\x01"),
+            ErrorCode::FRAME_SIZE_ERROR,
+        ),
+        ("7.1 PRIORITY_UPDATE of stream 0", priority_update(0, b"u=1"), protocol),
+        (
+            "7.1 PRIORITY_UPDATE of an idle push stream",
+            priority_update(2, b"u=1"),
+            protocol,
+        ),
+        ("2.1 SETTINGS_NO_RFC7540_PRIORITIES 2", uses(2), protocol),
+        (
+            "2.1 a change of SETTINGS_NO_RFC7540_PRIORITIES",
+            [uses(1), uses(0)].concat(),
+            protocol,
+        ),
+    ];
+    for (rule, input, code) in cases {
+        let mut server = Peer::server();
+        server.receive(&input);
+        let (events, progress) = server.run();
+        ended(progress, Kind::Malformed);
+        assert!(
+            events.iter().all(|event| matches!(event, Seen::Settings(_))),
+            "{rule}: {events:?}"
+        );
+        let sent = server.sent();
+        assert!(sent.ends_with(&goaway(0, code)), "{rule}: {sent:02x?}");
+    }
+    let mut client = Peer::client();
+    client.receive(&priority_update(1, b"u=1"));
+    ended(client.run().1, Kind::Malformed);
+    assert_eq!(client.sent(), goaway(0, protocol), "7.1 a PRIORITY_UPDATE to a client");
+}
+
+/// The updates of idle streams with a priority, and the open streams, stay within the endpoint's
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` of 100, and one update past it is a connection error
+/// PROTOCOL_ERROR (RFC 9218, section 7.1). An update of the same idle stream takes the place of
+/// the one before it. A value past 64 bytes is ignored, so the connection keeps no more of it
+/// (the declared bound of N212).
+#[test]
+fn the_updates_of_idle_streams_stay_within_the_stream_limit() {
+    let mut server = Peer::server();
+    // Stream 1 is open, so 99 idle streams can have a priority.
+    server.receive(&request(1, false));
+    assert_eq!(server.run().0.len(), 1, "a request");
+    let updates: Vec<u8> = (0..99).flat_map(|n| priority_update(3 + 2 * n, b"u=2")).collect();
+    let again: Vec<u8> = (0..99).flat_map(|n| priority_update(3 + 2 * n, b"u=4, i")).collect();
+    // A valid dictionary of 67 bytes: read, it would give stream 201 the 100th priority.
+    let long = priority_update(201, &[&b"u=1, x="[..], &[b'a'; 60]].concat());
+    server.receive(&[updates, again, long].concat());
+    assert_eq!(
+        server.run(),
+        (vec![], WAIT),
+        "99 updates, each two times, and a long value"
+    );
+    server.receive(&priority_update(201, b"u=2"));
+    ended(server.run().1, Kind::Malformed);
+    assert_eq!(server.sent(), goaway(1, ErrorCode::PROTOCOL_ERROR));
+}
+
+/// A slow consumer holds back only its own stream with priorities set too. Stream 1, whose
+/// consumer releases nothing, has the highest urgency, so the scheduler visits it first. When its
+/// window of 65,535 is spent, it leaves, and each other stream, of each urgency and both kinds,
+/// ends by the bound of `a_stalled_consumer_holds_back_only_its_own_stream`.
+#[test]
+fn a_stalled_consumer_holds_back_only_its_own_stream_with_priorities_set() {
+    let frames_per_body = BODY.div_ceil(16_384);
+    let wire = (STREAMS - 1) * (BODY + 9 * frames_per_body) + 65_535 + 9 * 65_535_usize.div_ceil(16_384);
+    let rounds = wire.div_ceil(LINK) * 102 / 100;
+    let priority = |stream: u32| {
+        Some(if stream == 1 {
+            Priority {
+                urgency: Urgency::HIGHEST,
+                incremental: false,
+            }
+        } else {
+            Priority {
+                urgency: Urgency::new(u8::try_from(stream % 8).unwrap()).unwrap(),
+                incremental: stream % 3 == 0,
+            }
+        })
+    };
+    let mut multiplex = Multiplex::with_priorities(Bodies::Responses, 2 * 65_535, priority);
+    while multiplex.round < rounds && multiplex.ended[1..].contains(&None) {
+        multiplex.round();
+    }
+    assert_eq!(multiplex.received[0], 65_535, "the window of stream 1");
+    assert_eq!(multiplex.ended[0], None);
+    for (index, ended) in multiplex.ended.iter().enumerate().skip(1) {
+        assert!(
+            ended.is_some_and(|round| round <= rounds),
+            "stream {} ended at {ended:?}, after round {rounds}",
+            2 * index + 1
         );
     }
 }

@@ -56,6 +56,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "priority"
+path = "fuzz_targets/priority.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "hpack"
 path = "fuzz_targets/hpack.rs"
 test = false

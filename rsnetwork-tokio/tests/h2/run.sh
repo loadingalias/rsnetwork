@@ -95,7 +95,9 @@ fi
 if want curl; then
 SECTION=curl
 # curl: a streamed upload with trailers in the response, a reset of the server beside a stream
-# that goes on, a reset of curl, and a GOAWAY with a stream in flight.
+# that goes on, a reset of curl, a GOAWAY with a stream in flight, and two responses on one
+# connection whose `priority` fields order them (RFC 9218): curl prints each transfer as it
+# completes.
 start curl
 C=(curl -sS --http2 --cacert "$OUT/ca.pem")
 "${C[@]}" -T - "$(URL /echo)" -o "$OUT/echoed" --trace-ascii "$OUT/curl-echo.trace" < "$OUT/body"
@@ -121,6 +123,15 @@ if [ "$(wc -c < "$OUT/slow")" -eq 10240 ] && expect 'REPORT' 20; then
 	cell curl goaway-drain PASS "$(grep REPORT "$LOG")"
 else
 	cell curl goaway-drain FAIL "the stream in flight did not complete"
+fi
+P=(-o /dev/null -w '%{url} %{num_connects} %{size_download}\n' --http2 --cacert "$OUT/ca.pem")
+curl -sS -Z "${P[@]}" -H 'priority: u=7' "$(URL /urgency/low)" --next "${P[@]}" -H 'priority: u=0' \
+	"$(URL /urgency/high)" > "$OUT/urgency"
+if [ "$(awk '{ print $1 }' "$OUT/urgency" | tr '\n' ' ')" = "$(URL /urgency/high) $(URL /urgency/low) " ] &&
+	[ "$(awk '{ connects += $2 } END { print connects }' "$OUT/urgency")" = 1 ]; then
+	cell curl urgency PASS "u=0 completed first on one connection"
+else
+	cell curl urgency FAIL "$(tr '\n' ';' < "$OUT/urgency")"
 fi
 stop "$SECTION"
 fi

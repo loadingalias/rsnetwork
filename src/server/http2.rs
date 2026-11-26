@@ -22,6 +22,7 @@ use crate::h2::message::{self, CHUNK_WAITS, Refusal};
 use crate::h2::session::{Inflow, Session, Step};
 use crate::hpack::FieldLine;
 use crate::message::{RequestHead, Stream};
+use crate::priority::Priority;
 use crate::value::{Field, Method, Status};
 
 /// Where the request of a stream is.
@@ -902,6 +903,15 @@ impl Http {
         if let Some(out) = &mut exchange.out {
             out.error = Some(Error::new(Kind::Cancelled, "the application cancelled the response"));
         }
+    }
+
+    pub(super) fn h2_prioritize(&mut self, stream: Stream, priority: Priority) {
+        let Some(index) = self.h2().find(stream) else { return };
+        let id = self.h2().exchanges[index].id;
+        let (session, _) = self.h2_parts();
+        // A stream that the engine closed, at the end of its response or at a reset of the
+        // client, has nothing left to send: the engine refuses it, and nothing changes.
+        let _closed = session.connection().prioritize(id, priority);
     }
 
     pub(super) fn h2_close(&mut self, stream: Stream) {

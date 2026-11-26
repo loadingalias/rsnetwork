@@ -14,6 +14,8 @@
 //!   `PEER-RESET /slow <parts> <kind>` when the peer reset the stream.
 //! - `/shutdown`: `closing`, and then the close of the server: a GOAWAY on each connection, the
 //!   exchanges in flight end, and `REPORT accepted=<n> failed=<n> aborted=<n>`.
+//! - `/urgency/<name>`: 16 MiB in one chunk, after two of these requests arrived, so both bodies
+//!   wait together and only their priorities (RFC 9218) order them (N212).
 //! - `/browser` and `/goaway`: the pages of the browser cells. `POST /report` prints `BROWSER <body>`.
 //!
 //! `client <address> <tls-dir> <case>...` connects to an independent server for `server.test` at
@@ -56,7 +58,7 @@ use rsnetwork::tls::{
 use rsnetwork::value::{Authority, Field, Method, Status, Target};
 use rsnetwork_tokio::Clock;
 use rsnetwork_tokio::server::{Exchange, Server};
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 
 type Result<T> = core::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -94,6 +96,8 @@ const TLS: tls::Limits = tls::Limits {
     key_records_max: u64::MAX,
     turn: TURN,
 };
+/// The body of each `/urgency` response.
+const URGENCY_BYTES: usize = 16 << 20;
 /// The time of each exchange of the client cases.
 const PATIENCE: Duration = Duration::from_secs(20);
 
@@ -195,9 +199,10 @@ async fn serve(address: SocketAddr, directory: &Path) -> Result<()> {
             pool(&budget)?,
         ))
     };
+    let both = Arc::new(Barrier::new(2));
     let handler = {
         let shutdown = Arc::clone(&shutdown);
-        move |exchange: Exchange| handle(exchange, Arc::clone(&shutdown))
+        move |exchange: Exchange| handle(exchange, Arc::clone(&shutdown), Arc::clone(&both))
     };
     let server = Server::serve(listener, NonZeroUsize::new(256).expect("not zero"), make, handler);
     shutdown.notified().await;
@@ -223,16 +228,24 @@ fn ok(length: Option<u64>) -> Response<'static> {
 }
 
 /// Serves one exchange on its route, and prints the error of a route that failed.
-async fn handle(exchange: Exchange, shutdown: Arc<Notify>) -> core::result::Result<(), drive::Error> {
+async fn handle(
+    exchange: Exchange,
+    shutdown: Arc<Notify>,
+    both: Arc<Barrier>,
+) -> core::result::Result<(), drive::Error> {
     let path = String::from_utf8_lossy(exchange.head().target().as_bytes()).into_owned();
-    let result = route(exchange, shutdown).await;
+    let result = route(exchange, shutdown, both).await;
     if let Err(error) = &result {
         line(&format!("ERROR {path} {:?} {error}", error.kind()));
     }
     result
 }
 
-async fn route(mut exchange: Exchange, shutdown: Arc<Notify>) -> core::result::Result<(), drive::Error> {
+async fn route(
+    mut exchange: Exchange,
+    shutdown: Arc<Notify>,
+    both: Arc<Barrier>,
+) -> core::result::Result<(), drive::Error> {
     // h2load and curl print the group of their own side, so only the routes of the other peers
     // print it here.
     if matches!(exchange.head().target().as_bytes(), b"/" | b"/echo" | b"/browser") {
@@ -277,6 +290,12 @@ async fn route(mut exchange: Exchange, shutdown: Arc<Notify>) -> core::result::R
             exchange.finish().await?;
             shutdown.notify_one();
             Ok(())
+        }
+        b"/urgency/high" | b"/urgency/low" => {
+            both.wait().await;
+            exchange.respond(&ok(u64::try_from(URGENCY_BYTES).ok())).await?;
+            exchange.write(&Lease::from(vec![b'u'; URGENCY_BYTES])).await?;
+            exchange.finish().await
         }
         b"/browser" => page(&mut exchange, BROWSER).await,
         b"/goaway" => page(&mut exchange, GOAWAY).await,

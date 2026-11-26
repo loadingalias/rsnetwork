@@ -1,6 +1,7 @@
 //! HTTP/2 (RFC 9113): the frame codec and the engine of one connection, with no I/O.
 //!
-//! [`frame`] reads and writes each frame of RFC 9113, with each check of sections 4 and 6.
+//! [`frame`] reads and writes each frame of RFC 9113, with each check of sections 4 and 6, and the
+//! PRIORITY_UPDATE frame of RFC 9218.
 //! [`Connection`] is the engine of one connection. It sends and checks the connection preface,
 //! exchanges and acknowledges SETTINGS, answers PING, and joins a header block across HEADERS and
 //! CONTINUATION frames into one HPACK decode. It keeps the state of each stream (section 5.1),
@@ -20,9 +21,12 @@
 //! more credit only for the bytes that the consumer releases.
 //!
 //! The application gives the body of each stream in chunks. In each drive, the send scheduler
-//! sends one DATA frame of at most 16,384 bytes for each stream in turn, within the two send
-//! windows, as views of the chunks. A stream with no send credit waits in its own slot, so a slow
-//! consumer of the peer holds back only its stream.
+//! sends DATA frames of at most 16,384 bytes, within the two send windows, as views of the chunks.
+//! It orders the streams by their priority (RFC 9218): a higher urgency first, the incremental
+//! streams of one urgency in turn, one frame each, and its other streams one at a time, in the
+//! order of their identifiers. A stream with no send credit waits in its own slot, so a slow
+//! consumer of the peer holds back only its stream. Each endpoint sends
+//! `SETTINGS_NO_RFC7540_PRIORITIES` 1, and builds no priority tree of RFC 7540.
 //!
 //! ```
 //! use core::net::{Ipv4Addr, SocketAddr};
@@ -95,6 +99,7 @@
 mod connection;
 pub mod frame;
 pub(crate) mod message;
+mod schedule;
 pub(crate) mod session;
 mod stream;
 

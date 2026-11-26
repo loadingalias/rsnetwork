@@ -178,7 +178,7 @@ pub(crate) fn core_client(transport: Transport) -> client::Http1 {
 }
 
 /// The limits of a client of the tests.
-const CLIENT: client::Limits = client::Limits {
+pub(crate) const CLIENT: client::Limits = client::Limits {
     head: HEAD,
     h2: H2,
     body: BODY,

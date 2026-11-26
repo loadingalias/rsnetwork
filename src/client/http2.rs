@@ -18,6 +18,7 @@ use crate::host::{Connection, Engine, Io, Wait};
 use crate::hpack::FieldLine;
 use crate::link::{Link, earliest, queues};
 use crate::message::{ResponseHead, Stream};
+use crate::priority::Priority;
 #[cfg(feature = "tls")]
 use crate::tls::{self, ClientConfig, Negotiated, Tls};
 use crate::value::{Field, Method, Scheme};
@@ -509,6 +510,33 @@ impl Http2 {
     pub fn delivered(&mut self, stream: Stream) -> u64 {
         self.find(stream)
             .map_or(0, |index| self.exchanges[index].inflow.consumer().delivered())
+    }
+
+    /// Asks the server to send the response of `stream` with `priority`, in a PRIORITY_UPDATE
+    /// (RFC 9218, section 7.1): the latest signal wins at the server. A request carries its first
+    /// priority in its `priority` field: give [`Priority::field`] in the fields of the request.
+    ///
+    /// Gives `false` while the output queue has no room: send the output, and call again. A server
+    /// that does not use RFC 9218 gets no frame, and neither does a stream whose response ended:
+    /// the call changes nothing then. Refuses with [`Kind::Misuse`] when the stream is not open,
+    /// and with [`Kind::Deadline`] after its deadline.
+    pub fn prioritize(&mut self, stream: Stream, priority: Priority, now: Instant) -> Result<bool, Error> {
+        self.live(now)?;
+        let index = self.expire(stream, now)?;
+        let exchange = &self.exchanges[index];
+        let (id, ended) = (exchange.id, exchange.ended || exchange.inflow.ended());
+        let (session, outbound) = self.link.engine();
+        let connection = session.connection();
+        if ended || !connection.is_open(id) {
+            return Ok(true);
+        }
+        match connection.priority_update(outbound, id, priority) {
+            Ok(()) => {}
+            Err(error) if error.kind() == Kind::Overload => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        self.pump(now)?;
+        Ok(true)
     }
 
     /// Leaves `stream`: the client forgets it. When its exchange did not end, the stream resets

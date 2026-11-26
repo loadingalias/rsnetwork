@@ -21,10 +21,15 @@
 //! flight never pass the limit, however fast the peer opens and resets streams.
 //!
 //! The send scheduler sends the body of each stream from its own slot: one chunk, which the
-//! application gives. A ring of the streams whose chunk can go out serves them in turn, one DATA
-//! frame for each visit (round-robin). A stream with no send window leaves the ring until a
-//! WINDOW_UPDATE gives it credit. Thus the output queue holds only frames that can go now, and a
+//! application gives. The [`Schedule`] of the streams whose chunk can go out orders them by their
+//! priority (RFC 9218), one DATA frame for each visit. A stream with no send window leaves it until
+//! a WINDOW_UPDATE gives it credit. Thus the output queue holds only frames that can go now, and a
 //! slow consumer of the peer holds back only its own stream.
+//!
+//! A server takes the priority of a request from its `priority` field, and from the PRIORITY_UPDATE
+//! frames of the client, which can come before the request: the update of an idle stream waits
+//! until the stream opens, and it wins over the field. The streams of a client share the
+//! connection in turn, as incremental streams of one urgency.
 
 use core::alloc::Layout;
 use std::collections::VecDeque;
@@ -34,9 +39,11 @@ use rstypes::capacity::{Budget, Permit};
 
 use super::connection::Fault;
 use super::frame::{ErrorCode, MAX_STREAM, MIN_FRAME_SIZE};
+use super::schedule::Schedule;
 use super::{Role, Settings};
 use crate::drive::{Error, Kind};
 use crate::hpack::FieldLine;
+use crate::priority::Priority;
 
 /// The initial flow-control window of RFC 9113, section 6.9.2: of the connection, and of each
 /// stream until the peer applies another `SETTINGS_INITIAL_WINDOW_SIZE`.
@@ -48,6 +55,12 @@ const MAX: i64 = MAX_STREAM as i64;
 /// The most DATA bytes of one visit of the send scheduler: one frame of 16,384 bytes, the
 /// smallest `SETTINGS_MAX_FRAME_SIZE`, so each peer takes it. It is the DATA size of nghttp2.
 const QUANTUM: i64 = MIN_FRAME_SIZE as i64;
+
+/// The priority of each stream of a client: its request bodies share the connection in turn.
+const UPLOAD: Priority = Priority {
+    incremental: true,
+    ..Priority::DEFAULT
+};
 
 /// How a stream closed (RFC 9113, section 5.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,8 +145,8 @@ impl Credit {
 enum Body {
     /// No chunk waits.
     Idle,
-    /// A chunk waits. `queued` tells whether the ring of the scheduler holds the stream: a stream
-    /// with no send window leaves the ring.
+    /// A chunk waits. `queued` tells whether the schedule holds the stream: a stream with no send
+    /// window leaves it.
     Chunk {
         data: Lease,
         end_stream: bool,
@@ -154,10 +167,12 @@ struct Stream {
     window: i64,
     credit: Credit,
     body: Body,
+    /// The priority of the stream's body in the schedule.
+    priority: Priority,
 }
 
 impl Stream {
-    const fn new(id: u32, sending: Part, receiving: Part, window: i64, credit: i64) -> Self {
+    const fn new(id: u32, sending: Part, receiving: Part, (window, credit): (i64, i64), priority: Priority) -> Self {
         Self {
             id,
             sending,
@@ -165,6 +180,7 @@ impl Stream {
             window,
             credit: Credit::new(credit),
             body: Body::Idle,
+            priority,
         }
     }
 }
@@ -223,7 +239,10 @@ pub(super) struct Streams {
     /// The last closed streams that no longer hold a slot, oldest first: at most `limit`.
     closed: VecDeque<(u32, Closed)>,
     /// The streams whose chunk can go out, in the order of their next visit.
-    ready: VecDeque<u32>,
+    schedule: Schedule,
+    /// The priorities that PRIORITY_UPDATE frames gave to idle streams of the client, until they
+    /// open (RFC 9218, section 7). With the open streams, they stay within `limit`.
+    retained: Vec<(u32, Priority)>,
     /// The streams whose chunk went out, in order, for their `Event::Sent`.
     sent: VecDeque<u32>,
     /// The most streams of the table and of `held` together: the endpoint's
@@ -255,16 +274,20 @@ pub(super) struct Streams {
 impl Streams {
     /// Makes the streams of a connection of `role` with the endpoint's settings `local` and a
     /// connection receive window of `connection_window`. It charges a table of
-    /// `max_concurrent_streams` entries, and as many held identifiers and entries of each ring of
-    /// the scheduler, to `budget` before it allocates them.
+    /// `max_concurrent_streams` entries, and as many held identifiers, entries of each buffer of
+    /// the scheduler, and retained priorities, to `budget` before it allocates them.
     pub(super) fn new(role: Role, local: &Settings, connection_window: u32, budget: &Budget) -> Result<Self, Error> {
         let limit = usize::try_from(local.max_concurrent_streams).unwrap_or(usize::MAX);
         let too_large = Error::new(Kind::Overload, "the stream table is too large");
         let bytes = Layout::array::<Stream>(limit)
             .and_then(|table| {
-                let rings = table.extend(Layout::array::<u32>(limit)?.repeat(2)?.0)?.0;
+                // The turns and the groups of the schedule, and the streams that wait for their
+                // `Event::Sent`.
+                let rings = table.extend(Layout::array::<u32>(limit)?.repeat(3)?.0)?.0;
                 Ok(rings
                     .extend(Layout::array::<(u32, Closed)>(limit)?.repeat(2)?.0)?
+                    .0
+                    .extend(Layout::array::<(u32, Priority)>(limit)?)?
                     .0
                     .size())
             })
@@ -272,21 +295,22 @@ impl Streams {
         let charge = budget
             .reserve(u64::try_from(bytes).map_err(|_| too_large)?)
             .map_err(|_| Error::new(Kind::Overload, "the budget refused the stream table"))?;
-        let (mut table, mut held, mut ready, mut sent) = (Vec::new(), Vec::new(), VecDeque::new(), VecDeque::new());
+        let (mut table, mut held, mut sent, mut retained) = (Vec::new(), Vec::new(), VecDeque::new(), Vec::new());
         let mut closed = VecDeque::new();
         table
             .try_reserve_exact(limit)
             .and_then(|()| held.try_reserve_exact(limit))
             .and_then(|()| closed.try_reserve_exact(limit))
-            .and_then(|()| ready.try_reserve_exact(limit))
             .and_then(|()| sent.try_reserve_exact(limit))
+            .and_then(|()| retained.try_reserve_exact(limit))
             .map_err(|_| Error::new(Kind::Overload, "the memory for the stream table is not available"))?;
         Ok(Self {
             role,
             table,
             held,
             closed,
-            ready,
+            schedule: Schedule::new(limit)?,
+            retained,
             sent,
             limit,
             _charge: charge,
@@ -321,12 +345,11 @@ impl Streams {
         id.is_multiple_of(2) || id > self.highest
     }
 
-    /// Removes the stream at `index` from the table and from the rings of the scheduler. Its
-    /// chunk drops.
+    /// Removes the stream at `index` from the table and from the scheduler. Its chunk drops.
     fn remove(&mut self, index: usize) -> Stream {
         let stream = self.table.remove(index);
         match stream.body {
-            Body::Chunk { queued: true, .. } => self.ready.retain(|&id| id != stream.id),
+            Body::Chunk { queued: true, .. } => self.schedule.leave(stream.id, stream.priority),
             Body::Sent => self.sent.retain(|&id| id != stream.id),
             Body::Idle | Body::Chunk { .. } => {}
         }
@@ -403,16 +426,17 @@ impl Streams {
 
     /// Acts on a decoded header block on stream `id`, whose first line is `first`. `acknowledged`
     /// tells whether the peer acknowledged the endpoint's settings, so that it knows the
-    /// concurrency limit.
+    /// concurrency limit. A block that opens a stream of the client gives it `priority`, the
+    /// priority of its `priority` field.
     pub(super) fn headers(
         &mut self,
         id: u32,
         end_stream: bool,
-        first: Option<FieldLine<'_>>,
+        (first, priority): (Option<FieldLine<'_>>, Priority),
         acknowledged: bool,
     ) -> Result<Section, Fault> {
         let Some(index) = self.find(id) else {
-            return self.open_remote(id, end_stream, acknowledged);
+            return self.open_remote(id, end_stream, priority, acknowledged);
         };
         let stream = &mut self.table[index];
         let interim = stream.receiving == Part::Head && interim(first);
@@ -453,7 +477,13 @@ impl Streams {
 
     /// Acts on a header block on a stream with no entry: a new stream of the client on a server,
     /// a closed stream, or an idle stream that the peer cannot open.
-    fn open_remote(&mut self, id: u32, end_stream: bool, acknowledged: bool) -> Result<Section, Fault> {
+    fn open_remote(
+        &mut self,
+        id: u32,
+        end_stream: bool,
+        priority: Priority,
+        acknowledged: bool,
+    ) -> Result<Section, Fault> {
         if !self.idle(id) {
             return match self.closed(id) {
                 Some(Closed::Ours) => Ok(Section::Discard),
@@ -474,8 +504,16 @@ impl Streams {
                 "a header block came on an idle stream that the peer cannot open",
             ));
         }
-        // Section 5.1.1: each client stream below it that is still idle is now closed.
+        // Section 5.1.1: each client stream below it that is still idle is now closed. The update
+        // that the stream got while it was idle applies now.
         self.highest = id;
+        let mut update = None;
+        self.retained.retain(|&(retained, priority)| {
+            if retained == id {
+                update = Some(priority);
+            }
+            retained > id
+        });
         if let Drain::Sent(last) = self.drain
             && id > last
         {
@@ -496,7 +534,8 @@ impl Streams {
             "a new stream waits at its HEADERS frame until a slot is free"
         );
         let receiving = if end_stream { Part::Done } else { Part::Body };
-        let stream = Stream::new(id, Part::Head, receiving, self.send_initial, self.recv_initial);
+        let windows = (self.send_initial, self.recv_initial);
+        let stream = Stream::new(id, Part::Head, receiving, windows, update.unwrap_or(priority));
         self.table.push(stream);
         self.last_stream = id;
         Ok(Section::Head)
@@ -694,8 +733,12 @@ impl Streams {
         }
         self.peer_goaway = Some(last);
         if self.role == Role::Client {
+            for stream in self.table.iter().filter(|stream| stream.id > last) {
+                if let Body::Chunk { queued: true, .. } = stream.body {
+                    self.schedule.leave(stream.id, stream.priority);
+                }
+            }
             self.table.retain(|stream| stream.id <= last);
-            self.ready.retain(|&id| id <= last);
             self.sent.retain(|&id| id <= last);
         }
         Ok(())
@@ -747,7 +790,7 @@ impl Streams {
         assert!(id > self.highest, "a stream opens above each earlier stream");
         self.highest = id;
         let sending = if end_stream { Part::Done } else { Part::Body };
-        let stream = Stream::new(id, sending, Part::Head, self.send_initial, self.recv_initial);
+        let stream = Stream::new(id, sending, Part::Head, (self.send_initial, self.recv_initial), UPLOAD);
         self.table.push(stream);
     }
 
@@ -800,7 +843,7 @@ impl Streams {
     }
 
     /// Puts `data` into the send slot of stream `id`, which [`sendable_data`](Self::sendable_data)
-    /// checked. The stream joins the end of the ring when it has send credit.
+    /// checked. The stream joins the schedule when it has send credit.
     pub(super) fn chunk(&mut self, id: u32, data: Lease, end_stream: bool) {
         if let Some(index) = self.find(id) {
             self.table[index].body = Body::Chunk {
@@ -812,8 +855,8 @@ impl Streams {
         }
     }
 
-    /// Puts the stream at `index` back at the end of the ring when its chunk waits outside it and
-    /// its send window has credit.
+    /// Puts the stream at `index` back into the schedule when its chunk waits outside it and its
+    /// send window has credit.
     fn requeue(&mut self, index: usize) {
         let stream = &mut self.table[index];
         if let Body::Chunk {
@@ -822,15 +865,64 @@ impl Streams {
             && stream.window > 0
         {
             *queued = true;
-            assert!(
-                self.ready.len() < self.limit,
-                "each stream is in the ring at most one time"
-            );
-            self.ready.push_back(stream.id);
+            self.schedule.join(stream.id, stream.priority);
         }
     }
 
-    /// The index of stream `id` of a ring of the scheduler, which holds only streams of the table.
+    /// Gives the stream at `index` the priority `priority`: in the schedule, it moves to the place
+    /// of that priority.
+    fn reprioritize(&mut self, index: usize, priority: Priority) {
+        let stream = &mut self.table[index];
+        if stream.priority == priority {
+            return;
+        }
+        let queued = matches!(stream.body, Body::Chunk { queued: true, .. });
+        if queued {
+            self.schedule.leave(stream.id, stream.priority);
+        }
+        stream.priority = priority;
+        if queued {
+            self.schedule.join(stream.id, priority);
+        }
+    }
+
+    /// Gives stream `id`, which is open, the priority that the application of a server chose
+    /// (RFC 9218, section 8). A later PRIORITY_UPDATE of the client changes it again.
+    pub(super) fn prioritize(&mut self, id: u32, priority: Priority) -> Result<(), Error> {
+        let index = self.open_index(id)?;
+        self.reprioritize(index, priority);
+        Ok(())
+    }
+
+    /// Acts on a PRIORITY_UPDATE of the client for stream `id` with `priority` (RFC 9218, section
+    /// 7.1), which names an odd stream. An open stream takes it, an idle stream gets it when it
+    /// opens, and a closed stream discards it. An update that would make the idle streams with a
+    /// priority and the open streams more than the endpoint's `SETTINGS_MAX_CONCURRENT_STREAMS` is
+    /// a connection error.
+    pub(super) fn priority_update(&mut self, id: u32, priority: Priority) -> Result<(), Fault> {
+        if let Some(index) = self.find(id) {
+            self.reprioritize(index, priority);
+            return Ok(());
+        }
+        let discarded = matches!(self.drain, Drain::Sent(last) if id > last);
+        if !self.idle(id) || discarded {
+            return Ok(());
+        }
+        if let Some(retained) = self.retained.iter_mut().find(|(retained, _)| *retained == id) {
+            retained.1 = priority;
+            return Ok(());
+        }
+        if self.retained.len() + self.table.len() >= self.limit {
+            return Err(Fault::peer(
+                ErrorCode::PROTOCOL_ERROR,
+                "PRIORITY_UPDATE frames give more idle streams a priority than the stream limit permits",
+            ));
+        }
+        self.retained.push((id, priority));
+        Ok(())
+    }
+
+    /// The index of stream `id` of the schedule, which holds only streams of the table.
     fn ringed(&self, id: u32) -> usize {
         let (Ok(index) | Err(index)) = self.table.binary_search_by_key(&id, |stream| stream.id);
         assert!(
@@ -840,19 +932,19 @@ impl Streams {
         index
     }
 
-    /// Whether a stream of the ring can send when the output queue has room: the ring has a
-    /// stream, and the connection window has credit.
+    /// Whether a stream of the schedule can send when the output queue has room: the schedule has
+    /// a stream, and the connection window has credit.
     pub(super) fn ready(&self) -> bool {
-        !self.ready.is_empty() && self.window > 0
+        !self.schedule.is_empty() && self.window > 0
     }
 
-    /// The next DATA frame of the scheduler: the stream at the front of the ring sends at most
-    /// [`QUANTUM`] bytes of its chunk, within the two send windows, and goes to the end of the
-    /// ring. Gives the stream, the bytes, and whether the frame ends the stream. A stream that has
-    /// no send window leaves the ring. Gives `None` when the ring is empty or the connection
-    /// window has no credit.
+    /// The next DATA frame of the scheduler: the front stream of the schedule sends at most
+    /// [`QUANTUM`] bytes of its chunk, within the two send windows, and its turn ends. Gives the
+    /// stream, the bytes, and whether the frame ends the stream. A stream that has no send window
+    /// leaves the schedule. Gives `None` when the schedule is empty or the connection window has
+    /// no credit.
     pub(super) fn next_frame(&mut self) -> Option<(u32, Lease, bool)> {
-        while let Some(&id) = self.ready.front() {
+        while let Some(id) = self.schedule.front() {
             if self.window <= 0 {
                 return None;
             }
@@ -860,7 +952,7 @@ impl Streams {
             let stream = &mut self.table[index];
             assert!(
                 matches!(stream.body, Body::Chunk { queued: true, .. }),
-                "each stream of the ring has a chunk that waits"
+                "each stream of the schedule has a chunk that waits"
             );
             let Body::Chunk {
                 data,
@@ -871,9 +963,10 @@ impl Streams {
                 return None;
             };
             if stream.window <= 0 {
-                // The peer made its initial window smaller: the stream waits for credit.
+                // The peer made its initial window smaller: the stream waits for credit, and the
+                // turn goes on with the next stream of its group.
                 *queued = false;
-                self.ready.pop_front();
+                self.schedule.leave(id, stream.priority);
                 continue;
             }
             // Each chunk in the ring has a byte, so the frame has at least one.
@@ -886,14 +979,15 @@ impl Streams {
             let (Some(part), Some(rest)) = (data.view(..len), data.view(len..)) else {
                 return None;
             };
-            self.ready.pop_front();
             self.window -= sent;
             stream.window -= sent;
             let end = *end_stream && rest.initialized() == 0;
+            // The stream keeps its place while the rest of its chunk has credit.
+            let stays = rest.initialized() > 0 && stream.window > 0;
+            self.schedule.advance(stays);
             if rest.initialized() > 0 {
                 *data = rest;
-                *queued = false;
-                self.requeue(index);
+                *queued = stays;
             } else if end {
                 stream.body = Body::Idle;
                 stream.sending = Part::Done;

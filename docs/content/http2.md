@@ -27,8 +27,8 @@ it.
 3. Each `drive` call reads the queued frames in place and gives one `Event`, or none.
 4. You answer with `open`, `headers`, `reset`, `release`, `ping`, and `shutdown`, which push
    frames into the `Outbound` queue. You give each body to `data` in chunks, and each drive sends
-   the chunks of all streams in turn: see [multiplexing](multiplexing.md). When the handler of a
-   reset stream ends, you call `close`.
+   the chunks in the order of the priorities of their streams: see
+   [multiplexing](multiplexing.md). When the handler of a reset stream ends, you call `close`.
 5. The host sends each `Output` and acknowledges the bytes that the transport accepted.
 6. When the drive gives a terminal turn, the host sends the rest of the `Outbound` queue and closes
    the connection.
@@ -121,6 +121,8 @@ preface (RFC 9113, section 3.4):
 
 The SETTINGS frame has each setting of `limits.settings` that is not its initial value, in the
 order of the identifiers. A client then adds `SETTINGS_ENABLE_PUSH` 0, so a server never pushes.
+Each endpoint then adds `SETTINGS_NO_RFC7540_PRIORITIES` 1 (RFC 9218, section 2.1): it uses the
+priorities of RFC 9218, and it builds no priority tree of RFC 7540.
 When `limits.connection_window` is above 65,535, a WINDOW_UPDATE on stream 0 follows: see
 [flow control](#flow-control). The output queue needs at least 3 entries.
 
@@ -150,7 +152,8 @@ such as large cookies, and costs more for each drive.
 | `max_header_list_size` | The list limit of the HPACK decoder. A larger decoded block goes up with `lines: None` |
 
 The connection applies each SETTINGS frame of the peer in its order, with each setting in its
-order. It ignores a setting that it does not know. Then it queues the acknowledgement and gives
+order. It ignores a setting that it does not know. The peer's `SETTINGS_NO_RFC7540_PRIORITIES` is
+0 or 1, and it cannot change after it came, as nghttp2 requires too. Then it queues the acknowledgement and gives
 `Event::Settings` with the values now in effect. `peer_settings()` gives them too. The peer's
 `SETTINGS_HEADER_TABLE_SIZE` limits the HPACK encoder from that acknowledgement on. The peer's
 `SETTINGS_INITIAL_WINDOW_SIZE` changes the send window of each stream by the difference (RFC 9113,
@@ -169,8 +172,8 @@ connection with `Kind::Unsupported`.
 ## Read frames
 
 Each drive gives at most one event. A frame with no event, such as a PING, a PRIORITY, a
-WINDOW_UPDATE, a frame of an unknown type, or a frame on a closed stream, gives none, and the drive
-reads the next frame. A
+PRIORITY_UPDATE, a WINDOW_UPDATE, a frame of an unknown type, or a frame on a closed stream, gives
+none, and the drive reads the next frame. A
 header block that gives no event ends the turn as `Pending`: drive again with no wait.
 
 | Event | Frame | What to do |
@@ -224,6 +227,7 @@ half-closed streams, and how each of the last `max_concurrent_streams` closed st
 | RST_STREAM | Connection error `PROTOCOL_ERROR` | The stream closes: `Reset` | The stream closes: `Reset` | Ignored |
 | WINDOW_UPDATE | Connection error `PROTOCOL_ERROR` | Applied, or ignored after your END_STREAM | Applied | Ignored |
 | PRIORITY | Ignored, and the stream stays idle | Ignored | Ignored | Ignored |
+| PRIORITY_UPDATE to a server, on stream 0 (RFC 9218, section 7.1) | Kept until the stream opens, and then it wins over the `priority` field. An even stream: connection error `PROTOCOL_ERROR` | Applied | Applied | Ignored |
 
 When a client opens a stream, each idle stream below it closes.
 
@@ -337,6 +341,8 @@ of type `FLOW_CONTROL_ERROR` (RFC 9113, section 6.9.1).
 | `close(stream)` | None: the handler of a stream that a reset ended has ended, and its slot is free | No reset holds the slot of the stream: it is open, or it was closed (`Kind::Misuse`) |
 | `release(&mut outbound, stream, bytes)` | WINDOW_UPDATE frames when credit is due | The consumer holds fewer bytes (`Kind::Misuse`). The output queue or the pool has no room for the frames (`Kind::Overload`) |
 | `ping(&mut outbound, opaque)` | One PING | The output queue or the frame pool is full (`Kind::Overload`) |
+| `prioritize(stream, priority)` | None: a server gives the response of the stream the priority, and the send scheduler orders it by it from the next frame (see [multiplexing](multiplexing.md#set-the-priority-of-a-response)) | A client, or the stream is not open (`Kind::Misuse`) |
+| `priority_update(&mut outbound, stream, priority)` | A client sends PRIORITY_UPDATE, or nothing to a server whose SETTINGS did not have `SETTINGS_NO_RFC7540_PRIORITIES` 1 | A server, or the stream is not open (`Kind::Misuse`). The output queue or the frame pool is full (`Kind::Overload`) |
 | `shutdown(&mut outbound)` | GOAWAY: see [shutdown](#shutdown-and-drain) | The output queue or the frame pool is full (`Kind::Overload`) |
 
 A refusal writes and changes nothing, so you can call again later. After the end of the
@@ -391,7 +397,7 @@ GOAWAY too.
 
 | Code | Causes | Kind |
 | --- | --- | --- |
-| `PROTOCOL_ERROR` | A wrong preface. A frame with the wrong stream 0 or non-zero stream for its type. A pad length past the payload. A frame inside a header block, a CONTINUATION after no block, or a CONTINUATION of another stream. A PUSH_PROMISE, in each role. A SETTINGS acknowledgement when no SETTINGS frame waits for one. A HEADERS or PRIORITY that depends on its own stream. `SETTINGS_ENABLE_PUSH` above 1, or 1 from a server. `SETTINGS_MAX_FRAME_SIZE` outside 2^14 to 2^24 - 1. A WINDOW_UPDATE of 0 on the connection. DATA, RST_STREAM, or WINDOW_UPDATE on an idle stream. A HEADERS frame on an even stream, or to a client on a stream that it did not open. A GOAWAY with a larger last stream than the GOAWAY before it | `Malformed` |
+| `PROTOCOL_ERROR` | A wrong preface. A frame with the wrong stream 0 or non-zero stream for its type. A pad length past the payload. A frame inside a header block, a CONTINUATION after no block, or a CONTINUATION of another stream. A PUSH_PROMISE, in each role. A SETTINGS acknowledgement when no SETTINGS frame waits for one. A HEADERS or PRIORITY that depends on its own stream. `SETTINGS_ENABLE_PUSH` above 1, or 1 from a server. `SETTINGS_MAX_FRAME_SIZE` outside 2^14 to 2^24 - 1. `SETTINGS_NO_RFC7540_PRIORITIES` above 1, or a change of it. A PRIORITY_UPDATE on a stream other than 0, for stream 0 or an even stream, to a client, or one that gives more idle streams a priority than `max_concurrent_streams` permits with the open streams. A WINDOW_UPDATE of 0 on the connection. DATA, RST_STREAM, or WINDOW_UPDATE on an idle stream. A HEADERS frame on an even stream, or to a client on a stream that it did not open. A GOAWAY with a larger last stream than the GOAWAY before it | `Malformed` |
 | `FRAME_SIZE_ERROR` | A frame larger than `max_frame_size`. A frame too short for its fixed fields, or a PING, PRIORITY, RST_STREAM, or WINDOW_UPDATE of another length. A SETTINGS frame whose length is not a multiple of 6, or an acknowledgement with a setting | `Malformed` |
 | `FLOW_CONTROL_ERROR` | `SETTINGS_INITIAL_WINDOW_SIZE` above 2^31 - 1, or a value that takes a send window past it. DATA past the connection window. A WINDOW_UPDATE that takes the connection window past 2^31 - 1 | `Malformed` |
 | `COMPRESSION_ERROR` | A block that breaks RFC 7541, or a block with no size update after the acknowledgement of a smaller table | `Malformed` |
@@ -402,6 +408,11 @@ RFC 9113 makes a PRIORITY frame of a wrong length a stream error. Its stream can
 reset is not permitted, so the connection ends it as a connection error, which section 5.4.1
 permits. RFC 9113 removed the rule against a stream that depends on itself, and the connection
 keeps it from RFC 7540.
+
+RFC 9218 permits a connection error for a PRIORITY_UPDATE whose value does not parse. The
+connection ignores the frame, as nghttp2 does, because a priority is a hint. It also ignores a
+value longer than 64 bytes, so it keeps no more of it: the longest value of RFC 9218, `u=7, i`, has
+6 bytes.
 
 The end of the input at a frame boundary with no open stream ends the connection with no error.
 The end inside a frame or a header block, or with an open stream, ends it with `Kind::Partial`, and
@@ -433,8 +444,10 @@ no event: see [streams](#streams).
 | `connection_window` | The DATA bytes of all streams that your consumers admit: the connection receive window, from 65,535 to 2^31 - 1 |
 
 `Connection::new` charges the HPACK decoder, the HPACK encoder, the stream table, and the frame
-pool to your budget. The stream table has `max_concurrent_streams` entries, and as many 4-byte
-identifiers in each of three lists: the held streams and the two rings of the send scheduler. The
+pool to your budget. The stream table has `max_concurrent_streams` entries, as many 4-byte
+identifiers in each of three lists of the send scheduler (its turns, its groups, and the streams
+whose `Sent` event waits), and as many 8-byte records in each of three lists: the reset streams
+that hold a slot, the last closed streams, and the priorities of idle streams. The
 pool has one slot of 64 bytes for each entry of the output queue, and one more. Each pool also
 charges an entry for each slot and its shared state: see [admission](limits.md#admission).
 `TurnLimits` bounds the work of each drive: `frames` counts each frame header, and `bytes` each
@@ -454,8 +467,9 @@ not charge.
 | Empty CONTINUATION frames | `work` / 9 frames for each header block | `COMPRESSION_ERROR` |
 | PING and SETTINGS frames, and frames that the connection answers with RST_STREAM, from a peer that does not read | One answer for each `Outbound` entry, and one that waits. The connection reads no frame while an answer waits | None |
 | Frames with no answer and no event: empty DATA, PRIORITY, frames of unknown types, and DATA, RST_STREAM, and WINDOW_UPDATE on a closed stream | `frames` for each turn, with no state | None |
+| PRIORITY_UPDATE | `frames` for each turn. Of an idle stream, one record that the next update of the stream replaces, within `max_concurrent_streams` with the open streams | `PROTOCOL_ERROR` past that limit |
 | Header blocks on closed or refused streams | One block for each turn, because the turn ends after its decode. Each block within `work` | `COMPRESSION_ERROR` for a block past `work` |
-| WINDOW_UPDATE on an open stream or the connection | `frames` for each turn, with no state. A stream that waits for credit joins the ring of the send scheduler one time | `FLOW_CONTROL_ERROR` for a window past 2^31 - 1 |
+| WINDOW_UPDATE on an open stream or the connection | `frames` for each turn, with no state. A stream that waits for credit joins the schedule of the send scheduler one time | `FLOW_CONTROL_ERROR` for a window past 2^31 - 1 |
 | SETTINGS | One frame for each turn, because its event ends the turn. A change of `SETTINGS_INITIAL_WINDOW_SIZE` visits each open stream one time | None |
 
 The connection does not end a flood with `ENHANCE_YOUR_CALM`. RFC 9113, section 10.5, permits

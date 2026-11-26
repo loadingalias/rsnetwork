@@ -25,13 +25,15 @@ use rsnetwork::body::{Collect, Outcome, Part, Read};
 use rsnetwork::buffer::{Lease, WriteLoan};
 use rsnetwork::client::Request;
 use rsnetwork::drive::{Error, Kind};
+use rsnetwork::h2;
 use rsnetwork::h2::frame::ErrorCode;
+use rsnetwork::priority::{Priority, Urgency};
 use rsnetwork::server::{Closed, Delivery};
 use rsnetwork::value::{Authority, Field, Method, Target};
 use rsnetwork_tokio::Clock;
 use rsnetwork_tokio::server::{Exchange, Report, Server};
 use support::{ALERT_RECORD, Held, Last, PATIENCE, Proxy, Transport, ok, on_each_runtime};
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Barrier, Notify, Semaphore, mpsc, oneshot};
 
 /// The deadline of the exchanges whose peer stops.
 const DEADLINE: Duration = Duration::from_millis(300);
@@ -1057,5 +1059,100 @@ fn a_trailer_section_larger_than_the_head_region_refuses_at_once_and_does_not_wa
         drop(exchange);
         within(client.close()).await.unwrap();
         within(server.close(Clock.deadline(PATIENCE))).await;
+    });
+}
+
+/// How a test gives the response of `/b` the highest urgency (RFC 9218).
+#[derive(Clone, Copy, Debug)]
+enum Signal {
+    /// The request of `/b` has the `priority` field `u=0`, and `/a` has `u=7`.
+    Field,
+    /// The handler of `/b` calls `prioritize`.
+    Server,
+    /// The client calls `prioritize` on the exchange of `/b`: a PRIORITY_UPDATE.
+    Update,
+}
+
+/// The highest urgency, for a response that the client uses whole.
+const URGENT: Priority = Priority {
+    urgency: Urgency::HIGHEST,
+    incremental: false,
+};
+
+/// The body of each response of the priority test: four times the connection window.
+const LARGE: usize = 256 * 1024;
+
+/// The response of a higher urgency completes first (RFC 9218, section 10), for each way to set
+/// its priority. Each handler writes its body after both requests arrived. The client has a
+/// connection window of 65,535, so at most that part of the bodies goes before the client reads,
+/// and then the scheduler gives each credit by priority. With no signal, `/a`, the first stream,
+/// would complete first.
+#[test]
+fn a_response_of_a_higher_urgency_completes_first_on_one_connection() {
+    on_each_runtime(|| async {
+        for signal in [Signal::Field, Signal::Server, Signal::Update] {
+            let (listener, address) = support::listener().await;
+            let both = Arc::new(Barrier::new(2));
+            let handler = {
+                let both = Arc::clone(&both);
+                move |mut exchange: Exchange| {
+                    let both = Arc::clone(&both);
+                    async move {
+                        both.wait().await;
+                        if matches!(signal, Signal::Server) && exchange.head().target().as_bytes() == b"/b" {
+                            exchange.prioritize(URGENT);
+                        }
+                        exchange.respond(&ok(Some(LARGE as u64))).await?;
+                        exchange.write(&Lease::from(vec![b'x'; LARGE])).await?;
+                        exchange.finish().await
+                    }
+                }
+            };
+            let server = serve(Transport::Plain, listener, handler);
+            let limits = rsnetwork::client::Limits {
+                h2: h2::Limits {
+                    connection_window: 65_535,
+                    ..support::H2
+                },
+                ..support::CLIENT
+            };
+            let core = rsnetwork::client::Http2::plain(limits, Clock.domain(), &support::budget()).unwrap();
+            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let client = rsnetwork_tokio::client::Http2::new(core, stream, support::pool(&support::budget())).unwrap();
+            let fields = |value| match signal {
+                Signal::Field => vec![Field::new(b"priority", value).unwrap()],
+                Signal::Server | Signal::Update => Vec::new(),
+            };
+            let (low, high) = (fields(b"u=7"), fields(b"u=0"));
+            let send = |target, fields| {
+                let client = client.clone();
+                let request = Request {
+                    fields,
+                    ..request(target, Some(0))
+                };
+                async move { client.send(&request, Clock.deadline(PATIENCE)).await.unwrap() }
+            };
+            let a = within(send(b"/a", &low[..])).await;
+            let mut b = within(send(b"/b", &high[..])).await;
+            if matches!(signal, Signal::Update) {
+                within(b.prioritize(URGENT)).await.unwrap();
+            }
+            let (done, mut order) = mpsc::unbounded_channel();
+            for (target, mut exchange) in [("/a", a), ("/b", b)] {
+                let done = done.clone();
+                tokio::spawn(async move {
+                    exchange.response().await.unwrap();
+                    let mut region = WriteLoan::new(Vec::with_capacity(LARGE));
+                    let collected = exchange.collect(&mut region).await.unwrap();
+                    assert!(matches!(collected, Collect::Complete(None)), "{target}: {collected:?}");
+                    assert_eq!(region.filled().len(), LARGE, "{target}");
+                    done.send(target).unwrap();
+                });
+            }
+            assert_eq!(within(order.recv()).await, Some("/b"), "{signal:?}");
+            assert_eq!(within(order.recv()).await, Some("/a"), "{signal:?}");
+            within(client.close()).await.unwrap();
+            within(server.close(Clock.deadline(PATIENCE))).await;
+        }
     });
 }

@@ -13,16 +13,22 @@ use rstypes::time::{Deadline, Instant};
 
 use super::frame::{
     self, ACK, ENABLE_PUSH, END_HEADERS, END_STREAM, Entries, ErrorCode, Fixed, Frame, FrameError, HEAD, Head,
-    INITIAL_WINDOW_SIZE, Kind, MAX_STREAM, PREFACE, flag,
+    INITIAL_WINDOW_SIZE, Kind, MAX_STREAM, NO_RFC7540_PRIORITIES, PREFACE, flag,
 };
 use super::stream::{self, Drain, Flow, INITIAL_WINDOW, Section, Streams};
 use super::{Limits, Role, SETTINGS_TIMEOUT, Settings};
 use crate::drive::{Blocked, Error, Inbound, Kind as ErrorKind, Outbound, Progress, Turn, TurnLimits, Work};
 use crate::hpack::{self, Block, DecodeError, Decoder, Encoder, FieldLine, Lines};
+use crate::priority::Priority;
 
 /// The size of a slot of the frame pool. The largest frame from the pool is the SETTINGS frame of
-/// the preface: 9 bytes and six settings of 6 bytes.
+/// the preface: 9 bytes and seven settings of 6 bytes.
 const SLOT: usize = 64;
+
+/// The longest value of a PRIORITY_UPDATE that the connection reads. A priority of RFC 9218 needs
+/// at most 6 bytes, `u=7, i`. A longer value is ignored, as a value that does not parse is: the
+/// connection keeps no more of it.
+const PRIORITY_VALUE_MAX: usize = 64;
 
 /// A SETTINGS frame with the flag ACK.
 const SETTINGS_ACK: &[u8] = &[0, 0, 0, 0x4, 0x1, 0, 0, 0, 0];
@@ -50,13 +56,16 @@ pub const SHUTDOWN_PING: [u8; 8] = *b"shutdown";
 /// sections 4 to 6), applies and acknowledges the peer's SETTINGS frames, answers each PING,
 /// joins and decodes each header block, and applies the rules of each stream state (section 5.1)
 /// and of flow control at the stream and the connection level (sections 5.2 and 6.9). Then it
-/// sends the chunks that [`data`](Self::data) gave, one DATA frame for each stream in turn.
+/// sends the chunks that [`data`](Self::data) gave, one DATA frame for each visit, in the order of
+/// their priority (RFC 9218, section 10). A server takes the priority of each request from its
+/// `priority` field and from the PRIORITY_UPDATE frames of the client, and
+/// [`prioritize`](Self::prioritize) changes it.
 ///
 /// A frame that breaks RFC 9113 is a connection error: the connection queues a GOAWAY with the
 /// code of the error and the last stream that it gave up, and the turn is terminal when the GOAWAY
 /// is in the queue. A stream error resets only its stream, with RST_STREAM. A frame of a type that
-/// RFC 9113 does not define is discarded, also its payload with no copy, unless it interrupts a
-/// header block.
+/// neither RFC 9113 nor RFC 9218 defines is discarded, also its payload with no copy, unless it
+/// interrupts a header block.
 ///
 /// The connection keeps at most one answer that the output queue has no room for: a SETTINGS
 /// acknowledgement, a PING answer, a RST_STREAM, a WINDOW_UPDATE, or a GOAWAY. It reads no frame
@@ -73,6 +82,9 @@ pub struct Connection {
     peer: Settings,
     /// The peer sent the SETTINGS frame of its preface.
     preface: bool,
+    /// The peer's `SETTINGS_NO_RFC7540_PRIORITIES` as `value == 1`, after a SETTINGS frame that
+    /// had it. It cannot change (RFC 9218, section 2.1).
+    peer_priorities: Option<bool>,
     decoder: Decoder,
     encoder: Encoder,
     /// The limits of the decoder.
@@ -262,11 +274,21 @@ enum Read {
     Padding(Head, Fixed, u32),
 }
 
-/// The bytes of a frame header or of fixed fields that the connection gathers across regions.
-#[derive(Clone, Copy, Debug, Default)]
+/// The bytes of a frame header, of fixed fields, or of the value of a PRIORITY_UPDATE that the
+/// connection gathers across regions.
+#[derive(Clone, Copy, Debug)]
 struct Carry {
-    bytes: [u8; HEAD],
+    bytes: [u8; PRIORITY_VALUE_MAX],
     len: usize,
+}
+
+impl Default for Carry {
+    fn default() -> Self {
+        Self {
+            bytes: [0; PRIORITY_VALUE_MAX],
+            len: 0,
+        }
+    }
 }
 
 /// A header block that the connection reads.
@@ -364,7 +386,8 @@ impl Connection {
     /// Makes the connection of `role` within `limits` and drives within `turn`, and queues its
     /// preface in `outbound`: for a client the 24 bytes of [`PREFACE`] and a SETTINGS frame, and
     /// for a server a SETTINGS frame. The frame has each setting that is not its initial value,
-    /// in the order of the identifiers, and then for a client `SETTINGS_ENABLE_PUSH` 0. When
+    /// in the order of the identifiers, then for a client `SETTINGS_ENABLE_PUSH` 0, and then
+    /// `SETTINGS_NO_RFC7540_PRIORITIES` 1 (RFC 9218, section 2.1). When
     /// `limits.connection_window` is above 65,535, a WINDOW_UPDATE on stream 0 follows, which
     /// raises the connection window to it.
     ///
@@ -424,6 +447,7 @@ impl Connection {
             acknowledged: false,
             peer: Settings::INITIAL,
             preface: false,
+            peer_priorities: None,
             decoder: Decoder::new(header, budget)?,
             encoder: Encoder::new(limits.encoder_table_bytes, budget)?,
             header,
@@ -444,8 +468,9 @@ impl Connection {
             end: None,
             marks: None,
         };
-        // The settings that differ from their initial values, and then the push setting.
-        let mut settings = [0; 36];
+        // The settings that differ from their initial values, the push setting, and the
+        // priorities of RFC 9218, which the endpoint uses in place of those of RFC 7540.
+        let mut settings = [0; 42];
         let mut len = 0;
         let push = (role == Role::Client).then_some((ENABLE_PUSH, 0));
         for (id, value) in local
@@ -455,6 +480,7 @@ impl Connection {
             .filter(|((_, value), (_, initial))| value != initial)
             .map(|(entry, _)| entry)
             .chain(push)
+            .chain([(NO_RFC7540_PRIORITIES, 1)])
         {
             settings[len..len + 2].copy_from_slice(&id.to_be_bytes());
             settings[len + 2..len + 6].copy_from_slice(&value.to_be_bytes());
@@ -571,6 +597,53 @@ impl Connection {
     pub fn ping(&mut self, outbound: &mut Outbound, opaque: [u8; 8]) -> Result<(), Error> {
         self.writable(outbound)?;
         let frame = self.pooled(&Frame::Ping { ack: false, opaque }).ok_or_else(full)?;
+        push_region(outbound, frame)
+    }
+
+    /// Gives the response on `stream` of a server the priority `priority`, which the application
+    /// chose (RFC 9218, section 8). From the next frame, the send scheduler orders the stream by
+    /// it. A later PRIORITY_UPDATE of the client changes it again: the latest signal wins.
+    ///
+    /// Refuses, and changes nothing, for a client, and when the stream is not open
+    /// ([`Kind::Misuse`](crate::drive::Kind::Misuse)).
+    pub fn prioritize(&mut self, stream: u32, priority: Priority) -> Result<(), Error> {
+        if self.role == Role::Client {
+            return Err(Error::new(
+                ErrorKind::Misuse,
+                "a client asks for a priority with priority_update",
+            ));
+        }
+        self.streams.prioritize(stream, priority)
+    }
+
+    /// Sends a PRIORITY_UPDATE that asks the server to send the response on `stream` with
+    /// `priority` (RFC 9218, section 7.1). It sends nothing when the SETTINGS of the server did not
+    /// have `SETTINGS_NO_RFC7540_PRIORITIES` 1, because such a server ignores the frame (section
+    /// 2.1.1).
+    ///
+    /// Refuses, and writes nothing, for a server, after the end of the connection, and when the
+    /// stream is not open ([`Kind::Misuse`](crate::drive::Kind::Misuse)), and when the output
+    /// queue or the frame pool is full ([`Kind::Overload`](crate::drive::Kind::Overload)).
+    pub fn priority_update(&mut self, outbound: &mut Outbound, stream: u32, priority: Priority) -> Result<(), Error> {
+        if self.role == Role::Server {
+            return Err(Error::new(ErrorKind::Misuse, "a server sends no PRIORITY_UPDATE"));
+        }
+        if self.end.is_some() {
+            return Err(Error::new(ErrorKind::Misuse, "the connection ended"));
+        }
+        if !self.streams.is_open(stream) {
+            return Err(Error::new(ErrorKind::Misuse, "the stream is not open"));
+        }
+        if self.preface && self.peer_priorities != Some(true) {
+            return Ok(());
+        }
+        self.writable(outbound)?;
+        let field = priority.field();
+        let update = Frame::PriorityUpdate {
+            prioritized: stream,
+            value: field.value(),
+        };
+        let frame = self.pooled(&update).ok_or_else(full)?;
         push_region(outbound, frame)
     }
 
@@ -701,8 +774,8 @@ impl Connection {
 
     /// Gives `data`, the next chunk of the body of `stream`, to the send scheduler, with no copy.
     /// `end_stream` ends the body with the last byte of the chunk. In each drive, the scheduler
-    /// sends one DATA frame of at most 16,384 bytes for each stream in turn, within the two send
-    /// windows, as views of `data`. When the chunk is all in the output queue, the drive gives
+    /// sends DATA frames of at most 16,384 bytes in the order of the priorities of the streams,
+    /// within the two send windows, as views of `data`. When the chunk is all in the output queue, the drive gives
     /// [`Event::Sent`]: give the next chunk then. A stream holds one chunk at a time, so a
     /// stream that waits for credit holds back only itself.
     ///
@@ -1103,7 +1176,7 @@ impl Connection {
                         let boundary = self.carry.len == 0 && self.block.is_none();
                         return Ok(self.wait(inbound, boundary));
                     }
-                    let head = Head::parse(self.carry.bytes);
+                    let head = Head::parse(self.carry.bytes.first_chunk().copied().ok_or(internal())?);
                     let fixed = self.begin(&head)?;
                     if head.kind == Kind::Headers && self.streams.waits(head.stream) {
                         // The header stays in the carry, and a later drive reads it again.
@@ -1225,15 +1298,44 @@ impl Connection {
                     if self.role == Role::Client && id == ENABLE_PUSH && value == 1 {
                         return Err(Fault::peer(ErrorCode::PROTOCOL_ERROR, "the server enabled push"));
                     }
+                    if id == NO_RFC7540_PRIORITIES {
+                        // RFC 9218, section 2.1: the value cannot change, the rule of nghttp2.
+                        if self.peer_priorities.is_some_and(|uses| uses != (value == 1)) {
+                            return Err(Fault::peer(
+                                ErrorCode::PROTOCOL_ERROR,
+                                "the peer changed SETTINGS_NO_RFC7540_PRIORITIES",
+                            ));
+                        }
+                        self.peer_priorities = Some(value == 1);
+                    }
                     self.peer.apply(id, value);
                     if id == INITIAL_WINDOW_SIZE {
                         self.window_peak = self.window_peak.max(value);
                     }
                     self.read = Read::Body(head, Fixed::Settings, left - 6);
                 }
+                Read::Body(head, Fixed::PriorityUpdate(prioritized), left) => {
+                    let len = left as usize;
+                    if len > PRIORITY_VALUE_MAX {
+                        self.read = Read::Body(head, Fixed::Unknown, left);
+                        continue;
+                    }
+                    if !self.gather(len, inbound, &mut work)? {
+                        return Ok(self.wait(inbound, false));
+                    }
+                    self.read = Read::Head;
+                    let priority = Priority::parse(&self.carry.bytes[..len]);
+                    self.carry.len = 0;
+                    // A value that does not parse is ignored (RFC 9218, section 7), as nghttp2
+                    // does.
+                    if let Some(priority) = priority {
+                        self.streams.priority_update(prioritized, priority)?;
+                    }
+                }
                 Read::Body(head, fixed, left) => {
-                    // The debug data of a GOAWAY, the payload of an unknown type, and a DATA
-                    // payload that the stream layer discards: discarded, with no copy.
+                    // The debug data of a GOAWAY, the payload of an unknown type, the value of a
+                    // PRIORITY_UPDATE past its bound, and a DATA payload that the stream layer
+                    // discards: discarded, with no copy.
                     let mut left = left;
                     if !skip(inbound, &mut left, &mut work)? {
                         self.read = Read::Body(head, fixed, left);
@@ -1410,6 +1512,19 @@ impl Connection {
                 self.read = Read::Head;
                 None
             }
+            // RFC 9218, section 7.1: only a client sends it. Push is off, so an even stream is a
+            // push stream in the idle state.
+            Fixed::PriorityUpdate(_) if self.role == Role::Client => {
+                return Err(Fault::peer(ErrorCode::PROTOCOL_ERROR, "a server sent PRIORITY_UPDATE"));
+            }
+            Fixed::PriorityUpdate(prioritized) if prioritized.is_multiple_of(2) => {
+                return Err(Fault::peer(
+                    ErrorCode::PROTOCOL_ERROR,
+                    "a PRIORITY_UPDATE names a push stream, and push is off",
+                ));
+            }
+            // The value is the variable part.
+            Fixed::PriorityUpdate(_) => None,
             Fixed::GoAway { .. } | Fixed::Unknown | Fixed::PushPromise { .. } => None,
         };
         Ok(event)
@@ -1448,8 +1563,21 @@ impl Connection {
             }
         };
         let first = lines.as_ref().and_then(|block| block.lines().next());
+        // The priority of a request (RFC 9218, section 5), which a new stream of a server takes.
+        let priority = match (&lines, self.role) {
+            (Some(block), Role::Server) => Priority::of_lines(
+                block
+                    .lines()
+                    .filter(|line| line.name == b"priority")
+                    .map(|line| line.value),
+            ),
+            _ => Priority::DEFAULT,
+        };
         Ok(
-            match self.streams.headers(stream, end_stream, first, self.acknowledged)? {
+            match self
+                .streams
+                .headers(stream, end_stream, (first, priority), self.acknowledged)?
+            {
                 Section::Head => Next::Event(Event::Headers {
                     stream,
                     end_stream,

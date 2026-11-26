@@ -15,6 +15,7 @@ use rsnetwork::buffer::{BufferMut, Lease, Pool, WriteLoan};
 use rsnetwork::drive::{Error, Kind};
 use rsnetwork::host::{Io as _, Wait};
 use rsnetwork::message::{RequestHead, Stream, Version};
+use rsnetwork::priority::Priority;
 use rsnetwork::server::{Closed, Delivery, Http as Core, Response};
 use rsnetwork::time::Deadline;
 use rsnetwork::tls::{ExportError, Negotiated};
@@ -227,6 +228,14 @@ impl Exchange {
     pub fn cancel(&mut self) {
         let stream = self.stream;
         self.shared.change(|server| server.cancel(stream));
+    }
+
+    /// Gives the response the priority `priority`, as
+    /// [`Http::prioritize`](rsnetwork::server::Http::prioritize) does: on HTTP/2, the connection
+    /// sends it in the order of its priority from the next frame.
+    pub fn prioritize(&mut self, priority: Priority) {
+        let stream = self.stream;
+        self.shared.change(|server| server.prioritize(stream, priority));
     }
 
     /// How much of the response the transport accepted, or `None` before the response.

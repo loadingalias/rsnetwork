@@ -1,5 +1,6 @@
-//! The frame codec (RFC 9113, sections 4 and 6): the frame header, the checks of each frame type,
-//! and a parser and a writer for each frame.
+//! The frame codec (RFC 9113, sections 4 and 6, and the PRIORITY_UPDATE frame of RFC 9218,
+//! section 7.1): the frame header, the checks of each frame type, and a parser and a writer for
+//! each frame.
 
 use core::fmt;
 
@@ -40,6 +41,9 @@ pub(crate) const MAX_CONCURRENT_STREAMS: u16 = 0x3;
 pub(crate) const INITIAL_WINDOW_SIZE: u16 = 0x4;
 pub(crate) const MAX_FRAME_SIZE: u16 = 0x5;
 pub(crate) const MAX_HEADER_LIST_SIZE: u16 = 0x6;
+/// `SETTINGS_NO_RFC7540_PRIORITIES` (RFC 9218, section 2.1): 1 when the endpoint uses no
+/// priority signal of RFC 7540.
+pub(crate) const NO_RFC7540_PRIORITIES: u16 = 0x9;
 
 /// An error code (RFC 9113, section 7). A code that this crate does not know keeps its value,
 /// and it has no special meaning.
@@ -134,7 +138,10 @@ pub enum Kind {
     WindowUpdate,
     /// CONTINUATION, type 0x9.
     Continuation,
-    /// A type that RFC 9113 does not define. A receiver discards the frame (section 4.1).
+    /// PRIORITY_UPDATE of RFC 9218, type 0x10.
+    PriorityUpdate,
+    /// A type that neither RFC 9113 nor RFC 9218 defines. A receiver discards the frame
+    /// (section 4.1).
     Unknown(u8),
 }
 
@@ -152,6 +159,7 @@ impl Kind {
             0x7 => Self::GoAway,
             0x8 => Self::WindowUpdate,
             0x9 => Self::Continuation,
+            0x10 => Self::PriorityUpdate,
             code => Self::Unknown(code),
         }
     }
@@ -169,6 +177,7 @@ impl Kind {
             Self::GoAway => 0x7,
             Self::WindowUpdate => 0x8,
             Self::Continuation => 0x9,
+            Self::PriorityUpdate => 0x10,
             Self::Unknown(code) => code,
         }
     }
@@ -240,6 +249,8 @@ impl Head {
             Kind::GoAway => (Some(true), 8, false),
             Kind::WindowUpdate => (None, 4, true),
             Kind::Continuation => (Some(false), 0, false),
+            // RFC 9218, section 7.1: the stream identifier of the frame is 0.
+            Kind::PriorityUpdate => (Some(true), 4, false),
             Kind::Unknown(_) => (None, 0, false),
         };
         if connection.is_some_and(|connection| connection != (self.stream == 0)) {
@@ -308,6 +319,8 @@ pub(crate) enum Fixed {
     },
     WindowUpdate(u32),
     Continuation,
+    /// The prioritized stream of a PRIORITY_UPDATE.
+    PriorityUpdate(u32),
     Unknown,
 }
 
@@ -319,7 +332,8 @@ impl Fixed {
     /// 6.6). A stream that depends on itself is a connection error too: RFC 7540 made it an
     /// error, RFC 9113 does not define it, and a reset could hit an idle stream. A window
     /// increment of 0 is a stream error on a stream, and a connection error on the connection
-    /// (section 6.9).
+    /// (section 6.9). A PRIORITY_UPDATE for stream 0 is a connection error (RFC 9218, section
+    /// 7.1).
     pub(crate) fn parse(head: &Head, bytes: &[u8]) -> Result<Self, FrameError> {
         let protocol = FrameError::Connection(ErrorCode::PROTOCOL_ERROR);
         let (padding, rest) = match bytes.split_first() {
@@ -369,6 +383,10 @@ impl Fixed {
                 increment => Self::WindowUpdate(increment),
             },
             Kind::Continuation => Self::Continuation,
+            Kind::PriorityUpdate => match word(rest) & MAX_STREAM {
+                0 => return Err(protocol),
+                prioritized => Self::PriorityUpdate(prioritized),
+            },
             Kind::Unknown(_) => Self::Unknown,
         })
     }
@@ -398,6 +416,8 @@ pub(crate) fn check_setting(id: u16, value: u32) -> Result<(), FrameError> {
         ENABLE_PUSH if value > 1 => error(ErrorCode::PROTOCOL_ERROR),
         INITIAL_WINDOW_SIZE if value > MAX_STREAM => error(ErrorCode::FLOW_CONTROL_ERROR),
         MAX_FRAME_SIZE if !(MIN_FRAME_SIZE..=MAX_LENGTH).contains(&value) => error(ErrorCode::PROTOCOL_ERROR),
+        // RFC 9218, section 2.1.
+        NO_RFC7540_PRIORITIES if value > 1 => error(ErrorCode::PROTOCOL_ERROR),
         _ => Ok(()),
     }
 }
@@ -528,7 +548,16 @@ pub enum Frame<'a> {
         /// The flag END_HEADERS.
         end_headers: bool,
     },
-    /// A frame of a type that RFC 9113 does not define.
+    /// PRIORITY_UPDATE (RFC 9218, section 7.1), on stream 0: a client changes the priority of a
+    /// response.
+    PriorityUpdate {
+        /// The stream whose priority changes: not 0.
+        prioritized: u32,
+        /// The priority, in the form of the `priority` field: see
+        /// [`Priority::parse`](crate::priority::Priority::parse).
+        value: &'a [u8],
+    },
+    /// A frame of a type that neither RFC 9113 nor RFC 9218 defines.
     Unknown {
         /// The type code.
         kind: u8,
@@ -608,6 +637,10 @@ impl<'a> Frame<'a> {
                 stream,
                 fragment: variable,
                 end_headers: flag(END_HEADERS),
+            },
+            Fixed::PriorityUpdate(prioritized) => Self::PriorityUpdate {
+                prioritized,
+                value: variable,
             },
             Fixed::Unknown => Self::Unknown {
                 kind: head.kind.code(),
@@ -721,6 +754,13 @@ impl<'a> Frame<'a> {
                 fragment,
                 0,
             ),
+            Self::PriorityUpdate { prioritized, value } => {
+                if prioritized > MAX_STREAM {
+                    return Err(WriteError::Range);
+                }
+                fixed[..4].copy_from_slice(&prioritized.to_be_bytes());
+                (Kind::PriorityUpdate, 0, 0, 4, value, 0)
+            }
             Self::Unknown {
                 kind,
                 flags,
@@ -841,6 +881,11 @@ impl fmt::Debug for Frame<'_> {
                 .field("stream", &stream)
                 .field("fragment", &fragment.len())
                 .field("end_headers", &end_headers)
+                .finish(),
+            Self::PriorityUpdate { prioritized, value } => f
+                .debug_struct("PriorityUpdate")
+                .field("prioritized", &prioritized)
+                .field("value", &value.len())
                 .finish(),
             Self::Unknown {
                 kind,

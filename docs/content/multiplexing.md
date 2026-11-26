@@ -1,9 +1,9 @@
 # Send many HTTP/2 streams on one connection
 
 The HTTP/2 engine, `h2::Connection`, sends the body of each stream from a send slot of that stream.
-In each drive, its send scheduler shares the connection between the streams in turn. A slow
-consumer at the peer holds back only its own stream, and a slow consumer of yours holds back only
-its own stream when the connection window follows the rule on this page.
+In each drive, its send scheduler shares the connection between the streams by their priority
+(RFC 9218). A slow consumer at the peer holds back only its own stream, and a slow consumer of
+yours holds back only its own stream when the connection window follows the rule on this page.
 
 rsnetwork is in development and has no release. The [client](client.md#http2) and the
 [server](server.md#streams) run this scheduler for each stream. This page is about the engine: see
@@ -31,17 +31,38 @@ refuses with `Kind::Misuse`.
 The example of [Run an HTTP/2 connection with no I/O](http2.md#example) sends a response body in one
 chunk with `end_stream`, and a drive sends it.
 
-## How the connection shares its streams
+## How the connection orders its streams
 
-The streams whose chunk can go out are in a ring, in their order of arrival. The scheduler visits
-the stream at the front of the ring and sends one DATA frame of at most 16,384 bytes, within the
-stream window and the connection window. Then the stream goes to the end of the ring. Thus each
-stream that can send gets one frame in each turn of the ring (round-robin). Each stream has the same
-share.
+The streams whose chunk can go out are in the schedule of the connection. Each visit of the
+scheduler sends one DATA frame of at most 16,384 bytes, within the stream window and the connection
+window. The priority of each stream decides the order (RFC 9218, section 10):
 
-- A stream whose send window has no credit leaves the ring, and its chunk waits in its slot. A
+1. A higher urgency goes first. A stream of urgency 0 sends before a stream of urgency 1, and so on
+   to urgency 7. A stream sends only when no stream of a higher urgency can send.
+2. The streams of one urgency share it in turns (round-robin): one DATA frame for each turn. Each
+   incremental stream has a turn of its own.
+3. The streams of one urgency that are not incremental share one turn, the turn of their group. In
+   it, the stream with the lowest identifier sends until its chunk is out or it has no credit. Thus
+   these streams go one at a time, in the order of their requests, and they do not starve the
+   incremental streams of their urgency, nor do those starve them.
+
+A request with no priority has urgency 3 and is not incremental (RFC 9218, section 4). The
+request bodies of a client go in turn: the client gives its own streams urgency 3, as incremental
+streams, so each has the same share.
+
+The order of the DATA frames of streams whose chunks of 3 frames are all ready, from the test
+`responses_go_by_urgency_and_share_the_connection_only_when_incremental`:
+
+| Streams, with urgency and the incremental flag | DATA frames |
+| --- | --- |
+| 1 (5), 3 (1) | 3, 3, 3, 1, 1, 1 |
+| 1 (3, incremental), 3 (3, incremental) | 1, 3, 1, 3, 1, 3 |
+| 1 (3), 3 (3): no signal | 1, 1, 1, 3, 3, 3 |
+| 1 (3), 3 (3, incremental), 5 (3) | 1, 3, 1, 3, 1, 3, 5, 5, 5 |
+
+- A stream whose send window has no credit leaves the schedule, and its chunk waits in its slot. A
   WINDOW_UPDATE of the peer on the stream, or a larger `SETTINGS_INITIAL_WINDOW_SIZE`, puts it back
-  at the end of the ring.
+  at its place: the end of the turns of its urgency, or its place in its group.
 - When the connection window has no credit, no stream sends until a WINDOW_UPDATE of the peer on
   stream 0.
 - The output queue holds only DATA frames that can go now, so no frame waits in it for credit.
@@ -53,11 +74,48 @@ share.
 
 16,384 bytes is the smallest `SETTINGS_MAX_FRAME_SIZE`, so each peer takes the frames.
 
+## Set the priority of a response
+
+A priority is a `priority::Priority`: an `Urgency` from 0, the highest, to 7, the lowest, and the
+flag `incremental`. An incremental response is of use in parts, for example a progressive image. A
+response that is not incremental is of use only when it is complete, for example a script.
+
+| Who | Call | When it applies |
+| --- | --- | --- |
+| A client, with its request | Give `priority.field()` in the fields of the request: the `priority` field (RFC 9218, section 5) | From the first frame of the response |
+| A client, later | `client::Http2::prioritize(stream, priority, now)`, or `h2::Connection::priority_update` on the engine: a PRIORITY_UPDATE (section 7.1) | When the server reads the frame |
+| A server | `server::Http::prioritize(stream, priority)`, or `h2::Connection::prioritize` on the engine | From the next frame |
+
+```rust
+use rsnetwork::priority::{Priority, Urgency};
+
+// An image that the client shows as its bytes arrive.
+let image = Priority { urgency: Urgency::new(5)?, incremental: true };
+let fields = [image.field()]; // the field line `priority: u=5, i`
+```
+
+- The latest signal wins, of the client or of the server. The streams of a client compete only
+  with each other, so a later update of the client states the current need of its user.
+- A PRIORITY_UPDATE that comes before its request applies when the stream opens, and it wins over
+  the `priority` field of the request. With the open streams, the idle streams with such an update
+  stay within `max_concurrent_streams`: one more is a connection error `PROTOCOL_ERROR`.
+- A value that is not a Structured Field Dictionary (RFC 9651) is ignored, and so is a parameter
+  out of its range or of another type: it keeps its default. `Priority::parse` reads one value, and
+  `Priority::of_lines` reads the lines of a field, for example of a request head.
+- A client sends no PRIORITY_UPDATE to a server whose SETTINGS did not have
+  `SETTINGS_NO_RFC7540_PRIORITIES` 1, because such a server ignores it (section 2.1.1). Each
+  endpoint of rsnetwork sends that setting.
+- HTTP/1.1 carries one stream at a time, so there `server::Http::prioritize` changes nothing.
+
+A priority is a hint: RFC 9218 gives no endpoint a guarantee from it. Bound the time of a response
+with its deadline, not with its urgency.
+
 ## Isolate a slow consumer
 
 A slow consumer at the peer: the peer gives no more credit to its stream, so the stream leaves the
-ring. The other streams go on, and the stream keeps only its chunk, a view of your region. The
-engine has no deadline for it. Bound its time with your own deadline, and then reset the stream.
+schedule. The other streams go on, also when the slow stream has the highest urgency, and the
+stream keeps only its chunk, a view of your region. The engine has no deadline for it. Bound its
+time with your own deadline, and then reset the stream.
 
 A slow consumer of yours: it holds the bytes that it received until it calls `release`. The peer
 can fill the window of a stream with no WINDOW_UPDATE, so a consumer that releases nothing holds

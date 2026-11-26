@@ -3,7 +3,8 @@
 //! [`value`] holds the checked values of HTTP: methods, request targets, statuses, field lines,
 //! authorities, and schemes. Each protocol of the core uses them. [`message`] is the message model
 //! that each protocol shares: the heads of a received request and response, and the stream of
-//! each exchange.
+//! each exchange. [`priority`] is the priority of a response (RFC 9218), which HTTP/2 and HTTP/3
+//! schedule by.
 //!
 //! [`client`] and [`server`] are the application API: an HTTP/1.1 client and an HTTP/2 client, and
 //! one server for HTTP/1.1 and HTTP/2. Each is one connection with no I/O.
@@ -51,10 +52,12 @@ pub mod host;
 pub mod hpack;
 mod link;
 pub mod message;
+pub mod priority;
 pub mod qpack;
 #[cfg(feature = "tls")]
 pub mod quic;
 pub mod server;
+mod structured;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub mod value;

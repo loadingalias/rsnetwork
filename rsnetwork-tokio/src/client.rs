@@ -10,6 +10,7 @@ use rsnetwork::client::{Http1 as Core, Http2 as Core2, Request};
 use rsnetwork::drive::{Error, Kind};
 use rsnetwork::host::Io as _;
 use rsnetwork::message::{ResponseHead, Stream};
+use rsnetwork::priority::Priority;
 use rsnetwork::time::Deadline;
 use rsnetwork::tls::{ExportError, Negotiated};
 use rsnetwork::value::Field;
@@ -334,6 +335,17 @@ impl Exchange {
     /// the part that arrived.
     pub fn delivered(&self) -> u64 {
         self.shared.lock().socket.connection_mut().delivered(self.stream)
+    }
+
+    /// Asks the server to send the response with `priority`, as
+    /// [`Http2::prioritize`](rsnetwork::client::Http2::prioritize) does. It waits while the
+    /// output has no room.
+    pub async fn prioritize(&mut self, priority: Priority) -> Result<(), Error> {
+        let stream = self.stream;
+        let sent = self.shared.until(Waits::Place(Some(stream)), |client, now| {
+            Ok(client.prioritize(stream, priority, now)?.then_some(()))
+        });
+        sent.await?.ok_or(ENDED)
     }
 }
 
