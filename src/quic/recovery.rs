@@ -15,7 +15,7 @@ use super::congestion::{CongestionControl, Controller};
 use super::connection::DATAGRAM_MIN;
 use super::frame::{Ack, EcnCounts, Frame};
 use super::packet::{BuildError, Builder};
-use super::path::{Mtu, Path, Validation};
+use super::path::{Mtu, Path, Probe, Validation};
 use super::reassembly::grow;
 use super::stream::StreamId;
 use super::{ConnectionId, VARINT_MAX, Writer, varint_len};
@@ -732,6 +732,9 @@ pub(super) struct Paths {
     pub(super) active: PathState,
     /// The validation of the active path, with the path that the connection came from.
     pub(super) validation: Option<Validation>,
+    /// The validation of the path to or from the preferred address of the server, before the
+    /// connection moves to it.
+    pub(super) probe: Option<Probe>,
     /// The send credit of one address with no validation that does not carry the connection. It
     /// is the newest such address that a datagram came from, or that the connection left. Each
     /// address has one credit, here or in its [`PathState`], so no datagram pays for two sends.
@@ -746,6 +749,7 @@ impl Paths {
             store: Store::new(budget),
             active,
             validation: None,
+            probe: None,
             off_path: None,
             next: 1,
         }

@@ -40,7 +40,7 @@ impl Connection {
             let tls = core::mem::replace(&mut self.tls, Tls::Failed);
             let input = &mut self.spaces[level as usize].receive;
             let config = match &mut self.end {
-                End::Server { config, parameters } => Some((Arc::clone(config), parameters)),
+                End::Server { config, parameters, .. } => Some((Arc::clone(config), parameters)),
                 End::Client { .. } => None,
             };
             let step = Self::step(tls, input, config, &mut self.events);
@@ -244,6 +244,15 @@ impl Connection {
         self.validate(&parameters)?;
         self.ids
             .first_peer(self.paths.active.remote_cid, parameters.stateless_reset_token);
+        if let Some(preferred) = parameters.preferred_address {
+            self.ids
+                .preferred_peer(preferred.connection_id, preferred.reset_token)
+                .map_err(|code| Failure::transport(code, 0, PARAMETERS))?;
+            let chosen = self.server_address(&preferred);
+            if let End::Client { preferred: slot, .. } = &mut self.end {
+                *slot = chosen;
+            }
+        }
         self.peer = Some(parameters);
         self.streams.peer(&parameters);
         self.paths.active.ack_delay_max = parameters.ack_delay_max;
@@ -253,8 +262,10 @@ impl Connection {
             (local, remote) => local.or(remote),
         };
         self.read = Level::Data;
+        // The connection ID of a preferred address is the second ID of its server.
         if !self.local_cid.as_bytes().is_empty()
             && (self.issuer.is_some() || parameters.stateless_reset_token.is_some())
+            && self.ids.has_room()
         {
             self.issue_id()?;
         }
@@ -272,12 +283,32 @@ impl Connection {
         Ok(())
     }
 
+    /// The preferred address of the server that the client validates after the handshake: the
+    /// address of the family of the handshake path, because the client sends from the local
+    /// address of that path. Gives `None` when the limits keep the handshake address, and when
+    /// the server gives no other address of that family. An address of zero bytes, or with the
+    /// port zero, is no address (RFC 9000, section 18.2).
+    fn server_address(&self, preferred: &PreferredAddress) -> Option<SocketAddr> {
+        if self.limits.server_address == ServerAddress::Handshake {
+            return None;
+        }
+        let handshake = self.paths.active.addresses.peer;
+        let address = match handshake {
+            SocketAddr::V4(_) => SocketAddr::from((preferred.ipv4.0, preferred.ipv4.1)),
+            SocketAddr::V6(_) => SocketAddr::from((preferred.ipv6.0, preferred.ipv6.1)),
+        };
+        (!address.ip().is_unspecified() && address.port() != 0 && address != handshake).then_some(address)
+    }
+
     /// Checks the connection IDs that the peer names in its parameters against the ones of its
     /// packets (RFC 9000, section 7.3).
     fn validate(&self, parameters: &Parameters) -> Result<(), Failure> {
         let invalid = || Failure::transport(ErrorCode::TRANSPORT_PARAMETER_ERROR, 0, PARAMETERS);
+        // A server with a connection ID of no bytes gives no reset token and no preferred address
+        // (RFC 9000, section 18.2).
+        let empty = self.paths.active.remote_cid.as_bytes().is_empty();
         if parameters.initial_source_cid != self.initial_peer
-            || (parameters.stateless_reset_token.is_some() && self.paths.active.remote_cid.as_bytes().is_empty())
+            || (empty && (parameters.stateless_reset_token.is_some() || parameters.preferred_address.is_some()))
         {
             return Err(invalid());
         }

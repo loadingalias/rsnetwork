@@ -62,12 +62,27 @@ impl Ids {
         self.remote[0] = Some(Id { sequence: 0, id, reset });
     }
 
+    /// Takes the connection ID of the preferred address of the server, with its sequence number 1
+    /// (RFC 9000, section 5.1.1). Refuses an ID or a token that the handshake ID has.
+    pub(super) fn preferred_peer(&mut self, id: ConnectionId, reset: [u8; 16]) -> Result<(), ErrorCode> {
+        let first = self.remote[0].ok_or(ErrorCode::PROTOCOL_VIOLATION)?;
+        if first.id == id || first.reset == Some(reset) {
+            return Err(ErrorCode::TRANSPORT_PARAMETER_ERROR);
+        }
+        self.remote[1] = Some(Id {
+            sequence: 1,
+            id,
+            reset: Some(reset),
+        });
+        Ok(())
+    }
+
     pub(super) fn peer(&self, cid: ConnectionId) -> Option<Id> {
         self.remote.iter().flatten().find(|p| p.id == cid).copied()
     }
 
     /// A connection ID of the peer that no path uses. `used` has the ID of each path.
-    pub(super) fn spare(&self, used: [ConnectionId; 2]) -> Option<Id> {
+    pub(super) fn spare(&self, used: [ConnectionId; 3]) -> Option<Id> {
         self.remote.iter().flatten().find(|p| !used.contains(&p.id)).copied()
     }
 
@@ -97,6 +112,22 @@ impl Ids {
             send: true,
         });
         Ok(())
+    }
+
+    /// Issues the connection ID of the preferred address, which the transport parameters carry
+    /// with its token, so no NEW_CONNECTION_ID frame carries it. It is the second ID, with the
+    /// sequence number 1 (RFC 9000, section 5.1.1).
+    pub(super) fn offer(&mut self, id: ConnectionId, reset: [u8; 16]) -> Result<(), ErrorCode> {
+        self.issue(id, reset)?;
+        if let Some(local) = self.local.iter_mut().flatten().find(|l| l.id.id == id) {
+            local.send = false;
+        }
+        Ok(())
+    }
+
+    /// Whether this end can issue one more connection ID.
+    pub(super) fn has_room(&self) -> bool {
+        self.local.iter().any(Option::is_none)
     }
 
     pub(super) fn retire_local(&mut self, sequence: u64, destination: ConnectionId) -> Result<bool, ErrorCode> {

@@ -176,8 +176,16 @@ impl Connection {
             .and_then(|keys| keys.previous.as_ref().map(|(_, until)| *until));
         let handshake = if self.confirmed { None } else { self.handshake_deadline };
         let validation = self.paths.validation.as_ref().map(|validation| validation.until);
+        let probe = self
+            .paths
+            .probe
+            .as_ref()
+            .map(|probe| earlier(Some(probe.next), Some(probe.until)));
         Ok(earlier(
-            earlier(earlier(self.idle_deadline()?, handshake), validation),
+            earlier(
+                earlier(self.idle_deadline()?, handshake),
+                earlier(validation, probe.flatten()),
+            ),
             earlier(
                 earlier(previous, self.recovery_timer().map(|(at, _)| at)),
                 self.paths.active.pacing_wait,
@@ -295,6 +303,7 @@ impl Connection {
         {
             return Err(NO_PATH);
         }
+        self.probe_ended(now)?;
         if let Some((at, alarm)) = self.recovery_timer()
             && reached(Some(at), now)?
         {
@@ -493,13 +502,17 @@ impl Connection {
             return Ok(());
         };
         // Another path carries only 1-RTT packets, after the handshake is confirmed. A server takes
-        // each path. A client takes only the path that it left, and no other address of the
-        // server (RFC 9000, section 9).
+        // each path. A client takes only the path that it left, the path to the preferred address
+        // of the server, and after its move there, the path of the handshake, where the server
+        // sends until it validates its preferred address. It takes no other address of the server
+        // (RFC 9000, sections 9 and 9.6).
         let known = self
             .paths
             .validation
             .as_ref()
-            .is_some_and(|validation| validation.fallback.addresses == path);
+            .is_some_and(|validation| validation.fallback.addresses == path)
+            || self.paths.probe.as_ref().is_some_and(|probe| probe.path == path)
+            || matches!(self.end, End::Client { left: Some(left), .. } if left == path);
         if !active && !(level == Level::Data && self.confirmed && (server || known)) {
             return Ok(());
         }
@@ -565,6 +578,18 @@ impl Connection {
         }
         let number = packet.number();
         if self.spaces[level as usize].ranges.seen(number) {
+            return Ok(());
+        }
+        // After its move to its preferred address, a server drops each newer packet that arrives
+        // at the address that it left, and reads a delayed one (RFC 9000, section 9.6.2).
+        if let End::Server {
+            left: Some((local, largest)),
+            ..
+        } = self.end
+            && level == Level::Data
+            && path.local == local
+            && number > largest
+        {
             return Ok(());
         }
         // Another address counts only a datagram whose first packet opens, so no forged datagram
@@ -665,7 +690,14 @@ impl Connection {
                     {
                         self.non_probing = Some(reading.number);
                         if server && reading.path != self.paths.active.addresses {
-                            self.moved(reading.path, reading.received_at)?;
+                            // A server validates the path from its preferred address before it
+                            // sends there (RFC 9000, section 9.6.2).
+                            if self.to_preferred(reading.path) {
+                                self.probe_preferred(reading.path, reading.received_at)
+                                    .map_err(Failure::local)?;
+                            } else {
+                                self.moved(reading.path, reading.received_at)?;
+                            }
                         }
                     }
                     if let Some(at) = reading.first_datagram {
@@ -737,6 +769,7 @@ impl Connection {
                 }
                 Frame::HandshakeDone if !server && !handshake_level => {
                     self.confirm();
+                    self.prefer(reading.received_at).map_err(Failure::local)?;
                     Ok(None)
                 }
                 Frame::HandshakeDone => {

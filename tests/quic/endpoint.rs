@@ -1,7 +1,7 @@
 //! The server listener processes real packets from the client engine, also when the client moves
 //! to a new local address.
 
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use core::num::NonZeroUsize;
 use std::assert_matches;
 use std::sync::Arc;
@@ -14,8 +14,9 @@ use rsnetwork::quic::packet::{self, Builder, Datagrams, Header, Outgoing, Side};
 use rsnetwork::quic::params::{Parameters, PreferredAddress};
 use rsnetwork::quic::{
     Connection, ConnectionId, Endpoint, EndpointKeys, EndpointLimits, Handle, Limits, Path, PeerClose,
-    REDEEMED_BYTES_DEFAULT, Route,
+    REDEEMED_BYTES_DEFAULT, Route, ServerAddress,
 };
+use rsnetwork::time::Instant;
 use rsnetwork::tls::{ClientConfig, Resumption, ServerConfig};
 
 /// The path of the listener for a client at the port `port` of the loopback address.
@@ -375,7 +376,7 @@ fn retired_connection_ids_leave_the_route_and_a_stateless_reset_drains_the_peer(
         peer: (Ipv4Addr::new(127, 0, 0, 2), SERVER_PORT).into(),
         ..client.path()
     };
-    arrive(&mut client, elsewhere, reply[..n].to_vec());
+    arrive(&mut client, elsewhere, reply[..n].to_vec(), at(0));
     assert_eq!(client.peer_close(), None);
     Pair::give(&mut client, reply[..n].to_vec(), at(0));
     assert_eq!(client.peer_close(), Some(PeerClose::StatelessReset));
@@ -453,12 +454,18 @@ fn mirror(route: Path) -> Path {
     }
 }
 
-/// Each datagram that `connection` sends now, with its path.
-fn routed(connection: &mut Connection) -> Vec<(Path, Vec<u8>)> {
+/// Each datagram that `connection` sends at `now`, with its path, after its timers at `now`.
+fn routed(connection: &mut Connection, now: Instant) -> Vec<(Path, Vec<u8>)> {
+    for _ in 0..64 {
+        let (event, turn) = connection.drive(now);
+        if event.is_none() && turn.progress != Progress::Pending {
+            break;
+        }
+    }
     let mut datagrams = Vec::new();
     let mut out = vec![0; 1500];
     for _ in 0..64 {
-        match connection.transmit(&mut out, NonZeroUsize::MIN, at(0)).unwrap() {
+        match connection.transmit(&mut out, NonZeroUsize::MIN, now).unwrap() {
             Some(sent) => datagrams.push((sent.path, out[..sent.len].to_vec())),
             None => return datagrams,
         }
@@ -466,12 +473,12 @@ fn routed(connection: &mut Connection) -> Vec<(Path, Vec<u8>)> {
     panic!("a connection sends at most 64 datagrams at once");
 }
 
-/// Gives `datagram` to `connection` as a datagram that arrived on `route`.
-fn arrive(connection: &mut Connection, route: Path, datagram: Vec<u8>) {
+/// Gives `datagram` to `connection` as a datagram that arrived on `route` at `now`.
+fn arrive(connection: &mut Connection, route: Path, datagram: Vec<u8>, now: Instant) {
     let len = connection.local_cid().as_bytes().len();
     let mut datagrams = Datagrams::new(Backing::from(datagram), None, len);
     for _ in 0..64 {
-        let (event, turn) = connection.receive(&mut datagrams, route, at(0));
+        let (event, turn) = connection.receive(&mut datagrams, route, now);
         if event.is_none() && turn.progress != Progress::Pending {
             return;
         }
@@ -486,34 +493,219 @@ type Sent = Vec<(Path, ConnectionId)>;
 /// Moves the datagrams between `client` and its connection in `endpoint` until none moves, each
 /// on the path that its sender names. Gives the datagrams of the client, and of the server.
 fn shuttle(endpoint: &mut Endpoint, handle: Handle, client: &mut Connection) -> (Sent, Sent) {
-    let destination = |datagram: &[u8], len| match Header::parse(datagram, len) {
+    exchange(endpoint, handle, client, at(0), None)
+}
+
+/// The destination connection ID of a 1-RTT datagram whose IDs have `len` bytes.
+fn destination(datagram: &[u8], len: usize) -> ConnectionId {
+    match Header::parse(datagram, len) {
         Ok(Header::Protected { dcid, .. }) => dcid,
         _ => panic!("a 1-RTT packet"),
-    };
+    }
+}
+
+/// Moves the datagrams as [`shuttle`] does, at `now`. Each datagram of the client to the address
+/// `lost` drops on its way.
+fn exchange(
+    endpoint: &mut Endpoint,
+    handle: Handle,
+    client: &mut Connection,
+    now: Instant,
+    lost: Option<SocketAddr>,
+) -> (Sent, Sent) {
     let (mut up, mut down) = (Vec::new(), Vec::new());
     let mut reply = [0; 1200];
     for _ in 0..64 {
-        let to_server = routed(client);
+        let to_server = routed(client, now);
         let moved = !to_server.is_empty();
         for (route, datagram) in to_server {
-            let listener = endpoint.route(mirror(route), &datagram, &mut reply, at(0)).unwrap();
-            assert_eq!(listener, Route::Existing(handle));
             // The connection IDs of the listener have 17 bytes.
             up.push((route, destination(&datagram, 17)));
+            if Some(route.peer) == lost {
+                continue;
+            }
+            let listener = endpoint.route(mirror(route), &datagram, &mut reply, now).unwrap();
+            assert_eq!(listener, Route::Existing(handle));
             endpoint
-                .with_connection(handle, |c| arrive(c, mirror(route), datagram))
+                .with_connection(handle, |c| arrive(c, mirror(route), datagram, now))
                 .unwrap();
         }
-        let to_client = endpoint.with_connection(handle, routed).unwrap();
+        let to_client = endpoint.with_connection(handle, |c| routed(c, now)).unwrap();
         if !moved && to_client.is_empty() {
             return (up, down);
         }
         for (route, datagram) in to_client {
             down.push((route, destination(&datagram, client.local_cid().as_bytes().len())));
-            arrive(client, mirror(route), datagram);
+            arrive(client, mirror(route), datagram, now);
         }
     }
     panic!("the connection is not quiet after 64 rounds");
+}
+
+/// The port of the preferred address of the listener, on the loopback address.
+const PREFERRED_PORT: u16 = 8443;
+
+/// A listener that gives the preferred address at [`PREFERRED_PORT`], and a client at
+/// [`CLIENT_PORT`] with `limits` after its handshake.
+fn preferred(limits: Limits) -> (Endpoint, Handle, Connection) {
+    let (config, server, keys) = configs();
+    let mut endpoint = listener(&server, &keys, 2);
+    let preferred = SocketAddrV4::new(Ipv4Addr::LOCALHOST, PREFERRED_PORT);
+    endpoint.prefer(Some(preferred), None).unwrap();
+    let route = path(CLIENT_PORT, SERVER_PORT);
+    let mut client = Connection::client(&config, "server.test", route, limits, &budget(), at(0)).unwrap();
+    // Each datagram goes on the path that its sender names, and the handshake ends when the
+    // client is confirmed, before its next datagram.
+    let mut reply = [0; 1200];
+    let mut accepted = None;
+    for _ in 0..64 {
+        for (route, datagram) in routed(&mut client, at(0)) {
+            let handle = match endpoint.route(mirror(route), &datagram, &mut reply, at(0)).unwrap() {
+                Route::Accepted(handle) | Route::Existing(handle) => handle,
+                other => panic!("unexpected handshake route {other:?}"),
+            };
+            accepted = Some(handle);
+            endpoint
+                .with_connection(handle, |c| arrive(c, mirror(route), datagram, at(0)))
+                .unwrap();
+        }
+        let handle = accepted.unwrap();
+        for (route, datagram) in endpoint.with_connection(handle, |c| routed(c, at(0))).unwrap() {
+            arrive(&mut client, mirror(route), datagram, at(0));
+        }
+        if client.is_confirmed() {
+            return (endpoint, handle, client);
+        }
+    }
+    panic!("the in-memory handshake did not finish")
+}
+
+/// Gives each datagram of `datagrams` to the connection of `endpoint` on the path that `sent`, the
+/// path of its sender, mirrors.
+fn give_server(endpoint: &mut Endpoint, handle: Handle, datagrams: Vec<(Path, Vec<u8>)>, sent: Path) {
+    let mut reply = [0; 1200];
+    for (_, datagram) in datagrams {
+        let listener = endpoint.route(mirror(sent), &datagram, &mut reply, at(0)).unwrap();
+        assert_eq!(listener, Route::Existing(handle));
+        endpoint
+            .with_connection(handle, |c| arrive(c, mirror(sent), datagram, at(0)))
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_client_validates_the_preferred_address_moves_there_and_the_server_follows_after_its_own_validation() {
+    let (mut endpoint, handle, mut client) = preferred(Limits::DEFAULT);
+    let (home, there) = (path(CLIENT_PORT, SERVER_PORT), path(CLIENT_PORT, PREFERRED_PORT));
+    let server_path = |endpoint: &mut Endpoint| endpoint.with_connection(handle, |c| c.path()).unwrap();
+    // After the handshake, the client sends one PATH_CHALLENGE to the preferred address, and it
+    // stays on its path until the answer (RFC 9000, section 9.6.1).
+    let (probe, acks): (Vec<_>, Vec<_>) = routed(&mut client, at(0))
+        .into_iter()
+        .partition(|(route, _)| *route == there);
+    assert!(acks.iter().all(|(route, _)| *route == home));
+    give_server(&mut endpoint, handle, acks, home);
+    assert_eq!((probe.len(), probe[0].1.len(), client.path()), (1, 1200, home));
+    let (old_up, probe_up) = (
+        endpoint.with_connection(handle, |c| *c.local_cid()).unwrap(),
+        destination(&probe[0].1, 17),
+    );
+    assert_ne!(
+        old_up, probe_up,
+        "the probe takes the connection ID of the preferred address"
+    );
+    // The server answers from the address that the challenge arrived at, in a datagram of 1,200
+    // bytes, and acknowledges on its path, where it stays.
+    give_server(&mut endpoint, handle, probe, there);
+    let answer = endpoint.with_connection(handle, |c| routed(c, at(0))).unwrap();
+    let from = |datagrams: &[(Path, Vec<u8>)], route| {
+        let sent = datagrams.iter().filter(|(sent, _)| *sent == route);
+        sent.map(|(_, datagram)| datagram.len()).collect::<Vec<_>>()
+    };
+    assert_eq!(from(&answer, mirror(there)), [1200]);
+    assert_eq!(from(&answer, mirror(home)).len() + 1, answer.len());
+    assert_eq!(server_path(&mut endpoint), mirror(home));
+    for (route, datagram) in answer {
+        arrive(&mut client, mirror(route), datagram, at(0));
+    }
+    assert_eq!(client.path(), there);
+    // The first packet of the client that is not a probe arrives there. The server then
+    // validates the path from its preferred address, and sends from its first address until the
+    // answer (RFC 9000, section 9.6.2).
+    let moved = routed(&mut client, at(0));
+    assert!(!moved.is_empty() && moved.iter().all(|(route, _)| *route == there));
+    give_server(&mut endpoint, handle, moved, there);
+    assert_eq!(server_path(&mut endpoint), mirror(home));
+    exchange(&mut endpoint, handle, &mut client, at(0), None);
+    assert_eq!((client.path(), server_path(&mut endpoint)), (there, mirror(there)));
+    // The connection goes on there. The client retired the connection ID of the handshake, and
+    // the listener routes it no more.
+    client.ping();
+    let (up, down) = exchange(&mut endpoint, handle, &mut client, at(0), None);
+    assert!(!up.is_empty() && up.iter().all(|(route, id)| *route == there && *id != old_up));
+    assert!(!down.is_empty() && down.iter().all(|(route, _)| *route == mirror(there)));
+    let ids = endpoint.with_connection(handle, |c| c.local_ids()).unwrap();
+    assert!(!ids.contains(&Some(old_up)));
+}
+
+#[test]
+fn a_client_that_gets_no_answer_from_the_preferred_address_stays_on_the_handshake_address() {
+    let (mut endpoint, handle, mut client) = preferred(Limits::DEFAULT);
+    let (home, there) = (path(CLIENT_PORT, SERVER_PORT), path(CLIENT_PORT, PREFERRED_PORT));
+    let mut probes = 0;
+    for ms in (0..=4000).step_by(100) {
+        client.ping();
+        let (up, down) = exchange(&mut endpoint, handle, &mut client, at(ms), Some(there.peer));
+        probes += up.iter().filter(|(route, _)| *route == there).count();
+        // Each packet that is not a probe goes on the path of the handshake, and its answer comes
+        // back there (RFC 9000, section 9.6.1).
+        assert_eq!(client.path(), home, "at {ms} ms");
+        assert!(up.iter().any(|(route, _)| *route == home) && down.iter().all(|(route, _)| *route == mirror(home)));
+        if ms == 500 {
+            // The two connection IDs of the server are on the path of the handshake and on the
+            // probe, so no third path has an ID (RFC 9000, section 9.5).
+            assert_eq!(client.migrate(path(4400, SERVER_PORT), at(ms)), Ok(false));
+        }
+    }
+    // One challenge for each probe timeout of at least 999 ms, until three timeouts end.
+    assert!((2..=4).contains(&probes), "{probes} probes");
+    // The client retired the ID of the probe. The new ID of the server lets the client move.
+    assert_eq!(client.migrate(path(4400, SERVER_PORT), at(4000)), Ok(true));
+}
+
+#[test]
+fn a_server_on_its_preferred_address_drops_newer_packets_that_arrive_at_its_first_address() {
+    let (mut endpoint, handle, mut client) = preferred(Limits::DEFAULT);
+    let (home, there) = (path(CLIENT_PORT, SERVER_PORT), path(CLIENT_PORT, PREFERRED_PORT));
+    exchange(&mut endpoint, handle, &mut client, at(0), None);
+    let server_path = |endpoint: &mut Endpoint| endpoint.with_connection(handle, |c| c.path()).unwrap();
+    assert_eq!(server_path(&mut endpoint), mirror(there));
+    // A copy of a newer packet arrives at the first address: the server drops it, stays, and
+    // answers nothing there (RFC 9000, section 9.6.2).
+    client.ping();
+    let newer = routed(&mut client, at(0));
+    give_server(&mut endpoint, handle, newer.clone(), home);
+    assert_eq!(server_path(&mut endpoint), mirror(there));
+    let after = endpoint.with_connection(handle, |c| routed(c, at(0))).unwrap();
+    assert!(after.is_empty(), "{} datagrams", after.len());
+    // The same packet still counts at the preferred address.
+    give_server(&mut endpoint, handle, newer, there);
+    let answer = endpoint.with_connection(handle, |c| routed(c, at(0))).unwrap();
+    assert!(!answer.is_empty() && answer.iter().all(|(route, _)| *route == mirror(there)));
+}
+
+#[test]
+fn a_client_that_keeps_the_handshake_address_sends_nothing_to_the_preferred_address() {
+    let limits = Limits {
+        server_address: ServerAddress::Handshake,
+        ..Limits::DEFAULT
+    };
+    let (mut endpoint, handle, mut client) = preferred(limits);
+    client.ping();
+    let (up, _) = exchange(&mut endpoint, handle, &mut client, at(0), None);
+    let home = path(CLIENT_PORT, SERVER_PORT);
+    assert!(!up.is_empty() && up.iter().all(|(route, _)| *route == home));
+    assert_eq!(client.path(), home);
 }
 
 #[test]

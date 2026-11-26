@@ -70,7 +70,7 @@ mod side;
 mod stream;
 
 pub use congestion::CongestionControl;
-pub use connection::{AddressToken, Connection, Limits, PeerClose, Transmission};
+pub use connection::{AddressToken, Connection, Limits, PeerClose, ServerAddress, Transmission};
 pub use crypto::CRYPTO_BUFFER_BYTES_MAX;
 pub use endpoint::{
     ENDPOINT_WORKERS_MAX, Endpoint, EndpointKeys, EndpointLimits, Handle, REDEEMED_BYTES_DEFAULT, Route,

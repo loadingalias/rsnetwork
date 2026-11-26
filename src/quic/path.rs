@@ -5,6 +5,7 @@ use core::net::SocketAddr;
 
 use rstypes::time::Instant;
 
+use super::ConnectionId;
 use super::connection::DATAGRAM_MIN;
 use super::recovery::PathState;
 
@@ -78,6 +79,52 @@ impl Validation {
     pub(super) fn answered(&self, data: [u8; 8]) -> Option<bool> {
         let challenge = self.challenges.iter().flatten().find(|(sent, _)| *sent == data);
         challenge.map(|(_, padded)| *padded)
+    }
+}
+
+/// The validation of a path that does not carry the connection, before the connection moves to
+/// it: the preferred address of the server (RFC 9000, section 9.6). A client validates that
+/// address before it moves, and a server validates the path from that address before it sends
+/// there. Each PATH_CHALLENGE frame goes alone, in a datagram of 1,200 bytes, one for each probe
+/// timeout.
+pub(super) struct Probe {
+    /// The path to validate.
+    pub(super) path: Path,
+    /// The connection ID of the peer that the datagrams of the path carry. No other path uses it.
+    pub(super) remote_cid: ConnectionId,
+    /// The data of each PATH_CHALLENGE frame that went out, the newest first.
+    challenges: [Option<[u8; 8]>; CHALLENGES_MAX],
+    /// The next PATH_CHALLENGE frame goes out at this time.
+    pub(super) next: Instant,
+    /// The validation fails at this time.
+    pub(super) until: Instant,
+}
+
+impl Probe {
+    /// The validation of `path` with the connection ID `remote_cid`. Its first challenge goes
+    /// out at `now`, and it fails at `until`.
+    pub(super) fn new(path: Path, remote_cid: ConnectionId, now: Instant, until: Instant) -> Self {
+        Self {
+            path,
+            remote_cid,
+            challenges: [None; CHALLENGES_MAX],
+            next: now,
+            until,
+        }
+    }
+
+    /// A PATH_CHALLENGE frame with `data` went out. The next one goes out at `next`. The oldest
+    /// frame leaves when the list is full.
+    pub(super) fn sent(&mut self, data: [u8; 8], next: Instant) {
+        self.challenges.rotate_right(1);
+        self.challenges[0] = Some(data);
+        self.next = next;
+    }
+
+    /// Whether `data` is the data of a challenge of this validation. An answer on any path
+    /// validates the path of its challenge (RFC 9000, section 8.2.3).
+    pub(super) fn answered(&self, data: [u8; 8]) -> bool {
+        self.challenges.contains(&Some(data))
     }
 }
 

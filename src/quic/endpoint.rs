@@ -5,7 +5,7 @@ mod table;
 
 use core::alloc::Layout;
 use core::fmt;
-use core::net::SocketAddr;
+use core::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use core::num::NonZeroU64;
 use std::sync::Arc;
 
@@ -139,6 +139,8 @@ pub struct Endpoint {
     free: Option<u16>,
     handshakes: u16,
     resets: usize,
+    /// The preferred addresses that each new connection gives: IPv4, then IPv6.
+    preferred: [Option<SocketAddr>; 2],
     _slots: Permit,
     /// The worker number, which no other live endpoint of `keys` has.
     _claim: Claim,
@@ -201,9 +203,35 @@ impl Endpoint {
             free: Some(0),
             handshakes: 0,
             resets: 0,
+            preferred: [None; 2],
             _slots: storage,
             _claim: claim,
         })
+    }
+
+    /// Gives each later connection the preferred addresses `ipv4` and `ipv6` of this server
+    /// (RFC 9000, section 9.6), or none when both are `None`. The transport parameters of the
+    /// server carry them with a second connection ID, which routes to the connection like each
+    /// other ID. A client validates the address of its family and moves to it. This server
+    /// validates the path from that address before it sends there, and then drops newer packets
+    /// that arrive at the address of the handshake. Give this endpoint each datagram that arrives
+    /// at these addresses.
+    ///
+    /// Refuses with [`Kind::Misuse`] when an address is unspecified or has the port 0.
+    pub fn prefer(&mut self, ipv4: Option<SocketAddrV4>, ipv6: Option<SocketAddrV6>) -> Result<(), Error> {
+        let preferred = [ipv4.map(SocketAddr::V4), ipv6.map(SocketAddr::V6)];
+        if preferred
+            .iter()
+            .flatten()
+            .any(|address| address.ip().is_unspecified() || address.port() == 0)
+        {
+            return Err(Error::new(
+                Kind::Misuse,
+                "a preferred address of a QUIC server is unspecified or has the port 0",
+            ));
+        }
+        self.preferred = preferred;
+        Ok(())
     }
 
     /// Routes one complete UDP payload that arrived on `path`. Pass the same datagram and path to an
@@ -303,7 +331,7 @@ impl Endpoint {
         let conn = Connection::server_admitted(
             &self.config,
             &header,
-            Some((issuer, proof)),
+            Some((issuer, proof, self.preferred)),
             path,
             self.connection_limits,
             &budget,

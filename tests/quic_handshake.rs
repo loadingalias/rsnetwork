@@ -747,7 +747,14 @@ fn transport_parameters_write_and_parse_back_and_the_defaults_take_no_bytes() {
 
 #[test]
 fn transport_parameters_that_break_a_rule_refuse_with_their_identifier() {
-    let cases: [(&[u8], Sender, Option<u64>); 9] = [
+    // A preferred address whose connection ID has no bytes (RFC 9000, section 18.2): IPv4 and its
+    // port, IPv6 and its port, the length 0, and the reset token.
+    let mut empty_id = vec![0x0d, 41];
+    empty_id.extend([192, 0, 2, 1, 0x01, 0xbb]);
+    empty_id.extend([0; 18]);
+    empty_id.push(0);
+    empty_id.extend([7; 16]);
+    let cases: [(&[u8], Sender, Option<u64>); 10] = [
         // A parameter two times.
         (&[0x01, 0x01, 0x05, 0x01, 0x01, 0x06], Sender::Client, Some(0x01)),
         // A UDP payload size below 1,200 bytes.
@@ -765,6 +772,7 @@ fn transport_parameters_that_break_a_rule_refuse_with_their_identifier() {
         (&[0x10, 0x01, 0x07], Sender::Client, Some(0x10)),
         // A value that ends past the parameters.
         (&[0x04, 0x02, 0x01], Sender::Server, Some(0x04)),
+        (&empty_id, Sender::Server, Some(0x0d)),
     ];
     for (bytes, sender, id) in cases {
         assert_eq!(

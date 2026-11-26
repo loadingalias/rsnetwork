@@ -477,7 +477,45 @@ impl Connection {
             let sent = self.single(&mut out[..DATAGRAM_MIN], (path.peer, dcid), &frame, None, send)?;
             return Ok(sent.map(|len| (len, path)));
         }
-        Ok(None)
+        self.preferred_challenge(out, send)
+    }
+
+    /// Builds the PATH_CHALLENGE frame of the validation of a preferred address when its time
+    /// came, in a datagram of 1,200 bytes (RFC 9000, section 8.2.1). The next one follows one
+    /// probe timeout later, and at least one initial probe timeout later. A server sends to an
+    /// address with no validation only what the credit of that address allows: with less than
+    /// 1,200 bytes, the challenge waits for its next time.
+    fn preferred_challenge(&mut self, out: &mut [u8], send: SendAt) -> Result<Option<(usize, Path)>, Failure> {
+        let Some(probe) = self.paths.probe.as_ref() else {
+            return Ok(None);
+        };
+        if send.now.as_nanos() < probe.next.as_nanos() {
+            return Ok(None);
+        }
+        let (path, dcid) = (probe.path, probe.remote_cid);
+        // A probe of a path goes no more often than an Initial packet (RFC 9000, section 8.2.1).
+        let next = after(send.now, self.pto().max(PTO_INITIAL)).map_err(Failure::local)?;
+        let active = &self.paths.active;
+        let validated = matches!(self.end, End::Client { .. })
+            || (path.peer == active.addresses.peer && active.amplification_credit.is_none());
+        if !validated && self.paths.off_path_room(path) < DATAGRAM_MIN {
+            if let Some(probe) = &mut self.paths.probe {
+                probe.next = next;
+            }
+            return Ok(None);
+        }
+        let data = challenge(self.stream.as_ref(), self.random)?;
+        let frame = Frame::PathChallenge { data };
+        let sent = self.single(&mut out[..DATAGRAM_MIN], (path.peer, dcid), &frame, None, send)?;
+        if let Some(len) = sent {
+            if !validated {
+                self.paths.off_path_sent(path, len as u64);
+            }
+            if let Some(probe) = &mut self.paths.probe {
+                probe.sent(data, next);
+            }
+        }
+        Ok(sent.map(|len| (len, path)))
     }
 
     /// Builds a probe of the next datagram size of the active path: a PING frame and its padding

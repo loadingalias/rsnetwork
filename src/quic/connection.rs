@@ -46,8 +46,8 @@ use super::crypto::{self, Refused};
 use super::endpoint::{self, Issuer};
 use super::frame::{Ack, Direction, Frame, STREAMS_MAX};
 use super::packet::{self, Builder, Datagrams, Header, Kind as PacketKind, OpenError, Outgoing, Side};
-use super::params::{Migration, Parameters, Sender};
-use super::path::{Path, Validation};
+use super::params::{Migration, Parameters, PreferredAddress, Sender};
+use super::path::{Path, Probe, Validation};
 use super::recovery::{self, DataRange, History, Output, PathState, Paths, Received, Record, RecoveryStats, Sent};
 use super::stream::{self, Event, Priority, Stop, StreamId, Streams};
 use super::{CongestionControl, ConnectionId, ErrorCode, VARINT_MAX};
@@ -125,6 +125,20 @@ pub struct Limits {
     /// that it makes, each counted as a frame, and the sent packets, side flows, and streams that
     /// it visits. Each limit is at least 1.
     pub turn: TurnLimits,
+    /// The address of the server that a client uses after the handshake. A server ignores it.
+    pub server_address: ServerAddress,
+}
+
+/// The address of the server that a client uses after the handshake (RFC 9000, section 9.6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServerAddress {
+    /// The preferred address of the server, when the server gives one of the address family of
+    /// the handshake path: the client validates it after the handshake is confirmed, and moves to
+    /// it when it answers. With no answer in three probe timeouts, the client stays.
+    #[default]
+    Preferred,
+    /// The address of the handshake.
+    Handshake,
 }
 
 impl Limits {
@@ -133,6 +147,7 @@ impl Limits {
     /// call. A window of 4 MiB for the connection and of 1 MiB for each stream, 100 streams of the
     /// peer in each direction, 6 MiB for data out of order, which the windows never reach, and no
     /// unreliable datagrams. The path uses CUBIC. Side-flow admission is off. Send regions share 4 MiB. Duplicate detection covers 100,000 packets/s for 100 ms.
+    /// A client moves to the preferred address of its server.
     pub const DEFAULT: Self = Self {
         congestion_control: CongestionControl::Cubic,
         side_flows_max: 0,
@@ -155,6 +170,7 @@ impl Limits {
             frames: 4096,
             visits: 16 * 1024,
         },
+        server_address: ServerAddress::Preferred,
     };
 }
 
@@ -493,11 +509,22 @@ enum End {
     Client {
         tickets: Option<Arc<ClientStore>>,
         service: [u8; 32],
+        /// The preferred address of the server, until the client starts its validation.
+        preferred: Option<SocketAddr>,
+        /// After the move to the preferred address: the path of the handshake, which the server
+        /// sends on until it validates its preferred address (RFC 9000, section 9.6.2).
+        left: Option<Path>,
     },
     Server {
         config: Arc<rustls::ServerConfig>,
         /// The encoded transport parameters, until rustls takes them.
         parameters: Option<Vec<u8>>,
+        /// The preferred addresses that this server gives: IPv4, then IPv6.
+        preferred: [Option<SocketAddr>; 2],
+        /// After the move to a preferred address: the local address that the server left, and the
+        /// largest number of a packet that is not a probe at the move. A packet with a higher
+        /// number that arrives at the address that the server left drops (RFC 9000, section 9.6.2).
+        left: Option<(SocketAddr, u64)>,
     },
 }
 
@@ -947,6 +974,8 @@ impl Connection {
                 End::Client {
                     tickets: config.store.clone(),
                     service: rscrypto::Sha256::digest(input_name.as_bytes()),
+                    preferred: None,
+                    left: None,
                 },
                 Tls::Failed,
             ),
@@ -994,7 +1023,7 @@ impl Connection {
     pub(super) fn server_admitted(
         config: &tls::ServerConfig,
         initial: &Header,
-        admission: Option<(Issuer, Option<endpoint::Proof>)>,
+        admission: Option<(Issuer, Option<endpoint::Proof>, [Option<SocketAddr>; 2])>,
         path: Path,
         limits: Limits,
         budget: &Budget,
@@ -1019,7 +1048,7 @@ impl Connection {
         let stream = config.entropy.stream(QUIC);
         let random = config.config.provider().secure_random;
         let local_cid = tls::scoped(stream.as_ref(), || match &admission {
-            Some((issuer, _)) => issuer.issue(random),
+            Some((issuer, ..)) => issuer.issue(random),
             None => random_cid(random, limits.cid_bytes),
         })?;
         let own = config.own.get();
@@ -1029,6 +1058,8 @@ impl Connection {
                 End::Server {
                     config: Arc::clone(&config.config),
                     parameters: None,
+                    preferred: [None; 2],
+                    left: None,
                 },
                 Tls::Server(ServerHandshake::NeedsInput(ServerHandshake::start(TlsVersion::V1))),
             ),
@@ -1039,7 +1070,8 @@ impl Connection {
             budget,
             now,
         )?;
-        if let Some((issuer, proof)) = admission {
+        let mut offered = None;
+        if let Some((issuer, proof, preferred)) = admission {
             connection.issuer = Some(issuer);
             if proof.is_some() {
                 connection.paths.active.amplification_credit = None;
@@ -1048,10 +1080,15 @@ impl Connection {
                 connection.original_cid = original;
                 connection.retry_cid = Some(retry);
             }
+            offered = connection.offer(preferred)?;
         }
         connection.initial_peer = Some(scid);
         connection.spaces[Level::Initial as usize].install(packet::initial_keys(&dcid, Side::Server));
-        let parameters = encode(&connection.parameters(), &mut connection.kept)?;
+        let parameters = Parameters {
+            preferred_address: offered,
+            ..connection.parameters()
+        };
+        let parameters = encode(&parameters, &mut connection.kept)?;
         if let End::Server { parameters: slot, .. } = &mut connection.end {
             *slot = Some(parameters);
         }
@@ -1254,13 +1291,17 @@ impl Connection {
         Ok(true)
     }
 
-    /// A connection ID of the peer that no path uses: not the active path, and not the path that
-    /// the connection left.
+    /// A connection ID of the peer that no path uses: not the active path, not the path that the
+    /// connection left, and not the path of the preferred address while it is validated.
     fn spare(&self) -> Option<Id> {
         let active = self.paths.active.remote_cid;
         let fallback = self.paths.validation.as_ref();
-        self.ids
-            .spare([active, fallback.map_or(active, |left| left.fallback.remote_cid)])
+        let probe = self.paths.probe.as_ref();
+        self.ids.spare([
+            active,
+            fallback.map_or(active, |left| left.fallback.remote_cid),
+            probe.map_or(active, |probe| probe.remote_cid),
+        ])
     }
 
     /// The connection ID of the peer for a datagram to `path`, which is not the active path. An
@@ -1274,6 +1315,9 @@ impl Connection {
         // A peer with a connection ID of no bytes has no other one.
         if active.remote_cid.as_bytes().is_empty() {
             return Some(active.remote_cid);
+        }
+        if let Some(probe) = self.paths.probe.as_ref().filter(|probe| probe.path == path) {
+            return Some(probe.remote_cid);
         }
         let one_local = path.local == active.addresses.local;
         let fallback = self.paths.validation.as_ref().map(|left| &left.fallback);
@@ -1365,11 +1409,100 @@ impl Connection {
         after(now, 3 * from.pto(ack_delay).max(PTO_INITIAL + ack_delay))
     }
 
+    /// Whether `path` arrives at a preferred address of this server that the connection does not
+    /// use yet.
+    pub(super) fn to_preferred(&self, path: Path) -> bool {
+        path.local != self.paths.active.addresses.local
+            && matches!(&self.end, End::Server { preferred, .. } if preferred.contains(&Some(path.local)))
+    }
+
+    /// Starts the validation of `path`, a path to or from the preferred address of the server, at
+    /// `now`. The path takes a connection ID of the peer that no path uses: with none, the
+    /// connection stays on its path.
+    pub(super) fn probe_preferred(&mut self, path: Path, now: Instant) -> Result<(), Error> {
+        if self.paths.probe.as_ref().is_some_and(|probe| probe.path == path) {
+            return Ok(());
+        }
+        let Some(spare) = self.spare() else {
+            return Ok(());
+        };
+        let until = self.validation_end(now)?;
+        self.paths.probe = Some(Probe::new(path, spare.id, now, until));
+        Ok(())
+    }
+
+    /// Starts the validation of the preferred address of the server, after the handshake of the
+    /// client is confirmed at `now` (RFC 9000, section 9.6.1).
+    pub(super) fn prefer(&mut self, now: Instant) -> Result<(), Error> {
+        let End::Client { preferred, .. } = &mut self.end else {
+            return Ok(());
+        };
+        let Some(peer) = preferred.take() else {
+            return Ok(());
+        };
+        let local = self.paths.active.addresses.local;
+        self.probe_preferred(Path { local, peer }, now)
+    }
+
+    /// Moves to the path of a validation of the preferred address that the data of a
+    /// PATH_RESPONSE frame answers. The connection ID of the path that the connection leaves is
+    /// not used again (RFC 9000, section 9.5). A client then sends a packet that is not a probe,
+    /// so the server sees the move, and keeps the path that it leaves, where the server still
+    /// sends. A server keeps the address that it leaves, and drops newer packets that arrive
+    /// there. Gives false when no such validation waits.
+    fn moved_to_preferred(&mut self, data: [u8; 8]) -> Result<bool, Failure> {
+        let Some(probe) = self.paths.probe.take_if(|probe| probe.answered(data)) else {
+            return Ok(false);
+        };
+        let violation = |code| Failure::transport(code, 0x1b, VIOLATION);
+        let next = self.paths.active.next(
+            probe.path,
+            probe.remote_cid,
+            self.datagram_top(),
+            self.limits.congestion_control,
+        );
+        let left = self.paths.switch(next).map_err(Failure::local)?;
+        self.paths.validation = None;
+        if let Some(old) = self.ids.peer(left.remote_cid) {
+            self.ids.retire_peer(old.sequence).map_err(violation)?;
+        }
+        match &mut self.end {
+            End::Client { left: from, .. } => {
+                *from = Some(left.addresses);
+                self.ping = true;
+            }
+            End::Server { left: from, .. } => {
+                *from = Some((left.addresses.local, self.non_probing.unwrap_or(0)));
+            }
+        }
+        Ok(true)
+    }
+
+    /// Ends a validation of the preferred address that reached its end at `now` with no answer:
+    /// the connection stays on its path. The connection ID of the validation went to that path,
+    /// so it is not used on another one (RFC 9000, section 9.5).
+    pub(super) fn probe_ended(&mut self, now: Instant) -> Result<(), Error> {
+        let Some(probe) = self
+            .paths
+            .probe
+            .take_if(|probe| probe.until.as_nanos() <= now.as_nanos())
+        else {
+            return Ok(());
+        };
+        if let Some(old) = self.ids.peer(probe.remote_cid) {
+            self.ids.retire_peer(old.sequence).map_err(|_| endpoint::NO_ROOM)?;
+        }
+        Ok(())
+    }
+
     /// Takes a PATH_RESPONSE frame. The data of a challenge of the active path shows that the
     /// peer is at its address. When the datagram of that challenge had 1,200 bytes, it also shows
     /// that the path carries QUIC, and the validation is complete. Else a challenge of 1,200 bytes
     /// follows, with its own period (RFC 9000, section 8.2.1).
     fn responded(&mut self, data: [u8; 8], now: Instant) -> Result<(), Failure> {
+        if self.moved_to_preferred(data)? {
+            return Ok(());
+        }
         let validation = self.paths.validation.as_ref();
         let Some(padded) = validation.and_then(|validation| validation.answered(data)) else {
             return Ok(());
@@ -1450,7 +1583,13 @@ impl Connection {
     }
 
     fn issue_id(&mut self) -> Result<(), Error> {
-        let (id, reset) = tls::scoped(self.stream.as_ref(), || -> Result<_, Error> {
+        let (id, reset) = self.new_id()?;
+        self.ids.issue(id, reset).map_err(|_| endpoint::NO_ROOM)
+    }
+
+    /// A new connection ID of this end and its stateless reset token.
+    fn new_id(&self) -> Result<(ConnectionId, [u8; 16]), Error> {
+        tls::scoped(self.stream.as_ref(), || -> Result<_, Error> {
             if let Some(issuer) = &self.issuer {
                 let id = issuer.issue(self.random)?;
                 return Ok((id, issuer.reset(&id)));
@@ -1459,8 +1598,37 @@ impl Connection {
             let mut reset = [0; 16];
             self.random.fill(&mut reset).map_err(|_| endpoint::RANDOM)?;
             Ok((id, reset))
-        })?;
-        self.ids.issue(id, reset).map_err(|_| endpoint::NO_ROOM)
+        })
+    }
+
+    /// Gives the transport parameter of the `preferred` addresses of a server, IPv4 then IPv6, with
+    /// a new connection ID that carries the route of the worker (RFC 9000, section 9.6). Gives
+    /// `None` when the server has no preferred address.
+    fn offer(&mut self, preferred: [Option<SocketAddr>; 2]) -> Result<Option<PreferredAddress>, Error> {
+        if preferred == [None; 2] {
+            return Ok(None);
+        }
+        let (connection_id, reset_token) = self.new_id()?;
+        self.ids
+            .offer(connection_id, reset_token)
+            .map_err(|_| endpoint::NO_ROOM)?;
+        if let End::Server { preferred: offered, .. } = &mut self.end {
+            *offered = preferred;
+        }
+        let ipv4 = match preferred[0] {
+            Some(SocketAddr::V4(address)) => (address.ip().octets(), address.port()),
+            _ => ([0; 4], 0),
+        };
+        let ipv6 = match preferred[1] {
+            Some(SocketAddr::V6(address)) => (address.ip().octets(), address.port()),
+            _ => ([0; 16], 0),
+        };
+        Ok(Some(PreferredAddress {
+            ipv4,
+            ipv6,
+            connection_id,
+            reset_token,
+        }))
     }
 
     /// Records a datagram to the address `peer` with the connection ID `dcid` of the peer, as the
