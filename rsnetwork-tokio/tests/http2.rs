@@ -1083,20 +1083,22 @@ const URGENT: Priority = Priority {
 const LARGE: usize = 256 * 1024;
 
 /// The response of a higher urgency completes first (RFC 9218, section 10), for each way to set
-/// its priority. Each handler writes its body after both requests arrived. The client has a
-/// connection window of 65,535, so at most that part of the bodies goes before the client reads,
-/// and then the scheduler gives each credit by priority. With no signal, `/a`, the first stream,
-/// would complete first.
+/// its priority. Each handler queues its body after both requests arrived, and the client reads
+/// only after both bodies are queued. The client has a connection window of 65,535 and a stream
+/// window larger than a body, so at most 65,535 bytes of the bodies go before the client reads,
+/// and then the scheduler gives each credit of the connection by priority. With no signal, `/a`,
+/// the first stream, would complete first.
 #[test]
 fn a_response_of_a_higher_urgency_completes_first_on_one_connection() {
     on_each_runtime(|| async {
         for signal in [Signal::Field, Signal::Server, Signal::Update] {
             let (listener, address) = support::listener().await;
             let both = Arc::new(Barrier::new(2));
+            let (queued, mut bodies) = mpsc::unbounded_channel();
             let handler = {
                 let both = Arc::clone(&both);
                 move |mut exchange: Exchange| {
-                    let both = Arc::clone(&both);
+                    let (both, queued) = (Arc::clone(&both), queued.clone());
                     async move {
                         both.wait().await;
                         if matches!(signal, Signal::Server) && exchange.head().target().as_bytes() == b"/b" {
@@ -1104,6 +1106,7 @@ fn a_response_of_a_higher_urgency_completes_first_on_one_connection() {
                         }
                         exchange.respond(&ok(Some(LARGE as u64))).await?;
                         exchange.write(&Lease::from(vec![b'x'; LARGE])).await?;
+                        queued.send(()).unwrap();
                         exchange.finish().await
                     }
                 }
@@ -1111,6 +1114,10 @@ fn a_response_of_a_higher_urgency_completes_first_on_one_connection() {
             let server = serve(Transport::Plain, listener, handler);
             let limits = rsnetwork::client::Limits {
                 h2: h2::Limits {
+                    settings: h2::Settings {
+                        initial_window_size: 1 << 20,
+                        ..support::H2.settings
+                    },
                     connection_window: 65_535,
                     ..support::H2
                 },
@@ -1136,6 +1143,9 @@ fn a_response_of_a_higher_urgency_completes_first_on_one_connection() {
             let mut b = within(send(b"/b", &high[..])).await;
             if matches!(signal, Signal::Update) {
                 within(b.prioritize(URGENT)).await.unwrap();
+            }
+            for _ in 0..2 {
+                within(bodies.recv()).await.unwrap();
             }
             let (done, mut order) = mpsc::unbounded_channel();
             for (target, mut exchange) in [("/a", a), ("/b", b)] {
