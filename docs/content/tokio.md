@@ -226,7 +226,9 @@ client.close().await?;
 - **Close.** `close()` ends each exchange in flight, sends GOAWAY, and over TLS `close_notify`. A
   connection whose last handle drops before its close resets.
 
-The rules of each stream are those of the core [HTTP/2 client](client.md#http2).
+The rules of each stream are those of the core [HTTP/2 client](client.md#http2). The
+[multiplexed connection example](multiplexed-example.md) is a complete program with these rules
+over TLS: an idle body, a cancel, a deadline, backpressure, and the close of the server.
 
 ## A server and its tasks
 

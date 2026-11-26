@@ -7,7 +7,8 @@ its own stream when the connection window follows the rule on this page.
 
 rsnetwork is in development and has no release. The [client](client.md#http2) and the
 [server](server.md#streams) run this scheduler for each stream. This page is about the engine: see
-[Run an HTTP/2 connection with no I/O](http2.md) for its model and its other calls.
+[Run an HTTP/2 connection with no I/O](http2.md) for its model and its other calls. The
+[multiplexed connection example](multiplexed-example.md) shows these rules on the Tokio binding.
 
 ## Send a body
 

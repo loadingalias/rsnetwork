@@ -1,9 +1,11 @@
 #!/bin/sh
 # Makes the certificates of the TLS and QUIC tests with the OpenSSL command (3.5 or later, for
 # ML-DSA), in this directory. Each key is in PKCS#8 DER: ECDSA P-256, or ML-DSA for the `mldsa`
-# files. Each certificate is valid from 2026-01-01 to 2036-01-01; the tests set their own wall
-# clock, so the result does not depend on the date of a run. Run it again only to change a
-# certificate, and commit each file that it writes. `generate.sh mldsa` makes only the ML-DSA files.
+# files. Each certificate is valid from 2026-01-01 to 2036-01-01. The tests set their own wall
+# clock, so their result does not depend on the date of a run. The example
+# `rsnetwork-tokio/examples/multiplexed.rs` uses the clock of the system: make the certificates
+# again before 2036-01-01. Run it again only to change a certificate, and commit each file that it
+# writes. `generate.sh mldsa` makes only the ML-DSA files.
 set -eu
 cd "$(dirname "$0")"
 scratch=$(mktemp -d)
