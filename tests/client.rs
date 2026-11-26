@@ -24,7 +24,7 @@ use rsnetwork::tls::{
     CertificateDer, ClientConfig, ClientOptions, Entropy, Identity, Limits as TlsLimits, PrivateKeyDer, Resumption,
     ServerConfig, ServerOptions, TimeProvider, Tls, UnixTime,
 };
-use rsnetwork::value::{Authority, Method, Status, Target};
+use rsnetwork::value::{Authority, Field, Method, Status, Target};
 
 const CA: &[u8] = include_bytes!("tls/ca.der");
 const SERVER: (&[u8], &[u8]) = (include_bytes!("tls/server.der"), include_bytes!("tls/server.key.der"));
@@ -685,4 +685,52 @@ fn a_response_before_the_end_of_the_request_body_leaves_the_client_working() {
         assert_eq!(parts, b"onetwosix", "{transport:?}");
         assert_matches!(outcome, Outcome::Complete(None), "{transport:?}");
     }
+}
+
+/// Request trailers wait for a place in a full output queue (N214). The test holds the
+/// acknowledgements, so the queue stays full. Each chunk of a body takes three entries (its size
+/// line, its data, and its CRLF) and the trailer section one, so a queue of 15 entries is full
+/// when a write refuses with `Kind::Overload`: the trailer call then gives `false`. After the
+/// transport accepted the output, it gives `true`, and the bytes are each part and then the last
+/// chunk with the trailer section (RFC 9112, section 7.1.2).
+#[test]
+fn over_http1_request_trailers_wait_for_a_place_in_a_full_output_queue() {
+    let limits = Limits {
+        queue: NonZeroUsize::new(15).unwrap(),
+        ..LIMITS
+    };
+    let mut client = Http1::plain(limits, clock(), &budget()).unwrap();
+    let mut sent = Vec::new();
+    let mut accept = |client: &mut Http1| {
+        while let Some(output) = client.output() {
+            sent.extend_from_slice(output.region.bytes());
+            client.ack(output.id, output.region.initialized()).unwrap();
+        }
+    };
+    let post = Request {
+        method: Method::POST,
+        length: None,
+        ..get()
+    };
+    assert!(client.send(&post, Deadline::at(at(1_000)), at(0)).unwrap());
+    accept(&mut client);
+    let part = Lease::from(vec![b'z'; 1000]);
+    let mut parts = 0;
+    loop {
+        match client.write(&part, at(0)) {
+            Ok(()) => parts += 1,
+            Err(error) if error.kind() == Kind::Overload => break,
+            Err(error) => panic!("{error}"),
+        }
+        assert!(parts < 1000, "the output queue is never full");
+    }
+    let trailers = [Field::new(b"x-request", b"done").unwrap()];
+    let first = client.finish_with_trailers(&trailers, at(0));
+    assert_eq!(first.map_err(|error| error.kind()), Ok(false), "the trailers wait");
+    accept(&mut client);
+    let second = client.finish_with_trailers(&trailers, at(0));
+    assert_eq!(second.map_err(|error| error.kind()), Ok(true));
+    accept(&mut client);
+    assert_eq!(sent.iter().filter(|&&byte| byte == b'z').count(), parts * 1000);
+    assert!(sent.ends_with(b"\r\n0\r\nx-request: done\r\n\r\n"), "{sent:?}");
 }

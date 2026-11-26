@@ -377,8 +377,12 @@ fn over_tls_the_head_timeout_bounds_the_handshake() {
 /// queue and the socket buffers of loopback hold, also when the kernel grows them.
 const PARTS_MAX: usize = 256;
 
+/// Over HTTP/1.1, trailers go after each byte of a body that filled the output queue and the
+/// socket buffers, in each direction. The core tests of `tests/client.rs` and `tests/server.rs`
+/// prove that a trailer call waits at a full queue. Here the kernel can free room between two
+/// polls, so this test does not assert that wait.
 #[test]
-fn over_http1_trailers_wait_for_a_place_in_a_full_output_and_follow_each_byte_in_each_direction() {
+fn over_http1_trailers_follow_each_byte_of_a_body_that_filled_the_output_in_each_direction() {
     on_each_runtime(|| async {
         let (listener, address) = support::listener().await;
         let (client_waited, server_reads) = oneshot::channel();
@@ -402,13 +406,8 @@ fn over_http1_trailers_wait_for_a_place_in_a_full_output_and_follow_each_byte_in
                 assert!(parts < PARTS_MAX, "the output queue of the server is never full");
             }
             let trailer = [Field::new(b"x-response", b"done").unwrap()];
-            let mut finish = pin!(exchange.finish_with_trailers(&trailer));
-            let finished = once(finish.as_mut()).await;
+            let finish = exchange.finish_with_trailers(&trailer);
             server_waited.send(parts).unwrap();
-            assert!(
-                finished.is_none(),
-                "the response trailers wait for a place in the full output queue: {finished:?}"
-            );
             finish.await.unwrap();
             // Bytes move only inside calls: the next request moves the rest of the response, and
             // it ends at the close of the client.
@@ -435,13 +434,8 @@ fn over_http1_trailers_wait_for_a_place_in_a_full_output_and_follow_each_byte_in
         }
         let trailer = [Field::new(b"x-request", b"done").unwrap()];
         {
-            let mut finish = pin!(client.finish_with_trailers(&trailer));
-            let finished = once(finish.as_mut()).await;
+            let finish = client.finish_with_trailers(&trailer);
             client_waited.send(parts).unwrap();
-            assert!(
-                finished.is_none(),
-                "the request trailers wait for a place in the full output queue: {finished:?}"
-            );
             finish.await.unwrap();
         }
         client.response().await.unwrap();

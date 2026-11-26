@@ -25,7 +25,7 @@ use rsnetwork::tls::{
     CertificateDer, ClientConfig, ClientOptions, Closure, Entropy, Identity, Limits as TlsLimits, PrivateKeyDer,
     Resumption, ServerConfig, ServerOptions, TimeProvider, Tls, UnixTime,
 };
-use rsnetwork::value::{Authority, Method, Status, Target};
+use rsnetwork::value::{Authority, Field, Method, Status, Target};
 
 const CA: &[u8] = include_bytes!("tls/ca.der");
 const SERVER: (&[u8], &[u8]) = (include_bytes!("tls/server.der"), include_bytes!("tls/server.key.der"));
@@ -674,4 +674,42 @@ fn over_tls_a_client_that_selects_another_protocol_ends_the_server() {
         }
     }
     assert_matches!(server.release(), Some(Closed { result: Err(error), .. }) if error.kind() == Kind::Unsupported);
+}
+
+/// Response trailers wait for a place in a full output queue (N214). The test holds the
+/// acknowledgements, so the queue stays full. Each chunk of a body takes three entries (its size
+/// line, its data, and its CRLF) and the trailer section one, so a queue of 15 entries is full
+/// when a write refuses with `Kind::Overload`: the trailer call then gives `false`. After the
+/// transport accepted the output, it gives `true`, and the bytes are each part and then the last
+/// chunk with the trailer section (RFC 9112, section 7.1.2).
+#[test]
+fn over_http1_response_trailers_wait_for_a_place_in_a_full_output_queue() {
+    let limits = Limits {
+        queue: NonZeroUsize::new(15).unwrap(),
+        ..LIMITS
+    };
+    let mut server = Http::plain(limits, clock(), &budget()).unwrap();
+    give(&mut server, b"GET / HTTP/1.1\r\nhost: a\r\n\r\n");
+    let (stream, _) = server.request(at(0)).unwrap().expect("a request");
+    assert!(server.respond(stream, &ok(None), at(0)).unwrap());
+    take(&mut server);
+    let part = Lease::from(vec![b'b'; 1000]);
+    let mut parts = 0;
+    loop {
+        match server.write(stream, &part, at(0)) {
+            Ok(()) => parts += 1,
+            Err(error) if error.kind() == Kind::Overload => break,
+            Err(error) => panic!("{error}"),
+        }
+        assert!(parts < 1000, "the output queue is never full");
+    }
+    let trailers = [Field::new(b"x-response", b"done").unwrap()];
+    let first = server.finish_with_trailers(stream, &trailers, at(0));
+    assert_eq!(first.map_err(|error| error.kind()), Ok(false), "the trailers wait");
+    let mut sent = take(&mut server);
+    let second = server.finish_with_trailers(stream, &trailers, at(0));
+    assert_eq!(second.map_err(|error| error.kind()), Ok(true));
+    sent.extend(take(&mut server));
+    assert_eq!(sent.iter().filter(|&&byte| byte == b'b').count(), parts * 1000);
+    assert!(sent.ends_with(b"\r\n0\r\nx-response: done\r\n\r\n"), "{sent:?}");
 }
