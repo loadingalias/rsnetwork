@@ -4,8 +4,11 @@
 //! Each call of a handle turns the connection under a short lock, which no wait holds. One of the
 //! handles that wait, the driver, also waits for the socket and the clock. After each turn, the
 //! core gives the streams that changed, and only their handles wake: no task, no channel, and no
-//! copy. A handle that waits for a place of the connection, a new stream or a head region, waits
-//! in order, and only the first wakes when the connection moves.
+//! copy. The call of another handle can give the connection an event that the driver does not
+//! wait for, such as an earlier deadline, output for the socket, or a reset after a cancel. Then
+//! the driver wakes, and waits again for each event of the connection. A handle that waits for a
+//! place of the connection, a new stream or a head region, waits in order, and only the first
+//! wakes when the connection moves.
 
 use core::future::poll_fn;
 use core::mem::DropGuard;
@@ -21,7 +24,7 @@ use rsnetwork::time::Instant;
 use tokio::task::coop;
 use tokio::time::Sleep;
 
-use crate::socket::{Socket, Turn};
+use crate::socket::{Interest, Socket, Turn};
 
 /// A connection of the core that tells which streams changed.
 pub(crate) trait Streams: Io {
@@ -63,8 +66,8 @@ pub(crate) struct Shared<C: Io> {
 #[derive(Debug)]
 pub(crate) struct State<C: Io> {
     pub(crate) socket: Socket<C>,
-    /// The key of the wait that also waits for the socket and the clock.
-    driver: Option<u64>,
+    /// The wait that also waits for the socket and the clock.
+    driver: Option<Driver>,
     /// The key of the next wait.
     next: u64,
     /// The waits for a change of their stream, with their keys. One handle has each stream.
@@ -75,6 +78,15 @@ pub(crate) struct State<C: Io> {
     watchers: Vec<(u64, Waker)>,
     /// The connection ended, and each wait woke.
     ended: bool,
+}
+
+/// The wait that also waits for the socket and the clock.
+#[derive(Debug)]
+struct Driver {
+    key: u64,
+    waker: Waker,
+    /// What its last turn waits for, or `None` after a wake that makes it turn again.
+    armed: Option<Interest>,
 }
 
 /// What one turn of a wait did.
@@ -121,6 +133,8 @@ impl<C: Streams> Shared<C> {
             state.changes(0, &mut wakes);
             state.moved(None, &mut wakes);
             state.vacate(&mut wakes);
+            // The change can leave work for a drive, for example a reset to send.
+            state.rearm(None, &mut wakes);
             result
         };
         wakes.into_iter().for_each(Waker::wake);
@@ -184,29 +198,36 @@ impl<C: Streams> State<C> {
                 self.leave(key, wakes);
                 Step::Ready(Err(error))
             }
-            Ok(Turn::Done(value)) => {
+            Ok(Turn::Done(value, after)) => {
                 // A place that a handle took can leave room for the next, and a stream that
                 // ended can free a place.
                 if value.is_some() && !matches!(waits, Waits::Connection) {
                     self.wake_place(key, wakes);
                 }
                 self.leave(key, wakes);
+                self.rearm(after, wakes);
                 Step::Ready(Ok(value))
             }
             Ok(Turn::Now) => {
                 self.moved(Some(key), wakes);
                 Step::Now
             }
-            Ok(Turn::Wait { read, write, deadline }) => {
+            Ok(Turn::Wait(interest)) => {
                 if changed {
                     self.moved(Some(key), wakes);
                 }
                 self.enter(key, waits, queued, cx.waker());
-                if self.driver.is_none_or(|driver| driver == key) {
-                    self.driver = Some(key);
-                    if self.socket.ready(cx, (read, write, deadline), sleep) {
-                        return Step::Again;
-                    }
+                if self.driver.as_ref().is_some_and(|driver| driver.key != key) {
+                    self.rearm(Some(interest), wakes);
+                    return Step::Pending;
+                }
+                self.driver = Some(Driver {
+                    key,
+                    waker: cx.waker().clone(),
+                    armed: Some(interest),
+                });
+                if self.socket.ready(cx, interest, sleep) {
+                    return Step::Again;
                 }
                 Step::Pending
             }
@@ -306,12 +327,24 @@ impl<C: Streams> State<C> {
         self.places.retain(|&(waiter, _)| waiter != key);
         self.watchers.retain(|&(waiter, _)| waiter != key);
         let had = waits != self.streams.len() + self.places.len() + self.watchers.len();
-        let drove = self.driver == Some(key);
+        let drove = self.driver.as_ref().is_some_and(|driver| driver.key == key);
         if drove {
             self.driver = None;
         }
         if had || drove {
             self.vacate(wakes);
+        }
+    }
+
+    /// Wakes the driver when the connection waits for an event that its last turn does not wait
+    /// for, or has more work now (`None`). Its next turn waits for each event again.
+    fn rearm(&mut self, interest: Option<Interest>, wakes: &mut Vec<Waker>) {
+        if let Some(driver) = &mut self.driver
+            && let Some(armed) = driver.armed
+            && interest.is_none_or(|interest| !armed.covers(interest))
+        {
+            driver.armed = None;
+            wakes.push(driver.waker.clone());
         }
     }
 

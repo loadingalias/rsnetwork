@@ -21,10 +21,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use rsnetwork::body::{Collect, Outcome, Read};
+use rsnetwork::body::{Collect, Outcome, Part, Read};
 use rsnetwork::buffer::{Lease, WriteLoan};
 use rsnetwork::client::Request;
 use rsnetwork::drive::{Error, Kind};
+use rsnetwork::h2::frame::ErrorCode;
 use rsnetwork::server::{Closed, Delivery};
 use rsnetwork::value::{Authority, Field, Method, Target};
 use rsnetwork_tokio::Clock;
@@ -225,6 +226,100 @@ fn a_slow_body_meets_its_deadline_on_its_stream_while_another_task_drives_the_co
             release.notify_one();
             within(client.close()).await.unwrap();
             assert_eq!(within(driving).await.unwrap(), Ok(()), "{transport:?}");
+            within(server.close(Clock.deadline(PATIENCE))).await;
+        }
+    });
+}
+
+/// How the client ends the stream of an exchange with no call of that stream.
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// The deadline of the exchange comes.
+    Deadline,
+    /// The exchange drops.
+    Drop,
+}
+
+#[test]
+fn a_stream_that_ends_with_no_call_resets_while_the_exchange_of_another_task_drives() {
+    on_each_runtime(|| async {
+        for transport in [Transport::Plain, Transport::Tls] {
+            let (listener, address) = support::listener().await;
+            let (started, mut starts) = mpsc::unbounded_channel();
+            let (seen, mut sight) = mpsc::unbounded_channel();
+            let release = Arc::new(Notify::new());
+            let handler = {
+                let release = Arc::clone(&release);
+                move |mut exchange: Exchange| {
+                    let (started, seen, release) = (started.clone(), seen.clone(), Arc::clone(&release));
+                    async move {
+                        if exchange.head().target().as_bytes() == b"/late" {
+                            // The request body waits for the client, until the client resets the
+                            // stream.
+                            loop {
+                                if let Part::End(outcome) = exchange.next().await? {
+                                    seen.send(outcome).unwrap();
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        started.send(()).unwrap();
+                        release.notified().await;
+                        exchange.respond(&ok(Some(2))).await?;
+                        exchange.write(&Lease::from(&b"ok"[..])).await?;
+                        exchange.finish().await
+                    }
+                }
+            };
+            let server = serve(transport, listener, handler);
+            let client = support::h2_client(transport, address).await;
+            // The wait of this task drives the connection. Its own deadline comes after the
+            // patience of each wait of the test.
+            let slow = tokio::spawn({
+                let client = client.clone();
+                async move {
+                    let deadline = Clock.deadline(PATIENCE.saturating_mul(6));
+                    let mut exchange = client.send(&request(b"/slow", Some(0)), deadline).await.unwrap();
+                    exchange.response().await.unwrap();
+                    collect(&mut exchange).await
+                }
+            });
+            within(starts.recv()).await.unwrap();
+            for ending in [Ending::Deadline, Ending::Drop] {
+                let deadline = Clock.deadline(match ending {
+                    Ending::Deadline => DEADLINE,
+                    Ending::Drop => PATIENCE,
+                });
+                let started = Instant::now();
+                let mut late = client.send(&request(b"/late", None), deadline).await.unwrap();
+                late.write(&Lease::from(&b"late"[..])).await.unwrap();
+                let late = match ending {
+                    Ending::Deadline => Some(late),
+                    Ending::Drop => {
+                        drop(late);
+                        None
+                    }
+                };
+                // No call of `/late` runs until the server saw its reset.
+                let outcome = within(sight.recv()).await.unwrap();
+                assert!(
+                    matches!(outcome, Outcome::Reset(Some(code)) if code == u64::from(ErrorCode::CANCEL.0)),
+                    "{transport:?} {ending:?}: {outcome:?}"
+                );
+                if let Some(mut late) = late {
+                    assert!(started.elapsed() >= DEADLINE, "{transport:?}: {:?}", started.elapsed());
+                    let error = within(late.response()).await.unwrap_err();
+                    assert_eq!(error.kind(), Kind::Deadline, "{transport:?}: {error:?}");
+                }
+            }
+            release.notify_one();
+            let (collected, body) = within(slow).await.unwrap();
+            assert!(
+                matches!(collected, Collect::Complete(None)),
+                "{transport:?}: {collected:?}"
+            );
+            assert_eq!(body, b"ok", "{transport:?}");
+            within(client.close()).await.unwrap();
             within(server.close(Clock.deadline(PATIENCE))).await;
         }
     });

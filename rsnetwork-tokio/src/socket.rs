@@ -44,16 +44,33 @@ pub struct Socket<C: Io> {
 
 /// What one turn of a call gave.
 pub(crate) enum Turn<T> {
-    /// The call gave its value, or `None` after the release.
-    Done(Option<T>),
+    /// The call gave its value, or `None` after the release. Then the connection waits for the
+    /// interest, or it has more work now (`None`).
+    Done(Option<T>, Option<Interest>),
     /// Call again now: bytes moved, or the connection has more work.
     Now,
-    /// Call again when the socket can read (`read`) or write (`write`), or at `deadline`.
-    Wait {
-        read: bool,
-        write: bool,
-        deadline: Option<Deadline>,
-    },
+    /// Call again at an event of the interest.
+    Wait(Interest),
+}
+
+/// What a connection waits for: the socket can read (`read`) or write (`write`), or `deadline`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Interest {
+    pub(crate) read: bool,
+    pub(crate) write: bool,
+    pub(crate) deadline: Option<Deadline>,
+}
+
+impl Interest {
+    /// Whether a wait for `self` wakes at each event of `other`, or before it.
+    pub(crate) fn covers(self, other: Self) -> bool {
+        let at = |deadline: Deadline| deadline.instant().as_nanos();
+        (self.read || !other.read)
+            && (self.write || !other.write)
+            && other
+                .deadline
+                .is_none_or(|other| self.deadline.is_some_and(|deadline| at(deadline) <= at(other)))
+    }
 }
 
 impl<C: Io> Socket<C> {
@@ -103,10 +120,10 @@ impl<C: Io> Socket<C> {
         poll_fn(|cx| {
             loop {
                 match self.turn(&mut call)? {
-                    Turn::Done(value) => return Poll::Ready(Ok(value)),
+                    Turn::Done(value, _) => return Poll::Ready(Ok(value)),
                     Turn::Now => ready!(coop::poll_proceed(cx)).made_progress(),
-                    Turn::Wait { read, write, deadline } => {
-                        if !self.ready(cx, (read, write, deadline), sleep.as_mut()) {
+                    Turn::Wait(interest) => {
+                        if !self.ready(cx, interest, sleep.as_mut()) {
                             return Poll::Pending;
                         }
                     }
@@ -127,8 +144,11 @@ impl<C: Io> Socket<C> {
         if let Some(value) = call(&mut self.connection, self.clock.now())? {
             // The output of the call goes now, also when the next call comes late. A pump
             // refuses only an input region, after its writes, and the next call meets that.
-            let _pumped = tcp.pump(&mut self.connection);
-            return Ok(Turn::Done(Some(value)));
+            let after = match tcp.pump(&mut self.connection) {
+                Ok(Next::Wait { read, write, deadline }) => Some(Interest { read, write, deadline }),
+                Ok(Next::Now | Next::Released) | Err(_) => None,
+            };
+            return Ok(Turn::Done(Some(value), after));
         }
         Ok(match tcp.pump(&mut self.connection)? {
             Next::Now => Turn::Now,
@@ -137,17 +157,17 @@ impl<C: Io> Socket<C> {
                 write: false,
                 deadline: None,
             } => return Err(CAPACITY),
-            Next::Wait { read, write, deadline } => Turn::Wait { read, write, deadline },
-            Next::Released => Turn::Done(call(&mut self.connection, self.clock.now())?),
+            Next::Wait { read, write, deadline } => Turn::Wait(Interest { read, write, deadline }),
+            Next::Released => Turn::Done(call(&mut self.connection, self.clock.now())?, None),
         })
     }
 
-    /// Makes `cx` wake when the socket can read (`read`) or write (`write`), or at `deadline`, on
-    /// `sleep`. Gives whether one of them is ready now: then turn again.
+    /// Makes `cx` wake at each event of `interest`, with `sleep` for its deadline. Gives whether
+    /// one of them is ready now: then turn again.
     pub(crate) fn ready(
         &self,
         cx: &mut Context<'_>,
-        (read, write, deadline): (bool, bool, Option<Deadline>),
+        Interest { read, write, deadline }: Interest,
         mut sleep: Pin<&mut Option<Sleep>>,
     ) -> bool {
         let stream = &self
