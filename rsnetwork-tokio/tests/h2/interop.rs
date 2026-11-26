@@ -16,6 +16,8 @@
 //!   exchanges in flight end, and `REPORT accepted=<n> failed=<n> aborted=<n>`.
 //! - `/urgency/<name>`: 16 MiB in one chunk, after two of these requests arrived, so both bodies
 //!   wait together and only their priorities (RFC 9218) order them (N212).
+//! - `/1k`: 1024 bytes, a view of one static region, for the small-response probe of N211. It
+//!   discards a request body.
 //! - `/browser` and `/goaway`: the pages of the browser cells. `POST /report` prints `BROWSER <body>`.
 //!
 //! `client <address> <tls-dir> <case>...` connects to an independent server for `server.test` at
@@ -98,6 +100,8 @@ const TLS: tls::Limits = tls::Limits {
 };
 /// The body of each `/urgency` response.
 const URGENCY_BYTES: usize = 16 << 20;
+/// The body of each `/1k` response.
+static KIB: [u8; 1024] = [b'k'; 1024];
 /// The time of each exchange of the client cases.
 const PATIENCE: Duration = Duration::from_secs(20);
 
@@ -290,6 +294,12 @@ async fn route(
             exchange.finish().await?;
             shutdown.notify_one();
             Ok(())
+        }
+        b"/1k" => {
+            discard(&mut exchange).await?;
+            exchange.respond(&ok(Some(1024))).await?;
+            exchange.write(&Lease::from(&KIB[..])).await?;
+            exchange.finish().await
         }
         b"/urgency/high" | b"/urgency/low" => {
             both.wait().await;
