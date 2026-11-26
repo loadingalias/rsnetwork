@@ -190,9 +190,13 @@ impl Inbound {
 
     /// Adds a region after the others. Gives it back if the queue is full. An empty region has
     /// no byte to consume, so the queue drops it.
-    #[expect(
-        clippy::result_large_err,
-        reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
+    // `Received` holds pointers, so it is above the threshold of the lint only on 64-bit targets.
+    #[cfg_attr(
+        target_pointer_width = "64",
+        expect(
+            clippy::result_large_err,
+            reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
+        )
     )]
     pub fn push(&mut self, received: Received) -> Result<(), Received> {
         if received.region.initialized() == 0 {

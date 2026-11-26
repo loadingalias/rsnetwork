@@ -11,6 +11,9 @@
 //! other boundary: the region that the serializer wrote is the region that the driver sends, and
 //! the body that it sends is a view of the received region.
 
+// WebAssembly has no TCP and no processes.
+#![cfg(not(target_family = "wasm"))]
+
 use core::net::SocketAddr;
 use core::ops::Range;
 use std::io::{ErrorKind, Read as _, Write as _};

@@ -32,12 +32,14 @@ tls = ["dep:rscrypto", "dep:rscrypto-rustls", "dep:rustls"]
 # dependency. Until `Read::read_buf` and `TcpStream::set_linger` are stable, it needs nightly.
 tcp = []
 
-# The cross-boundary proof (tests/cross_boundary.rs) runs the parser on Tokio:
-# a current-thread runtime and TCP, with no other feature.
 [dev-dependencies]
-tokio = { version = "1.54.1", features = ["rt", "net"] }
 # The independent head and chunk parser of the differential test (tests/h1_differential.rs).
 httparse = "1.10.1"
+
+# The cross-boundary proof (tests/cross_boundary.rs) runs the parser on Tokio: a current-thread
+# runtime and TCP, with no other feature. Tokio has no TCP on WebAssembly.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+tokio = { version = "1.54.1", features = ["rt", "net"] }
 
 # The proof runs the parser on the io_uring driver of rsasync, from its Git
 # `main`. The driver needs Linux on x86_64 or aarch64.

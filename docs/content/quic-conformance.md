@@ -17,6 +17,26 @@ cargo xtask test -E 'binary(quic_conformance) | binary(quic_streams) | binary(qu
 `cargo xtask test` with no argument also runs these tests. A failure names the cell and its
 expected result.
 
+## Run the QUIC tests on WebAssembly
+
+The QUIC core and its tests build for `wasm32-wasip1`, and the tests run in Wasmtime. This is a
+compile and test target only: no browser run and no other WebAssembly host has a claim.
+`wasm32-unknown-unknown` does not build yet, because rustls with `std` needs a JavaScript clock
+on that target.
+
+Prerequisites: `wasmtime` on the `PATH`. `rust-toolchain.toml` installs the `wasm32-wasip1`
+target, and `.cargo/config.toml` makes Wasmtime the test runner of that target.
+
+```sh
+cargo xtask test -p rsnetwork --target wasm32-wasip1 --cargo-profile release \
+  -E 'binary(/^quic/) | (kind(lib) & test(/^quic::/))'
+```
+
+The command runs the QUIC unit tests and the QUIC test binaries. The release profile keeps the
+overflow checks and runs about four times faster than the test profile in Wasmtime. A test that
+needs a thread, a socket, or a process cannot run on `wasm32-wasip1`. `cargo xtask check` builds and lints the core and all of its tests for this target, so a change
+that cannot build there fails the check.
+
 ## Replay a run
 
 A seeded run gives each end its own child of the seed as its entropy, and the faults of the path

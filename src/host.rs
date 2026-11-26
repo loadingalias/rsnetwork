@@ -265,9 +265,13 @@ pub trait Io: sealed::Sealed {
 
     /// Queues bytes that the transport received. Gives them back when the queue is full: drive
     /// first.
-    #[expect(
-        clippy::result_large_err,
-        reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
+    // `Received` holds pointers, so it is above the threshold of the lint only on 64-bit targets.
+    #[cfg_attr(
+        target_pointer_width = "64",
+        expect(
+            clippy::result_large_err,
+            reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
+        )
     )]
     fn receive(&mut self, received: Received) -> Result<(), Received>;
 

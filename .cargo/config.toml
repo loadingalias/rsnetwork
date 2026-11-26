@@ -3,3 +3,8 @@
 xtask = ["run", "--quiet", "--locked", "--package", "xtask", "--"]
 # Zed runs contextual tests through Nextest with this name (.zed/settings.json).
 nextest-run = ["nextest", "run"]
+
+# The tests for wasm32-wasip1 run in Wasmtime, which `machine` pins. A test
+# that panics stops its process, and Nextest reports that test as failed.
+[target.wasm32-wasip1]
+runner = "wasmtime"

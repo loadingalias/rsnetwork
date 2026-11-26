@@ -87,6 +87,10 @@ const DEADLOCK: &str = "(deadlock)";
 /// own package (`rsnetwork-tokio`, `rsnetwork-rsasync`), never in this closure.
 const PROTOCOL_CLOSURE: &[&str] = &["rsnetwork", "rstypes"];
 
+/// The WebAssembly target of the core (N318). Its tests run in Wasmtime:
+/// `cargo xtask test -p rsnetwork --target wasm32-wasip1`.
+const WASI_TARGET: &str = "wasm32-wasip1";
+
 /// The crates that the default `tls` feature adds: rustls, the rscrypto provider, and their
 /// dependencies. None builds C, and only rscrypto does cryptography (N101). A new crate here needs
 /// the approval of the user.
@@ -261,7 +265,8 @@ impl Repo {
     }
 
     /// Checks formatting, lints, and rustdoc. It changes no file. The lints also run on the
-    /// protocol-only build of `rsnetwork`, which no other step compiles.
+    /// protocol-only build of `rsnetwork`, which no other step compiles, and on `rsnetwork` and
+    /// its tests for [`WASI_TARGET`].
     fn check(&self, args: &[String]) -> Result<(), Failure> {
         let scope = scope(args);
         step("fmt --check", &mut self.cargo(&["fmt", "--all", "--check"]))?;
@@ -280,6 +285,20 @@ impl Repo {
                 "rsnetwork",
                 "--lib",
                 "--no-default-features",
+                "--quiet",
+            ]),
+        )?;
+        step(
+            "clippy wasm32-wasip1",
+            &mut self.cargo(&[
+                "clippy",
+                "--locked",
+                "--package",
+                "rsnetwork",
+                "--all-targets",
+                "--all-features",
+                "--target",
+                WASI_TARGET,
                 "--quiet",
             ]),
         )?;

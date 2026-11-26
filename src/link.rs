@@ -91,9 +91,13 @@ impl<E: Engine> Link<E> {
         each!(self, connection => connection.wait())
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
+    // `Received` holds pointers, so it is above the threshold of the lint only on 64-bit targets.
+    #[cfg_attr(
+        target_pointer_width = "64",
+        expect(
+            clippy::result_large_err,
+            reason = "a refusal gives the caller back its region and facts, and a box would make each refusal allocate"
+        )
     )]
     pub(crate) fn receive(&mut self, received: Received) -> Result<(), Received> {
         each!(self, connection => connection.receive(received))
