@@ -146,12 +146,27 @@ impl Exchange {
     }
 
     /// Sends the head of `response`. It waits while the transport holds the heads before, in the
-    /// order of the exchanges that wait. Send a body with [`write`](Self::write), and end it with
-    /// [`finish`](Self::finish).
+    /// order of the exchanges that wait. A zero length finishes the response here. On HTTP/2,
+    /// a response to HEAD or a status of 204 or 304 also finishes here.
+    /// For other responses, send any bytes with [`write`](Self::write), then call [`finish`](Self::finish).
     pub async fn respond(&mut self, response: &Response<'_>) -> Result<(), Error> {
+        self.send_head(|server, stream, now| server.respond(stream, response, now))
+            .await
+    }
+
+    /// Sends a streaming head under the rules of [`Core::respond_streaming`].
+    pub async fn respond_streaming(&mut self, response: &Response<'_>) -> Result<(), Error> {
+        self.send_head(|server, stream, now| server.respond_streaming(stream, response, now))
+            .await
+    }
+
+    async fn send_head(
+        &mut self,
+        mut send: impl FnMut(&mut Core, Stream, rsnetwork::time::Instant) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
         let stream = self.stream;
         let responded = self.shared.until(Waits::Place(Some(stream)), |server, now| {
-            Ok(server.respond(stream, response, now)?.then_some(()))
+            Ok(send(server, stream, now)?.then_some(()))
         });
         responded.await?.ok_or(ENDED)
     }

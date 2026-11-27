@@ -310,6 +310,36 @@ impl Pair {
     }
 }
 
+#[cfg(feature = "http")]
+#[test]
+fn http_conversion_mounts_a_caller_driven_http2_handler_over_cleartext_and_tls() {
+    use rsnetwork::http::{Adapter, Response};
+
+    let adapter = Adapter::new(HEAD, &budget());
+    for (mut pair, scheme) in [(Pair::plain(), "http"), (Pair::tls(), "https")] {
+        let now = at(0);
+        let client = pair.send(&get(b"/a%2Fb?x=1"), later(), now);
+        let (stream, response) = (0..16)
+            .find_map(|_| {
+                pair.transport(now);
+                pair.server
+                    .handle_http(&adapter, now, |request| {
+                        assert_eq!(request.uri().scheme_str(), Some(scheme));
+                        assert_eq!(request.uri().authority().unwrap().as_str(), "server.test");
+                        assert_eq!(request.uri().path_and_query().unwrap().as_str(), "/a%2Fb?x=1");
+                        Response::builder().status(202).body(()).unwrap()
+                    })
+                    .unwrap()
+            })
+            .expect("the handler receives the HTTP/2 request");
+        let view = adapter.native_response(&response, Some(0)).unwrap();
+        assert!(pair.server.respond(stream, &view.head(), now).unwrap());
+        assert_eq!(pair.response(client, now).unwrap().status().code(), 202);
+        assert_matches!(pair.collect(client, now), (bytes, Collect::Complete(None)) if bytes.is_empty());
+        pair.server.close(stream);
+    }
+}
+
 #[test]
 fn a_complete_delivery_needs_each_byte_and_a_reset_after_the_finish_makes_it_partial() {
     // Over TCP, the count is exact: each DATA payload byte that the transport accepted.

@@ -10,14 +10,19 @@ use std::assert_matches;
 use std::sync::Arc;
 
 use rsnetwork::body::{Outcome, Part};
-use rsnetwork::buffer::Lease;
-use rsnetwork::drive::Error;
+use rsnetwork::buffer::{Lease, Pool};
+use rsnetwork::drive::{Error, Kind};
 use rsnetwork::http::{Adapter, Body, Response};
+use rsnetwork::server::Http;
 use rsnetwork::value::{Field, Method, Target};
 use rsnetwork_tokio::Clock;
 use rsnetwork_tokio::server::Server;
 use support::{HEAD, PATIENCE, Transport, on_each_runtime};
 use tokio::sync::Notify;
+
+fn connection(make: fn(Transport) -> Http) -> (Http, Pool) {
+    (make(Transport::Plain), support::pool(&support::budget()))
+}
 
 #[test]
 fn http_conversion_streams_the_request_body_and_trailers_after_the_handler_returns() {
@@ -26,12 +31,7 @@ fn http_conversion_streams_the_request_body_and_trailers_after_the_handler_retur
         let server = Server::serve_http(
             listener,
             NonZeroUsize::MIN,
-            || {
-                Ok((
-                    support::core_server(Transport::Plain),
-                    support::pool(&support::budget()),
-                ))
-            },
+            || Ok(connection(support::core_server)),
             Adapter::new(HEAD, &support::budget()),
             |request| async move {
                 assert_eq!(request.method().as_str(), "Echo-Body");
@@ -99,12 +99,7 @@ fn http_conversion_delivers_the_peer_reset_code_to_the_request_handler() {
         let server = Server::serve_http(
             listener,
             NonZeroUsize::MIN,
-            || {
-                Ok((
-                    support::core_h2_server(Transport::Plain),
-                    support::pool(&support::budget()),
-                ))
-            },
+            || Ok(connection(support::core_h2_server)),
             Adapter::new(HEAD, &support::budget()),
             move |request| {
                 let (received, ended) = (Arc::clone(&received), Arc::clone(&ended));
@@ -153,14 +148,14 @@ fn http_conversion_delivers_the_peer_reset_code_to_the_request_handler() {
 }
 
 struct Interrupted {
-    prefix: Option<Lease>,
+    regions: &'static [&'static [u8]],
     read: Arc<Notify>,
 }
 
 impl Body for Interrupted {
     async fn next(&mut self) -> Result<Part, Error> {
-        if let Some(bytes) = self.prefix.take() {
-            return Ok(Part::Data(bytes));
+        if let Some(bytes) = self.regions.split_off_first() {
+            return Ok(Part::Data(Lease::from(bytes.to_vec())));
         }
         self.read.notified().await;
         Ok(Part::End(Outcome::Reset(Some(0x17))))
@@ -176,17 +171,12 @@ fn http_conversion_exposes_a_reset_after_the_prefix_instead_of_clean_eof() {
         let server = Server::serve_http(
             listener,
             NonZeroUsize::MIN,
-            || {
-                Ok((
-                    support::core_h2_server(Transport::Plain),
-                    support::pool(&support::budget()),
-                ))
-            },
+            || Ok(connection(support::core_h2_server)),
             Adapter::new(HEAD, &support::budget()),
             move |request| {
                 assert_eq!(request.version(), rsnetwork::http::Version::HTTP_2);
                 let body = Interrupted {
-                    prefix: Some(Lease::from(b"prefix".to_vec())),
+                    regions: &[b"prefix"],
                     read: Arc::clone(&signal),
                 };
                 async move { Ok(Response::new(body)) }
@@ -200,6 +190,239 @@ fn http_conversion_exposes_a_reset_after_the_prefix_instead_of_clean_eof() {
         assert_matches!(exchange.next().await.unwrap(), Part::End(Outcome::Reset(_)));
         drop(exchange);
         client.close().await.unwrap();
+        assert_eq!(server.close(Clock.deadline(PATIENCE)).await.failed, 1);
+    });
+}
+
+#[test]
+fn http_conversion_finishes_empty_http2_responses_and_preserves_the_head_length() {
+    on_each_runtime(|| async {
+        let (listener, address) = support::listener().await;
+        let server = Server::serve_http(
+            listener,
+            NonZeroUsize::MIN,
+            || Ok(connection(support::core_h2_server)),
+            Adapter::new(HEAD, &support::budget()),
+            |request| async move {
+                let mut head = Response::builder();
+                if request.method() == rsnetwork::http::Method::HEAD {
+                    head = head.header("content-length", "42");
+                }
+                Ok(head.body(()).unwrap())
+            },
+        );
+        let client = support::h2_client(Transport::Plain, address).await;
+        for method in [Method::GET, Method::HEAD] {
+            let mut exchange = client
+                .send(
+                    &rsnetwork::client::Request {
+                        method,
+                        ..support::get()
+                    },
+                    Clock.deadline(PATIENCE),
+                )
+                .await
+                .unwrap();
+            let head = exchange.response().await.unwrap();
+            assert_eq!(head.status().code(), 200);
+            if method == Method::HEAD {
+                assert!(
+                    head.fields()
+                        .any(|field| field.name() == b"content-length" && field.value() == b"42")
+                );
+            }
+            assert_matches!(exchange.next().await.unwrap(), Part::End(Outcome::Complete(None)));
+        }
+        client.close().await.unwrap();
+        assert_eq!(server.close(Clock.deadline(PATIENCE)).await.failed, 0);
+    });
+}
+
+#[test]
+fn http_conversion_delivers_trailers_on_a_body_with_zero_bytes() {
+    use rsnetwork::http::Version;
+    use rsnetwork_tokio::server::Incoming;
+
+    struct EmptyWithTrailers(Incoming);
+    impl Body for EmptyWithTrailers {
+        fn length(&self) -> Option<u64> {
+            Some(0)
+        }
+        async fn next(&mut self) -> Result<Part, Error> {
+            self.0.next().await
+        }
+    }
+
+    on_each_runtime(|| async {
+        for version in [Version::HTTP_11, Version::HTTP_2] {
+            let (listener, address) = support::listener().await;
+            let server = Server::serve_http(
+                listener,
+                NonZeroUsize::MIN,
+                move || {
+                    Ok(connection(if version == Version::HTTP_2 {
+                        support::core_h2_server
+                    } else {
+                        support::core_server
+                    }))
+                },
+                Adapter::new(HEAD, &support::budget()),
+                |request| async move {
+                    let mut response = Response::builder();
+                    if request.version() == Version::HTTP_2 {
+                        response = response.header("content-length", "0");
+                    }
+                    Ok(response.body(EmptyWithTrailers(request.into_body())).unwrap())
+                },
+            );
+            let head = rsnetwork::client::Request {
+                method: Method::POST,
+                length: None,
+                ..support::get()
+            };
+            let trailers = [Field::new(b"x-check", b"present").unwrap()];
+            let end = if version == Version::HTTP_2 {
+                let client = support::h2_client(Transport::Plain, address).await;
+                let mut request = client.send(&head, Clock.deadline(PATIENCE)).await.unwrap();
+                request.finish_with_trailers(&trailers).await.unwrap();
+                assert_eq!(request.response().await.unwrap().length(), Some(0));
+                let end = request.next().await.unwrap();
+                drop(request);
+                client.close().await.unwrap();
+                end
+            } else {
+                let mut client = support::client(Transport::Plain, address).await;
+                client.send(&head, Clock.deadline(PATIENCE)).await.unwrap();
+                client.finish_with_trailers(&trailers).await.unwrap();
+                assert_eq!(client.response().await.unwrap().length(), None);
+                let end = client.next().await.unwrap();
+                client.close().await.unwrap();
+                end
+            };
+            let Part::End(Outcome::Complete(Some(fields))) = end else {
+                panic!("expected the trailer section")
+            };
+            assert!(fields.fields().eq(trailers));
+            assert_eq!(server.close(Clock.deadline(PATIENCE)).await.failed, 0);
+        }
+    });
+}
+
+#[test]
+fn http_conversion_refuses_a_reset_before_empty_http2_headers_can_finish_the_stream() {
+    on_each_runtime(|| async {
+        let (listener, address) = support::listener().await;
+        let server = Server::serve_http(
+            listener,
+            NonZeroUsize::MIN,
+            || Ok(connection(support::core_h2_server)),
+            Adapter::new(HEAD, &support::budget()),
+            |_| async {
+                let read = Arc::new(Notify::new());
+                read.notify_one();
+                let body = Interrupted { regions: &[], read };
+                Ok(Response::builder().header("content-length", "0").body(body).unwrap())
+            },
+        );
+        let client = support::h2_client(Transport::Plain, address).await;
+        let mut exchange = client.send(&support::get(), Clock.deadline(PATIENCE)).await.unwrap();
+        assert_eq!(exchange.response().await.unwrap_err().kind(), Kind::Uncertain);
+        drop(exchange);
+        client.close().await.unwrap();
+        assert_eq!(server.close(Clock.deadline(PATIENCE)).await.failed, 1);
+    });
+}
+
+#[test]
+fn http_conversion_sends_a_fixed_length_http1_body_and_serves_the_next_head_request() {
+    on_each_runtime(|| async {
+        let (listener, address) = support::listener().await;
+        let server = Server::serve_http(
+            listener,
+            NonZeroUsize::MIN,
+            || Ok(connection(support::core_server)),
+            Adapter::new(HEAD, &support::budget()),
+            |request| async move {
+                let body =
+                    (request.method() != rsnetwork::http::Method::HEAD).then(|| Lease::from(b"value".as_slice()));
+                Ok(Response::builder().header("content-length", "5").body(body).unwrap())
+            },
+        );
+        let mut client = support::client(Transport::Plain, address).await;
+        for method in [Method::GET, Method::HEAD] {
+            client
+                .send(
+                    &rsnetwork::client::Request {
+                        method,
+                        ..support::get()
+                    },
+                    Clock.deadline(PATIENCE),
+                )
+                .await
+                .unwrap();
+            let head = client.response().await.unwrap();
+            assert!(
+                head.fields()
+                    .any(|field| field.name() == b"content-length" && field.value() == b"5")
+            );
+            let mut received = Vec::new();
+            loop {
+                match client.next().await.unwrap() {
+                    Part::Data(bytes) => received.extend_from_slice(bytes.as_ref()),
+                    Part::End(Outcome::Complete(None)) => break,
+                    end => panic!("expected a complete response, got {end:?}"),
+                }
+            }
+            assert_eq!(
+                received,
+                if method == Method::HEAD {
+                    b"".as_slice()
+                } else {
+                    b"value"
+                }
+            );
+        }
+        client.close().await.unwrap();
+        assert_eq!(server.close(Clock.deadline(PATIENCE)).await.failed, 0);
+    });
+}
+
+#[test]
+fn http_conversion_keeps_a_fixed_length_http1_response_partial_when_its_source_resets() {
+    on_each_runtime(|| async {
+        let (listener, address) = support::listener().await;
+        let read = Arc::new(Notify::new());
+        let signal = Arc::clone(&read);
+        let server = Server::serve_http(
+            listener,
+            NonZeroUsize::MIN,
+            || Ok(connection(support::core_server)),
+            Adapter::new(HEAD, &support::budget()),
+            move |_| {
+                let body = Interrupted {
+                    regions: &[b"one", b"two"],
+                    read: Arc::clone(&signal),
+                };
+                async move { Ok(Response::builder().header("content-length", "6").body(body).unwrap()) }
+            },
+        );
+        let mut client = support::client(Transport::Plain, address).await;
+        client.send(&support::get(), Clock.deadline(PATIENCE)).await.unwrap();
+        assert_eq!(client.response().await.unwrap().length(), Some(6));
+        let mut received = Vec::new();
+        while received.len() < 3 {
+            let Part::Data(bytes) = client.next().await.unwrap() else {
+                panic!("expected the first three bytes")
+            };
+            received.extend_from_slice(bytes.as_ref());
+        }
+        assert_eq!(received, b"one");
+        read.notify_one();
+        assert_matches!(
+            client.next().await.unwrap(),
+            Part::End(Outcome::Truncated | Outcome::Reset(_))
+        );
+        drop(client);
         assert_eq!(server.close(Clock.deadline(PATIENCE)).await.failed, 1);
     });
 }

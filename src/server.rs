@@ -75,6 +75,12 @@ use crate::value::{Field, Status};
 use http1::H1;
 use http2::H2;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmptyBody {
+    Finish,
+    AwaitEnd,
+}
+
 /// The limits of a server connection, which the caller sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -423,10 +429,10 @@ impl Http {
         }
     }
 
-    /// Sends the head of `response` to the request of `stream`, at `now`. A response with the
-    /// length `Some(0)` is finished at once. For another body, send it with
-    /// [`write`](Self::write), and end it with [`finish`](Self::finish), also when the request
-    /// was HEAD or the status has no body.
+    /// Sends the head of `response` to the request of `stream`, at `now`. A length of `Some(0)`
+    /// finishes the response here. On HTTP/2, a response to HEAD or a status of 204 or 304 also
+    /// finishes here. For other responses, send any body bytes with [`write`](Self::write),
+    /// then call [`finish`](Self::finish).
     ///
     /// Gives `false` when the transport still holds the regions of the heads before: wait as
     /// [`wait`](Self::wait) says, and respond again. Refuses with [`Kind::Misuse`] when the stream
@@ -434,10 +440,28 @@ impl Http {
     /// [`Kind::Unsupported`] for a 101 response or a 2xx response to CONNECT: this server does
     /// not change the protocol.
     pub fn respond(&mut self, stream: Stream, response: &Response<'_>, now: Instant) -> Result<bool, Error> {
+        self.respond_head(stream, response, EmptyBody::Finish, now)
+    }
+
+    /// Sends the head as [`respond`](Self::respond) does. On HTTP/2, a regular zero-length body stays open
+    /// for [`finish_with_trailers`](Self::finish_with_trailers) or [`finish`](Self::finish).
+    /// A response to HEAD or a status of 204 or 304 still ends at its head on HTTP/2.
+    /// On HTTP/1.1, only chunked framing permits trailers.
+    pub fn respond_streaming(&mut self, stream: Stream, response: &Response<'_>, now: Instant) -> Result<bool, Error> {
+        self.respond_head(stream, response, EmptyBody::AwaitEnd, now)
+    }
+
+    fn respond_head(
+        &mut self,
+        stream: Stream,
+        response: &Response<'_>,
+        empty: EmptyBody,
+        now: Instant,
+    ) -> Result<bool, Error> {
         self.writable(now)?;
         match self.link.engine_ref() {
             Protocol::H1(..) => self.h1_respond(stream, response, now),
-            Protocol::H2(..) => self.h2_respond(stream, response, now),
+            Protocol::H2(..) => self.h2_respond(stream, response, empty, now),
             Protocol::Pending => Err(not_open()),
         }
     }

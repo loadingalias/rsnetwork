@@ -35,6 +35,12 @@ Return `()` for an empty response, `Some(lease)` for one region, or implement `r
 Its `next` method yields a native `Part`. Only `Part::End(Outcome::Complete(...))` finishes a response.
 A handler can read the original reset code from its incoming body. A failed outgoing body cancels its own exchange. [Body outcomes](body.md#outcomes)
 
+The Tokio adapter checks the body outcome before it sends a zero-length response, a response to HEAD, or status 204 or 304.
+A HEAD response can declare the size of the selected representation and return `()`.
+For fixed-length HTTP/1 responses, the adapter holds the last region until the producer confirms completion.
+Earlier regions stream as they arrive. This keeps a source reset from appearing as a complete response on the wire.
+HTTP/2 can carry trailers with any declared length, including zero. On HTTP/1.1, return an unknown length to stream a body with trailers.
+
 On a caller-driven HTTP/1.1 or HTTP/2 server, call `Http::handle_http`.
 The request body holds the stream identifier. Read its parts through `Http::next`, then send the converted response under the same stream's backpressure.
 On caller-driven HTTP/3, pass the head and stream from `Event::Request` to `Adapter::handle`.
@@ -63,6 +69,7 @@ An ecosystem message's `Debug` output can contain the request target and header 
 
 Native conversion takes the authority from the URI or Host field. Conflicting authorities, conflicting lengths, and unsupported transfer encodings give an error.
 Content-Length supplies the native length. HTTP/1.1 chunked framing gives an unknown length. With neither field, the caller supplies the length.
+The Tokio server validates response framing against the negotiated protocol.
 Native field validation rejects leading or trailing whitespace. A caller-set sensitive marker that native compression cannot preserve gives `Kind::Unsupported`.
 The direct HTTP/3 response writer passes that marker to QPACK.
 

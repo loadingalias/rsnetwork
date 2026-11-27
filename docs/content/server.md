@@ -140,9 +140,11 @@ fn echo(
 }
 ```
 
-A response with the length `Some(0)` is finished at `respond`. A response of unknown length,
-`None`, goes in chunks on HTTP/1.1, to an HTTP/1.0 client until the close, and on HTTP/2 until the
-end of its stream.
+A response with the length `Some(0)` finishes at `respond`.
+On HTTP/2, a response to HEAD or a status of 204 or 304 also finishes at `respond`.
+Call `finish` for other responses, including an HTTP/1 response to HEAD with a positive representation length.
+To send HTTP/2 trailers after an empty body, use `respond_streaming`, then `finish_with_trailers`.
+An unknown length selects chunks on HTTP/1.1. On HTTP/1.0, the body ends at connection close. On HTTP/2, it ends with the stream.
 
 ## Streams
 

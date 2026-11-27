@@ -13,7 +13,7 @@ use rstypes::buffer::{Buffer as _, BufferMut, Lease, WriteLoan};
 use rstypes::capacity::{Budget, Permit};
 use rstypes::time::{Deadline, Instant};
 
-use super::{Delivery, Http, Limits, Protocol, Response, misuse, not_open};
+use super::{Delivery, EmptyBody, Http, Limits, Protocol, Response, misuse, not_open};
 use crate::body::{Collect, Outcome, Part, Read, Trailers};
 use crate::drive::{Error, Kind, Outbound};
 use crate::h1;
@@ -701,7 +701,13 @@ impl Http {
         Ok(index)
     }
 
-    pub(super) fn h2_respond(&mut self, stream: Stream, response: &Response<'_>, now: Instant) -> Result<bool, Error> {
+    pub(super) fn h2_respond(
+        &mut self,
+        stream: Stream,
+        response: &Response<'_>,
+        empty: EmptyBody,
+        now: Instant,
+    ) -> Result<bool, Error> {
         let index = self.h2_live(stream)?;
         let exchange = &self.h2().exchanges[index];
         if exchange.out.is_some() {
@@ -734,7 +740,7 @@ impl Http {
         let lines = core::iter::once(status_line)
             .chain(message::lines(fields))
             .chain(length_line);
-        let end_stream = bodiless || length == Some(0);
+        let end_stream = bodiless || (length == Some(0) && empty == EmptyBody::Finish);
         let (session, _) = self.h2_parts();
         if session.connection().block_room(lines.clone()) > self.limits.head.head_bytes {
             return Err(Error::new(
