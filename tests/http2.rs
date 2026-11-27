@@ -590,6 +590,31 @@ fn a_write_goes_on_when_its_wait_for_the_chunk_before_removes_a_stream_that_the_
 }
 
 #[test]
+fn an_early_http2_response_leaves_only_the_lifetime_on_the_unfinished_upload() {
+    let mut pair = Pair::plain();
+    let op = client::Operation::new(Deadline::at(at(100)), NonZeroUsize::MIN)
+        .with_body_idle(Duration::from_millis(20))
+        .unwrap();
+    let request = Request {
+        method: Method::POST,
+        length: Some(2),
+        ..get(b"/upload")
+    };
+    let stream = pair.client.send(&request, &op, at(0)).unwrap().unwrap();
+    let (server, _) = pair.request(at(10));
+    pair.answer(server, b"", at(10));
+    pair.response(stream, at(10)).unwrap();
+    assert_matches!(pair.collect(stream, at(10)).1, Collect::Complete(None));
+    let byte = Lease::from(&b"x"[..]);
+    pair.client.write(stream, &byte, at(40)).unwrap();
+    let error = pair.client.write(stream, &byte, at(100)).unwrap_err();
+    assert_eq!(
+        (error.kind(), error.reason()),
+        (Kind::Deadline, "the deadline came before the end of the request")
+    );
+}
+
+#[test]
 fn a_slow_body_meets_its_deadline_on_its_stream_and_the_connection_goes_on() {
     let mut pair = Pair::plain();
     let slow = pair.send(&get(b"/slow"), Deadline::at(at(1_000)), at(0));

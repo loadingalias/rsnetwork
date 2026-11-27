@@ -17,8 +17,10 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::sync::mpsc;
 
+use rsnetwork::client::Operation;
+use rsnetwork::client::establish::{ConnectError, Dial};
 use rsnetwork::drive::Kind;
-use rsnetwork_tokio::Blocking;
+use rsnetwork_tokio::{Blocking, Clock, client::connect};
 use support::{PATIENCE, on_each_runtime};
 
 #[test]
@@ -118,4 +120,60 @@ fn a_lookup_outside_a_tokio_runtime_reports_an_unsupported_host() {
     let mut wait = pin!(blocking.lookup("localhost", 443, NonZeroUsize::MIN));
     let outcome = wait.as_mut().poll(&mut Context::from_waker(Waker::noop()));
     assert!(matches!(outcome, Poll::Ready(Err(e)) if e.kind() == Kind::Unsupported));
+}
+
+#[test]
+fn a_connect_deadline_during_dns_leaves_the_lookup_and_its_memory_with_the_worker() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (release, hold) = mpsc::channel::<()>();
+            let (started, active) = tokio::sync::oneshot::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                hold.recv_timeout(PATIENCE).unwrap();
+            });
+            active.await.unwrap();
+            let resolver = Blocking::new(NonZeroUsize::MIN);
+            let mem = support::budget();
+            let mut op = Operation::new(
+                Clock.deadline(Duration::from_millis(100)),
+                NonZeroUsize::new(2).unwrap(),
+            );
+            let result = connect("127.0.0.1", 80, &resolver, Dial::default(), &mut op, &mem).await;
+            assert!(
+                matches!(result,Err(ConnectError::Operation(e)) if e.kind()==Kind::Deadline),
+                "{result:?}"
+            );
+            assert_eq!((op.occupied(), op.remaining()), (1, 1));
+            assert!(mem.available() < mem.bound());
+            let refused = resolver.run(|| ()).await.unwrap_err();
+            assert_eq!(refused.kind(), Kind::Overload);
+            release.send(()).unwrap();
+            worker.await.unwrap();
+            // This worker runs after the abandoned lookup in the single-thread blocking queue.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert_eq!((op.occupied(), op.remaining(), mem.available()), (0, 1, mem.bound()));
+        });
+}
+
+#[test]
+fn repeated_lookup_errors_spend_the_original_work_budget() {
+    on_each_runtime(|| async {
+        let resolver = Blocking::new(NonZeroUsize::MIN);
+        let mem = support::budget();
+        let mut op = Operation::new(Clock.deadline(PATIENCE), NonZeroUsize::new(3).unwrap());
+        for left in [2, 1] {
+            // A system resolver cannot accept a NUL in the host name.
+            let result = connect("bad\0host", 443, &resolver, Dial::default(), &mut op, &mem).await;
+            assert!(matches!(result, Err(ConnectError::Io(_))), "{result:?}");
+            assert_eq!((op.remaining(), op.occupied(), mem.available()), (left, 0, mem.bound()));
+        }
+        let result = connect("127.0.0.1", 443, &resolver, Dial::default(), &mut op, &mem).await;
+        assert!(matches!(result, Err(ConnectError::Operation(error)) if error.kind() == Kind::Overload));
+        assert_eq!(op.remaining(), 1, "a refused lookup spends no unit");
+    });
 }

@@ -4,6 +4,8 @@ The operating system resolver returns socket addresses in its preferred order. E
 Set two limits. One bounds queued and running jobs together. The other bounds the number of addresses that one lookup returns.
 The operating system can produce a longer list internally. This interface returns addresses only. It supplies no DNS TTL or HTTPS records.
 
+To open a connection, give the returned addresses to the TCP address race. It shares the request's time and work limits. [Connect within one deadline](establishment.md)
+
 ## Caller-driven hosts
 
 Enable the `os-resolver` feature of `rsnetwork`. It works without TLS, TCP, or a runtime dependency.

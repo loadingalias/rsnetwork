@@ -6,12 +6,13 @@ use std::sync::Arc;
 
 use rsnetwork::body::{Collect, Outcome, Part, Read};
 use rsnetwork::buffer::{BufferMut, Lease, Pool, WriteLoan};
-use rsnetwork::client::{Http1 as Core, Http2 as Core2, Request};
+use rsnetwork::client::{Http1 as Core, Http2 as Core2, Request, ResponseDeadline};
 use rsnetwork::drive::{Error, Kind};
 use rsnetwork::host::Io as _;
 use rsnetwork::message::{ResponseHead, Stream};
 use rsnetwork::priority::Priority;
-use rsnetwork::time::Deadline;
+mod establish;
+pub use establish::{connect, connect_addresses, connect_with};
 use rsnetwork::tls::{ExportError, Negotiated};
 use rsnetwork::value::Field;
 use tokio::net::TcpStream;
@@ -49,7 +50,8 @@ impl Http1 {
     /// [`Http1::send`](rsnetwork::client::Http1::send) does. It waits while the body before
     /// drains and while the transport holds the last request head. Send a body with
     /// [`write`](Self::write), and end it with [`finish`](Self::finish).
-    pub async fn send(&mut self, request: &Request<'_>, deadline: Deadline) -> Result<(), Error> {
+    pub async fn send(&mut self, request: &Request<'_>, deadline: impl Into<ResponseDeadline>) -> Result<(), Error> {
+        let deadline = deadline.into();
         let sent = self
             .socket
             .until(|client, now| Ok(client.send(request, deadline, now)?.then_some(())));
@@ -188,11 +190,21 @@ impl Http2 {
     /// [`Http2::send`](rsnetwork::client::Http2::send) does, and gives the handle of the stream.
     /// It waits while each stream is in use, in the order of the calls that wait. Send a body
     /// with [`Exchange::write`], and end it with [`Exchange::finish`].
-    pub async fn send(&self, request: &Request<'_>, deadline: Deadline) -> Result<Exchange, Error> {
+    pub async fn send(&self, request: &Request<'_>, deadline: impl Into<ResponseDeadline>) -> Result<Exchange, Error> {
+        let deadline = deadline.into();
+        if deadline.lifetime().instant().domain() != Clock.domain() {
+            return Err(Error::new(
+                Kind::Misuse,
+                "the deadline is not on the clock of the client",
+            ));
+        }
         let sent = self
             .shared
             .until(Waits::Place(None), |client, now| client.send(request, deadline, now));
-        let stream = sent.await?.ok_or(ENDED)?;
+        let stream = tokio::time::timeout_at(Clock.tokio(deadline.lifetime()), sent)
+            .await
+            .map_err(|_| Error::new(Kind::Deadline, "the deadline came before the request went out"))??
+            .ok_or(ENDED)?;
         Ok(Exchange {
             shared: Arc::clone(&self.shared),
             stream,

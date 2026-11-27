@@ -14,6 +14,8 @@ you drive the queues yourself.
 
 ## Prerequisites
 
+To include DNS and TCP connection time, create one `client::Operation` before lookup and pass it to `send`. [Connect within one deadline](establishment.md)
+
 - A host that moves bytes between the socket and the client, and reads a monotonic clock.
 - `client::Limits`: the limits of the HTTP/1.1 response head (see [HTTP/1.1](http1.md#limits)),
   the HTTP/2 connection (see [HTTP/2](http2.md#settings)), the body, the turn limits, and the size
@@ -139,17 +141,16 @@ decoded lines of their exact size on HTTP/2.
 
 ## The deadline
 
-One deadline covers the operation: the TLS handshake, the response head, and each byte of the
-body until the body ends. `wait()` includes it, so your host wakes at the deadline also when no
-byte arrives. At the deadline, the call fails with `Kind::Deadline`:
+One deadline covers the TLS handshake, the response head, and the body. An operation created before lookup also includes connection time.
+`wait()` includes the next deadline of each admitted exchange. A deadline gives `Kind::Deadline` with a reason.
 
-- `the deadline came before the response head`: no head arrived.
-- `the deadline came before the end of the response`: the head arrived, and `delivered()` gives
-  the bytes of the body that arrived before the deadline.
+- `the deadline came before the response head` means the final response head did not arrive in time.
+- `the deadline came before the end of the response` means the body exceeded the absolute lifetime. `delivered()` gives the byte count so far.
+- `the response body reached its idle limit` means the configured interval passed without body data.
+- `the deadline came before the end of the request` means the upload reached its lifetime after an early response.
 
-The exchange cannot complete, so the connection ends. Send the rest of the output, and make a new
-client for the next request. A deadline that passed before the request went out on a clean
-connection refuses the request, and the connection stays.
+An expired exchange ends its HTTP/1.1 connection. Send the remaining output and use a new connection for the next request.
+On HTTP/2, expiry resets only that stream. A request that expires before it goes out on a clean connection leaves the connection available.
 
 ## Reuse a connection
 

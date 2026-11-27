@@ -2,6 +2,7 @@
 
 use core::alloc::Layout;
 
+use super::ResponseDeadline;
 use rstypes::buffer::{Backing, Buffer as _, BufferMut, Lease, Pool, WriteLoan};
 use rstypes::capacity::{Budget, Permit};
 use rstypes::time::{ClockDomain, Deadline, Instant};
@@ -53,7 +54,7 @@ struct Out {
 #[derive(Debug)]
 struct Exchange {
     id: u32,
-    deadline: Deadline,
+    deadline: ResponseDeadline,
     out: Out,
     head: Option<ResponseHead>,
     /// The request is HEAD: its response has no body.
@@ -93,15 +94,19 @@ impl Exchange {
     /// Ends the exchange with [`Kind::Deadline`] when `now` reached its deadline, and its stream
     /// resets.
     fn lapse(&mut self, now: Instant) -> Result<(), Error> {
-        let reached = self
-            .deadline
+        let Some(deadline) = self.timer() else {
+            return Ok(());
+        };
+        let reached = deadline
             .is_reached(now)
             .map_err(|_| misuse("the time is not on the clock of the client"))?;
-        if reached && !self.inflow.ended() && self.error.is_none() {
+        if reached {
             let reason = if self.head.is_none() {
                 "the deadline came before the response head"
+            } else if self.inflow.ended() {
+                "the deadline came before the end of the request"
             } else {
-                "the deadline came before the end of the response"
+                self.deadline.body_expiry()
             };
             let error = Error::new(Kind::Deadline, reason);
             self.refuse(ErrorCode::CANCEL, error, Outcome::Cancelled);
@@ -111,9 +116,15 @@ impl Exchange {
         Ok(())
     }
 
-    /// Whether the exchange ended: with an error, or with the end of its body.
-    fn done(&self) -> bool {
-        self.error.is_some() || self.inflow.ended()
+    /// After an early response, only the absolute lifetime applies to the unfinished upload.
+    fn timer(&self) -> Option<Deadline> {
+        if self.error.is_some() {
+            None
+        } else if !self.inflow.ended() {
+            Some(self.deadline.next())
+        } else {
+            (!self.out.ended && !self.ended && self.reset.is_none()).then(|| self.deadline.lifetime())
+        }
     }
 }
 
@@ -234,12 +245,18 @@ impl Http2 {
     /// the end of the connection, and with a field that HTTP/2 forbids; with
     /// [`Kind::Unsupported`] for CONNECT, because the client opens no tunnel; and with
     /// [`Kind::Deadline`] at the deadline.
-    pub fn send(&mut self, request: &Request<'_>, deadline: Deadline, now: Instant) -> Result<Option<Stream>, Error> {
+    pub fn send(
+        &mut self,
+        request: &Request<'_>,
+        deadline: impl Into<ResponseDeadline>,
+        now: Instant,
+    ) -> Result<Option<Stream>, Error> {
+        let deadline = deadline.into();
         self.live(now)?;
-        if deadline.instant().domain() != self.clock {
+        if deadline.lifetime().instant().domain() != self.clock {
             return Err(misuse("the deadline is not on the clock of the client"));
         }
-        if deadline.is_reached(now) == Ok(true) {
+        if deadline.lifetime().is_reached(now) == Ok(true) {
             return Err(Error::new(
                 Kind::Deadline,
                 "the deadline came before the request went out",
@@ -830,6 +847,7 @@ impl Http2 {
                         let declared = response.length();
                         exchange.declared = declared;
                         exchange.head = Some(ResponseHead::h2_form(response));
+                        exchange.deadline.progress(now);
                         if end_stream {
                             if declared.is_some_and(|declared| declared != 0) {
                                 exchange.refuse(ErrorCode::PROTOCOL_ERROR, malformed, Outcome::Malformed);
@@ -894,6 +912,9 @@ impl Http2 {
                 if exchange.reset.is_some() || exchange.inflow.ended() || exchange.left {
                     exchange.inflow.discard(data);
                     return Ok(true);
+                }
+                if data.initialized() != 0 {
+                    exchange.deadline.progress(now);
                 }
                 let total = exchange.inflow.received().saturating_add(data.initialized() as u64);
                 if exchange.declared.is_some_and(|declared| total > declared) {
@@ -988,8 +1009,8 @@ impl Io for Http2 {
         let deadline = self
             .exchanges
             .iter()
-            .filter(|exchange| !exchange.left && !exchange.done())
-            .map(|exchange| Some(exchange.deadline))
+            .filter(|exchange| !exchange.left)
+            .map(Exchange::timer)
             .fold(None, earliest);
         match self.link.wait() {
             Wait::Until { blocked, deadline: own } => Wait::Until {

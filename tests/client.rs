@@ -734,3 +734,124 @@ fn over_http1_request_trailers_wait_for_a_place_in_a_full_output_queue() {
     assert_eq!(sent.iter().filter(|&&byte| byte == b'z').count(), parts * 1000);
     assert!(sent.ends_with(b"\r\n0\r\nx-request: done\r\n\r\n"), "{sent:?}");
 }
+
+#[cfg(all(feature = "tcp", not(target_family = "wasm")))]
+#[test]
+fn one_deadline_expires_in_the_body_after_the_second_family_connects() {
+    use core::alloc::Layout;
+    use core::net::Ipv6Addr;
+    use core::num::NonZeroU32;
+    use core::task::Poll;
+    use rsnetwork::buffer::Pool;
+    use rsnetwork::capacity::Permit;
+    use rsnetwork::client::Operation;
+    use rsnetwork::client::establish::{Dial, Step};
+    use rsnetwork::host::Tcp;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+
+    let pair = |ip| {
+        let listener = TcpListener::bind(SocketAddr::new(ip, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(address).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        (address, Some(stream), peer)
+    };
+    let (v6, mut first, mut losing_peer) = pair(IpAddr::V6(Ipv6Addr::LOCALHOST));
+    let (v4, mut second, mut serving_peer) = pair(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let mem = budget();
+    let lifetime = Deadline::at(at(500));
+    let mut op = Operation::new(lifetime, NonZeroUsize::new(2).unwrap());
+    let addresses = [v6, v4];
+    // The host withholds the first completion. Both handles own real sockets.
+    let mut race = Dial::default().race(&addresses, &mut op, at(40), &mem).unwrap();
+    let mut started = Vec::new();
+    let mut start = |addr, place| {
+        started.push(addr);
+        Ok((if addr == v4 { second.take() } else { first.take() }, place, addr == v4))
+    };
+    let poll = |attempt: &mut (Option<TcpStream>, Permit, bool)| {
+        if attempt.2 {
+            Poll::Ready(Ok(attempt.0.take().unwrap()))
+        } else {
+            Poll::Pending
+        }
+    };
+    for now in [40, 289] {
+        assert_matches!(race.advance(at(now), &mut start, poll),Ok(Step::Wait(d)) if d==Deadline::at(at(290)));
+    }
+    let Step::Connected(winner) = race.advance(at(290), &mut start, poll).unwrap() else {
+        panic!("the second family must connect");
+    };
+    drop(race);
+    assert_eq!(started, [v6, v4]);
+    losing_peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    assert_eq!(losing_peer.read(&mut [0; 1]).unwrap(), 0);
+    assert_eq!(op.occupied(), 0);
+    let pool = Pool::new(&mem, NonZeroU32::new(2).unwrap(), Layout::new::<[u8; 1024]>()).unwrap();
+    let mut tcp = Tcp::new(winner, pool).unwrap();
+    let mut client = Http1::plain(LIMITS, clock(), &mem).unwrap();
+    assert!(client.send(&get(), &op, at(290)).unwrap());
+    tcp.pump(&mut client).unwrap();
+    serving_peer
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc")
+        .unwrap();
+    for _ in 0..64 {
+        tcp.pump(&mut client).unwrap();
+        if client.response(at(300)).unwrap().is_some() {
+            break;
+        }
+    }
+    assert_matches!(client.next(at(300)).unwrap(), Some(Part::Data(d)) if d.bytes()==b"abc");
+    assert_matches!(client.next(at(499)).unwrap(), None);
+    assert_matches!(client.next(at(500)),Err(e) if e.kind()==Kind::Deadline && e.reason()=="the deadline came before the end of the response");
+    assert_eq!(client.delivered(), 3);
+}
+
+#[test]
+fn only_response_progress_renews_body_idle_time_within_the_absolute_lifetime() {
+    use rsnetwork::client::Operation;
+    for (lifetime, expiry, reason) in [
+        (500, 160, "the response body reached its idle limit"),
+        (145, 145, "the deadline came before the end of the response"),
+    ] {
+        let op = Operation::new(Deadline::at(at(lifetime)), NonZeroUsize::MIN)
+            .with_body_idle(Duration::from_millis(50))
+            .unwrap();
+        let mut client = Http1::plain(LIMITS, clock(), &budget()).unwrap();
+        assert!(client.send(&get(), &op, at(0)).unwrap());
+        assert!(client.response(at(99)).unwrap().is_none());
+        give_client(&mut client, b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n".to_vec()).unwrap();
+        assert_eq!(client.response(at(100)).unwrap().unwrap().status().code(), 200);
+        give_client(&mut client, b"ab".to_vec()).unwrap();
+        assert_matches!(client.next(at(110)).unwrap(),Some(Part::Data(d)) if d.bytes()==b"ab");
+        assert_matches!(client.next(at(expiry - 1)).unwrap(), None);
+        assert_matches!(client.wait(),Wait::Until{deadline:Some(d),..} if d==Deadline::at(at(expiry)));
+        assert_matches!(client.next(at(expiry)),Err(e) if e.kind()==Kind::Deadline && e.reason()==reason);
+        assert_eq!(client.delivered(), 2);
+    }
+}
+
+#[test]
+fn a_complete_early_response_ends_its_idle_timer_while_the_upload_continues() {
+    use rsnetwork::client::Operation;
+    let op = Operation::new(Deadline::at(at(1_000)), NonZeroUsize::MIN)
+        .with_body_idle(Duration::from_millis(50))
+        .unwrap();
+    let mut client = Http1::plain(LIMITS, clock(), &budget()).unwrap();
+    let post = Request {
+        method: Method::POST,
+        length: Some(1),
+        ..get()
+    };
+    assert!(client.send(&post, &op, at(0)).unwrap());
+    give_client(&mut client, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()).unwrap();
+    assert_eq!(client.response(at(10)).unwrap().unwrap().status().code(), 200);
+    assert_matches!(client.next(at(10)).unwrap(), Some(Part::End(Outcome::Complete(None))));
+    client.write(&Lease::from(&b"x"[..]), at(70)).unwrap();
+    client.finish(at(70)).unwrap();
+    while let Some(output) = client.output() {
+        client.ack(output.id, output.region.initialized()).unwrap();
+    }
+    assert_matches!(client.wait(), Wait::Until { deadline: None, .. });
+}

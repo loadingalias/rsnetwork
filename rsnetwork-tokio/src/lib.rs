@@ -107,6 +107,8 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+#![feature(allocator_ext)]
+
 mod blocking;
 pub mod client;
 pub mod server;

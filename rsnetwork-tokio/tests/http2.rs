@@ -1166,3 +1166,63 @@ fn a_response_of_a_higher_urgency_completes_first_on_one_connection() {
         }
     });
 }
+
+#[test]
+fn a_waiting_http2_request_keeps_its_lifetime_and_a_stream_keeps_its_own_idle_limit() {
+    use rsnetwork::buffer::Buffer as _;
+    use rsnetwork::client::Operation;
+    on_each_runtime(|| async {
+        let (listener, address) = support::listener().await;
+        let hold = Arc::new(Notify::new());
+        let release = hold.clone();
+        let server = serve(Transport::Plain, listener, move |mut exchange: Exchange| {
+            let hold = hold.clone();
+            async move {
+                if exchange.head().target().as_bytes() == b"/slow" {
+                    exchange.respond(&ok(Some(3))).await?;
+                    exchange.write(&Lease::from(&b"a"[..])).await?;
+                    hold.notified().await;
+                } else {
+                    exchange.respond(&ok(Some(0))).await?;
+                    exchange.finish().await?;
+                }
+                Ok(())
+            }
+        });
+        let mut limits = support::CLIENT;
+        limits.h2.settings.max_concurrent_streams = 1;
+        let mem = support::budget();
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let core = rsnetwork::client::Http2::plain(limits, Clock.domain(), &mem).unwrap();
+        let client = rsnetwork_tokio::client::Http2::new(core, stream, support::pool(&mem)).unwrap();
+        let slow_time = Operation::new(Clock.deadline(PATIENCE), NonZeroUsize::MIN)
+            .with_body_idle(Duration::from_millis(300))
+            .unwrap();
+        let mut slow = client.send(&request(b"/slow", Some(0)), &slow_time).await.unwrap();
+        slow.response().await.unwrap();
+        assert!(matches!(slow.next().await.unwrap(),rsnetwork::body::Part::Data(d) if d.bytes()==b"a"));
+        let waiting = Operation::new(Clock.deadline(Duration::from_millis(40)), NonZeroUsize::MIN);
+        let error = within(client.send(&request(b"/waiting", Some(0)), &waiting))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.kind(), error.reason()),
+            (Kind::Deadline, "the deadline came before the request went out")
+        );
+        let error = within(slow.next()).await.unwrap_err();
+        assert_eq!(
+            (error.kind(), error.reason()),
+            (Kind::Deadline, "the response body reached its idle limit")
+        );
+        assert_eq!(slow.delivered(), 1);
+        drop(slow);
+        release.notify_one();
+        let mut next = within(client.send(&request(b"/next", Some(0)), Clock.deadline(PATIENCE)))
+            .await
+            .unwrap();
+        assert_eq!(within(next.response()).await.unwrap().status().code(), 200);
+        drop(next);
+        drop(client);
+        within(server.close(Clock.deadline(PATIENCE))).await;
+    });
+}

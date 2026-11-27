@@ -33,14 +33,17 @@
 //! - **One connection.** When the connection ends, the client takes no more requests: make a new
 //!   one.
 
+pub mod establish;
 mod http2;
+
+pub use establish::{Operation, ResponseDeadline};
 
 use core::alloc::Layout;
 use core::num::{NonZeroU32, NonZeroUsize};
 
-use rstypes::buffer::{Backing, BufferMut, Lease, Pool, PoolRefused, WriteLoan};
+use rstypes::buffer::{Backing, Buffer as _, BufferMut, Lease, Pool, PoolRefused, WriteLoan};
 use rstypes::capacity::Budget;
-use rstypes::time::{ClockDomain, Deadline, Instant};
+use rstypes::time::{ClockDomain, Instant};
 
 use crate::body::{Collect, Consumer, Outcome, Part, Read};
 use crate::drive::{AckError, ActionId, Endpoint, Error, Kind, Output, Outstanding, Received, TurnLimits};
@@ -118,7 +121,7 @@ pub struct Http1 {
     clock: ClockDomain,
     state: State,
     /// The deadline of the exchange in flight.
-    deadline: Option<Deadline>,
+    deadline: Option<ResponseDeadline>,
     head: Option<ResponseHead>,
     /// The framing of the response body.
     framing: Framing,
@@ -185,9 +188,15 @@ impl Http1 {
     /// [`wait`](Self::wait) says, and send again. Refuses with [`Kind::Misuse`] when the response
     /// of the request before has no head yet, when the connection ended, or when the time is not
     /// on the clock of the client, and with [`Kind::Deadline`] at the deadline.
-    pub fn send(&mut self, request: &Request<'_>, deadline: Deadline, now: Instant) -> Result<bool, Error> {
+    pub fn send(
+        &mut self,
+        request: &Request<'_>,
+        deadline: impl Into<ResponseDeadline>,
+        now: Instant,
+    ) -> Result<bool, Error> {
+        let deadline = deadline.into();
         self.live(now)?;
-        if deadline.instant().domain() != self.clock {
+        if deadline.lifetime().instant().domain() != self.clock {
             return Err(misuse("the deadline is not on the clock of the client"));
         }
         match self.state {
@@ -418,6 +427,7 @@ impl Http1 {
             return Ok(());
         };
         if !deadline
+            .next()
             .is_reached(now)
             .map_err(|_| misuse("the time is not on the clock of the client"))?
         {
@@ -433,7 +443,8 @@ impl Http1 {
             }
             State::Draining => "the deadline came before the request went out",
             State::Head => "the deadline came before the response head",
-            State::Body | State::Arrived => "the deadline came before the end of the response",
+            State::Body => deadline.body_expiry(),
+            State::Arrived => "the deadline came before the end of the request",
         };
         let error = Error::new(Kind::Deadline, reason);
         self.end = Some(error);
@@ -466,35 +477,49 @@ impl Http1 {
     fn pump(&mut self, now: Instant) -> Result<bool, Error> {
         let hold = !self.body.wants_data();
         self.link.engine().0.hold_body(hold);
-        let Some(event) = self.link_drive(now)? else {
-            return Ok(false);
-        };
+        let event = self.link_drive(now)?;
+        let progressed = event.is_some();
         match event {
-            ClientEvent::Informational(_) => {}
-            ClientEvent::Response(head) => {
+            None | Some(ClientEvent::Informational(_)) => {}
+            Some(ClientEvent::Response(head)) => {
                 self.framing = head.head().framing();
                 self.head = Some(ResponseHead::h1_form(head));
                 self.state = State::Body;
+                if let Some(deadline) = &mut self.deadline {
+                    deadline.progress(now);
+                }
             }
-            ClientEvent::Data(data) => {
+            Some(ClientEvent::Data(data)) => {
+                if data.initialized() != 0
+                    && let Some(deadline) = &mut self.deadline
+                {
+                    deadline.progress(now);
+                }
                 // The client drives only when the consumer takes a part.
                 let taken = self.body.data(data);
                 assert!(taken.is_ok(), "the client drives only when the body takes a part");
             }
             // The end of a body that the application cancelled changes nothing: the drain goes on.
-            ClientEvent::End(_) if self.state == State::Draining => {}
-            ClientEvent::End(outcome) => {
+            Some(ClientEvent::End(_)) if self.state == State::Draining => {}
+            Some(ClientEvent::End(outcome)) => {
                 let outcome = self.unnotified(outcome);
                 self.body.end(outcome);
                 self.state = State::Arrived;
             }
-            ClientEvent::Handoff => {
+            Some(ClientEvent::Handoff) => {
                 let error = Error::new(Kind::Unsupported, "the client does not switch protocols");
                 self.end = Some(error);
                 return Err(error);
             }
         }
-        Ok(true)
+        if self.state == State::Arrived {
+            // An early response leaves only the upload under the absolute lifetime.
+            self.deadline = self
+                .deadline
+                .filter(|_| !self.link.engine().0.ready())
+                .map(|time| time.lifetime().into());
+        }
+        Ok(progressed)
     }
 
     /// Drives the connection one time. Over TLS, a server that selected a protocol other than
@@ -543,7 +568,7 @@ impl Io for Http1 {
         match self.link.wait() {
             Wait::Until { blocked, deadline } => Wait::Until {
                 blocked,
-                deadline: earliest(deadline, self.deadline),
+                deadline: earliest(deadline, self.deadline.map(ResponseDeadline::next)),
             },
             wait => wait,
         }

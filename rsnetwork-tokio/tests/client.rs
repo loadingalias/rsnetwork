@@ -353,3 +353,85 @@ fn a_trailer_section_larger_than_the_head_region_refuses_at_once_and_does_not_wa
         drop(accept.await.unwrap());
     });
 }
+
+#[test]
+fn the_tokio_stagger_starts_ipv4_while_ipv6_waits_and_closes_the_losing_socket() {
+    use core::num::NonZeroUsize;
+    use rsnetwork::client::{Operation, establish::Dial};
+    use rsnetwork_tokio::client::connect_with;
+    use tokio::net::{TcpListener as Listener, TcpStream};
+
+    on_each_runtime(|| async {
+        let first = Listener::bind("[::1]:0").await.unwrap();
+        let second = Listener::bind("127.0.0.1:0").await.unwrap();
+        let addresses = [first.local_addr().unwrap(), second.local_addr().unwrap()];
+        let mut held = Some(TcpStream::connect(addresses[0]).await.unwrap());
+        let (loser, _) = first.accept().await.unwrap();
+        let dial = Dial {
+            delay: Duration::from_millis(50),
+            ..Dial::default()
+        };
+        let mut op = Operation::new(Clock.deadline(PATIENCE), NonZeroUsize::new(2).unwrap());
+        let mem = support::budget();
+        let before = Clock.now();
+        let mut starts = Vec::new();
+        let winner = connect_with(&addresses, dial, &mut op, &mem, |address| {
+            starts.push((address, Clock.now()));
+            let pending = held.take();
+            async move {
+                if let Some(socket) = pending {
+                    // The host withholds this connect completion. Cancellation must close its socket.
+                    core::future::pending::<()>().await;
+                    Ok(socket)
+                } else {
+                    TcpStream::connect(address).await
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(starts.len(), 2);
+        assert_eq!([starts[0].0, starts[1].0], addresses);
+        assert!(starts[1].1.duration_since(before).unwrap() >= dial.delay);
+        assert_eq!(winner.peer_addr().unwrap(), addresses[1]);
+        assert_eq!(second.accept().await.unwrap().1, winner.local_addr().unwrap());
+        tokio::time::timeout(PATIENCE, loser.readable()).await.unwrap().unwrap();
+        assert_eq!(loser.try_read(&mut [0; 1]).unwrap(), 0);
+        assert_eq!((op.remaining(), op.occupied(), mem.available()), (0, 0, mem.bound()));
+    });
+}
+
+#[test]
+fn lookup_and_connect_share_the_work_budget_with_the_ensuing_http_exchange() {
+    use core::num::NonZeroUsize;
+    use rsnetwork::client::{Operation, establish::Dial};
+    use rsnetwork_tokio::client::connect;
+    on_each_runtime(|| async {
+        let (listener, address) = support::listener().await;
+        let peer = tokio::spawn(async move {
+            let mut server = support::server(Transport::Plain, &listener).await;
+            let mut exchange = server.request().await.unwrap().unwrap();
+            exchange.respond(&ok(Some(2))).await.unwrap();
+            exchange.write(&Lease::from(&b"ok"[..])).await.unwrap();
+            exchange.finish().await.unwrap();
+            exchange
+        });
+        let resolver = rsnetwork_tokio::Blocking::new(NonZeroUsize::MIN);
+        let mem = support::budget();
+        let mut op = Operation::new(Clock.deadline(PATIENCE), NonZeroUsize::new(2).unwrap());
+        let socket = connect("127.0.0.1", address.port(), &resolver, Dial::default(), &mut op, &mem)
+            .await
+            .unwrap();
+        assert_eq!((op.remaining(), op.occupied()), (0, 0));
+        let mut http = Http1::new(support::core_client(Transport::Plain), socket, support::pool(&mem)).unwrap();
+        http.send(&get(), &op).await.unwrap();
+        assert_eq!(http.response().await.unwrap().status().code(), 200);
+        let mut data = WriteLoan::new(Vec::with_capacity(2));
+        assert!(matches!(
+            http.collect(&mut data).await.unwrap(),
+            Collect::Complete(None)
+        ));
+        assert_eq!(data.filled(), b"ok");
+        peer.await.unwrap();
+    });
+}
