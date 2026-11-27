@@ -130,7 +130,8 @@ impl Stream {
     pub fn drive(&mut self, now: Instant) -> Result<(), Error> {
         self.live(now)?;
         while self.pump(now)? {}
-        Ok(())
+        // Let the host send a pending TLS alert before reporting the terminal handshake error.
+        self.connection.release().unwrap_or(Ok(()))
     }
 
     /// Copies the next received bytes into the free capacity of `region`, as many as fit, or

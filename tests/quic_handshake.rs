@@ -19,8 +19,8 @@ use rsnetwork::quic::params::{Migration, ParameterError, Parameters, PreferredAd
 use rsnetwork::quic::{CRYPTO_BUFFER_BYTES_MAX, Connection, ConnectionId, ErrorCode, Limits, Path, PeerClose};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
-    Authentication, CertificateDer, ClientConfig, ClientOptions, Entropy, Group, Handshake, Identity, PrivateKeyDer,
-    Resumption, ServerConfig, ServerOptions, TimeProvider, UnixTime,
+    Authentication, CertificateDer, ClassicalSelection, ClientConfig, ClientOptions, Entropy, Group, Handshake,
+    Identity, KeyExchangeProfile, PrivateKeyDer, Resumption, ServerConfig, ServerOptions, TimeProvider, UnixTime,
 };
 
 const CA: &[u8] = include_bytes!("tls/ca.der");
@@ -78,34 +78,53 @@ const SERVER_PORT: u16 = 443;
 const CLIENT_PORT: u16 = 4301;
 
 fn client_config(root: &[u8], resumption: Resumption) -> ClientConfig {
-    ClientConfig::new(ClientOptions {
-        roots: &[certificate(root)],
-        identity: None,
-        protocols: &[ALPN],
-        resumption,
-        budget: &budget(),
-        clock: Arc::new(At(VALID)),
-        entropy: Entropy::System,
-    })
+    client_profile(root, resumption, KeyExchangeProfile::Default)
+}
+
+fn client_profile(root: &[u8], resumption: Resumption, profile: KeyExchangeProfile) -> ClientConfig {
+    ClientConfig::with_key_exchange(
+        ClientOptions {
+            roots: &[certificate(root)],
+            identity: None,
+            protocols: &[ALPN],
+            resumption,
+            budget: &budget(),
+            clock: Arc::new(At(VALID)),
+            entropy: Entropy::System,
+        },
+        profile,
+    )
     .unwrap()
 }
 
 /// A server with the leaf `(leaf, key)`, and `chain` after it.
-fn server_config((leaf, key): (&[u8], &[u8]), chain: &[&[u8]], resumption: Resumption) -> ServerConfig {
+fn server_config(leaf: (&[u8], &[u8]), chain: &[&[u8]], resumption: Resumption) -> ServerConfig {
+    server_profile(leaf, chain, resumption, KeyExchangeProfile::Default)
+}
+
+fn server_profile(
+    (leaf, key): (&[u8], &[u8]),
+    chain: &[&[u8]],
+    resumption: Resumption,
+    profile: KeyExchangeProfile,
+) -> ServerConfig {
     let mut certificates = vec![certificate(leaf)];
     certificates.extend(chain.iter().map(|der| certificate(der)));
-    ServerConfig::new(ServerOptions {
-        identity: Identity {
-            chain: certificates,
-            key: PrivateKeyDer::try_from(key.to_vec()).unwrap(),
+    ServerConfig::with_key_exchange(
+        ServerOptions {
+            identity: Identity {
+                chain: certificates,
+                key: PrivateKeyDer::try_from(key.to_vec()).unwrap(),
+            },
+            client_roots: None,
+            protocols: &[ALPN],
+            resumption,
+            budget: &budget(),
+            clock: Arc::new(At(VALID)),
+            entropy: Entropy::System,
         },
-        client_roots: None,
-        protocols: &[ALPN],
-        resumption,
-        budget: &budget(),
-        clock: Arc::new(At(VALID)),
-        entropy: Entropy::System,
-    })
+        profile,
+    )
     .unwrap()
 }
 
@@ -266,6 +285,57 @@ fn terminal(progress: Progress) -> Option<Result<(), Error>> {
     match progress {
         Progress::Terminal(outcome) => Some(outcome),
         _ => None,
+    }
+}
+
+#[test]
+fn quic_reports_the_classical_choice_and_rejects_peers_outside_the_strict_profile() {
+    use ClassicalSelection::{ExplicitProfile, NoHybridOffer, PeerSelected};
+    use KeyExchangeProfile::{Classical, Default, Strict};
+    let make = |client, server| {
+        Pair::new(
+            &client_profile(CA, Resumption::Off, client),
+            server_profile(SERVER, &[], Resumption::Off, server),
+            (Limits::DEFAULT, Limits::DEFAULT),
+        )
+    };
+    for (client, server, group, at_client, at_server) in [
+        (
+            Default,
+            Classical,
+            Group::X25519,
+            Some(PeerSelected),
+            Some(ExplicitProfile),
+        ),
+        (
+            Classical,
+            Default,
+            Group::X25519,
+            Some(ExplicitProfile),
+            Some(NoHybridOffer),
+        ),
+        (Strict, Strict, Group::X25519_MLKEM768, None, None),
+    ] {
+        let mut pair = make(client, server);
+        pair.run(at(0), Order::Sent);
+        assert!(pair.client.is_confirmed() && pair.server().is_confirmed());
+        let facts = pair.client.negotiated().unwrap();
+        assert_eq!(
+            (facts.group, facts.classical_selection, facts.handshake),
+            (group, at_client, Handshake::Full)
+        );
+        assert_eq!(facts.peer.unwrap().authentication, Authentication::EcdsaP256);
+        let facts = pair.server().negotiated().unwrap();
+        assert_eq!((facts.group, facts.classical_selection), (group, at_server));
+    }
+    for (client, server) in [(Strict, Classical), (Classical, Strict)] {
+        let mut pair = make(client, server);
+        pair.run(at(0), Order::Sent);
+        assert_eq!(
+            terminal(pair.client_outcome(at(0))).unwrap().unwrap_err().kind(),
+            Kind::Unsupported
+        );
+        assert!(pair.client.negotiated().is_none() && pair.server().negotiated().is_none());
     }
 }
 

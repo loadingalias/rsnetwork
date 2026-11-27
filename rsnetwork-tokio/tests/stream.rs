@@ -38,6 +38,31 @@ async fn read(stream: &mut Stream, length: usize) -> Vec<u8> {
 }
 
 #[test]
+fn incompatible_key_exchange_reaches_both_handshake_callers() {
+    use rsnetwork::drive::Kind;
+    use tls::KeyExchangeProfile::{Classical, Strict};
+    on_each_runtime(|| async {
+        let (listener, address) = support::listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mem = support::budget();
+            let core = tls::Stream::accept(&support::server_profile(Classical), LIMITS, Clock.domain(), &mem).unwrap();
+            let mut stream = Stream::new(core, tcp, support::pool(&mem)).unwrap();
+            let error = stream.handshake().await.unwrap_err();
+            assert_eq!(error.kind(), Kind::Unsupported, "{error}");
+        });
+        let mem = support::budget();
+        let config = support::client_with(&[], Strict);
+        let core = tls::Stream::connect(&config, "server.test", LIMITS, Clock.domain(), &mem).unwrap();
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut stream = Stream::new(core, tcp, support::pool(&mem)).unwrap();
+        let error = stream.handshake().await.unwrap_err();
+        assert_eq!(error.kind(), Kind::Unsupported, "{error}");
+        server.await.unwrap();
+    });
+}
+
+#[test]
 fn a_tls_stream_carries_bytes_each_way_and_ends_complete_after_close_notify() {
     on_each_runtime(|| async {
         let (listener, address) = support::listener().await;

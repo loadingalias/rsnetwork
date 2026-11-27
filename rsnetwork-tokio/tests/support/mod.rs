@@ -128,37 +128,47 @@ pub(crate) fn pool(budget: &Budget) -> Pool {
 }
 
 pub(crate) fn server_config() -> ServerConfig {
+    server_profile(tls::KeyExchangeProfile::Default)
+}
+
+pub(crate) fn server_profile(profile: tls::KeyExchangeProfile) -> ServerConfig {
     let (chain, key) = SERVER;
-    ServerConfig::new(ServerOptions {
-        identity: Identity {
-            chain: vec![CertificateDer::from(chain.to_vec())],
-            key: PrivateKeyDer::try_from(key.to_vec()).unwrap(),
+    ServerConfig::with_key_exchange(
+        ServerOptions {
+            identity: Identity {
+                chain: vec![CertificateDer::from(chain.to_vec())],
+                key: PrivateKeyDer::try_from(key.to_vec()).unwrap(),
+            },
+            client_roots: None,
+            protocols: &[b"h2", b"http/1.1"],
+            resumption: Resumption::Off,
+            budget: &budget(),
+            clock: Arc::new(At),
+            entropy: Entropy::System,
         },
-        client_roots: None,
-        protocols: &[b"h2", b"http/1.1"],
-        resumption: Resumption::Off,
-        budget: &budget(),
-        clock: Arc::new(At),
-        entropy: Entropy::System,
-    })
+        profile,
+    )
     .unwrap()
 }
 
 /// A client configuration with ALPN `http/1.1`, which the server selects.
 pub(crate) fn client_config() -> ClientConfig {
-    client_with(&[b"http/1.1"])
+    client_with(&[b"http/1.1"], tls::KeyExchangeProfile::Default)
 }
 
-fn client_with(protocols: &[&[u8]]) -> ClientConfig {
-    ClientConfig::new(ClientOptions {
-        roots: &[CertificateDer::from(CA.to_vec())],
-        identity: None,
-        protocols,
-        resumption: Resumption::Off,
-        budget: &budget(),
-        clock: Arc::new(At),
-        entropy: Entropy::System,
-    })
+pub(crate) fn client_with(protocols: &[&[u8]], profile: tls::KeyExchangeProfile) -> ClientConfig {
+    ClientConfig::with_key_exchange(
+        ClientOptions {
+            roots: &[CertificateDer::from(CA.to_vec())],
+            identity: None,
+            protocols,
+            resumption: Resumption::Off,
+            budget: &budget(),
+            clock: Arc::new(At),
+            entropy: Entropy::System,
+        },
+        profile,
+    )
     .unwrap()
 }
 
@@ -192,7 +202,7 @@ pub(crate) fn core_h2_client(transport: Transport) -> client::Http2 {
     match transport {
         Transport::Plain => client::Http2::plain(CLIENT, Clock.domain(), &budget()).unwrap(),
         Transport::Tls => client::Http2::tls(
-            &client_with(&[b"h2"]),
+            &client_with(&[b"h2"], tls::KeyExchangeProfile::Default),
             "server.test",
             (CLIENT, TLS),
             Clock.domain(),

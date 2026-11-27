@@ -743,6 +743,7 @@ pub struct Connection {
     /// The peer source ID in Initial and Handshake packets. Rotation only affects the data path.
     initial_peer: Option<ConnectionId>,
     facts: Option<Facts>,
+    if_classical: Option<tls::ClassicalSelection>,
     peer: Option<Parameters>,
     limits: Limits,
     budget: Budget,
@@ -981,6 +982,7 @@ impl Connection {
                     left: None,
                 },
                 Tls::Failed,
+                config.if_classical,
             ),
             (stream, random, held, config.cost, Arc::clone(&config.own)),
             (local_cid, original_cid, original_cid),
@@ -1065,6 +1067,7 @@ impl Connection {
                     left: None,
                 },
                 Tls::Server(ServerHandshake::NeedsInput(ServerHandshake::start(TlsVersion::V1))),
+                config.if_classical,
             ),
             (stream, random, held, config.cost, Arc::clone(&config.own)),
             (local_cid, scid, dcid),
@@ -1099,7 +1102,7 @@ impl Connection {
     }
 
     fn new(
-        (end, tls): (End, Tls),
+        (end, tls, if_classical): (End, Tls, Option<tls::ClassicalSelection>),
         (stream, random, held, cost, own): (
             Option<rscrypto_rustls::replay::Stream>,
             &'static dyn rustls::crypto::SecureRandom,
@@ -1172,6 +1175,7 @@ impl Connection {
             initial_local: local_cid,
             initial_peer: None,
             facts: None,
+            if_classical,
             peer: None,
             limits,
             budget: budget.clone(),

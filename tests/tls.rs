@@ -30,7 +30,8 @@ use rsnetwork::host::{Connection, Engine, Io as _, Wait};
 use rsnetwork::time::{ClockDomain, Instant, Suspend};
 use rsnetwork::tls::{
     Authentication, CertificateDer, ChaCha20Rng, ClientConfig, ClientOptions, Closure, Copies, Entropy, Group,
-    Handshake, Identity, Limits, PrivateKeyDer, Resumption, ServerConfig, ServerOptions, TimeProvider, Tls, UnixTime,
+    Handshake, Identity, KeyExchangeProfile, Limits, PrivateKeyDer, Resumption, ServerConfig, ServerOptions,
+    TimeProvider, Tls, UnixTime,
 };
 use rsnetwork::value::{Authority, Field, Method, Status, Target};
 
@@ -808,40 +809,98 @@ fn a_certificate_chain_larger_than_one_record_completes_when_it_arrives_in_parts
 }
 
 #[test]
-fn a_seeded_run_replays_each_byte_of_its_handshake_and_request() {
-    let run = |seed: u8| {
-        let root = ChaCha20Rng::from_seed([seed; ChaCha20Rng::SEED_SIZE]);
-        let client = ClientConfig::new(ClientOptions {
-            roots: &[certificate(CA)],
-            identity: None,
-            protocols: &[b"http/1.1"],
-            resumption: Resumption::Off,
-            budget: &budget(),
-            clock: Arc::new(At(VALID)),
-            entropy: Entropy::Seeded(root.child(b"client\0\0", 0)),
-        })
+fn the_client_hello_advertises_only_the_groups_of_its_profile_in_preference_order() {
+    use rustls::crypto::kx::NamedGroup;
+    use rustls::server::ServerHandshake;
+    for (profile, expected) in [
+        (
+            KeyExchangeProfile::Default,
+            &[NamedGroup::X25519MLKEM768, NamedGroup::X25519][..],
+        ),
+        (KeyExchangeProfile::Strict, &[NamedGroup::X25519MLKEM768][..]),
+        (KeyExchangeProfile::Classical, &[NamedGroup::X25519][..]),
+    ] {
+        let config = ClientConfig::with_key_exchange(
+            ClientOptions {
+                roots: &[certificate(CA)],
+                identity: None,
+                protocols: &[],
+                resumption: Resumption::Off,
+                budget: &budget(),
+                clock: Arc::new(At(VALID)),
+                entropy: Entropy::System,
+            },
+            profile,
+        )
         .unwrap();
-        let server = ServerConfig::new(ServerOptions {
-            identity: identity(SERVER),
-            client_roots: None,
-            protocols: &[b"http/1.1"],
-            resumption: Resumption::Off,
-            budget: &budget(),
-            clock: Arc::new(At(VALID)),
-            entropy: Entropy::Seeded(root.child(b"server\0\0", 0)),
-        })
+        let mut connection = client(&config, "server.test", LIMITS);
+        drive(&mut connection, |_, _| {});
+        let mut input = VecInput::default();
+        while let Some(output) = connection.output() {
+            let mut bytes = output.region.bytes();
+            while !bytes.is_empty() {
+                input.read(&mut bytes).unwrap();
+            }
+            connection.ack(output.id, output.region.initialized()).unwrap();
+        }
+        let ServerHandshake::Accepted(hello) = ServerHandshake::start().process(&mut input, &mut Vec::new()).unwrap()
+        else {
+            panic!("the server must receive a complete ClientHello");
+        };
+        assert_eq!(hello.client_hello().named_groups(), Some(expected));
+    }
+}
+
+#[test]
+fn a_seeded_run_replays_each_byte_of_its_handshake_and_request() {
+    let run = |seed: u8, profile, expected| {
+        let root = ChaCha20Rng::from_seed([seed; ChaCha20Rng::SEED_SIZE]);
+        let client = ClientConfig::with_key_exchange(
+            ClientOptions {
+                roots: &[certificate(CA)],
+                identity: None,
+                protocols: &[b"http/1.1"],
+                resumption: Resumption::Off,
+                budget: &budget(),
+                clock: Arc::new(At(VALID)),
+                entropy: Entropy::Seeded(root.child(b"client\0\0", 0)),
+            },
+            profile,
+        )
+        .unwrap();
+        let server = ServerConfig::with_key_exchange(
+            ServerOptions {
+                identity: identity(SERVER),
+                client_roots: None,
+                protocols: &[b"http/1.1"],
+                resumption: Resumption::Off,
+                budget: &budget(),
+                clock: Arc::new(At(VALID)),
+                entropy: Entropy::Seeded(root.child(b"server\0\0", 0)),
+            },
+            profile,
+        )
         .unwrap();
         let mut pair = Pair::new(&client, "server.test", &server);
         pair.request(&[]);
         pair.run();
         assert_eq!(pair.body, BODY);
+        let facts = pair.client.parts().0.negotiated().unwrap();
+        assert_eq!((facts.group, facts.classical_selection), expected);
         pair.transcript
     };
-    let first = run(1);
-    assert!(first.len() > 1000);
-    assert_eq!(first, run(1));
-    // Another seed gives other bytes, so the seed and not a constant made them.
-    assert_ne!(first, run(2));
+    for (profile, expected) in [
+        (KeyExchangeProfile::Default, (Group::X25519_MLKEM768, None)),
+        (KeyExchangeProfile::Strict, (Group::X25519_MLKEM768, None)),
+        (
+            KeyExchangeProfile::Classical,
+            (Group::X25519, Some(rsnetwork::tls::ClassicalSelection::ExplicitProfile)),
+        ),
+    ] {
+        let first = run(1, profile, expected);
+        assert_eq!(first, run(1, profile, expected));
+        assert_ne!(first, run(2, profile, expected));
+    }
 }
 
 /// The three suites of the provider.

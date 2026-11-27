@@ -68,12 +68,10 @@ certificate, or an ALPN name that is empty or longer than 255 bytes. With
 `Resumption::Process(n)`, they charge the `n` places of the session store to `budget` first, and
 refuse with `Kind::Overload` when it cannot pay.
 
-The key exchange is the default hybrid profile. A client offers X25519MLKEM768 first and X25519
-second, with a key share for each, in each ClientHello: it keeps no hint of the group that a server
-chose before. A server selects X25519MLKEM768 whenever the client offers it.
-It sends a HelloRetryRequest for it when the client sent no key share for it. The suites are the
-TLS 1.3 suites AES-256-GCM, AES-128-GCM, and ChaCha20-Poly1305. TLS 1.2 is off. 0-RTT is off: no
-end sends or accepts early data.
+`ClientConfig::new` and `ServerConfig::new` use the default hybrid profile. The first ClientHello offers X25519MLKEM768 and X25519 with both key shares.
+Use `with_key_exchange` to require hybrid or classical key exchange for a configuration. [Choose a key-exchange profile](pq-profiles.md)
+
+The TLS 1.3 cipher suites are AES-256-GCM, AES-128-GCM, and ChaCha20-Poly1305. TLS 1.2 and 0-RTT are off.
 
 ## Run an engine over TLS
 
@@ -246,6 +244,7 @@ budget has each of their bytes back.
 | Field | Value |
 | --- | --- |
 | `group` | The key-exchange group, by its IANA code point: `Group::X25519_MLKEM768` or `Group::X25519` |
+| `classical_selection` | Why this end negotiated X25519, or `None` for hybrid key exchange |
 | `protocol` | The ALPN name that the server selected, or `None` |
 | `handshake` | `Handshake::Full`, `Handshake::Retried` (after a HelloRetryRequest), or `Handshake::Resumed` |
 | `peer` | `Some(Peer { certificate, authentication })`: the DER of the end-entity certificate of the peer that your roots verified, and its key algorithm, `Authentication::EcdsaP256`, `EcdsaP384`, `Ed25519`, `Rsa`, `MlDsa44`, `MlDsa65`, or `MlDsa87`. `None` for a client with no certificate |

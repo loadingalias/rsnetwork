@@ -10,9 +10,10 @@
 //!
 //! - **Configuration.** [`ClientConfig`] and [`ServerConfig`] take each choice explicitly: the
 //!   trust roots, the identity of each end, ALPN, resumption, and the wall clock that checks the
-//!   validity of certificates. The key exchange offers X25519MLKEM768 first and X25519 second, and
-//!   a server selects X25519MLKEM768 whenever a client offers it. Each configuration has its own
-//!   provider, so nothing installs a provider for the process.
+//!   validity of certificates. The default client offers X25519MLKEM768 first and X25519 second.
+//!   The default server selects X25519MLKEM768 whenever the client offers it.
+//!   [`KeyExchangeProfile`] also permits a strict hybrid profile or an explicit classical profile.
+//!   Each configuration has its own provider.
 //! - **Receive.** A host receives into the region that
 //!   [`host::Io::region`](crate::host::Io::region) lends: the tail of the input
 //!   region, so a record that continues after a receive completes in place. A region that the host
@@ -42,6 +43,7 @@
 mod export;
 pub(crate) mod memory;
 mod peer;
+mod profile;
 mod record;
 mod sent;
 pub(crate) mod stream;
@@ -56,7 +58,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use memory::{ClientStore, Cost, Held, Own, Owns, ServerStore};
 use record::{CONTENT_MAX, Content, HEADER, PROTECTED_MAX, Protection, TAG, Violation};
-use rscrypto_rustls::kx_group::{X25519Group, X25519MlKem768Group};
+use rscrypto_rustls::kx_group::{X25519, X25519Group, X25519MLKEM768, X25519MlKem768Group};
 use rscrypto_rustls::replay::{self, ScopedRandom};
 use rstypes::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, PoolRefused, WriteLoan};
 use rstypes::capacity::{Budget, Credit};
@@ -80,6 +82,7 @@ use rustls::{
 use sent::Sent;
 
 pub use export::{EXPORT_CONTEXT_MAX, EXPORT_LABEL_MAX, EXPORT_OUTPUT_MAX, ExportError, RESERVED_LABEL_PREFIX};
+pub use profile::{ClassicalSelection, KeyExchangeProfile};
 pub use rscrypto::ChaCha20Rng;
 pub use rustls::pki_types::pem::PemObject;
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
@@ -200,6 +203,7 @@ static SCOPED_KEYS: rscrypto_rustls::sign::Provider = rscrypto_rustls::sign::Pro
 static SCOPED_HYBRID: X25519MlKem768Group = X25519MlKem768Group::new(&SCOPED);
 static SCOPED_X25519: X25519Group = X25519Group::new(&SCOPED);
 static SCOPED_GROUPS: [&dyn SupportedKxGroup; 2] = [&SCOPED_HYBRID, &SCOPED_X25519];
+static SYSTEM_GROUPS: [&dyn SupportedKxGroup; 2] = [X25519MLKEM768, X25519];
 
 /// The randomness of a configuration: the root generator of each stream, or `None` for the
 /// system, and the index of the next stream.
@@ -220,17 +224,22 @@ impl Source {
     }
 
     /// The provider whose draws come from this source.
-    fn provider(&self) -> CryptoProvider {
-        let provider = rscrypto_rustls::default_provider();
-        if self.root.is_none() {
-            return provider;
-        }
-        CryptoProvider {
-            kx_groups: Cow::Borrowed(&SCOPED_GROUPS),
-            secure_random: &SCOPED,
-            key_provider: &SCOPED_KEYS,
-            ..provider
-        }
+    fn provider(&self, profile: KeyExchangeProfile) -> CryptoProvider {
+        let mut provider = rscrypto_rustls::default_provider();
+        let groups = if self.root.is_some() {
+            provider.secure_random = &SCOPED;
+            provider.key_provider = &SCOPED_KEYS;
+            &SCOPED_GROUPS
+        } else {
+            &SYSTEM_GROUPS
+        };
+        // The offer stays fixed even when another crate enables more provider groups.
+        provider.kx_groups = Cow::Borrowed(match profile {
+            KeyExchangeProfile::Default => groups,
+            KeyExchangeProfile::Strict => &groups[..1],
+            KeyExchangeProfile::Classical => &groups[1..],
+        });
+        provider
     }
 
     /// The stream of the next owner that `label` names, or `None` for the system.
@@ -263,6 +272,7 @@ pub struct ClientConfig {
     pub(crate) config: Arc<rustls::ClientConfig>,
     resumption: Resumption,
     pub(crate) entropy: Arc<Source>,
+    pub(crate) if_classical: Option<ClassicalSelection>,
     /// What each connection charges for rustls.
     pub(crate) cost: Cost,
     pub(crate) own: Arc<Owns>,
@@ -273,10 +283,16 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
-    /// Makes the configuration from `options`. Refuses with [`Kind::Misuse`] when it has no root,
+    /// Makes the configuration with the default key-exchange profile. Refuses with [`Kind::Misuse`] when it has no root,
     /// a root or the identity is not valid, or a protocol name is empty or longer than 255 bytes,
     /// and with [`Kind::Overload`] when `budget` cannot pay for the places of the session store.
     pub fn new(options: ClientOptions<'_>) -> Result<Self, Error> {
+        Self::with_key_exchange(options, KeyExchangeProfile::Default)
+    }
+
+    /// Makes a client configuration with the selected key-exchange profile for TLS and QUIC.
+    /// The trust roots, certificate checks, and configuration errors follow [`Self::new`].
+    pub fn with_key_exchange(options: ClientOptions<'_>, profile: KeyExchangeProfile) -> Result<Self, Error> {
         let entropy = Source::new(options.entropy);
         let identity = options.identity.is_some();
         // The ClientHello carries each ALPN name with its length.
@@ -289,7 +305,7 @@ impl ClientConfig {
             Resumption::Off => None,
             Resumption::Process(sessions) => Some(Arc::new(ClientStore::new(options.budget, sessions.get())?)),
         };
-        let builder = rustls::ClientConfig::builder_with_details(Arc::new(entropy.provider()), options.clock)
+        let builder = rustls::ClientConfig::builder_with_details(Arc::new(entropy.provider(profile)), options.clock)
             .with_root_certificates(roots(options.roots)?);
         let mut config = match options.identity {
             None => builder.with_no_client_auth(),
@@ -312,6 +328,7 @@ impl ClientConfig {
             config: Arc::new(config),
             resumption: options.resumption,
             entropy: Arc::new(entropy),
+            if_classical: profile.if_classical(ClassicalSelection::PeerSelected),
             cost: Cost::client(options.protocols, identity),
             own: Arc::new(Owns::new(own)),
             store,
@@ -341,6 +358,7 @@ pub struct ServerConfig {
     identity: Arc<Rotation>,
     resumption: Resumption,
     pub(crate) entropy: Arc<Source>,
+    pub(crate) if_classical: Option<ClassicalSelection>,
     /// What each connection charges for rustls.
     pub(crate) cost: Cost,
     pub(crate) own: Arc<Owns>,
@@ -349,11 +367,17 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Makes the configuration from `options`. Refuses with [`Kind::Misuse`] when the identity is
+    /// Makes the configuration with the default key-exchange profile. Refuses with [`Kind::Misuse`] when the identity is
     /// not valid, its key does not match its certificate, a client root is not valid, or a
     /// protocol name is empty or longer than 255 bytes, and with [`Kind::Overload`] when `budget`
     /// cannot pay for the places of the session store.
     pub fn new(options: ServerOptions<'_>) -> Result<Self, Error> {
+        Self::with_key_exchange(options, KeyExchangeProfile::Default)
+    }
+
+    /// Makes a server configuration with the selected key-exchange profile for TLS and QUIC.
+    /// The identity, certificate checks, and configuration errors follow [`Self::new`].
+    pub fn with_key_exchange(options: ServerOptions<'_>, profile: KeyExchangeProfile) -> Result<Self, Error> {
         let entropy = Source::new(options.entropy);
         let hints = Own::new(options.client_roots.unwrap_or_default());
         let own = Own::new(&options.identity.chain).plus(hints);
@@ -361,7 +385,7 @@ impl ServerConfig {
             Resumption::Off => Arc::new(NoServerSessionStorage {}),
             Resumption::Process(sessions) => Arc::new(ServerStore::new(options.budget, sessions.get())?),
         };
-        let provider = Arc::new(entropy.provider());
+        let provider = Arc::new(entropy.provider(profile));
         let identity = Arc::new(Rotation(RwLock::new(credential(
             options.identity,
             &provider,
@@ -393,6 +417,7 @@ impl ServerConfig {
             identity,
             resumption: options.resumption,
             entropy: Arc::new(entropy),
+            if_classical: profile.if_classical(ClassicalSelection::NoHybridOffer),
             cost: Cost::server(options.client_roots),
             own: Arc::new(Owns::new(own)),
             hints,
@@ -564,6 +589,8 @@ pub enum Handshake {
 pub struct Negotiated<'a> {
     /// The key-exchange group.
     pub group: Group,
+    /// Why this connection used X25519. A hybrid exchange gives `None`.
+    pub classical_selection: Option<ClassicalSelection>,
     /// The application protocol that ALPN selected, or `None`.
     pub protocol: Option<&'a [u8]>,
     /// How the handshake ran.
@@ -1034,6 +1061,7 @@ impl Protocol {
 /// What the handshake negotiated. The connection keeps it after rustls gives its keys.
 pub(crate) struct Facts {
     group: Group,
+    classical_selection: Option<ClassicalSelection>,
     protocol: Option<Protocol>,
     handshake: Handshake,
     peer: Option<Evidence>,
@@ -1051,6 +1079,7 @@ impl Facts {
     pub(crate) fn negotiated(&self) -> Negotiated<'_> {
         Negotiated {
             group: self.group,
+            classical_selection: self.classical_selection,
             protocol: self.protocol.as_ref().map(Protocol::name),
             handshake: self.handshake,
             peer: self.peer.as_ref().map(|evidence| Peer {
@@ -1062,7 +1091,7 @@ impl Facts {
 
     /// The facts of a completed handshake, or `None` when rustls lacks one of them. Refuses with
     /// [`Kind::Overload`] when the memory for the certificate of the peer is not available.
-    pub(crate) fn of(common: &CommonState) -> Result<Option<Self>, Error> {
+    pub(crate) fn of(common: &CommonState, if_classical: Option<ClassicalSelection>) -> Result<Option<Self>, Error> {
         let peer = match common.peer_identity().map(|identity| identity.identity()) {
             Some(Chain::X509(chain)) => {
                 let der = chain.end_entity.as_ref();
@@ -1095,8 +1124,20 @@ impl Facts {
             },
             None => None,
         };
+        let group = Group(u16::from(group.name()));
+        let classical_selection = match (group, if_classical) {
+            (Group::X25519, Some(reason)) => Some(reason),
+            (Group::X25519_MLKEM768, policy) if policy != Some(ClassicalSelection::ExplicitProfile) => None,
+            _ => {
+                return Err(Error::new(
+                    Kind::Unsupported,
+                    "the negotiated group is outside the key-exchange profile",
+                ));
+            }
+        };
         Ok(Some(Self {
-            group: Group(u16::from(group.name())),
+            group,
+            classical_selection,
             protocol,
             // A handshake that neither resumed nor retried is full.
             handshake: match kind {
@@ -1360,6 +1401,7 @@ pub struct Tls<E> {
     phase: Phase,
     /// What the handshake negotiated, after it completed.
     facts: Option<Facts>,
+    if_classical: Option<ClassicalSelection>,
     /// The stream of each draw of the connection, or `None` for the system.
     stream: Option<replay::Stream>,
     /// The charge of the memory of rustls.
@@ -1433,7 +1475,7 @@ impl<E: Engine> Tls<E> {
         held.after(0, &own);
         let session = session.map_err(|error| refused(&error))?;
         Ok(Self::new(
-            (Session::Client(session), stream),
+            (Session::Client(session), stream, config.if_classical),
             (held, config.cost, Arc::clone(&config.own), config.store.clone()),
             (written, sent),
             engine,
@@ -1468,7 +1510,7 @@ impl<E: Engine> Tls<E> {
         held.after(0, &own);
         let session = session.map_err(|error| refused(&error))?;
         Ok(Self::new(
-            (Session::Server(session), stream),
+            (Session::Server(session), stream, config.if_classical),
             (held, config.cost, Arc::clone(&config.own), None),
             (written, sent),
             engine,
@@ -1479,7 +1521,7 @@ impl<E: Engine> Tls<E> {
     }
 
     fn new(
-        (session, stream): (Session, Option<replay::Stream>),
+        (session, stream, if_classical): (Session, Option<replay::Stream>, Option<ClassicalSelection>),
         (held, cost, own, tickets): (Held, Cost, Arc<Owns>, Option<Arc<ClientStore>>),
         (written, sent): (Bytes, Sent),
         engine: E,
@@ -1493,6 +1535,7 @@ impl<E: Engine> Tls<E> {
             outbound,
             phase: Phase::Handshake(session),
             facts: None,
+            if_classical,
             stream,
             held,
             cost,
@@ -1828,7 +1871,7 @@ impl<E: Engine> Tls<E> {
         let Phase::Handshake(session) = core::mem::replace(&mut self.phase, Phase::Failed) else {
             return Ok(());
         };
-        self.facts = Facts::of(session.common())?;
+        self.facts = Facts::of(session.common(), self.if_classical)?;
         let (kernel, secrets, exporter) = Kernel::new(session)?;
         let kept = match kernel {
             Kernel::Client(_) => peer,

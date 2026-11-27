@@ -233,7 +233,7 @@ impl Connection {
         let parameters = Parameters::parse(parameters.ok_or_else(invalid)?, sender).map_err(|_| invalid())?;
         let identity = common.peer_identity();
         let (peer, evidence) = (memory::chain_bytes(identity), memory::end_entity_bytes(identity));
-        let facts = Facts::of(common)
+        let facts = Facts::of(common, self.if_classical)
             .map_err(Failure::local)?
             .ok_or(Failure::local(Error::new(
                 Kind::Unsupported,

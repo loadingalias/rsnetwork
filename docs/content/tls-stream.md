@@ -129,6 +129,7 @@ accepts its records. Then `write` refuses with `Kind::Overload` until output goe
 | Field | Value |
 | --- | --- |
 | `group` | The key-exchange group: `Group::X25519_MLKEM768`, a post-quantum hybrid, or `Group::X25519` |
+| `classical_selection` | Why this end negotiated X25519, or `None` for hybrid key exchange. [Read the key-exchange result](pq-profiles.md#read-the-result) |
 | `protocol` | The ALPN name that the server selected, or `None` |
 | `handshake` | `Handshake::Full`, `Retried`, or `Resumed` |
 | `peer` | `Some(Peer { certificate, authentication })` when the peer showed a certificate that your roots verified, and `None` for a client with no certificate |
