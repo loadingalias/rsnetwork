@@ -33,7 +33,7 @@ use rsnetwork::value::{Authority, Field, Method, Target};
 use rsnetwork_tokio::Clock;
 use rsnetwork_tokio::server::{Exchange, Report, Server};
 use support::{ALERT_RECORD, Held, Last, PATIENCE, Proxy, Transport, ok, on_each_runtime};
-use tokio::sync::{Barrier, Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 /// The deadline of the exchanges whose peer stops.
 const DEADLINE: Duration = Duration::from_millis(300);
@@ -1079,36 +1079,39 @@ const URGENT: Priority = Priority {
     incremental: false,
 };
 
-/// The body of each response of the priority test: four times the connection window.
+/// The initial HTTP/2 connection window in bytes.
+const CONNECTION_WINDOW: usize = 65_535;
+
+/// Each response needs more than two connection windows.
 const LARGE: usize = 256 * 1024;
 
-/// The response of a higher urgency completes first (RFC 9218, section 10), for each way to set
-/// its priority. Each handler queues its body after both requests arrived, and the client reads
-/// only after both bodies are queued. The client has a connection window of 65,535 and a stream
-/// window larger than a body, so at most 65,535 bytes of the bodies go before the client reads,
-/// and then the scheduler gives each credit of the connection by priority. With no signal, `/a`,
-/// the first stream, would complete first.
+/// Both responses have queued data when the client releases the first window of `/a`.
+/// It then reads only `/b`. The unread bytes of `/a` keep their connection credit.
+/// Thus `/a` cannot finish until the client resumes it, and an ignored priority stalls `/b`.
 #[test]
 fn a_response_of_a_higher_urgency_completes_first_on_one_connection() {
     on_each_runtime(|| async {
         for signal in [Signal::Field, Signal::Server, Signal::Update] {
             let (listener, address) = support::listener().await;
-            let both = Arc::new(Barrier::new(2));
             let (queued, mut bodies) = mpsc::unbounded_channel();
-            let handler = {
-                let both = Arc::clone(&both);
-                move |mut exchange: Exchange| {
-                    let (both, queued) = (Arc::clone(&both), queued.clone());
-                    async move {
-                        both.wait().await;
-                        if matches!(signal, Signal::Server) && exchange.head().target().as_bytes() == b"/b" {
-                            exchange.prioritize(URGENT);
-                        }
-                        exchange.respond(&ok(Some(LARGE as u64))).await?;
-                        exchange.write(&Lease::from(vec![b'x'; LARGE])).await?;
-                        queued.send(()).unwrap();
-                        exchange.finish().await
+            let handler = move |mut exchange: Exchange| {
+                let queued = queued.clone();
+                async move {
+                    let low = exchange.head().target().as_bytes() == b"/a";
+                    if !low && matches!(signal, Signal::Server) {
+                        exchange.prioritize(URGENT);
                     }
+                    exchange.respond(&ok(Some(LARGE as u64))).await?;
+                    let remaining = if low {
+                        exchange.write(&Lease::from(vec![b'a'; CONNECTION_WINDOW])).await?;
+                        LARGE - CONNECTION_WINDOW
+                    } else {
+                        LARGE
+                    };
+                    // A second chunk can enter the stream only after the first used its send credit.
+                    exchange.write(&Lease::from(vec![b'x'; remaining])).await?;
+                    queued.send(()).unwrap();
+                    exchange.finish().await
                 }
             };
             let server = serve(Transport::Plain, listener, handler);
@@ -1118,7 +1121,7 @@ fn a_response_of_a_higher_urgency_completes_first_on_one_connection() {
                         initial_window_size: 1 << 20,
                         ..support::H2.settings
                     },
-                    connection_window: 65_535,
+                    connection_window: u32::try_from(CONNECTION_WINDOW).unwrap(),
                     ..support::H2
                 },
                 ..support::CLIENT
@@ -1139,28 +1142,28 @@ fn a_response_of_a_higher_urgency_completes_first_on_one_connection() {
                 };
                 async move { client.send(&request, Clock.deadline(PATIENCE)).await.unwrap() }
             };
-            let a = within(send(b"/a", &low[..])).await;
+            let mut a = within(send(b"/a", &low[..])).await;
+            within(a.response()).await.unwrap();
+            within(bodies.recv()).await.unwrap();
             let mut b = within(send(b"/b", &high[..])).await;
             if matches!(signal, Signal::Update) {
                 within(b.prioritize(URGENT)).await.unwrap();
             }
-            for _ in 0..2 {
-                within(bodies.recv()).await.unwrap();
+            within(bodies.recv()).await.unwrap();
+            let mut prefix = WriteLoan::new(Vec::with_capacity(CONNECTION_WINDOW));
+            while prefix.filled().len() < CONNECTION_WINDOW {
+                assert!(matches!(within(a.read_into(&mut prefix)).await.unwrap(), Read::Bytes(n) if n > 0));
             }
-            let (done, mut order) = mpsc::unbounded_channel();
-            for (target, mut exchange) in [("/a", a), ("/b", b)] {
-                let done = done.clone();
-                tokio::spawn(async move {
-                    exchange.response().await.unwrap();
-                    let mut region = WriteLoan::new(Vec::with_capacity(LARGE));
-                    let collected = exchange.collect(&mut region).await.unwrap();
-                    assert!(matches!(collected, Collect::Complete(None)), "{target}: {collected:?}");
-                    assert_eq!(region.filled().len(), LARGE, "{target}");
-                    done.send(target).unwrap();
-                });
+            assert!(prefix.filled().iter().all(|&byte| byte == b'a'));
+            within(b.response()).await.unwrap();
+            for (mut exchange, expected) in [(b, LARGE), (a, LARGE - CONNECTION_WINDOW)] {
+                let mut body = WriteLoan::new(Vec::with_capacity(expected));
+                let result = within(exchange.collect(&mut body))
+                    .await
+                    .expect("the scheduled response completes");
+                assert!(matches!(result, Collect::Complete(None)), "{signal:?}: {result:?}");
+                assert_eq!(body.filled().len(), expected, "{signal:?}");
             }
-            assert_eq!(within(order.recv()).await, Some("/b"), "{signal:?}");
-            assert_eq!(within(order.recv()).await, Some("/a"), "{signal:?}");
             within(client.close()).await.unwrap();
             within(server.close(Clock.deadline(PATIENCE))).await;
         }
