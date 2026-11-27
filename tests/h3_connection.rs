@@ -158,6 +158,97 @@ impl Network {
     }
 }
 
+#[cfg(feature = "tower")]
+#[test]
+fn tower_runs_an_axum_route_on_caller_driven_http3_and_returns_consumed_quic_credit() {
+    use core::pin::pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+    use rsnetwork::http::{Adapter, Body as _, StatusCode};
+    use rsnetwork::tower::{Bytes, dispatch};
+    use std::sync::Arc;
+
+    let mut n = Network::new(true, true);
+    n.client.events.clear();
+    let adapter = Adapter::new(
+        rsnetwork::h1::Limits {
+            head_bytes: 4096,
+            fields: 32,
+            name_bytes: 64,
+            value_bytes: 512,
+        },
+        &n.server.budget,
+    );
+    let http = n.client.http.as_mut().unwrap();
+    let id = http.open(&mut n.client.quic).unwrap().unwrap();
+    http.headers(
+        id,
+        &[
+            field(b":method", b"POST"),
+            field(b":scheme", b"https"),
+            field(b":authority", b"server.test"),
+            field(b":path", b"/echo"),
+        ],
+        false,
+    )
+    .unwrap();
+    n.pump().unwrap();
+    n.client
+        .http
+        .as_mut()
+        .unwrap()
+        .data(id, &Lease::from(b"over QUIC".as_slice()), true)
+        .unwrap();
+    n.pump().unwrap();
+    let mut events = mem::take(&mut n.server.events).into_iter();
+    let head = events
+        .find_map(|e| match e {
+            Event::Request(s, head) if s == id => Some(head),
+            _ => None,
+        })
+        .unwrap();
+    let credit = Arc::new(AtomicUsize::new(0));
+    let consumed = Arc::clone(&credit);
+    let request = adapter
+        .tower_request(&head, move |_: &mut Context<'_>| {
+            let Event::Body(s, part) = events.next().expect("the complete upload is available") else {
+                panic!("expected a request body event")
+            };
+            assert_eq!(s, id);
+            if let Part::Data(bytes) = &part {
+                consumed.fetch_add(bytes.initialized(), Ordering::Relaxed);
+            }
+            Poll::Ready(Ok(part))
+        })
+        .unwrap();
+    let mut app = axum::Router::new().route(
+        "/echo",
+        axum::routing::post(|body: Bytes| async move { (StatusCode::CREATED, body) }),
+    );
+    let cx = &mut Context::from_waker(Waker::noop());
+    let Poll::Ready(Ok(response)) = pin!(dispatch(&mut app, request)).poll(cx) else {
+        panic!("the router has all its input")
+    };
+    let consumed = credit.load(Ordering::Relaxed);
+    assert_eq!(consumed, 9);
+    let http = n.server.http.as_mut().unwrap();
+    http.release(&mut n.server.quic, id, consumed as u64).unwrap();
+    http.respond_http(id, &response, false).unwrap();
+    n.pump().unwrap();
+    let mut producer = pin!(response.into_body());
+    let mut body = adapter.tower_body(producer.as_mut());
+    let Poll::Ready(Ok(Part::Data(data))) = pin!(body.next()).poll(cx) else {
+        panic!("expected the router's bytes")
+    };
+    assert_matches!(
+        pin!(body.next()).poll(cx),
+        Poll::Ready(Ok(Part::End(Outcome::Complete(None))))
+    );
+    n.server.http.as_mut().unwrap().data(id, &data, true).unwrap();
+    n.pump().unwrap();
+    assert_matches!(n.client.events.as_slice(), [Event::Response(s, h), Event::Body(_, Part::Data(d)), Event::Body(_, Part::End(Outcome::Complete(None)))] if *s == id && h.status().code() == 201 && d.bytes()==b"over QUIC");
+}
+
 #[cfg(feature = "http")]
 #[test]
 fn http_conversion_mounts_a_handler_on_the_http3_request_stream() {

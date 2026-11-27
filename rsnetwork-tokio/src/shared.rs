@@ -56,6 +56,14 @@ pub(crate) enum Waits {
     Connection,
 }
 
+/// The registration of one pending call.
+#[derive(Debug)]
+pub(crate) struct Registration {
+    pub(crate) key: u64,
+    waits: Waits,
+    queued: bool,
+}
+
 /// One connection of the core on one socket, which many handles share.
 #[derive(Debug)]
 pub(crate) struct Shared<C: Io> {
@@ -148,36 +156,54 @@ impl<C: Streams> Shared<C> {
         waits: Waits,
         mut call: impl FnMut(&mut C, Instant) -> Result<Option<T>, Error>,
     ) -> Result<Option<T>, Error> {
-        let key = {
-            let mut state = self.lock();
-            state.next = state.next.wrapping_add(1);
-            state.next
-        };
+        let mut wait = self.register(waits);
         // A wait that drops, also in a cancel, leaves its place, and gives its drive on.
-        let _leave = DropGuard::new((), |()| {
-            let mut wakes = Vec::new();
-            self.lock().leave(key, &mut wakes);
-            wakes.into_iter().for_each(Waker::wake);
-        });
+        let _leave = DropGuard::new(wait.key, |key| self.unregister(key));
         let mut sleep = pin!(None);
-        let mut queued = false;
-        poll_fn(|cx| {
-            loop {
-                let mut wakes = Vec::new();
-                let step = self
-                    .lock()
-                    .turn(cx, (key, waits, &mut queued), &mut call, sleep.as_mut(), &mut wakes);
-                // Each handle wakes after the lock, so no waker runs inside the connection.
-                wakes.into_iter().for_each(Waker::wake);
-                match step {
-                    Step::Ready(result) => return Poll::Ready(result),
-                    Step::Pending => return Poll::Pending,
-                    Step::Now => ready!(coop::poll_proceed(cx)).made_progress(),
-                    Step::Again => {}
-                }
+        poll_fn(|cx| self.poll_until(cx, &mut wait, &mut call, sleep.as_mut())).await
+    }
+
+    pub(crate) fn register(&self, waits: Waits) -> Registration {
+        let mut state = self.lock();
+        state.next = state.next.wrapping_add(1);
+        Registration {
+            key: state.next,
+            waits,
+            queued: false,
+        }
+    }
+
+    pub(crate) fn unregister(&self, key: u64) {
+        let mut wakes = Vec::new();
+        self.lock().leave(key, &mut wakes);
+        wakes.into_iter().for_each(Waker::wake);
+    }
+
+    pub(crate) fn poll_until<T>(
+        &self,
+        cx: &mut Context<'_>,
+        wait: &mut Registration,
+        call: &mut impl FnMut(&mut C, Instant) -> Result<Option<T>, Error>,
+        mut sleep: Pin<&mut Option<Sleep>>,
+    ) -> Poll<Result<Option<T>, Error>> {
+        loop {
+            let mut wakes = Vec::new();
+            let step = self.lock().turn(
+                cx,
+                (wait.key, wait.waits, &mut wait.queued),
+                call,
+                sleep.as_mut(),
+                &mut wakes,
+            );
+            // Wakers can call the connection. Release its lock first.
+            wakes.into_iter().for_each(Waker::wake);
+            match step {
+                Step::Ready(result) => return Poll::Ready(result),
+                Step::Pending => return Poll::Pending,
+                Step::Now => ready!(coop::poll_proceed(cx)).made_progress(),
+                Step::Again => {}
             }
-        })
-        .await
+        }
     }
 }
 

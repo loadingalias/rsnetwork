@@ -33,6 +33,7 @@ as the monotonic clock of the target does. On Windows it goes on.
 ## Serve requests and send one
 
 For a handler that accepts `http::Request`, use the optional `http` feature. [Mount an HTTP-typed handler](http-conversions.md#mount-the-handler)
+For an axum router, pass the router to `Server::serve_tower`. [Serve a Tower service](tower.md)
 
 A server answers each request with `hello`, and a client sends one request over loopback. The code
 runs in a function that returns `Result<(), Box<dyn std::error::Error>>`. The documentation of the

@@ -54,6 +54,8 @@ pub mod host;
 pub mod hpack;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "tower")]
+pub use http::tower;
 mod link;
 pub mod message;
 pub mod priority;

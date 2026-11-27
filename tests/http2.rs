@@ -310,6 +310,75 @@ impl Pair {
     }
 }
 
+#[cfg(feature = "tower")]
+#[test]
+fn tower_serves_a_caller_driven_http2_upload_without_a_runtime() {
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+    use rsnetwork::http::{Adapter, Body as _};
+    use rsnetwork::tower::{Bytes, dispatch};
+    use std::sync::Mutex;
+
+    let now = at(0);
+    let mut pair = Pair::plain();
+    let upload = pair.send(
+        &Request {
+            method: Method::POST,
+            length: Some(5),
+            ..get(b"/echo")
+        },
+        later(),
+        now,
+    );
+    pair.client
+        .write(upload, &Lease::from(b"bytes".as_slice()), now)
+        .unwrap();
+    pair.client.finish(upload, now).unwrap();
+    let (stream, head) = pair.request(now);
+    let pair = Arc::new(Mutex::new(pair));
+    let source = Arc::clone(&pair);
+    let adapter = Adapter::new(HEAD, &budget());
+    let request = adapter
+        .tower_request(&head, move |_: &mut Context<'_>| {
+            let mut pair = source.lock().unwrap();
+            match pair.server.next(stream, now)? {
+                Some(part) => Poll::Ready(Ok(part)),
+                None => Poll::Pending,
+            }
+        })
+        .unwrap();
+    let mut app = axum::Router::new().route("/echo", axum::routing::post(|data: Bytes| async move { data }));
+    let cx = &mut Context::from_waker(Waker::noop());
+    let mut call = pin!(dispatch(&mut app, request));
+    let response = (0..16)
+        .find_map(|_| match call.as_mut().poll(cx) {
+            Poll::Ready(value) => Some(value.unwrap()),
+            Poll::Pending => {
+                pair.lock().unwrap().transport(now);
+                None
+            }
+        })
+        .expect("the uploaded bytes reach the router");
+    let mut pair = pair.lock().unwrap();
+    let head = adapter.native_response(&response, Some(5)).unwrap();
+    assert!(pair.server.respond(stream, &head.head(), now).unwrap());
+    drop(head);
+    let mut source = pin!(response.into_body());
+    let mut body = adapter.tower_body(source.as_mut());
+    let Poll::Ready(Ok(Part::Data(bytes))) = pin!(body.next()).poll(cx) else {
+        panic!("expected the echo body")
+    };
+    pair.server.write(stream, &bytes, now).unwrap();
+    assert_matches!(
+        pin!(body.next()).poll(cx),
+        Poll::Ready(Ok(Part::End(Outcome::Complete(None))))
+    );
+    pair.server.finish(stream, now).unwrap();
+    assert_eq!(pair.response(upload, now).unwrap().status().code(), 200);
+    assert_matches!(pair.collect(upload, now), (bytes, Collect::Complete(None)) if bytes == b"bytes");
+    pair.server.close(stream);
+}
+
 #[cfg(feature = "http")]
 #[test]
 fn http_conversion_mounts_a_caller_driven_http2_handler_over_cleartext_and_tls() {

@@ -31,6 +31,10 @@ use crate::{Clock, Socket, Step, queued};
 mod http;
 #[cfg(feature = "http")]
 pub use http::Incoming;
+#[cfg(feature = "tower")]
+mod tower;
+#[cfg(feature = "tower")]
+pub use tower::TowerReader;
 
 /// The refusal of a call after the connection ended.
 const ENDED: Error = Error::new(Kind::Misuse, "the connection ended");

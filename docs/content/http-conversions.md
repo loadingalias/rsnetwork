@@ -3,6 +3,7 @@
 Enable the `http` feature on `rsnetwork-tokio` to mount a handler that accepts `http::Request` and returns `http::Response`.
 For a caller-driven host, enable `http` on `rsnetwork`. Both features are off by default.
 The module `rsnetwork::http` exports the same types as the `http` 1.x crate.
+For a Tower service or axum router, enable the optional `tower` feature. [Serve a Tower service](tower.md)
 
 ## Mount the handler
 

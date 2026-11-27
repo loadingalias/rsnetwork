@@ -20,8 +20,10 @@ socket2 = "0.6.5"
 
 [features]
 http = ["rsnetwork/http"]
+tower = ["http", "rsnetwork/tower"]
 
 [dev-dependencies]
+axum.workspace = true
 # The tests run each case on a current-thread and on a multi-thread runtime.
 tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
 

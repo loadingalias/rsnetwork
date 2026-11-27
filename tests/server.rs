@@ -625,6 +625,50 @@ fn a_request_that_waits_for_100_continue_gets_it_at_the_first_read_of_its_body()
     );
 }
 
+#[cfg(feature = "tower")]
+#[test]
+fn tower_serves_a_chunked_http1_upload_on_a_caller_driven_connection() {
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+    use rsnetwork::http::{Adapter, StatusCode};
+    use rsnetwork::tower::{Bytes, dispatch};
+    use std::sync::Mutex;
+
+    let mut server = plain();
+    give(
+        &mut server,
+        b"POST /upload HTTP/1.1\r\nhost: a\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+    );
+    let (stream, head) = server.request(at(0)).unwrap().unwrap();
+    let server = Arc::new(Mutex::new(server));
+    let reader = Arc::clone(&server);
+    let adapter = Adapter::new(HEAD, &budget());
+    let request = adapter
+        .tower_request(&head, move |_: &mut Context<'_>| {
+            Poll::Ready(Ok(reader
+                .lock()
+                .unwrap()
+                .next(stream, at(0))?
+                .expect("the full request arrived")))
+        })
+        .unwrap();
+    let mut app = axum::Router::new().route(
+        "/upload",
+        axum::routing::post(|bytes: Bytes| async move {
+            assert_eq!(bytes.as_ref(), b"abcde");
+            StatusCode::NO_CONTENT
+        }),
+    );
+    let Poll::Ready(Ok(response)) = pin!(dispatch(&mut app, request)).poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("the router has the complete upload")
+    };
+    let response = adapter.native_response(&response, Some(0)).unwrap();
+    let mut server = server.lock().unwrap();
+    assert!(server.respond(stream, &response.head(), at(0)).unwrap());
+    assert!(take(&mut server).starts_with(b"HTTP/1.1 204 "));
+}
+
 #[cfg(feature = "http")]
 #[test]
 fn http_conversion_keeps_wire_targets_repeated_values_and_received_backing() {

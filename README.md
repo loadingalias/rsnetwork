@@ -9,6 +9,8 @@ key exchange by default. It has no C.
 
 rsnetwork is in development. Each release can change the API.
 
+To serve an existing axum router, enable the optional `tower` feature on `rsnetwork-tokio`. [Serve a Tower service](docs/content/tower.md)
+
 rsnetwork is one part of a family of Rust libraries:
 [rscrypto](https://github.com/loadingalias/rscrypto) (cryptography),
 [rsasync](https://github.com/loadingalias/rsasync) (runtime),

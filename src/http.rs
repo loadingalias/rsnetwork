@@ -5,6 +5,8 @@
 //! backing of the received head. Its body keeps the type and the ownership that the caller gives.
 
 mod native;
+#[cfg(feature = "tower")]
+pub mod tower;
 
 use core::fmt;
 use core::future::Future;

@@ -23,6 +23,8 @@ complete example.
 | `rsnetwork` with the `tls` feature, on by default | Also [TLS 1.3](tls.md), `rsnetwork::tls` | Also rustls and the `rscrypto-rustls` provider, with their dependencies: no C, and no cryptography other than rscrypto |
 | `rsnetwork` with the `tcp` feature, off by default | Also `host::Tcp`, the binding of a caller-driven host to a nonblocking TCP socket, and `host::Socket`, the calls of that socket | No new crate. Until `Read::read_buf` and `TcpStream::set_linger` are stable in std, it needs the nightly toolchain that rsnetwork pins |
 | `rsnetwork` with the optional `os-resolver` feature | The host admits lookups and runs them on its blocking service. [Resolve a name](resolver.md) | No new crate |
+| `rsnetwork` with the optional `http` feature | Convert native heads and bodies to ecosystem types. [HTTP conversions](http-conversions.md) | `http`, `bytes`, and `itoa` |
+| `rsnetwork` with the optional `tower` feature | Run a service in the host's existing event loop. [Tower services](tower.md) | The `http` feature plus `tower-service` and `http-body` |
 | `rsnetwork-tokio` | The [Tokio binding](tokio.md): the HTTP/1.1 and HTTP/2 clients, the server, and the TLS stream on Tokio, a `Server` that owns its tasks, and bounded blocking jobs | `rsnetwork` with `tcp` and `os-resolver`, Tokio 1.54 with `rt`, `net`, `sync`, and `time`, and socket2: no C |
 
 A binding that needs a runtime is a package of its own, which depends on `rsnetwork` and on that
@@ -37,10 +39,9 @@ runtime. `rsnetwork` never depends on a binding. Thus:
 Socket code that needs no new dependency goes in `rsnetwork` behind a feature that is off by
 default: `tcp`. Thus a protocol-only build also has no socket code.
 
-`cargo xtask check` enforces the layout on each target. It fails when the protocol-only build holds
-a crate other than `rsnetwork` and `rstypes`. It also fails when the default build, or a build
-with all features, adds a crate outside the closure of the `tls` feature, and when
-`rsnetwork-tokio` adds a crate outside its approved list.
+`cargo xtask check` checks the dependency list across all targets.
+The protocol-only build contains `rsnetwork` and `rstypes`.
+The default, HTTP, Tower, and all-feature builds each have an approved dependency list.
 
 ## Host effects
 

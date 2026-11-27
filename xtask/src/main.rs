@@ -112,6 +112,9 @@ const TLS_CLOSURE: &[&str] = &[
 /// The optional HTTP type conversions and their dependencies (N701).
 const HTTP_CLOSURE: &[&str] = &["http", "bytes", "itoa"];
 
+/// The service and body traits used by the optional Tower adapter.
+const TOWER_CLOSURE: &[&str] = &["tower-service", "http-body"];
+
 /// The crates that the Tokio binding adds to the core with all its features: Tokio with `rt`,
 /// `net`, `sync`, and `time`, socket2, and their dependencies (N107). None builds C. A new crate
 /// here needs the approval of the user.
@@ -312,11 +315,8 @@ impl Repo {
         self.closure()
     }
 
-    /// Fails when a build of a package holds a crate outside its list. The protocol-only build
-    /// of `rsnetwork` (no default features) holds only [`PROTOCOL_CLOSURE`]: no executor, socket
-    /// driver, or Tokio. The default build, and a build with all features, add only
-    /// [`TLS_CLOSURE`]: the `tcp` feature adds no crate. `rsnetwork-tokio` adds only
-    /// [`TOKIO_CLOSURE`]. It reads the normal and build dependencies on every target.
+    /// Checks the normal and build dependencies on every target for each feature selection.
+    /// The protocol core needs only [`PROTOCOL_CLOSURE`]. Each adapter adds its own listed crates.
     fn closure(&self) -> Result<(), Failure> {
         eprintln!("── closure");
         let started = Instant::now();
@@ -324,27 +324,39 @@ impl Repo {
             (
                 "rsnetwork",
                 "a protocol-only build",
-                Some("--no-default-features"),
+                &["--no-default-features"][..],
                 &[][..],
             ),
-            ("rsnetwork", "the default build", None, &[TLS_CLOSURE][..]),
+            ("rsnetwork", "the default build", &[][..], &[TLS_CLOSURE][..]),
+            (
+                "rsnetwork",
+                "the HTTP conversions",
+                &["--no-default-features", "--features", "http"][..],
+                &[HTTP_CLOSURE][..],
+            ),
+            (
+                "rsnetwork",
+                "the Tower adapter",
+                &["--no-default-features", "--features", "tower"][..],
+                &[HTTP_CLOSURE, TOWER_CLOSURE][..],
+            ),
             (
                 "rsnetwork-tokio",
                 "the default build",
-                None,
+                &[][..],
                 &[TLS_CLOSURE, TOKIO_CLOSURE][..],
             ),
             (
                 "rsnetwork",
                 "a build with all features",
-                Some("--all-features"),
-                &[TLS_CLOSURE, HTTP_CLOSURE][..],
+                &["--all-features"][..],
+                &[TLS_CLOSURE, HTTP_CLOSURE, TOWER_CLOSURE][..],
             ),
             (
                 "rsnetwork-tokio",
                 "a build with all features",
-                Some("--all-features"),
-                &[TLS_CLOSURE, HTTP_CLOSURE, TOKIO_CLOSURE][..],
+                &["--all-features"][..],
+                &[TLS_CLOSURE, HTTP_CLOSURE, TOWER_CLOSURE, TOKIO_CLOSURE][..],
             ),
         ] {
             let mut args = vec![
@@ -362,7 +374,7 @@ impl Repo {
                 "--format",
                 "{p}",
             ];
-            args.extend(features);
+            args.extend_from_slice(features);
             let output = self
                 .cargo(&args)
                 .output()
