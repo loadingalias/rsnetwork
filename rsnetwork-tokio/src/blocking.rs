@@ -2,16 +2,12 @@
 
 use core::net::SocketAddr;
 use core::num::NonZeroUsize;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use std::io;
-use std::net::ToSocketAddrs as _;
 use std::panic;
-use std::sync::Arc;
 
 use rsnetwork::drive::{Error, Kind};
-
-/// The refusal of a job when the bound is full.
-const FULL: Error = Error::new(Kind::Overload, "each place for a blocking job is in use");
+use rsnetwork::host;
+use tokio::runtime::Handle;
 
 /// The refusal of a job that the runtime dropped before it ran, at its shutdown.
 const DROPPED: Error = Error::new(Kind::Cancelled, "the runtime shut down before the blocking job ended");
@@ -24,48 +20,27 @@ const DROPPED: Error = Error::new(Kind::Cancelled, "the runtime shut down before
 /// the resolver of the system answers. Clones share the places.
 #[derive(Clone, Debug)]
 pub struct Blocking {
-    running: Arc<AtomicUsize>,
-    jobs_max: usize,
-}
-
-/// The place of one job, which it gives back when it returns.
-struct Place(Arc<AtomicUsize>);
-
-impl Drop for Place {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
+    service: host::Blocking,
 }
 
 impl Blocking {
     /// Places for at most `jobs_max` jobs at a time.
     pub fn new(jobs_max: NonZeroUsize) -> Self {
         Self {
-            running: Arc::default(),
-            jobs_max: jobs_max.get(),
+            service: host::Blocking::new(jobs_max),
         }
     }
 
     /// Runs `job` on the blocking pool of Tokio, and gives its result. Refuses with
-    /// [`Kind::Overload`], and runs nothing, when `jobs_max` jobs run. Call it in a task of the
-    /// runtime. A job that panics panics in the caller.
+    /// [`Kind::Overload`] when each place is in use. Outside a Tokio runtime it gives
+    /// [`Kind::Unsupported`]. A job that panics panics in the caller.
     pub async fn run<T: Send + 'static>(&self, job: impl FnOnce() -> T + Send + 'static) -> Result<T, Error> {
-        let admitted = self.running.try_update(Ordering::AcqRel, Ordering::Acquire, |running| {
-            (running < self.jobs_max).then_some(running + 1)
-        });
-        if admitted.is_err() {
-            return Err(FULL);
-        }
-        let place = Place(Arc::clone(&self.running));
-        let ran = tokio::task::spawn_blocking(move || {
+        let place = self.service.reserve()?;
+        run(move || {
             let _place = place;
             job()
-        });
-        match ran.await {
-            Ok(result) => Ok(result),
-            Err(error) if error.is_panic() => panic::resume_unwind(error.into_panic()),
-            Err(_) => Err(DROPPED),
-        }
+        })
+        .await
     }
 
     /// Looks up the addresses of `host` with the resolver of the system, as one blocking job.
@@ -78,11 +53,21 @@ impl Blocking {
         port: u16,
         addresses_max: NonZeroUsize,
     ) -> Result<io::Result<Vec<SocketAddr>>, Error> {
-        let host = host.to_owned();
-        self.run(move || {
-            let addresses = (host.as_str(), port).to_socket_addrs()?;
-            Ok(addresses.take(addresses_max.get()).collect())
-        })
-        .await
+        let lookup = self.service.reserve_lookup(addresses_max)?;
+        let mut name = String::new();
+        if name.try_reserve_exact(host.len()).is_err() {
+            return Ok(Err(io::ErrorKind::OutOfMemory.into()));
+        }
+        name.push_str(host);
+        run(move || lookup.run((name.as_str(), port))).await
+    }
+}
+
+async fn run<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> Result<T, Error> {
+    let runtime = Handle::try_current().map_err(|_| Error::new(Kind::Unsupported, "no Tokio runtime is active"))?;
+    match runtime.spawn_blocking(job).await {
+        Ok(result) => Ok(result),
+        Err(error) if error.is_panic() => panic::resume_unwind(error.into_panic()),
+        Err(_) => Err(DROPPED),
     }
 }

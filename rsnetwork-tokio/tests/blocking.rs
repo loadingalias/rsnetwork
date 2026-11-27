@@ -13,7 +13,7 @@ mod support;
 use core::future::poll_fn;
 use core::num::NonZeroUsize;
 use core::pin::pin;
-use core::task::Poll;
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::sync::mpsc;
 
@@ -79,4 +79,43 @@ fn a_lookup_of_localhost_gives_loopback_addresses_with_the_port() {
             "{addresses:?}"
         );
     });
+}
+
+#[test]
+fn a_dropped_lookup_wait_keeps_its_place_while_the_job_is_queued() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (entered, started) = mpsc::channel();
+        let (release, hold) = mpsc::channel::<()>();
+        let worker = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            hold.recv_timeout(PATIENCE).unwrap();
+        });
+        started.recv_timeout(PATIENCE).unwrap();
+        let blocking = Blocking::new(NonZeroUsize::MIN);
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut wait = pin!(blocking.lookup("localhost", 443, NonZeroUsize::MIN));
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+        }
+        let mut other = pin!(blocking.lookup("127.0.0.1", 443, NonZeroUsize::MIN));
+        let outcome = other.as_mut().poll(&mut cx);
+        release.send(()).unwrap();
+        worker.await.unwrap();
+        assert!(
+            matches!(outcome, Poll::Ready(Err(e)) if e.kind() == Kind::Overload),
+            "{outcome:?}"
+        );
+    });
+}
+
+#[test]
+fn a_lookup_outside_a_tokio_runtime_reports_an_unsupported_host() {
+    let blocking = Blocking::new(NonZeroUsize::MIN);
+    let mut wait = pin!(blocking.lookup("localhost", 443, NonZeroUsize::MIN));
+    let outcome = wait.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+    assert!(matches!(outcome, Poll::Ready(Err(e)) if e.kind() == Kind::Unsupported));
 }

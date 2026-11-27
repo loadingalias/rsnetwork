@@ -10,8 +10,8 @@ publish.workspace = true
 include = ["/src", "/README.md"]
 
 [dependencies]
-# The core, with TLS and the socket rules of `host::Tcp`.
-rsnetwork = { path = "..", version = "0.1.0-alpha.1", features = ["tcp"] }
+# The core, with TLS, the TCP socket rules, and the system resolver.
+rsnetwork = { path = "..", version = "0.1.0-alpha.1", features = ["tcp", "os-resolver"] }
 # The Tokio runtime of the application: its tasks and blocking pool (`rt`), its sockets (`net`),
 # the close signal of a server (`sync`), and its timer (`time`). It starts no runtime.
 tokio = { version = "1.54.1", default-features = false, features = ["net", "rt", "sync", "time"] }

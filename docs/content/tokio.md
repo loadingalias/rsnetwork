@@ -304,6 +304,8 @@ Tokio's blocking pool has no bound on its queue. `Blocking::new(jobs_max)` admit
   cannot stop a job that runs, so a lookup that its caller abandoned stays occupied until the
   resolver answers. A lookup has no timeout of its own.
 
+The caller-driven host uses the same admission rules. [Resolve a name on the host](resolver.md)
+
 ## Errors
 
 The calls refuse with the `rsnetwork::drive::Error` of the core call, and with these:
@@ -312,6 +314,7 @@ The calls refuse with the `rsnetwork::drive::Error` of the core call, and with t
 | --- | --- | --- |
 | `Overload` | `the connection waits for capacity: drop the views of its received bytes, and call again` | The connection waits for capacity that no event of the socket gives back. Drop the views of received bytes, for example the parts of a body, and call again |
 | `Overload` | `each place for a blocking job is in use` | Retry the job later, or give `Blocking` more places |
+| `Unsupported` | `no Tokio runtime is active` | Run the job on the application's Tokio runtime |
 | `Misuse` | `the connection ended: make a new client`, `the connection ended`, or `the stream ended` | The connection or the stream ended before the call gave its value. Make a new one |
 | `Cancelled` | `the runtime shut down before the blocking job ended` | None: the runtime stopped |
 

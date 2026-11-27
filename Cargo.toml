@@ -31,6 +31,8 @@ tls = ["dep:rscrypto", "dep:rscrypto-rustls", "dep:rustls"]
 # The binding of a caller-driven host to a nonblocking std TCP socket (`host::Tcp`). It adds no
 # dependency. Until `Read::read_buf` and `TcpStream::set_linger` are stable, it needs nightly.
 tcp = []
+# The operating system resolver on a host's blocking service.
+os-resolver = []
 
 [dev-dependencies]
 # The independent head and chunk parser of the differential test (tests/h1_differential.rs).

@@ -22,7 +22,8 @@ complete example.
 | `rsnetwork` | The protocol engines and the caller-driven host, `rsnetwork::host` | `rstypes`, the shared buffer, capacity, and time types of the runtime family, with no scheduler and no driver |
 | `rsnetwork` with the `tls` feature, on by default | Also [TLS 1.3](tls.md), `rsnetwork::tls` | Also rustls and the `rscrypto-rustls` provider, with their dependencies: no C, and no cryptography other than rscrypto |
 | `rsnetwork` with the `tcp` feature, off by default | Also `host::Tcp`, the binding of a caller-driven host to a nonblocking TCP socket, and `host::Socket`, the calls of that socket | No new crate. Until `Read::read_buf` and `TcpStream::set_linger` are stable in std, it needs the nightly toolchain that rsnetwork pins |
-| `rsnetwork-tokio` | The [Tokio binding](tokio.md): the HTTP/1.1 and HTTP/2 clients, the server, and the TLS stream on Tokio, a `Server` that owns its tasks, and bounded blocking jobs | `rsnetwork` with `tcp`, Tokio 1.54 with `rt`, `net`, `sync`, and `time`, and socket2: no C |
+| `rsnetwork` with the optional `os-resolver` feature | The host admits lookups and runs them on its blocking service. [Resolve a name](resolver.md) | No new crate |
+| `rsnetwork-tokio` | The [Tokio binding](tokio.md): the HTTP/1.1 and HTTP/2 clients, the server, and the TLS stream on Tokio, a `Server` that owns its tasks, and bounded blocking jobs | `rsnetwork` with `tcp` and `os-resolver`, Tokio 1.54 with `rt`, `net`, `sync`, and `time`, and socket2: no C |
 
 A binding that needs a runtime is a package of its own, which depends on `rsnetwork` and on that
 runtime. `rsnetwork` never depends on a binding. Thus:
@@ -151,6 +152,4 @@ the output that did not go.
 
 - A wake when capacity is free again. It needs a release listener in the shared capacity types. Until
   then, drive again after your code releases capacity, for example after it consumes a body.
-- Name resolution and other blocking jobs, with a bound, in the core. The Tokio binding has
-  `Blocking`: see [blocking jobs and host lookups](tokio.md#blocking-jobs-and-host-lookups).
 - A send of several output regions in one call.

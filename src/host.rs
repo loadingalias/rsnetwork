@@ -90,9 +90,13 @@ use crate::drive::{
 use crate::h1::{Client, ClientEvent, Server, ServerEvent};
 use crate::time::{ClockDomain, Deadline, Instant};
 
+#[cfg(feature = "os-resolver")]
+mod resolver;
 #[cfg(feature = "tcp")]
 mod tcp;
 
+#[cfg(feature = "os-resolver")]
+pub use resolver::{Blocking, Lookup};
 #[cfg(feature = "tcp")]
 pub use tcp::{Next, Socket, Tcp};
 
