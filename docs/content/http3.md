@@ -8,7 +8,7 @@ The host supplies datagrams and time. The engine owns HTTP message order, the co
 1. Offer the ALPN name `h3` in the client and server TLS configurations.
 2. Set `quic::Limits` before creating the QUIC connection. Allow at least three unidirectional streams and positive stream, connection, and send byte limits.
 3. Create the engine with `h3::Connection::new(&quic, limits, &budget)`. Use this QUIC connection for every operation on the engine.
-4. Call `drive(&mut quic, &mut input, now)` with each event from QUIC. Also drive with `None` after handshake progress and application writes.
+4. Call `drive(&mut quic, &mut input, now)` with each event from QUIC. Drive with `None` after transport progress or an application write. A credit grant can arrive without a QUIC event.
 5. On `Step::Again`, drive again. On `Step::Event`, handle the event and resume. On `Step::Wait`, resume at the next transport or application event.
 6. Continue to service QUIC transmission and its deadlines. On `Event::Closed`, finish pending exchanges with the transport outcome.
 
@@ -32,10 +32,23 @@ Call `cancel` to abandon a request. Call `retire` when both directions end. A pe
 
 ## Limits and shutdown
 
-`h3::Limits` bounds concurrent requests, the encoded size of each received field section, and control-stream storage.
-Its QPACK limits bound the dynamic tables, decoded fields, blocked streams, and encoder work.
-The shared budget pays for retained fields and data waiting on a QPACK insertion. Split large outgoing bodies into DATA frames within the send limit.
-An invalid field section can end one request. A framing or critical-stream error closes QUIC with its HTTP/3 application code. [QPACK limits](qpack.md#limits)
+A slow body reader can hold request bytes. HTTP/3 reserves local send storage and peer connection credit for its three critical streams.
+The reserve grows to a quarter of the available window, up to `control_bytes`. A window of two or three bytes reserves one byte.
+The peer must grant stream credit for the critical bytes to advance.
+An encoder queues an insertion only when its complete instruction fits both stream and connection credit.
+Otherwise, it can send the field as a literal. Split large outgoing bodies into DATA frames within the send limit. [RFC 9204, section 2.1.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.3)
+
+| Limit | Default | What it bounds |
+| --- | --- | --- |
+| `h3::Limits::control_bytes` | 4 KiB | The incoming SETTINGS payload and each outgoing critical-stream buffer. Each critical stream also has one funded send region of this size. |
+| `h3::Limits::blocked_bytes` | 256 KiB | The combined capacity of blocked field sections and bytes held behind them. Both buffers count while a buffer grows. |
+| `decoder.blocked_streams` | 16 | The advertised count also fits the request limit, the QUIC visit limit, and one two-byte section prefix per slot. |
+| `quic::Limits::turn` | 1 MiB, 4096 frames, 16,384 visits | Each drive call reads a bounded input slice. It handles one control-frame part or up to `frames` QPACK instructions. A feedback scan visits at most `visits` sections. |
+
+A byte-limit refusal for blocked data resets that request with `H3_EXCESSIVE_LOAD`. Other requests can continue.
+Exceeding the advertised blocked-stream count closes the connection with `QPACK_DECOMPRESSION_FAILED`.
+Invalid encoder or decoder instructions close it with the corresponding QPACK stream error.
+On `Step::Again`, resume with the same input slot. A cancellation can need several turns after its last byte arrives. [QPACK limits](qpack.md#limits)
 
 Call `goaway` to end admission and finish accepted requests. A server sends the first excluded request ID.
 A client that receives `Event::GoAway(id)` stops opening requests. Existing requests below the cutoff can still receive responses.

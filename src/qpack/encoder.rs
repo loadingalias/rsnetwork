@@ -30,6 +30,7 @@ pub struct Encoder {
     /// acknowledgement, oldest first. It holds at most `sections`.
     sections: VecDeque<Section>,
     stash: Stash,
+    scan: Option<FeedbackScan>,
     /// An instruction on the decoder stream failed.
     failed: bool,
     _charge: Permit,
@@ -45,8 +46,23 @@ struct Section {
     oldest: u64,
 }
 
+/// The unvisited prefix of the section FIFO. Visited survivors rotate to the back.
+struct FeedbackScan {
+    action: Feedback,
+    left: usize,
+    rotated: bool,
+}
+#[derive(Clone, Copy)]
+enum Feedback {
+    Acknowledge(u64),
+    Cancel(u64),
+    Restore,
+}
+
 /// The state of one encode.
 struct Encode {
+    /// The end of the encoder-stream bytes that the caller can send.
+    instruction_end: usize,
     /// The Base of the section: the Insert Count before its insertions.
     base: u64,
     /// The references can name only entries with an absolute index below it.
@@ -85,6 +101,7 @@ impl Encoder {
             capacity: None,
             sections,
             stash: Stash::default(),
+            scan: None,
             failed: false,
             _charge: charge,
         })
@@ -148,13 +165,26 @@ impl Encoder {
         section: &mut WriteLoan<B>,
         instructions: &mut WriteLoan<C>,
     ) -> Result<Prefix, EncodeError> {
+        self.encode_with_credit(stream, lines, section, instructions, usize::MAX)
+    }
+
+    pub(crate) fn encode_with_credit<'a, B: BufferMut, C: BufferMut>(
+        &mut self,
+        stream: u64,
+        lines: impl Iterator<Item = FieldLine<'a>> + Clone,
+        section: &mut WriteLoan<B>,
+        instructions: &mut WriteLoan<C>,
+        credit: usize,
+    ) -> Result<Prefix, EncodeError> {
         let needed = self.needed(lines.clone());
         let available = free(section);
         if needed > available {
             return Err(EncodeError::Full(Full { needed, available }));
         }
+        let room = free(instructions).min(credit);
+        let instruction_end = instructions.filled().len() + room;
         if let Some(capacity) = self.capacity
-            && integer::len(capacity as u64, 5) <= free(instructions)
+            && integer::len(capacity as u64, 5) <= room
         {
             put(instructions, capacity as u64, 5, 0x20);
             self.table.ring.set_max(capacity);
@@ -171,7 +201,7 @@ impl Encoder {
             .filter(waits)
             .any(|section| section.stream == stream)
             || (self.sections.iter().filter(waits).count() as u64) < peer.blocked_streams;
-        let below = if entries == 0 || self.sections.len() >= self.limits.sections {
+        let below = if entries == 0 || self.sections.len() >= self.limits.sections || self.scan.is_some() {
             0
         } else if blocking {
             u64::MAX
@@ -179,6 +209,7 @@ impl Encoder {
             known
         };
         let mut encode = Encode {
+            instruction_end,
             base: self.table.inserted,
             below,
             pinned: self.sections.iter().map(|section| section.oldest).fold(known, u64::min),
@@ -230,7 +261,7 @@ impl Encoder {
         }
         let (exact, mut named) = self.table.find(line.name, line.value, encode.below);
         let mut reference = exact.filter(|&index| !never_indexed && index < encode.below);
-        if !never_indexed && exact.is_none() && self.insert(line, named_static, encode.pinned, instructions) {
+        if !never_indexed && exact.is_none() && self.insert(line, named_static, encode, instructions) {
             let index = self.table.inserted - 1;
             if index < encode.below {
                 reference = Some(index);
@@ -271,7 +302,7 @@ impl Encoder {
         &mut self,
         line: FieldLine<'_>,
         named_static: Option<usize>,
-        pinned: u64,
+        encode: &Encode,
         out: &mut WriteLoan<C>,
     ) -> bool {
         let size = line
@@ -294,7 +325,7 @@ impl Encoder {
             let Some((name, value)) = self.table.ring.get(position) else {
                 return false;
             };
-            if self.table.inserted - 1 - position as u64 >= pinned {
+            if self.table.inserted - 1 - position as u64 >= encode.pinned {
                 return false;
             }
             room += name.len() + value.len() + OVERHEAD;
@@ -310,7 +341,7 @@ impl Encoder {
             (None, Some(index)) => integer::len(relative(index), 6),
             (None, None) => string_len(line.name, 5),
         } + string_len(line.value, 7);
-        if len > free(out) {
+        if len > encode.instruction_end - out.filled().len() {
             return false;
         }
         match (named_static, named) {
@@ -329,49 +360,96 @@ impl Encoder {
     /// An instruction that breaks RFC 9204 gives [`StreamError::Decoder`], and the encoder
     /// refuses each later call.
     pub fn receive(&mut self, bytes: &[u8]) -> Result<(), StreamError> {
+        let mut rest = bytes;
+        loop {
+            let used = self.receive_part(rest, usize::MAX, usize::MAX)?;
+            rest = &rest[used..];
+            if rest.is_empty() && self.scan.is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn feedback_pending(&self) -> bool {
+        self.scan.is_some()
+    }
+
+    /// Advances a bounded number of instructions and section visits. An unfinished scan also accepts empty input.
+    pub(crate) fn receive_part(
+        &mut self,
+        bytes: &[u8],
+        mut instructions: usize,
+        mut visits: usize,
+    ) -> Result<usize, StreamError> {
         if self.failed {
             return Err(StreamError::Decoder);
         }
         let mut rest = bytes;
-        while let Some(first) = self.stash.first(rest) {
-            let prefix = if first >= 0x80 { 7 } else { 6 };
-            let result = match self.stash.integer(&mut rest, prefix) {
-                Ok(Some((value, first))) => self.instruction(value, first),
-                Ok(None) => break,
-                Err(()) => Err(()),
-            };
-            if result.is_err() {
-                self.failed = true;
-                return Err(StreamError::Decoder);
+        let result = (|| {
+            loop {
+                if let Some(scan) = &mut self.scan {
+                    while scan.left > 0 && visits > 0 {
+                        let section = self.sections.pop_front().expect("the scan owns its unvisited prefix");
+                        visits -= 1;
+                        scan.left -= 1;
+                        match scan.action {
+                            Feedback::Acknowledge(id) if section.stream == id => {
+                                self.known = self.known.max(section.required);
+                                // An acknowledgement of the front entry leaves the FIFO in order.
+                                if !scan.rotated {
+                                    scan.left = 0;
+                                }
+                                scan.action = Feedback::Restore;
+                            }
+                            Feedback::Cancel(id) if section.stream == id => {}
+                            _ => {
+                                self.sections.push_back(section);
+                                scan.rotated = true;
+                            }
+                        }
+                    }
+                    if scan.left != 0 {
+                        break;
+                    }
+                    if matches!(scan.action, Feedback::Acknowledge(_)) {
+                        return Err(());
+                    }
+                    self.scan = None;
+                }
+                if instructions == 0 || rest.is_empty() {
+                    break;
+                }
+                let first = self.stash.first(rest).expect("the input has at least one byte");
+                let prefix = if first >= 0x80 { 7 } else { 6 };
+                let Some((value, first)) = self.stash.integer(&mut rest, prefix)? else {
+                    break;
+                };
+                instructions -= 1;
+                let action = match first {
+                    0x80.. => Feedback::Acknowledge(value),
+                    0x40.. => Feedback::Cancel(value),
+                    _ => {
+                        self.known = self
+                            .known
+                            .checked_add(value)
+                            .filter(|&known| value > 0 && known <= self.table.inserted)
+                            .ok_or(())?;
+                        continue;
+                    }
+                };
+                self.scan = Some(FeedbackScan {
+                    action,
+                    left: self.sections.len(),
+                    rotated: false,
+                });
             }
-        }
-        Ok(())
-    }
-
-    /// Applies one decoder instruction with its integer and its first byte.
-    fn instruction(&mut self, value: u64, first: u8) -> Result<(), ()> {
-        match first {
-            0x80.. => {
-                // Section Acknowledgment: the oldest section of the stream that waits.
-                let at = self
-                    .sections
-                    .iter()
-                    .position(|section| section.stream == value)
-                    .ok_or(())?;
-                let section = self.sections.remove(at).ok_or(())?;
-                self.known = self.known.max(section.required);
-            }
-            0x40.. => self.sections.retain(|section| section.stream != value),
-            _ => {
-                // Insert Count Increment: not zero, and not past the insertions.
-                self.known = self
-                    .known
-                    .checked_add(value)
-                    .filter(|&known| value > 0 && known <= self.table.inserted)
-                    .ok_or(())?;
-            }
-        }
-        Ok(())
+            Ok(bytes.len() - rest.len())
+        })();
+        result.map_err(|()| {
+            self.failed = true;
+            StreamError::Decoder
+        })
     }
 }
 

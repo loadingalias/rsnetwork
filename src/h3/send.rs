@@ -1,10 +1,12 @@
 //! Admission and ordered output for the three critical streams and each request.
 
+use core::alloc::Layout;
+use core::num::NonZeroU32;
 use std::collections::VecDeque;
 
 use super::connection::{Code, Connection, Error, Limits, MethodKind, Phase, ROOM, Scratch, empty, misuse};
 use super::frame::{Header, Kind};
-use crate::buffer::{Buffer as _, Lease, WriteLoan};
+use crate::buffer::{Buffer as _, Lease, Pool, WriteLoan};
 use crate::capacity::{Budget, Permit};
 use crate::drive::{Error as HostError, Kind as HostKind};
 use crate::h2::message;
@@ -24,6 +26,8 @@ pub(super) const REQUEST_PRIORITY: quic::Priority = quic::Priority {
 struct Critical {
     id: Option<StreamId>,
     bytes: Scratch,
+    reserve: Pool,
+    waiting: bool,
     busy: bool,
     staged: u64,
     acknowledged: u64,
@@ -33,6 +37,9 @@ impl Critical {
         Ok(Self {
             id: None,
             bytes: Scratch::new(cap, budget)?,
+            reserve: Pool::new(budget, NonZeroU32::MIN, Layout::array::<u8>(cap).map_err(|_| ROOM)?)
+                .map_err(|_| ROOM)?,
+            waiting: false,
             busy: false,
             staged: 0,
             acknowledged: 0,
@@ -58,7 +65,11 @@ pub(super) struct Output {
     attempts: usize,
     app_bytes: usize,
     app_max: usize,
-    reserve: usize,
+    storage_reserve: usize,
+    flow_reserve: u64,
+    /// Encoder-stream bytes promised to field sections and not yet admitted to QUIC.
+    encoder_pending: u64,
+    encoder_room: usize,
 }
 impl Output {
     pub(super) fn new(limits: Limits, budget: &Budget) -> Result<Self, Error> {
@@ -78,7 +89,10 @@ impl Output {
             attempts: 0,
             app_bytes: 0,
             app_max: 0,
-            reserve: 0,
+            storage_reserve: 0,
+            flow_reserve: 0,
+            encoder_pending: 0,
+            encoder_room: 0,
         })
     }
     pub(super) fn started(&self) -> bool {
@@ -103,7 +117,7 @@ impl Output {
             || self
                 .critical
                 .iter()
-                .any(|c| !c.busy && !c.bytes.loan.filled().is_empty())
+                .any(|c| !c.busy && !c.waiting && !c.bytes.loan.filled().is_empty())
     }
     fn check(&self, n: usize) -> Result<(), Error> {
         if n > self.app_max - self.app_bytes {
@@ -119,14 +133,6 @@ impl Output {
         self.writes.push_back(w);
         self.wake();
     }
-    pub(super) fn discard(&mut self, id: StreamId) {
-        if let Some(i) = self.writes.iter().position(|w| w.id == id)
-            && let Some(w) = self.writes.remove(i)
-        {
-            self.app_bytes -= w.len();
-        }
-        self.wake();
-    }
 }
 
 impl Connection {
@@ -139,7 +145,7 @@ impl Connection {
         }
         let limit = usize::try_from(q.local_limits().send_bytes_max).unwrap_or(usize::MAX);
         self.out.app_max = limit;
-        self.out.reserve = (limit / 4).min(self.limits.control_bytes);
+        self.out.storage_reserve = (limit / 4).max(usize::from(limit >= 2)).min(self.limits.control_bytes);
         for (k, prefix) in [(CONTROL, 0), (ENCODER, 2), (DECODER, 3)] {
             let stream = q.open(Direction::Unidirectional)?.ok_or(Code::StreamCreation)?;
             q.set_priority(
@@ -152,6 +158,7 @@ impl Connection {
             self.out.critical[k].id = Some(stream);
             assert_eq!(self.out.loan(k).fill_from(&[prefix]), 1);
         }
+        self.out.encoder_pending = 1; // The encoder stream starts with its type.
         let d = self.limits.decoder;
         let mut payload = [0; 48];
         let mut len = 0;
@@ -160,7 +167,7 @@ impl Connection {
             len += integer(&mut payload[len..], v as u64);
         }
         self.control_frame(Kind::SETTINGS, &payload[..len])?;
-        Ok(())
+        self.refresh_credit(q)
     }
     fn control_frame(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error> {
         let out = self.out.loan(CONTROL);
@@ -267,10 +274,16 @@ impl Connection {
         let (mut bytes, charge) = message::region(cap, &self.budget).ok_or(ROOM)?;
         bytes.resize(PREFIX_ROOM, 0);
         let mut section = WriteLoan::new(bytes);
+        let credit = self.out.encoder_room;
+        let instructions = self.out.loan(ENCODER);
+        let before = instructions.filled().len();
         let prefix = self
             .encoder
-            .encode(id.get(), lines, &mut section, self.out.loan(ENCODER))
+            .encode_with_credit(id.get(), lines, &mut section, instructions, credit)
             .expect("the field section has the encoder's required capacity");
+        let added = instructions.filled().len() - before;
+        self.out.encoder_room -= added;
+        self.out.encoder_pending += added as u64;
         let mut bytes = section.into_inner();
         let field_bytes = bytes.len() - PREFIX_ROOM + prefix.bytes().len();
         let mut header = [0; 16];
@@ -397,6 +410,23 @@ impl Connection {
                 .all(|c| c.bytes.loan.filled().is_empty() && !c.busy && c.acknowledged >= c.staged)
     }
 
+    /// Leaves connection credit for a GOAWAY and a decoder instruction, including their largest identifiers.
+    pub(super) fn refresh_credit(&mut self, q: &quic::Connection) -> Result<(), Error> {
+        const FEEDBACK_BYTES: u64 = 20;
+        let available = q.connection_credit();
+        // Learn a usable window even when the peer initially offers zero bytes.
+        let quarter = if available >= 2 { (available / 4).max(1) } else { 0 };
+        self.out.flow_reserve = self.out.flow_reserve.max(quarter.min(self.limits.control_bytes as u64));
+        let id = self.out.critical[ENCODER].id.expect("the encoder stream is open");
+        let available = available.saturating_sub(self.out.flow_reserve.min(FEEDBACK_BYTES));
+        let room = q
+            .stream_credit(id)?
+            .min(available)
+            .saturating_sub(self.out.encoder_pending);
+        self.out.encoder_room = usize::try_from(room).unwrap_or(usize::MAX);
+        Ok(())
+    }
+
     pub(super) fn flush(&mut self, q: &mut quic::Connection) -> Result<(), Error> {
         for k in [CONTROL, DECODER, ENCODER] {
             let c = &mut self.out.critical[k];
@@ -404,7 +434,11 @@ impl Connection {
                 continue;
             }
             let id = c.id.expect("the critical streams started");
-            let first = c.bytes.drain(&self.budget)?;
+            let Some(first) = c.bytes.drain(&mut c.reserve, &self.budget) else {
+                c.waiting = true;
+                continue;
+            };
+            c.waiting = false;
             c.staged = c
                 .staged
                 .checked_add(first.initialized() as u64)
@@ -425,7 +459,28 @@ impl Connection {
         };
         self.out.attempts -= 1;
         let critical = self.out.critical(w.id);
-        let Some(room) = q.send_room(w.id, if critical.is_some() { 0 } else { self.out.reserve })? else {
+        let request = if critical.is_none() {
+            Some(self.index(w.id)?)
+        } else {
+            None
+        };
+        // Cancellation leaves each queued write in place until its next turn.
+        if let Some(i) = request
+            && self.requests[i].settled
+        {
+            self.requests[i].queued = false;
+            self.out.app_bytes -= w.len();
+            return Ok(());
+        }
+        let (storage, flow) = match critical {
+            Some(ENCODER) => (0, 0),
+            Some(_) => (0, self.out.encoder_pending),
+            None => (
+                self.out.storage_reserve,
+                self.out.flow_reserve.saturating_add(self.out.encoder_pending),
+            ),
+        };
+        let Some(room) = q.send_room(w.id, storage, flow)? else {
             // QUIC has stopped this direction. Its STOP_SENDING event discards this write.
             self.out.writes.push_back(w);
             return Ok(());
@@ -441,11 +496,13 @@ impl Connection {
         q.send(w.id, data, all && w.fin)?;
         if critical.is_none() {
             self.out.app_bytes -= n;
+        } else if critical == Some(ENCODER) {
+            self.out.encoder_pending -= n as u64;
         }
         if all {
             if let Some(k) = critical {
                 self.out.critical[k].busy = false;
-            } else if let Ok(i) = self.at(w.id) {
+            } else if let Some(i) = request {
                 self.requests[i].queued = false;
             }
         } else {

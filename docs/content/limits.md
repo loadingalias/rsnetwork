@@ -125,7 +125,7 @@ deadline for it, and end the connection when it passes.
 | `h1::BodyLimits` | The body, the drain, the chunk extensions, and the trailers | [HTTP/1.1](http1.md#limits) |
 | `hpack::Limits` | The dynamic table, the decoded lines, and the work of one HTTP/2 header block | [HPACK](hpack.md#limits) |
 | `qpack::Limits`, `qpack::EncoderLimits` | The dynamic tables, the blocked streams, the decoded lines of one HTTP/3 field section, the sections that wait for an acknowledgement, and the work of one read of the encoder stream | [QPACK](qpack.md#limits) |
-| `h3::Limits` | Concurrent requests, encoded field sections, critical-stream storage, and QPACK state | [HTTP/3](http3.md#limits-and-shutdown) |
+| `h3::Limits` | Concurrent requests, encoded field sections, bytes retained on blocked streams, critical-stream storage, and QPACK state | [HTTP/3](http3.md#limits-and-shutdown) |
 | `h2::Limits` | The settings that an HTTP/2 endpoint sends, the largest header block, the encoder table, and the connection receive window | [HTTP/2](http2.md#limits) |
 | `server::Limits`, `server::Linger` | The limits of an HTTP/1.1 server connection, its head timeout, and its linger after the last output | [Serve requests](server.md) |
 | `tls::Limits` | The capacity of each TLS input region, which also bounds the largest handshake message, the records under one key, and the work of one drive | [TLS](tls.md#limits) |

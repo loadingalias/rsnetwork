@@ -28,6 +28,7 @@ pub struct Decoder {
     /// Each blocked stream, with the Required Insert Count of its field section. It holds at
     /// most `blocked_streams`.
     blocked: Vec<(u64, u64)>,
+    examined: usize,
     reader: Reader,
     /// An instruction on the encoder stream failed, so the table is not known.
     failed: bool,
@@ -100,6 +101,7 @@ impl Decoder {
             limits,
             known: 0,
             blocked,
+            examined: 0,
             reader: Reader {
                 step: Step::Start,
                 stash: Stash::default(),
@@ -124,22 +126,36 @@ impl Decoder {
     /// An instruction that breaks RFC 9204 gives [`StreamError::Encoder`]. The state of the
     /// table is then not known, and the decoder refuses each later call.
     pub fn receive<B: BufferMut>(&mut self, bytes: &[u8], out: &mut WriteLoan<B>) -> Result<usize, StreamError> {
+        self.receive_part(bytes, out, usize::MAX).map(|(used, _)| used)
+    }
+
+    pub(crate) fn receive_part<B: BufferMut>(
+        &mut self,
+        bytes: &[u8],
+        out: &mut WriteLoan<B>,
+        mut instructions: usize,
+    ) -> Result<(usize, bool), StreamError> {
         if self.failed {
             return Err(StreamError::Encoder);
         }
         let mut rest = bytes;
-        let mut work = 0_usize;
-        while !rest.is_empty() && (work == 0 || work < self.limits.work) {
-            match self.step(&mut rest, &mut work) {
-                Ok(()) => {}
-                Err(()) => {
-                    self.failed = true;
-                    return Err(StreamError::Encoder);
-                }
+        let mut work = 0;
+        let before = self.table.inserted;
+        while !rest.is_empty() && instructions > 0 && (work == 0 || work < self.limits.work) {
+            if self.step(&mut rest, &mut work).is_err() {
+                self.failed = true;
+                return Err(StreamError::Encoder);
+            }
+            if matches!(self.reader.step, Step::Start) && self.reader.stash.len == 0 {
+                instructions -= 1;
             }
         }
         self.increment(out);
-        Ok(bytes.len() - rest.len())
+        let inserted = self.table.inserted != before;
+        if inserted {
+            self.examined = 0;
+        }
+        Ok((bytes.len() - rest.len(), inserted))
     }
 
     /// Reads one step of an instruction from `rest`, and adds its work to `work`.
@@ -284,6 +300,19 @@ impl Decoder {
         lines: &'l mut Lines,
         out: &mut WriteLoan<B>,
     ) -> Result<Block<'l>, DecodeError> {
+        let previous = self.blocked.iter().position(|&(id, _)| id == stream);
+        self.decode_section(stream, section, lines, out, previous)
+    }
+
+    /// HTTP supplies a fresh section or one already removed by `unblocked`.
+    pub(crate) fn decode_section<'l, B: BufferMut>(
+        &mut self,
+        stream: u64,
+        section: &[u8],
+        lines: &'l mut Lines,
+        out: &mut WriteLoan<B>,
+        previous: Option<usize>,
+    ) -> Result<Block<'l>, DecodeError> {
         if self.failed {
             return Err(DecodeError::Malformed);
         }
@@ -294,7 +323,7 @@ impl Decoder {
         let mut rest = section;
         let (required, base) = self.prefix(&mut rest).ok_or(DecodeError::Malformed)?;
         if required > self.table.inserted {
-            if self.blocked.iter().any(|&(blocked, _)| blocked == stream) {
+            if previous.is_some() {
                 return Err(DecodeError::Blocked);
             }
             if self.blocked.len() >= self.limits.blocked_streams {
@@ -309,7 +338,9 @@ impl Decoder {
         if needed > available {
             return Err(DecodeError::Full(Full { needed, available }));
         }
-        self.blocked.retain(|&(blocked, _)| blocked != stream);
+        if let Some(i) = previous {
+            self.remove_blocked(i);
+        }
         let result = self.lines(rest, required, base, lines);
         if result == Err(DecodeError::Malformed) {
             return Err(DecodeError::Malformed);
@@ -493,11 +524,13 @@ impl Decoder {
     /// after [`receive`](Self::receive) until it gives `None`, and decode the section of each
     /// stream.
     pub fn unblocked(&mut self) -> Option<u64> {
-        let at = self
-            .blocked
-            .iter()
-            .position(|&(_, required)| required <= self.table.inserted)?;
-        Some(self.blocked.swap_remove(at).0)
+        while let Some(&(_, required)) = self.blocked.get(self.examined) {
+            if required <= self.table.inserted {
+                return Some(self.blocked.swap_remove(self.examined).0);
+            }
+            self.examined += 1;
+        }
+        None
     }
 
     /// Ends the field sections of `stream`: the stream was reset, or the caller stopped reading
@@ -516,10 +549,17 @@ impl Decoder {
         if needed > available {
             return Err(Full { needed, available });
         }
-        self.blocked.retain(|&(blocked, _)| blocked != stream);
+        if let Some(i) = self.blocked.iter().position(|&(id, _)| id == stream) {
+            self.remove_blocked(i);
+        }
         put(out, stream, 6, 0x40);
         self.increment(out);
         Ok(())
+    }
+
+    fn remove_blocked(&mut self, at: usize) {
+        self.blocked.swap_remove(at);
+        self.examined = self.examined.min(at);
     }
 
     /// Writes an Insert Count Increment for the entries that the encoder does not know of yet

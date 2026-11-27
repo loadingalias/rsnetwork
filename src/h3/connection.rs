@@ -5,7 +5,7 @@ use core::fmt;
 use core::mem;
 
 use crate::body::{Outcome, Part as BodyPart, Trailers};
-use crate::buffer::{Buffer as _, Lease, WriteLoan};
+use crate::buffer::{Buffer as _, Lease, Pool, WriteLoan};
 use crate::capacity::{Budget, Permit};
 use crate::drive::{Error as HostError, Kind};
 use crate::h2::message::{self, Refusal, ResponseFields};
@@ -25,6 +25,8 @@ pub struct Limits {
     pub requests: usize,
     /// Maximum encoded bytes of one received field section.
     pub field_section_bytes: usize,
+    /// Aggregate capacity of blocked field sections and the stream bytes held behind them.
+    pub blocked_bytes: usize,
     /// Bytes available for a SETTINGS frame and for each outgoing critical stream buffer.
     pub control_bytes: usize,
     /// Local QPACK decoder limits, including the maximum decoded field size.
@@ -39,6 +41,7 @@ impl Default for Limits {
             requests: 100,
             field_section_bytes: 64 << 10,
             control_bytes: 4096,
+            blocked_bytes: 256 << 10,
             decoder: qpack::Limits {
                 table_bytes: 4096,
                 blocked_streams: 16,
@@ -202,13 +205,21 @@ impl Scratch {
             charge,
         })
     }
-    pub(super) fn drain(&mut self, budget: &Budget) -> Result<Lease, Error> {
-        let (mut bytes, charge) = message::region(self.loan.filled().len(), budget).ok_or(ROOM)?;
-        bytes.extend_from_slice(self.loan.filled());
+    pub(super) fn drain(&mut self, pool: &mut Pool, budget: &Budget) -> Option<Lease> {
+        let data = self.loan.filled();
+        let lease = if let Ok(slot) = pool.acquire() {
+            let mut out = WriteLoan::new(slot);
+            assert_eq!(out.fill_from(data), data.len());
+            Lease::from(out.into_inner())
+        } else {
+            let (mut bytes, charge) = message::region(data.len(), budget)?;
+            bytes.extend_from_slice(data);
+            message::charged(bytes, charge)
+        };
         let mut buffer = mem::replace(&mut self.loan, WriteLoan::new(Vec::new())).into_inner();
         buffer.clear();
         self.loan = WriteLoan::new(buffer);
-        Ok(message::charged(bytes, charge))
+        Some(lease)
     }
     fn lease(self) -> Lease {
         message::charged(self.loan.into_inner(), self.charge)
@@ -277,6 +288,7 @@ pub(super) struct Request {
     join: Option<Scratch>,
     blocked: Option<Lease>,
     suffix: Option<Scratch>,
+    growth: Option<Scratch>,
     suffix_fin: bool,
     held: u64,
     trailers: Option<Trailers>,
@@ -299,6 +311,7 @@ impl Request {
             join: None,
             blocked: None,
             suffix: None,
+            growth: None,
             suffix_fin: false,
             held: 0,
             trailers: None,
@@ -312,6 +325,11 @@ enum Uni {
     Encoder,
     Decoder,
     Ignore,
+}
+enum Unblock {
+    Idle,
+    Scan,
+    Decode(StreamId),
 }
 struct Input {
     id: StreamId,
@@ -343,8 +361,11 @@ pub struct Connection {
     pub(super) local_goaway: Option<u64>,
     pub(super) highest: Option<StreamId>,
     push_credit: Option<u64>,
-    unblock_pending: bool,
+    unblock: Unblock,
+    blocked_used: usize,
     input: Option<Input>,
+    frame_turn: usize,
+    visit_turn: usize,
     byte_turn: usize,
     pub(super) failed: Option<Error>,
 }
@@ -360,7 +381,7 @@ impl fmt::Debug for Connection {
 }
 impl Connection {
     /// Makes the HTTP state for this transport. Offer the ALPN name `h3` in its TLS configuration.
-    pub fn new(transport: &quic::Connection, limits: Limits, budget: &Budget) -> Result<Self, Error> {
+    pub fn new(transport: &quic::Connection, mut limits: Limits, budget: &Budget) -> Result<Self, Error> {
         super::check_transport(transport.local_limits())?;
         if limits.requests == 0
             || limits.control_bytes < 64
@@ -379,6 +400,13 @@ impl Connection {
                 "invalid HTTP/3 request, field-section, or critical-stream limits",
             ));
         }
+        // One lookup of the blocked sections must fit a drive turn. Advertise the effective limit.
+        limits.decoder.blocked_streams = limits
+            .decoder
+            .blocked_streams
+            .min(limits.requests)
+            .min(transport.local_limits().turn.visits)
+            .min(limits.blocked_bytes / 2);
         let side = transport.side();
         let (requests, r) = storage(limits.requests, budget)?;
         let (uni, u) = storage(
@@ -411,8 +439,11 @@ impl Connection {
             local_goaway: None,
             highest: None,
             push_credit: None,
-            unblock_pending: false,
+            unblock: Unblock::Idle,
+            blocked_used: 0,
             input: None,
+            frame_turn: transport.local_limits().turn.frames,
+            visit_turn: transport.local_limits().turn.visits,
             byte_turn: usize::try_from(transport.local_limits().turn.bytes)
                 .unwrap_or(usize::MAX)
                 .max(1),
@@ -475,6 +506,13 @@ impl Connection {
             self.start(q)?;
         }
         self.flush(q)?;
+        self.refresh_credit(q)?;
+        if self.encoder.feedback_pending() {
+            self.encoder
+                .receive_part(&[], self.frame_turn, self.visit_turn)
+                .map_err(|_| Code::DecoderStream)?;
+            return Ok(Step::Again);
+        }
         if let Some(mut region) = self.input.take() {
             let event = self.read(q, &mut region)?;
             if region.at < region.bytes.initialized() || region.fin {
@@ -482,14 +520,29 @@ impl Connection {
             }
             return Ok(event.map_or(Step::Again, Step::Event));
         }
-        if self.unblock_pending
-            && let Some(id) = self.decoder.unblocked().and_then(StreamId::new)
-            && let Ok(i) = self.at(id)
-            && let Some(section) = self.requests[i].blocked.take()
-        {
+        if matches!(self.unblock, Unblock::Scan) {
+            self.unblock = self
+                .decoder
+                .unblocked()
+                .and_then(StreamId::new)
+                .map_or(Unblock::Idle, Unblock::Decode);
+            return Ok(Step::Again);
+        }
+        if let Unblock::Decode(id) = self.unblock {
+            self.unblock = Unblock::Scan;
+            let Ok(i) = self.at(id) else {
+                return Ok(Step::Again);
+            };
+            let Some(section) = self.requests[i].blocked.take() else {
+                return Ok(Step::Again);
+            };
+            self.blocked_used -= section.initialized();
             let next = self.decode(q, i, section)?;
             if self.requests.get(i).is_some_and(|r| r.id == id && r.blocked.is_none()) {
                 let r = &mut self.requests[i];
+                if let Some(suffix) = &r.suffix {
+                    self.blocked_used -= suffix.loan.capacity();
+                }
                 if r.suffix.is_some() || r.suffix_fin {
                     self.input = Some(Input {
                         id,
@@ -501,9 +554,13 @@ impl Connection {
             }
             return Ok(next.map_or(Step::Again, Step::Event));
         }
-        self.unblock_pending = false;
         let Some(event) = input.take() else {
-            return Ok(if self.out.more() { Step::Again } else { Step::Wait });
+            if self.out.more() {
+                return Ok(Step::Again);
+            }
+            // A QUIC MAX_DATA or MAX_STREAM_DATA can grant credit without an application event.
+            self.out.wake();
+            return Ok(Step::Wait);
         };
         self.out.wake();
         let event = match event {
@@ -524,9 +581,8 @@ impl Connection {
                 let Some(i) = self.request_slot(q, stream)? else {
                     return Ok(Step::Again);
                 };
-                self.out.discard(stream);
+                self.out.wake();
                 let r = &mut self.requests[i];
-                r.queued = false;
                 r.settled = true;
                 r.send = Phase::End;
                 Some(Event::Stopped(stream, code))
@@ -590,8 +646,16 @@ impl Connection {
             let data = &r.bytes.bytes()[r.at..];
             let n = data.len().min(self.byte_turn);
             if n > 0 {
-                append(&mut self.requests[i].suffix, &data[..n], &self.budget)?;
-                r.at += n;
+                match self.requests[i].append_blocked(
+                    &data[..n],
+                    &self.budget,
+                    &mut self.blocked_used,
+                    self.limits.blocked_bytes,
+                    self.byte_turn,
+                ) {
+                    Ok(used) => r.at += used,
+                    Err(_) => return self.refuse(q, i, Code::ExcessiveLoad),
+                }
             }
             if r.at == r.bytes.initialized() {
                 self.requests[i].suffix_fin |= mem::take(&mut r.fin);
@@ -687,24 +751,32 @@ impl Connection {
     fn decode(&mut self, q: &mut quic::Connection, i: usize, section: Lease) -> Result<Option<Event>, Error> {
         let r = &mut self.requests[i];
         let id = r.id;
-        let block = match self
-            .decoder
-            .decode(id.get(), section.bytes(), &mut self.lines, self.out.loan(DECODER))
-        {
-            Ok(block) => block,
-            Err(qpack::DecodeError::Blocked) => {
-                let mut owned = Scratch::new(section.initialized(), &self.budget)?;
-                assert_eq!(owned.loan.fill_from(section.bytes()), section.initialized());
-                r.blocked = Some(owned.lease());
-                return Ok(None);
-            }
-            Err(qpack::DecodeError::TooLarge) => return self.refuse(q, i, Code::ExcessiveLoad),
-            Err(qpack::DecodeError::Full(_)) => return Err(Code::ExcessiveLoad.into()),
-            Err(qpack::DecodeError::Misuse) => return Err(Code::Internal.into()),
-            Err(qpack::DecodeError::Malformed | qpack::DecodeError::TooManyBlocked) => {
-                return Err(Code::Decompression.into());
-            }
-        };
+        let block =
+            match self
+                .decoder
+                .decode_section(id.get(), section.bytes(), &mut self.lines, self.out.loan(DECODER), None)
+            {
+                Ok(block) => block,
+                Err(qpack::DecodeError::Blocked) => {
+                    let size = section.initialized();
+                    if size > self.limits.blocked_bytes - self.blocked_used {
+                        return self.refuse(q, i, Code::ExcessiveLoad);
+                    }
+                    let Ok(mut owned) = Scratch::new(size, &self.budget) else {
+                        return self.refuse(q, i, Code::ExcessiveLoad);
+                    };
+                    self.blocked_used += size;
+                    assert_eq!(owned.loan.fill_from(section.bytes()), section.initialized());
+                    r.blocked = Some(owned.lease());
+                    return Ok(None);
+                }
+                Err(qpack::DecodeError::TooLarge) => return self.refuse(q, i, Code::ExcessiveLoad),
+                Err(qpack::DecodeError::Full(_)) => return Err(Code::ExcessiveLoad.into()),
+                Err(qpack::DecodeError::Misuse) => return Err(Code::Internal.into()),
+                Err(qpack::DecodeError::Malformed | qpack::DecodeError::TooManyBlocked) => {
+                    return Err(Code::Decompression.into());
+                }
+            };
         let result: Result<Option<Event>, Refusal> = (|| {
             if r.recv != Phase::Head {
                 r.recv.finish().map_err(|_| Refusal::Malformed)?;
@@ -760,10 +832,18 @@ impl Connection {
             self.cancel_section(id)?;
         }
         let r = &mut self.requests[i];
-        r.blocked = None;
+        if let Some(section) = r.blocked.take() {
+            self.blocked_used -= section.initialized();
+        }
+        if let Some(growth) = r.growth.take() {
+            self.blocked_used -= growth.loan.capacity();
+        }
         r.join = None;
         r.suffix_fin = false;
-        Ok(r.suffix.take().map_or(0, |s| s.loan.filled().len() as u64))
+        Ok(r.suffix.take().map_or(0, |s| {
+            self.blocked_used -= s.loan.capacity();
+            s.loan.filled().len() as u64
+        }))
     }
     fn refuse(&mut self, q: &mut quic::Connection, i: usize, c: Code) -> Result<Option<Event>, Error> {
         let id = self.requests[i].id;
@@ -772,11 +852,10 @@ impl Connection {
             q.release(id, held)?;
         }
         q.abort_stream(id, c as u64)?;
-        self.out.discard(id);
+        self.out.wake();
         let r = &mut self.requests[i];
         r.recv = Phase::End;
         r.send = Phase::End;
-        r.queued = false;
         r.settled = true;
         let outcome = if c == Code::RequestIncomplete {
             Outcome::Truncated
@@ -872,16 +951,21 @@ impl Connection {
             }
             Uni::Ignore => bytes = &[],
             Uni::Encoder => {
-                let n = self
+                let (n, inserted) = self
                     .decoder
-                    .receive(bytes, self.out.loan(DECODER))
+                    .receive_part(bytes, self.out.loan(DECODER), self.frame_turn)
                     .map_err(|_| Code::EncoderStream)?;
-                self.unblock_pending = true;
+                if inserted {
+                    self.unblock = Unblock::Scan;
+                }
                 bytes = &bytes[n..];
             }
             Uni::Decoder => {
-                self.encoder.receive(bytes).map_err(|_| Code::DecoderStream)?;
-                bytes = &[];
+                let n = self
+                    .encoder
+                    .receive_part(bytes, self.frame_turn, self.visit_turn)
+                    .map_err(|_| Code::DecoderStream)?;
+                bytes = &bytes[n..];
             }
             Uni::Control => {
                 let before = bytes.len();
@@ -1006,17 +1090,46 @@ pub(super) fn empty() -> Lease {
     Lease::from(&[][..])
 }
 
-fn append(target: &mut Option<Scratch>, data: &[u8], budget: &Budget) -> Result<(), Error> {
-    let old = target.as_ref().map_or(&[][..], |s| s.loan.filled());
-    let need = old.len().checked_add(data.len()).ok_or(ROOM)?;
-    if target.as_ref().is_none_or(|s| s.loan.capacity() < need) {
-        let mut new = Scratch::new(need.max(old.len().saturating_mul(2)), budget)?;
-        assert_eq!(new.loan.fill_from(old), old.len());
-        *target = Some(new);
+impl Request {
+    /// Copies at most one byte turn. Both buffers count toward the limit during growth.
+    fn append_blocked(
+        &mut self,
+        data: &[u8],
+        budget: &Budget,
+        used: &mut usize,
+        limit: usize,
+        turn: usize,
+    ) -> Result<usize, HostError> {
+        let old = self.suffix.as_ref().map_or(&[][..], |s| s.loan.filled());
+        let need = old.len().checked_add(data.len()).ok_or(ROOM)?;
+        if self.suffix.as_ref().is_none_or(|s| s.loan.capacity() < need) {
+            if self.growth.is_none() {
+                let room = limit - *used;
+                if need > room {
+                    return Err(ROOM);
+                }
+                let cap = need.max(old.len().saturating_mul(2)).min(room);
+                self.growth = Some(Scratch::new(cap, budget)?);
+                *used += cap;
+            }
+            let growth = self.growth.as_mut().expect("the larger buffer is charged");
+            let at = growth.loan.filled().len();
+            let n = turn.min(old.len() - at);
+            assert_eq!(growth.loan.fill_from(&old[at..at + n]), n);
+            if at + n == old.len() {
+                if let Some(old) = self.suffix.take() {
+                    *used -= old.loan.capacity();
+                }
+                self.suffix = self.growth.take();
+            }
+            if n != 0 {
+                return Ok(0);
+            }
+        }
+        assert_eq!(
+            self.suffix.as_mut().expect("the suffix has room").loan.fill_from(data),
+            data.len()
+        );
+        Ok(data.len())
     }
-    assert_eq!(
-        target.as_mut().expect("the suffix has room").loan.fill_from(data),
-        data.len()
-    );
-    Ok(())
 }

@@ -472,6 +472,8 @@ pub(super) struct Streams {
     /// The limit of the peer for the connection, and the bytes that this end sent.
     send_max: u64,
     send_used: u64,
+    /// Bytes admitted to streams that have not yet spent wire credit.
+    send_queued: u64,
     /// The limit that the last DATA_BLOCKED frame named.
     blocked_at: Option<u64>,
     /// The frames of [`owed`] that wait.
@@ -545,6 +547,7 @@ impl Streams {
             window: Window::new(config.data_bytes),
             send_max: 0,
             send_used: 0,
+            send_queued: 0,
             blocked_at: None,
             owed: 0,
             openable: [false; 2],
@@ -867,6 +870,7 @@ impl Streams {
         };
         let mut region = core::mem::replace(&mut send.held, NONE);
         send.head = NONE;
+        self.send_queued -= send.queued;
         (send.tail, send.head_at, send.regions, send.queued) = (NONE, 0, 0, 0);
         while let Some(entry) = self.regions.get_mut(region as usize) {
             self.retained_bytes -= entry.lease.take().map_or(0, |lease| lease.initialized() as u64);
@@ -1245,8 +1249,24 @@ impl Streams {
         Ok(Some(id))
     }
 
+    /// Remaining peer connection credit after all queued stream offsets.
+    pub(super) fn connection_credit(&self) -> u64 {
+        (self.send_max - self.send_used).saturating_sub(self.send_queued)
+    }
+
+    /// Remaining peer stream credit after its queued offsets.
+    pub(super) fn stream_credit(&self, id: StreamId) -> Result<u64, Error> {
+        let send = self.slots[self.open_slot(id)?].send.as_ref().ok_or(NOT_OPEN)?;
+        Ok(send.max.saturating_sub(send.offset + send.queued))
+    }
+
     /// The available send bytes after a reservation for other streams. An ended direction gives `None`.
-    pub(super) fn send_room(&self, id: StreamId, reserve: usize) -> Result<Option<usize>, Error> {
+    pub(super) fn send_room(
+        &self,
+        id: StreamId,
+        storage_reserve: usize,
+        flow_reserve: u64,
+    ) -> Result<Option<usize>, Error> {
         let send = self.slots[self.open_slot(id)?].send.as_ref().ok_or(NOT_OPEN)?;
         if send.state != Sending::Open {
             return Ok(None);
@@ -1255,8 +1275,9 @@ impl Streams {
             0
         } else {
             (self.config.send_bytes - self.retained_bytes)
-                .saturating_sub(reserve as u64)
-                .min(VARINT_MAX - send.offset - send.queued)
+                .saturating_sub(storage_reserve as u64)
+                .min(self.connection_credit().saturating_sub(flow_reserve))
+                .min(send.max.saturating_sub(send.offset + send.queued))
         };
         Ok(Some(usize::try_from(bytes).unwrap_or(usize::MAX)))
     }
@@ -1338,6 +1359,7 @@ impl Streams {
                 send.tail = at;
                 send.regions += 1;
                 send.queued += len as u64;
+                self.send_queued += len as u64;
             }
         }
         let Some(send) = &mut self.slots[slot].send else {
@@ -1890,6 +1912,7 @@ impl Streams {
             send.queued -= len as u64;
             send.head_at += len;
             self.send_used += len as u64;
+            self.send_queued -= len as u64;
             if fin {
                 send.state = Sending::FinSent;
             }

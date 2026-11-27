@@ -1824,9 +1824,22 @@ impl Connection {
         }
     }
 
-    pub(crate) fn send_room(&self, id: StreamId, reserve: usize) -> Result<Option<usize>, Error> {
+    pub(crate) fn connection_credit(&self) -> u64 {
+        self.streams.connection_credit()
+    }
+
+    pub(crate) fn stream_credit(&self, id: StreamId) -> Result<u64, Error> {
+        self.streams.stream_credit(id)
+    }
+
+    pub(crate) fn send_room(
+        &self,
+        id: StreamId,
+        storage_reserve: usize,
+        flow_reserve: u64,
+    ) -> Result<Option<usize>, Error> {
         self.live()?;
-        self.streams.send_room(id, reserve)
+        self.streams.send_room(id, storage_reserve, flow_reserve)
     }
 
     pub(crate) fn abort_stream(&mut self, stream: StreamId, code: u64) -> Result<(), Error> {

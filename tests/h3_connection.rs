@@ -1,6 +1,7 @@
 //! The HTTP/3 connection exchanges encrypted QUIC datagrams with an HTTP engine or a wire peer.
 #![cfg(feature = "tls")]
 
+mod counting;
 #[expect(dead_code, reason = "the QUIC suites share the path and its impairment profiles")]
 mod quic_path;
 
@@ -10,7 +11,8 @@ use std::assert_matches;
 use quic_path::{Pair, Received, Setup, budget, driven_at, give_at, ms, sent_at};
 use rsnetwork::body::{Outcome, Part};
 use rsnetwork::buffer::{Buffer as _, Lease};
-use rsnetwork::drive::Kind;
+use rsnetwork::capacity::Budget;
+use rsnetwork::drive::{Kind, TurnLimits};
 use rsnetwork::h3::{self, Code, Event, Step};
 use rsnetwork::message::Version;
 use rsnetwork::qpack::FieldLine;
@@ -21,13 +23,16 @@ struct Peer {
     quic: quic::Connection,
     http: Option<h3::Connection>,
     events: Vec<Event>,
+    budget: Budget,
     wire: Received,
 }
 
 impl Peer {
-    fn new(quic: quic::Connection, http: bool) -> Self {
+    fn new(quic: quic::Connection, limits: Option<h3::Limits>) -> Self {
+        let budget = budget();
         Self {
-            http: http.then(|| h3::Connection::new(&quic, h3::Limits::default(), &budget()).unwrap()),
+            http: limits.map(|limits| h3::Connection::new(&quic, limits, &budget).unwrap()),
+            budget,
             quic,
             events: Vec::new(),
             wire: Received::default(),
@@ -100,6 +105,13 @@ impl Network {
         Self::with(Setup::default(), client, server)
     }
     fn with(setup: Setup, client: bool, server: bool) -> Self {
+        Self::configured(
+            setup,
+            client.then(h3::Limits::default),
+            server.then(h3::Limits::default),
+        )
+    }
+    fn configured(setup: Setup, client: Option<h3::Limits>, server: Option<h3::Limits>) -> Self {
         let pair = Pair::build(setup, usize::MAX, b"h3");
         let mut n = Self {
             client: Peer::new(pair.client, client),
@@ -384,7 +396,6 @@ fn critical_stream_and_frame_violations_send_their_connection_codes() {
 fn h3_checks_stream_credit_before_either_handshake_consumes_a_budget() {
     use core::num::NonZeroU64;
     use quic_path::{SERVER_ADDRESS, client_address, configs_for, from_server, now, sent};
-    use rsnetwork::capacity::Budget;
     let (client, server) = configs_for(Some(1), b"h3");
     let path = quic::Path {
         local: client_address(4301),
@@ -555,4 +566,391 @@ fn a_peer_can_stop_the_response_before_its_request_headers_arrive() {
             .any(|e| matches!(e,Event::Request(stream,_) if *stream==id))
     );
     assert!(n.server.http.as_mut().unwrap().retire(&mut n.server.quic, id).unwrap());
+}
+
+#[test]
+fn goaway_reaches_a_reader_that_holds_connection_credit_and_the_server_budget() {
+    let mut n = Network::with(
+        Setup {
+            client: quic::Limits {
+                data_bytes_max: 128,
+                stream_bytes_max: 1024,
+                ..quic::Limits::DEFAULT
+            },
+            ..Setup::default()
+        },
+        true,
+        true,
+    );
+    let id = n.client.request();
+    n.pump().unwrap();
+    n.server.headers(id, &[field(b":status", b"200")], false);
+    n.pump().unwrap();
+    n.client.events.clear();
+    let body = quic_path::region(0, 512);
+    n.server.http.as_mut().unwrap().data(id, &body, true).unwrap();
+    // Allow pacing and delayed credit for the consumed frame headers to settle.
+    for _ in 0..8 {
+        n.pump().unwrap();
+    }
+    let mut held = Vec::new();
+    for event in mem::take(&mut n.client.events) {
+        let Event::Body(_, Part::Data(d)) = event else {
+            panic!("expected body data")
+        };
+        held.extend_from_slice(d.bytes());
+    }
+    assert!(!held.is_empty() && held.len() < 128);
+    assert_eq!(held, &body.bytes()[..held.len()]);
+    n.pump().unwrap();
+    assert!(
+        n.client.events.is_empty(),
+        "the application still holds all body credit"
+    );
+    let _held_budget = n.server.budget.reserve(n.server.budget.available()).unwrap();
+    assert_eq!(n.server.budget.available(), 0);
+    assert_eq!(n.server.http.as_mut().unwrap().goaway().unwrap(), 4);
+    n.pump().unwrap();
+    let mut events = mem::take(&mut n.client.events).into_iter();
+    assert_matches!(events.next(), Some(Event::GoAway(4)));
+    // Consuming GOAWAY can trigger a grant for previously consumed framing bytes.
+    for event in events {
+        let Event::Body(_, Part::Data(d)) = event else {
+            panic!("expected body data")
+        };
+        held.extend_from_slice(d.bytes());
+    }
+    assert!(held.len() <= 128 - 32);
+    assert_eq!(held, &body.bytes()[..held.len()]);
+}
+
+#[test]
+fn a_field_section_uses_literals_when_an_insertion_exceeds_encoder_stream_credit() {
+    let mut n = Network::with(
+        Setup {
+            client: quic::Limits {
+                stream_bytes_max: 16,
+                ..quic::Limits::DEFAULT
+            },
+            ..Setup::default()
+        },
+        false,
+        true,
+    );
+    // The peer permits a 256-byte dynamic table and four blocked streams.
+    n.client
+        .stream(Direction::Unidirectional, b"\x00\x04\x05\x01\x41\x00\x07\x04", false);
+    let id = n.client.stream(
+        Direction::Bidirectional,
+        b"\x01\x0a\x00\x00\xd1\xd7\xc1\x50\x03foo",
+        true,
+    );
+    n.pump().unwrap();
+    let value = [b'z'; 80];
+    n.server
+        .headers(id, &[field(b":status", b"200"), field(b"x-result", &value)], true);
+    n.pump().unwrap();
+    // Only the stream type and Set Dynamic Table Capacity reach the peer.
+    assert_eq!(n.client.wire.streams[&7].0, [2, 0x3f, 0xe1, 1]);
+    let (response, fin) = &n.client.wire.streams[&id.get()];
+    assert!(fin);
+    let mut rest = response.as_slice();
+    let mut decoder = h3::frame::Decoder::new(h3::frame::Stream::Response);
+    assert_matches!(decoder.next(&mut rest).unwrap(), Some(h3::frame::Part::Header(_)));
+    let Some(h3::frame::Part::Bytes { bytes, end: true, .. }) = decoder.next(&mut rest).unwrap() else {
+        panic!("missing complete HEADERS")
+    };
+    assert_eq!(bytes[..2], [0, 0], "the section requires no insertion");
+    let limits = h3::Limits::default().decoder;
+    let mut qpack = rsnetwork::qpack::Decoder::new(limits, &budget()).unwrap();
+    let mut lines = rsnetwork::qpack::Lines::new(limits, &budget()).unwrap();
+    let mut feedback = rsnetwork::buffer::WriteLoan::new(Vec::new());
+    let block = qpack.decode(id.get(), bytes, &mut lines, &mut feedback).unwrap();
+    assert!(
+        block
+            .lines()
+            .any(|line| line.name == b"x-result" && line.value == value)
+    );
+}
+
+#[test]
+fn blocked_field_sections_share_one_byte_limit_and_release_it_on_cancel() {
+    let mut n = Network::configured(
+        Setup::default(),
+        Some(h3::Limits {
+            blocked_bytes: 24,
+            ..h3::Limits::default()
+        }),
+        None,
+    );
+    let encoder = n.server.stream(Direction::Unidirectional, b"\x02", false);
+    let first = n.client.request();
+    let second = n.client.request();
+    let third = n.client.request();
+    n.pump().unwrap();
+    n.client.events.clear();
+    let room = n.client.budget.available();
+    // Four bytes for the blocked section and sixteen for its following DATA frame.
+    n.server
+        .raw(first, b"\x01\x04\x02\x00\xd9\x80\x00\x0eabcdefghijklmn", false);
+    n.pump().unwrap();
+    assert!(n.client.events.is_empty());
+    assert!(n.client.budget.available() < room);
+    n.server.raw(second, b"\x01\x04\x02\x00\xd9\x80\x00\x01x", true);
+    n.pump().unwrap();
+    assert_matches!(n.client.events.as_slice(), [Event::Body(id, Part::End(Outcome::Reset(Some(0x107))))] if *id==second);
+    n.client.events.clear();
+    n.client
+        .http
+        .as_mut()
+        .unwrap()
+        .cancel(&mut n.client.quic, first)
+        .unwrap();
+    n.pump().unwrap();
+    assert_eq!(n.client.budget.available(), room);
+    n.server.raw(third, b"\x01\x04\x02\x00\xd9\x80\x00\x06abcdef", true);
+    n.pump().unwrap();
+    assert!(n.client.events.is_empty());
+    n.server.raw(encoder, b"\x3f\x61\x48x-source\x03one", false);
+    n.pump().unwrap();
+    assert_matches!(n.client.events.as_slice(), [Event::Response(id,_), Event::Body(_, Part::Data(d)), Event::Body(_, Part::End(Outcome::Complete(None)))] if *id==third && d.bytes()==b"abcdef");
+}
+
+#[test]
+fn exceeding_the_advertised_blocked_stream_limit_sends_decompression_failed() {
+    let mut n = Network::with(
+        Setup {
+            client: quic::Limits {
+                turn: TurnLimits {
+                    visits: 2,
+                    ..quic::Limits::DEFAULT.turn
+                },
+                ..quic::Limits::DEFAULT
+            },
+            ..Setup::default()
+        },
+        true,
+        true,
+    );
+    assert_matches!(n.server.events.as_slice(), [Event::Settings(s)] if s.qpack.blocked_streams==2);
+    let ids = [n.client.request(), n.client.request(), n.client.request()];
+    n.pump().unwrap();
+    for id in &ids[..2] {
+        n.server.raw(*id, b"\x01\x04\x02\x00\xd9\x80", false);
+        n.pump().unwrap();
+    }
+    assert!(n.client.events.iter().all(|e| !matches!(e, Event::Response(..))));
+    n.server.raw(ids[2], b"\x01\x04\x02\x00\xd9\x80", false);
+    n.closed(true, Code::Decompression);
+}
+
+/// Gives one encrypted stream region to HTTP. The counts below start after QUIC delivers the region.
+fn batch(n: &mut Network, stream: StreamId, bytes: Vec<u8>) {
+    let size = bytes.len();
+    n.client.quic.send(stream, Lease::from(bytes), false).unwrap();
+    n.ticks += 30;
+    let at = ms(n.ticks);
+    let mut input = None;
+    for packet in sent_at(&mut n.client.quic, at) {
+        for e in give_at(&mut n.server.quic, &packet, at) {
+            if matches!(&e, quic::Event::Stream {stream: id, data, ..} if *id==stream && data.initialized()==size) {
+                assert!(input.replace(e).is_none());
+            } else {
+                n.server.drive(vec![e], at).unwrap();
+            }
+        }
+    }
+    assert!(input.is_some(), "QUIC delivers the complete batch in one region");
+    assert_matches!(
+        n.server
+            .http
+            .as_mut()
+            .unwrap()
+            .drive(&mut n.server.quic, &mut input, at),
+        Ok(Step::Again)
+    );
+    assert!(input.is_none());
+}
+
+/// Each successful turn uses the connection's funded state. The last instruction has a known wire error.
+fn limited_turns(n: &mut Network, turns: core::ops::RangeInclusive<usize>, code: Code) {
+    let available = n.server.budget.available();
+    let at = ms(n.ticks);
+    for count in 0..=*turns.end() {
+        let (result, allocs) =
+            counting::allocations(|| n.server.http.as_mut().unwrap().drive(&mut n.server.quic, &mut None, at));
+        match result {
+            Ok(Step::Again) => {
+                assert_eq!(allocs, 0, "a critical-stream turn retained or allocated extra storage");
+                assert_eq!(available, n.server.budget.available());
+            }
+            Err(h3::Error::Connection(actual)) => {
+                assert_eq!(actual, code);
+                assert!(turns.contains(&count), "error after {count} turns, expected {turns:?}");
+                n.closed(false, code);
+                return;
+            }
+            other => panic!("unexpected critical-stream result {other:?}"),
+        }
+    }
+    panic!("the engine did not reach the last instruction");
+}
+
+fn limited_network() -> Network {
+    Network::with(
+        Setup {
+            server: quic::Limits {
+                turn: TurnLimits {
+                    frames: 2,
+                    visits: 2,
+                    ..quic::Limits::DEFAULT.turn
+                },
+                ..quic::Limits::DEFAULT
+            },
+            ..Setup::default()
+        },
+        false,
+        true,
+    )
+}
+
+#[test]
+fn encoder_instructions_fit_funded_storage_and_yield_at_the_turn_limit() {
+    let mut n = limited_network();
+    let encoder = n.client.stream(Direction::Unidirectional, b"\x02", false);
+    n.pump().unwrap();
+    // Twelve Set Dynamic Table Capacity instructions, then an invalid duplicate of a missing entry.
+    let mut bytes = vec![0x20; 12];
+    bytes.push(0);
+    batch(&mut n, encoder, bytes);
+    limited_turns(&mut n, 6..=6, Code::EncoderStream);
+}
+
+#[test]
+fn control_frames_and_stream_cancellations_yield_and_send_the_specified_error() {
+    let mut n = limited_network();
+    let control = n.client.stream(Direction::Unidirectional, b"\x00\x04\x00", false);
+    n.pump().unwrap();
+    let mut frames = [0x0d, 1, 1].repeat(12);
+    frames.extend_from_slice(&[0x0d, 1, 0]); // A lower MAX_PUSH_ID is an ID error.
+    batch(&mut n, control, frames);
+    limited_turns(&mut n, 25..=25, Code::Id);
+
+    let mut n = limited_network();
+    let decoder = n.client.stream(Direction::Unidirectional, b"\x03", false);
+    n.pump().unwrap();
+    let mut feedback = vec![0x40; 12];
+    feedback.push(0); // An Insert Count Increment must be positive.
+    batch(&mut n, decoder, feedback);
+    limited_turns(&mut n, 6..=6, Code::DecoderStream);
+}
+
+#[test]
+fn cancelling_outstanding_sections_yields_after_two_visits_and_preserves_other_requests() {
+    let mut n = limited_network();
+    n.client
+        .stream(Direction::Unidirectional, b"\x00\x04\x05\x01\x41\x00\x07\x04", false);
+    let decoder = n.client.stream(Direction::Unidirectional, b"\x03", false);
+    let ids = core::array::from_fn::<_, 2, _>(|_| {
+        n.client.stream(
+            Direction::Bidirectional,
+            b"\x01\x0a\x00\x00\xd1\xd7\xc1\x50\x03foo",
+            true,
+        )
+    });
+    n.pump().unwrap();
+    for i in 0..12 {
+        n.server.headers(
+            ids[i % 2],
+            &[field(b":status", b"103"), field(b"x-source", b"one")],
+            false,
+        );
+        n.pump().unwrap();
+    }
+    assert!(n.client.wire.streams[&7].0.len() > 4, "the encoder sent an insertion");
+    batch(&mut n, decoder, vec![0x40]);
+    for _ in 0..5 {
+        assert_matches!(
+            n.server
+                .http
+                .as_mut()
+                .unwrap()
+                .drive(&mut n.server.quic, &mut None, ms(n.ticks)),
+            Ok(Step::Again)
+        );
+    }
+    // This response arrives while cancellation still has sections to visit.
+    n.server
+        .headers(ids[1], &[field(b":status", b"200"), field(b"x-source", b"one")], true);
+    n.pump().unwrap();
+    let response = &n.client.wire.streams[&ids[1].get()];
+    assert!(response.1);
+    let mut rest = response.0.as_slice();
+    let mut frames = h3::frame::Decoder::new(h3::frame::Stream::Response);
+    let mut required = Vec::new();
+    while !rest.is_empty() {
+        if let Some(h3::frame::Part::Bytes { bytes, .. }) = frames.next(&mut rest).unwrap() {
+            required.push(bytes[0]);
+        }
+    }
+    assert_eq!(required.len(), 7);
+    assert!(required[..6].iter().all(|count| *count != 0));
+    assert_eq!(required[6], 0);
+    // The six sections of stream four can still be acknowledged. A seventh has no matching section.
+    batch(&mut n, decoder, vec![0x84; 7]);
+    limited_turns(&mut n, 3..=3, Code::DecoderStream);
+}
+
+#[test]
+fn a_fragmented_blocked_body_replays_exactly_after_a_qpack_duplicate() {
+    let mut n = Network::with(
+        Setup {
+            client: quic::Limits {
+                turn: TurnLimits {
+                    bytes: 16,
+                    ..quic::Limits::DEFAULT.turn
+                },
+                ..quic::Limits::DEFAULT
+            },
+            ..Setup::default()
+        },
+        true,
+        false,
+    );
+    let encoder = n.server.stream(Direction::Unidirectional, b"\x02", false);
+    let id = n.client.request();
+    n.pump().unwrap();
+    n.client.events.clear();
+    // The section refers to the second insertion. The DATA frame holds 160 bytes.
+    n.server.raw(id, b"\x01\x04\x03\x00\xd9\x80\x00\x40\xa0", false);
+    n.pump().unwrap();
+    n.server.raw(encoder, b"\x3f\x61\x48x-source\x03one", false);
+    n.pump().unwrap();
+    let payload: Vec<u8> = (0..160).collect();
+    for (i, part) in payload.chunks(40).enumerate() {
+        n.server.quic.send(id, Lease::from(part.to_vec()), i == 3).unwrap();
+        n.pump().unwrap();
+        assert!(n.client.events.is_empty());
+    }
+    n.server.raw(encoder, b"\x00", false);
+    n.pump().unwrap();
+    let mut events = mem::take(&mut n.client.events).into_iter();
+    assert_matches!(events.next(), Some(Event::Response(stream,h)) if stream==id && h.fields().any(|f|f.name()==b"x-source" && f.value()==b"one"));
+    assert_matches!(events.next_back(), Some(Event::Body(stream,Part::End(Outcome::Complete(None)))) if stream==id);
+    let mut received = Vec::new();
+    for e in events {
+        let Event::Body(_, Part::Data(d)) = e else {
+            panic!("expected a body region")
+        };
+        assert!(d.initialized() <= 16);
+        received.extend_from_slice(d.bytes());
+    }
+    assert_eq!(received, payload);
+    n.client
+        .http
+        .as_mut()
+        .unwrap()
+        .release(&mut n.client.quic, id, 160)
+        .unwrap();
+    assert!(n.client.http.as_mut().unwrap().retire(&mut n.client.quic, id).unwrap());
 }
