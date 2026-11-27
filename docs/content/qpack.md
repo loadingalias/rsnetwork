@@ -6,8 +6,8 @@ section and gives its field lines. Each is the one owner of its dynamic table: t
 field lines that a section can name with one small index.
 
 rsnetwork is in development and has no release. It has no HTTP/3 engine yet, so you call the codec
-yourself. The codec does no I/O and needs no QUIC stream: you give it bytes, and it writes bytes
-into your regions.
+yourself. Give it instruction bytes and complete field sections. It writes its output into your regions.
+The HTTP/3 frame decoder identifies HEADERS payloads on a request or response stream. [HTTP/3 framing](http3.md)
 
 ## The three kinds of bytes
 

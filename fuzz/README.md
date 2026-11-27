@@ -10,6 +10,7 @@ writes. The module documentation of each target gives its input format and its c
 
 | Target | Production code | Checks |
 | --- | --- | --- |
+| `h3_frame` | `h3::frame::Decoder` | Fragmented and contiguous streams give the same headers, settings, identifiers, content, skipped byte count, and terminal result. |
 | `request` | `h1::Server` | A cut input gives the result of the whole input. Each complete body has the length of its framing. No response follows a refusal. The bounds of the transport hold. |
 | `response` | `h1::Client` | A cut input gives the result of the whole input. Each complete body has the length of its framing. The bounds of the transport hold. |
 | `chunked` | `h1::ChunkDecoder` | Pieces give the result of the whole input. No step allocates. The data and the trailers stay in their limits. |

@@ -22,6 +22,7 @@
 //! its dynamic table. [`h2`] is HTTP/2: the frame codec, and the engine of one connection with
 //! its streams and flow control. [`qpack`] is the field compression of HTTP/3, with its encoder
 //! and decoder streams.
+//! [`h3::frame`] reads HTTP/3 frames from successive regions of a single QUIC stream.
 //!
 //! [`tls`] is TLS 1.3 (the default `tls` feature): the configuration of each end, and the engine
 //! that runs an HTTP engine over TLS records, with the cryptography of rscrypto.
@@ -48,6 +49,7 @@ pub mod client;
 pub mod drive;
 pub mod h1;
 pub mod h2;
+pub mod h3;
 pub mod host;
 pub mod hpack;
 mod link;
@@ -61,3 +63,4 @@ mod structured;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub mod value;
+mod varint;

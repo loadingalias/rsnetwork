@@ -180,19 +180,11 @@ impl ErrorCode {
 }
 
 /// The largest value of a variable-length integer: 2^62 - 1 (RFC 9000, section 16).
-pub const VARINT_MAX: u64 = (1 << 62) - 1;
+pub const VARINT_MAX: u64 = crate::varint::MAX;
 
 /// The length of the shortest encoding of `value` as a variable-length integer, or `None` above
 /// [`VARINT_MAX`].
-pub(crate) const fn varint_len(value: u64) -> Option<usize> {
-    match value {
-        0..=0x3f => Some(1),
-        0x40..=0x3fff => Some(2),
-        0x4000..=0x3fff_ffff => Some(4),
-        0x4000_0000..=VARINT_MAX => Some(8),
-        _ => None,
-    }
-}
+pub(crate) use crate::varint::len as varint_len;
 
 /// A reader of the fields of a header or a frame.
 pub(crate) struct Reader<'a> {
@@ -235,13 +227,9 @@ impl<'a> Reader<'a> {
 
     /// A variable-length integer (RFC 9000, section 16), and the length of its encoding.
     pub(crate) fn varint_with_len(&mut self) -> Option<(u64, usize)> {
-        let first = *self.bytes.get(self.at)?;
-        let len = 1 << (first >> 6);
-        let bytes = self.take(len)?;
-        let value = bytes[1..]
-            .iter()
-            .fold(u64::from(first & 0x3f), |value, &byte| (value << 8) | u64::from(byte));
-        Some((value, len))
+        let field = crate::varint::read(self.rest())?;
+        self.at += field.1;
+        Some(field)
     }
 
     pub(crate) fn varint(&mut self) -> Option<u64> {
@@ -287,20 +275,8 @@ impl<'a> Writer<'a> {
 
     /// `value` in an encoding of `len` bytes: 1, 2, 4, or 8, and long enough for it.
     pub(crate) fn varint_in(&mut self, value: u64, len: usize) -> Option<()> {
-        if varint_len(value)? > len {
-            return None;
-        }
-        let prefix = match len {
-            1 => 0,
-            2 => 1,
-            4 => 2,
-            8 => 3,
-            _ => return None,
-        };
-        let bytes = value.to_be_bytes();
-        let start = 8 - len;
-        self.bytes(&bytes[start..])?;
-        self.out[self.at - len] |= prefix << 6;
+        crate::varint::write(&mut self.out[self.at..], value, len)?;
+        self.at += len;
         Some(())
     }
 }

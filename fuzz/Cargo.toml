@@ -119,6 +119,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "h3_frame"
+path = "fuzz_targets/h3_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "quic_params"
 path = "fuzz_targets/quic_params.rs"
 test = false
