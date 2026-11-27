@@ -173,9 +173,9 @@ impl Endpoint {
         {
             return Err(Error::new(Kind::Misuse, "invalid QUIC handshake admission limits"));
         }
-        let claim = keys.claim(worker)?;
         connection_limits.cid_bytes = keys::CID_BYTES;
-        super::connection::check(&connection_limits)?;
+        super::connection::check(&connection_limits, &config.config.alpn_protocols)?;
+        let claim = keys.claim(worker)?;
         let stream = config.entropy.stream(b"quic-end");
         let rng = config.config.provider().secure_random;
         let capacity = usize::from(limits.connections_max);

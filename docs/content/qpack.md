@@ -5,9 +5,8 @@ writes the field lines of a request or a response as one field section. A `Decod
 section and gives its field lines. Each is the one owner of its dynamic table: the table of recent
 field lines that a section can name with one small index.
 
-rsnetwork is in development and has no release. It has no HTTP/3 engine yet, so you call the codec
-yourself. Give it instruction bytes and complete field sections. It writes its output into your regions.
-The HTTP/3 frame decoder identifies HEADERS payloads on a request or response stream. [HTTP/3 framing](http3.md)
+The HTTP/3 connection drives the codec for each request, response, and trailer section.
+For direct codec use, supply instruction bytes and complete field sections. The codec writes its output into your regions. [Drive an HTTP/3 connection](http3.md)
 
 ## The three kinds of bytes
 

@@ -189,12 +189,12 @@ fn field<'a>(line: FieldLine<'a>, facts: &mut Facts<'a>) -> Result<(), Refusal> 
 /// The pseudo-header fields of `block`, which come first, and the facts of its other fields.
 /// `pseudo` takes each pseudo-header field, and refuses one that the message does not have.
 fn section<'a>(
-    block: Block<'a>,
+    lines: impl Iterator<Item = FieldLine<'a>>,
     mut pseudo: impl FnMut(&'a [u8], &'a [u8]) -> Result<(), Refusal>,
 ) -> Result<Facts<'a>, Refusal> {
     let mut facts = Facts::default();
     let mut fields = false;
-    for line in block.lines() {
+    for line in lines {
         if let Some(name) = line.name.strip_prefix(b":") {
             if fields {
                 return Err(Refusal::Malformed);
@@ -219,8 +219,57 @@ fn once<'a>(slot: &mut Option<&'a [u8]>, value: &'a [u8]) -> Result<(), Refusal>
 /// Checks the request section `block` (RFC 9113, section 8.3.1), and copies it into a head
 /// charged to `budget`.
 pub(crate) fn request(block: Block<'_>, budget: &Budget) -> Result<Request, Refusal> {
+    let RequestFields {
+        method,
+        path,
+        authority,
+        scheme,
+        facts,
+    } = request_fields(block.lines())?;
+    let mut out = Out::new(
+        [Some(method), path, authority, scheme]
+            .into_iter()
+            .flatten()
+            .map(<[u8]>::len)
+            .sum::<usize>()
+            .saturating_add(facts.bytes),
+        budget,
+    )?;
+    let method = out.put(method);
+    let path = path.map(|path| out.put(path));
+    let authority = authority.map(|authority| out.put(authority));
+    let scheme = scheme.map(|scheme| out.put(scheme));
+    let fields = out.fields(block);
+    Ok(Request {
+        method,
+        target: path.or(authority).unwrap_or(method),
+        authority,
+        scheme,
+        fields,
+        length: facts.length,
+        bytes: out.lease(),
+    })
+}
+
+/// The checked pseudo-fields and length of an HTTP/2 or HTTP/3 request.
+pub(crate) struct RequestFields<'a> {
+    pub(crate) method: &'a [u8],
+    path: Option<&'a [u8]>,
+    authority: Option<&'a [u8]>,
+    scheme: Option<&'a [u8]>,
+    facts: Facts<'a>,
+}
+
+impl RequestFields<'_> {
+    #[cfg(feature = "tls")]
+    pub(crate) fn length(&self) -> Option<u64> {
+        self.facts.length
+    }
+}
+
+pub(crate) fn request_fields<'a>(lines: impl Iterator<Item = FieldLine<'a>>) -> Result<RequestFields<'a>, Refusal> {
     let (mut method, mut scheme, mut authority, mut path) = (None, None, None, None);
-    let facts = section(block, |name, value| match name {
+    let facts = section(lines, |name, value| match name {
         b"method" => once(&mut method, value),
         b"scheme" => once(&mut scheme, value),
         b"authority" => once(&mut authority, value),
@@ -266,72 +315,82 @@ pub(crate) fn request(block: Block<'_>, budget: &Budget) -> Result<Request, Refu
             return Err(Refusal::Malformed);
         }
     }
-    let mut out = Out::new(
-        [Some(method), path, authority, scheme]
-            .into_iter()
-            .flatten()
-            .map(<[u8]>::len)
-            .sum::<usize>()
-            .saturating_add(facts.bytes),
-        budget,
-    )?;
-    let method = out.put(method);
-    let path = path.map(|path| out.put(path));
-    let authority = authority.map(|authority| out.put(authority));
-    let scheme = scheme.map(|scheme| out.put(scheme));
-    let fields = out.fields(block);
-    Ok(Request {
+    Ok(RequestFields {
         method,
-        target: path.or(authority).unwrap_or(method),
+        path,
         authority,
         scheme,
-        fields,
-        length: facts.length,
-        bytes: out.lease(),
+        facts,
     })
 }
 
 /// Checks the response section `block` (RFC 9113, section 8.3.2). A final response copies into
 /// a head charged to `budget`. A 204 or 304 response has the length 0.
 pub(crate) fn response(block: Block<'_>, budget: &Budget) -> Result<Answer, Refusal> {
-    let mut status = None;
-    let facts = section(block, |name, value| match name {
-        b"status" => once(&mut status, value),
-        _ => Err(Refusal::Malformed),
-    })?;
-    let status = status
-        .filter(|status| status.len() == 3)
-        .and_then(decimal)
-        .and_then(|code| u16::try_from(code).ok())
-        .and_then(|code| Status::new(code).ok())
-        .ok_or(Refusal::Malformed)?;
-    // HTTP/2 has no 101 (section 8.6).
-    match status.code() {
-        101 => return Err(Refusal::Malformed),
-        100..=199 => return Ok(Answer::Interim),
-        _ => {}
+    let fields = ResponseFields::check(block.lines())?;
+    if fields.status.code() < 200 {
+        return Ok(Answer::Interim);
     }
-    let mut out = Out::new(facts.bytes, budget)?;
-    out.fields(block);
-    let length = if matches!(status.code(), 204 | 304) {
-        Some(0)
-    } else {
-        facts.length
-    };
-    Ok(Answer::Final(Response {
-        bytes: out.lease(),
-        status,
-        length,
-    }))
+    fields.retain(block, budget).map(Answer::Final)
 }
 
+/// Checked response semantics shared by the two multiplexed protocols.
+pub(crate) struct ResponseFields {
+    pub(crate) status: Status,
+    pub(crate) length: Option<u64>,
+    bytes: usize,
+}
+
+impl ResponseFields {
+    pub(crate) fn check<'a>(lines: impl Iterator<Item = FieldLine<'a>>) -> Result<Self, Refusal> {
+        let mut status = None;
+        let facts = section(lines, |name, value| match name {
+            b"status" => once(&mut status, value),
+            _ => Err(Refusal::Malformed),
+        })?;
+        let status = status
+            .filter(|status| status.len() == 3)
+            .and_then(decimal)
+            .and_then(|code| u16::try_from(code).ok())
+            .and_then(|code| Status::new(code).ok())
+            .ok_or(Refusal::Malformed)?;
+        if status.code() == 101 {
+            return Err(Refusal::Malformed);
+        }
+        let length = if status.code() < 200 || matches!(status.code(), 204 | 304) {
+            Some(0)
+        } else {
+            facts.length
+        };
+        Ok(Self {
+            status,
+            length,
+            bytes: facts.bytes,
+        })
+    }
+
+    pub(crate) fn retain(self, block: Block<'_>, budget: &Budget) -> Result<Response, Refusal> {
+        let mut out = Out::new(self.bytes, budget)?;
+        out.fields(block);
+        Ok(Response {
+            bytes: out.lease(),
+            status: self.status,
+            length: self.length,
+        })
+    }
+}
 /// Checks the trailer section `block` (RFC 9113, section 8.1), which has no pseudo-header field,
 /// and copies its fields into a region charged to `budget`, as `name: value` and CR LF.
 pub(crate) fn trailers(block: Block<'_>, budget: &Budget) -> Result<Lease, Refusal> {
-    let facts = section(block, |_, _| Err(Refusal::Malformed))?;
+    let facts = section(block.lines(), |_, _| Err(Refusal::Malformed))?;
     let mut out = Out::new(facts.bytes, budget)?;
     out.fields(block);
     Ok(out.lease())
+}
+
+#[cfg(feature = "tls")]
+pub(crate) fn check_trailers<'a>(lines: impl Iterator<Item = FieldLine<'a>>) -> Result<(), Refusal> {
+    section(lines, |_, _| Err(Refusal::Malformed)).map(drop)
 }
 
 /// The region of one head, which takes exactly the bytes that its checks counted.
@@ -342,9 +401,7 @@ struct Out {
 
 impl Out {
     fn new(len: usize, budget: &Budget) -> Result<Self, Refusal> {
-        let charge = budget.reserve(len as u64).map_err(|_| Refusal::Capacity)?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(len).map_err(|_| Refusal::Capacity)?;
+        let (bytes, charge) = region(len, budget).ok_or(Refusal::Capacity)?;
         Ok(Self { bytes, charge })
     }
 
@@ -374,6 +431,19 @@ impl Out {
     fn lease(self) -> Lease {
         charged(self.bytes, self.charge)
     }
+}
+
+/// Charges the bytes and the reference-counted owner of the lease.
+pub(crate) fn lease_charge(len: usize, budget: &Budget) -> Option<Permit> {
+    let total = len.checked_add(Lease::owner_layout::<Owned>().size())?;
+    budget.reserve(total as u64).ok()
+}
+
+pub(crate) fn region(len: usize, budget: &Budget) -> Option<(Vec<u8>, Permit)> {
+    let charge = lease_charge(len, budget)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).ok()?;
+    Some((bytes, charge))
 }
 
 /// A lease of `bytes`, which keeps `charge` until its last view drops.

@@ -1,10 +1,57 @@
-# Read HTTP/3 frames
+# Drive an HTTP/3 connection
 
-Use `rsnetwork::h3::frame` to read or write HTTP/3 framing without a socket.
-The module works with `default-features = false`.
-It exposes the frame boundaries, stream placement rules, and payload bytes. The application owns its connection state.
+Use `rsnetwork::h3::Connection` with the default `tls` feature to serve or request resources over QUIC.
+The host supplies datagrams and time. The engine owns HTTP message order, the control streams, and both QPACK tables.
+
+## Start and drive the connection
+
+1. Offer the ALPN name `h3` in the client and server TLS configurations.
+2. Set `quic::Limits` before creating the QUIC connection. Allow at least three unidirectional streams and positive stream, connection, and send byte limits.
+3. Create the engine with `h3::Connection::new(&quic, limits, &budget)`. Use this QUIC connection for every operation on the engine.
+4. Call `drive(&mut quic, &mut input, now)` with each event from QUIC. Also drive with `None` after handshake progress and application writes.
+5. On `Step::Again`, drive again. On `Step::Event`, handle the event and resume. On `Step::Wait`, resume at the next transport or application event.
+6. Continue to service QUIC transmission and its deadlines. On `Event::Closed`, finish pending exchanges with the transport outcome.
+
+After negotiation, each endpoint opens a control stream and two QPACK streams. SETTINGS is the first control frame.
+Reserve these streams for the engine. It can receive a request before the peer’s SETTINGS arrives. [RFC 9114, section 6](https://www.rfc-editor.org/rfc/rfc9114.html#section-6)
+
+## Send and receive a message
+
+A client calls `open` for a request stream. A server receives its identifier in `Event::Request`.
+Pass the pseudo-header fields first in `headers`. For example, an HTTPS GET uses `:method`, `:scheme`, `:authority`, and `:path`.
+Use `data` to admit a body region. Set the last frame’s `end` flag, or call `finish` after the last frame advances.
+Each stream admits one pending frame. If that slot is full, drive the connection before retrying with the same input.
+
+The client receives each informational response with its fields, then the final response.
+A `103 Early Hints` event lets the application decide whether its cache, authority policy, and byte budget permit a fetch.
+The client grants no push IDs. The server continues to serve requests when a peer offers push credit. [Early Hints](https://www.rfc-editor.org/rfc/rfc8297.html)
+
+A DATA event carries a view of the received bytes. Call `release` with the consumed byte count to restore flow credit.
+A clean FIN yields `Outcome::Complete` with any trailers. A reset carries its stream code and releases that stream’s blocked QPACK section.
+Call `cancel` to abandon a request. Call `retire` when both directions end. A pending send acknowledgement gives `Ok(false)`.
+
+## Limits and shutdown
+
+`h3::Limits` bounds concurrent requests, the encoded size of each received field section, and control-stream storage.
+Its QPACK limits bound the dynamic tables, decoded fields, blocked streams, and encoder work.
+The shared budget pays for retained fields and data waiting on a QPACK insertion. Split large outgoing bodies into DATA frames within the send limit.
+An invalid field section can end one request. A framing or critical-stream error closes QUIC with its HTTP/3 application code. [QPACK limits](qpack.md#limits)
+
+Call `goaway` to end admission and finish accepted requests. A server sends the first excluded request ID.
+A client that receives `Event::GoAway(id)` stops opening requests. Existing requests below the cutoff can still receive responses.
+After the requests retire and QUIC acknowledges the critical-stream output, `drained()` returns true.
+The host can then call `quic.close(h3::Code::NoError as u64, now)` and drive QUIC through its closing period. [RFC 9114, section 5.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-5.2)
+
+Run the exchange from a repository checkout to check two Early Hints, the final body, its trailers, and graceful shutdown.
+
+```sh
+cargo xtask test -E 'test(early_hints_precede_the_final_response_and_goaway_drains_the_request)'
+```
 
 ## Read a stream
+
+The independent `rsnetwork::h3::frame` module also works with `default-features = false`.
+Use it for wire framing when the caller owns the connection state.
 
 1. On a unidirectional stream, pass its first bytes to `StreamType::read`. Retain an incomplete prefix until more bytes arrive.
 2. On a control stream, create a `Decoder` with `Stream::ClientControl` or `Stream::ServerControl` according to the sender.

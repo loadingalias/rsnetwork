@@ -8,9 +8,9 @@
 //! - **HTTP/1.1.** The head is a view of the received bytes, with no copy. The field names keep
 //!   their case. [`RequestHead::h1`] and [`ResponseHead::h1`] give the facts that only HTTP/1.1
 //!   has, such as persistence and `100 Continue`.
-//! - **HTTP/2.** The HPACK decoder writes each header block into one buffer of the connection.
+//! - **HTTP/2 and HTTP/3.** The connection decodes field sections with HPACK or QPACK.
 //!   The head copies the decoded lines into a charged region of their exact size, so its memory
-//!   follows the size of the head. The field names are lowercase (RFC 9113, section 8.2.1).
+//!   follows the size of the head. The field names are lowercase.
 //!
 //! [`length`](RequestHead::length) is the length of the body when the sender declared it, and
 //! `None` when the body ends with its stream or with its last chunk.
@@ -30,6 +30,8 @@ pub enum Version {
     Http11,
     /// HTTP/2 (RFC 9113).
     Http2,
+    /// HTTP/3 (RFC 9114).
+    Http3,
 }
 
 /// The stream of one exchange on a connection: one request and its response.
@@ -83,7 +85,7 @@ pub struct RequestHead(RequestForm);
 #[derive(Clone)]
 enum RequestForm {
     H1(RetainedRequest),
-    H2(H2Request),
+    Multiplexed(H2Request, Version),
 }
 
 impl RequestHead {
@@ -92,37 +94,42 @@ impl RequestHead {
     }
 
     pub(crate) fn h2_form(head: H2Request) -> Self {
-        Self(RequestForm::H2(head))
+        Self(RequestForm::Multiplexed(head, Version::Http2))
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn h3_form(head: H2Request) -> Self {
+        Self(RequestForm::Multiplexed(head, Version::Http3))
     }
 
     /// The method. An unknown method stays as it is.
     pub fn method(&self) -> Method<'_> {
         match &self.0 {
             RequestForm::H1(head) => head.head().method(),
-            RequestForm::H2(head) => head.method(),
+            RequestForm::Multiplexed(head, _) => head.method(),
         }
     }
 
-    /// The request target, in its exact bytes: on HTTP/2, the `:path`, and the authority of a
+    /// The request target, in its exact bytes: on HTTP/2 and HTTP/3, the `:path`, and the authority of a
     /// CONNECT request, which has no `:path`.
     pub fn target(&self) -> Target<'_> {
         match &self.0 {
             RequestForm::H1(head) => head.head().target(),
-            RequestForm::H2(head) => head.target(),
+            RequestForm::Multiplexed(head, _) => head.target(),
         }
     }
 
     /// The authority of the request: on HTTP/1.1, that of the target or of the Host field
-    /// (RFC 9112, section 3.3), and on HTTP/2, the `:authority`, or else the Host field (RFC 9113,
+    /// (RFC 9112, section 3.3), and on HTTP/2 and HTTP/3, the `:authority`, or else the Host field (RFC 9113,
     /// section 8.3.1). `None` when the request has none.
     pub fn authority(&self) -> Option<Authority<'_>> {
         match &self.0 {
             RequestForm::H1(head) => head.head().authority(),
-            RequestForm::H2(head) => head.authority(),
+            RequestForm::Multiplexed(head, _) => head.authority(),
         }
     }
 
-    /// The scheme of the target URI: on HTTP/2, the `:scheme`, and on HTTP/1.1, the scheme of an
+    /// The scheme of the target URI: on HTTP/2 and HTTP/3, the `:scheme`, and on HTTP/1.1, the scheme of an
     /// absolute-form target. `None` when the request does not give it.
     pub fn scheme(&self) -> Option<Scheme<'_>> {
         match &self.0 {
@@ -130,16 +137,16 @@ impl RequestHead {
                 TargetForm::Absolute { scheme, .. } => Some(scheme),
                 _ => None,
             },
-            RequestForm::H2(head) => head.scheme(),
+            RequestForm::Multiplexed(head, _) => head.scheme(),
         }
     }
 
-    /// The fields, in their received order. On HTTP/2, the pseudo-header fields are not fields:
+    /// The fields, in their received order. On HTTP/2 and HTTP/3, the pseudo-header fields are not fields:
     /// the other calls give their values.
     pub fn fields(&self) -> Fields<'_> {
         match &self.0 {
             RequestForm::H1(head) => head.head().fields(),
-            RequestForm::H2(head) => head.fields(),
+            RequestForm::Multiplexed(head, _) => head.fields(),
         }
     }
 
@@ -151,7 +158,7 @@ impl RequestHead {
                 h1::Framing::Length(length) => Some(length),
                 h1::Framing::Chunked | h1::Framing::Close => None,
             },
-            RequestForm::H2(head) => head.length(),
+            RequestForm::Multiplexed(head, _) => head.length(),
         }
     }
 
@@ -159,15 +166,15 @@ impl RequestHead {
     pub fn version(&self) -> Version {
         match &self.0 {
             RequestForm::H1(head) => head.head().version(),
-            RequestForm::H2(_) => Version::Http2,
+            RequestForm::Multiplexed(_, version) => *version,
         }
     }
 
-    /// The HTTP/1.1 head, with the facts that only HTTP/1.1 has, or `None` on HTTP/2.
+    /// The HTTP/1.1 head, with the facts that only HTTP/1.1 has, or `None` on HTTP/2 and HTTP/3.
     pub fn h1(&self) -> Option<h1::RequestHead<'_>> {
         match &self.0 {
             RequestForm::H1(head) => Some(head.head()),
-            RequestForm::H2(_) => None,
+            RequestForm::Multiplexed(..) => None,
         }
     }
 }
@@ -191,7 +198,7 @@ pub struct ResponseHead(ResponseForm);
 #[derive(Clone)]
 enum ResponseForm {
     H1(RetainedResponse),
-    H2(H2Response),
+    Multiplexed(H2Response, Version),
 }
 
 impl ResponseHead {
@@ -200,22 +207,27 @@ impl ResponseHead {
     }
 
     pub(crate) fn h2_form(head: H2Response) -> Self {
-        Self(ResponseForm::H2(head))
+        Self(ResponseForm::Multiplexed(head, Version::Http2))
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn h3_form(head: H2Response) -> Self {
+        Self(ResponseForm::Multiplexed(head, Version::Http3))
     }
 
     /// The status.
     pub fn status(&self) -> Status {
         match &self.0 {
             ResponseForm::H1(head) => head.head().status(),
-            ResponseForm::H2(head) => head.status(),
+            ResponseForm::Multiplexed(head, _) => head.status(),
         }
     }
 
-    /// The fields, in their received order. On HTTP/2, the `:status` is not a field.
+    /// The fields, in their received order. On HTTP/2 and HTTP/3, use `status` for the `:status` pseudo-header.
     pub fn fields(&self) -> Fields<'_> {
         match &self.0 {
             ResponseForm::H1(head) => head.head().fields(),
-            ResponseForm::H2(head) => head.fields(),
+            ResponseForm::Multiplexed(head, _) => head.fields(),
         }
     }
 
@@ -228,7 +240,7 @@ impl ResponseHead {
                 h1::Framing::Length(length) => Some(length),
                 h1::Framing::Chunked | h1::Framing::Close => None,
             },
-            ResponseForm::H2(head) => head.length(),
+            ResponseForm::Multiplexed(head, _) => head.length(),
         }
     }
 
@@ -236,15 +248,15 @@ impl ResponseHead {
     pub fn version(&self) -> Version {
         match &self.0 {
             ResponseForm::H1(head) => head.head().version(),
-            ResponseForm::H2(_) => Version::Http2,
+            ResponseForm::Multiplexed(_, version) => *version,
         }
     }
 
-    /// The HTTP/1.1 head, with the facts that only HTTP/1.1 has, or `None` on HTTP/2.
+    /// The HTTP/1.1 head, with the facts that only HTTP/1.1 has, or `None` on HTTP/2 and HTTP/3.
     pub fn h1(&self) -> Option<h1::ResponseHead<'_>> {
         match &self.0 {
             ResponseForm::H1(head) => Some(head.head()),
-            ResponseForm::H2(_) => None,
+            ResponseForm::Multiplexed(..) => None,
         }
     }
 }

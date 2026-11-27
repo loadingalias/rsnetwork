@@ -135,7 +135,7 @@ impl Exchange {
     /// connection gives in turn.
     fn sending(&self) -> Waits {
         match self.head.version() {
-            Version::Http2 => Waits::Stream(self.stream),
+            Version::Http2 | Version::Http3 => Waits::Stream(self.stream),
             Version::Http10 | Version::Http11 => Waits::Place(Some(self.stream)),
         }
     }

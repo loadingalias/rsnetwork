@@ -134,7 +134,7 @@ fn serve(input: &[u8]) -> Reading {
                 let version = match head.version() {
                     Version::Http10 => "HTTP/1.0",
                     Version::Http11 => "HTTP/1.1",
-                    Version::Http2 => panic!("an HTTP/1.1 head has no HTTP/2 version"),
+                    Version::Http2 | Version::Http3 => panic!("the HTTP/1 parser returned a multiplexed version"),
                 };
                 let persistence = if head.persistent() { "keep" } else { "close" };
                 let lines = fields(head.fields().map(|field| (field.name(), field.value())));

@@ -249,11 +249,15 @@ pub(crate) fn root(seed: u64) -> ChaCha20Rng {
 /// The configurations of a client and a server: with the entropy of the system, or each one with
 /// its own child of the root of `seed`.
 pub(crate) fn configs(seed: Option<u64>) -> (ClientConfig, ServerConfig) {
+    configs_for(seed, b"test")
+}
+
+pub(crate) fn configs_for(seed: Option<u64>, protocol: &[u8]) -> (ClientConfig, ServerConfig) {
     let entropy = |label: &[u8; 8]| seed.map_or(Entropy::System, |seed| Entropy::Seeded(root(seed).child(label, 0)));
     let client = ClientConfig::new(ClientOptions {
         roots: &[CertificateDer::from(CA.to_vec())],
         identity: None,
-        protocols: &[b"test"],
+        protocols: &[protocol],
         resumption: Resumption::Off,
         budget: &budget(),
         clock: Arc::new(At(VALID)),
@@ -266,7 +270,7 @@ pub(crate) fn configs(seed: Option<u64>) -> (ClientConfig, ServerConfig) {
             key: PrivateKeyDer::try_from(SERVER.1.to_vec()).unwrap(),
         },
         client_roots: None,
-        protocols: &[b"test"],
+        protocols: &[protocol],
         resumption: Resumption::Off,
         budget: &budget(),
         clock: Arc::new(At(VALID)),
@@ -487,17 +491,17 @@ impl Pair {
             server,
             ..Setup::default()
         };
-        Self::build(setup, path_bytes)
+        Self::build(setup, path_bytes, b"test")
     }
 
     /// A client and a server after their handshake on a path with no delay and no fault, which
     /// then take the links of `setup`.
     pub(crate) fn with(setup: Setup) -> Self {
-        Self::build(setup, usize::MAX)
+        Self::build(setup, usize::MAX, b"test")
     }
 
-    fn build(setup: Setup, path_bytes: usize) -> Self {
-        let (client_config, server_config) = configs(setup.seed);
+    pub(crate) fn build(setup: Setup, path_bytes: usize, protocol: &[u8]) -> Self {
+        let (client_config, server_config) = configs_for(setup.seed, protocol);
         let route = Path {
             local: client_address(4301),
             peer: SERVER_ADDRESS,

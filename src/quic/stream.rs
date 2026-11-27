@@ -1245,6 +1245,22 @@ impl Streams {
         Ok(Some(id))
     }
 
+    /// The available send bytes after a reservation for other streams. An ended direction gives `None`.
+    pub(super) fn send_room(&self, id: StreamId, reserve: usize) -> Result<Option<usize>, Error> {
+        let send = self.slots[self.open_slot(id)?].send.as_ref().ok_or(NOT_OPEN)?;
+        if send.state != Sending::Open {
+            return Ok(None);
+        }
+        let bytes = if send.regions == STREAM_REGIONS_MAX {
+            0
+        } else {
+            (self.config.send_bytes - self.retained_bytes)
+                .saturating_sub(reserve as u64)
+                .min(VARINT_MAX - send.offset - send.queued)
+        };
+        Ok(Some(usize::try_from(bytes).unwrap_or(usize::MAX)))
+    }
+
     /// Gives `data` to stream `id`, after the regions that wait, and its end with `end`.
     pub(super) fn send(&mut self, id: StreamId, data: Lease, end: bool) -> Result<(), Error> {
         let slot = self.open_slot(id)?;
@@ -1337,6 +1353,26 @@ impl Streams {
             self.link(slot);
         } else if send.blocked_at.replace(send.max) != Some(send.max) {
             self.owe(slot, control::BLOCKED);
+        }
+        Ok(())
+    }
+
+    /// Aborts each direction that can still send or receive. A FIN or reset can cross the abort.
+    pub(super) fn abort(&mut self, id: StreamId, code: u64) -> Result<(), Error> {
+        let slot = self.open_slot(id)?;
+        if self.slots[slot]
+            .send
+            .as_ref()
+            .is_some_and(|s| !s.delivered() && !matches!(s.state, Sending::Reset { .. }))
+        {
+            self.reset(id, code)?;
+        }
+        if self.slots[slot]
+            .recv
+            .as_ref()
+            .is_some_and(|r| r.state == Receiving::Open)
+        {
+            self.stop(id, code)?;
         }
         Ok(())
     }

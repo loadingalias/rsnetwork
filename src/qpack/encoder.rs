@@ -108,7 +108,7 @@ impl Encoder {
 
     /// The longest lines of a section that [`encode`](Self::encode) can give for `lines`: the
     /// free bytes that it needs in its region.
-    fn needed<'a>(&self, lines: impl Iterator<Item = FieldLine<'a>>) -> usize {
+    pub(crate) fn needed<'a>(&self, lines: impl Iterator<Item = FieldLine<'a>>) -> usize {
         // The largest index: the static table, or the entries of the largest table.
         let index = (STATIC.len() + self.table.ring.limit() / OVERHEAD) as u64;
         lines.fold(0, |needed: usize, line| {

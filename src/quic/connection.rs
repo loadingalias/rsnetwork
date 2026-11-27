@@ -871,7 +871,10 @@ fn receive_window(limits: &Limits) -> Result<u64, Error> {
 }
 
 /// Checks the limits that the caller set.
-pub(super) fn check(limits: &Limits) -> Result<(), Error> {
+pub(super) fn check(limits: &Limits, protocols: &[rustls::enums::ApplicationProtocol<'_>]) -> Result<(), Error> {
+    if protocols.iter().any(|name| name.as_ref() == b"h3") {
+        crate::h3::check_transport(limits)?;
+    }
     if !(DATAGRAM_MIN..=DATAGRAM_MAX).contains(&limits.datagram_bytes_max)
         || limits.cid_bytes > ConnectionId::MAX
         || limits.key_packets_max < 2
@@ -948,7 +951,7 @@ impl Connection {
         budget: &Budget,
         now: Instant,
     ) -> Result<Self, Error> {
-        check(&limits)?;
+        check(&limits, &config.config.alpn_protocols)?;
         if config.protocols == 0 {
             return Err(Error::new(Kind::Misuse, "a QUIC client offers no ALPN name"));
         }
@@ -1029,7 +1032,7 @@ impl Connection {
         budget: &Budget,
         now: Instant,
     ) -> Result<Self, Error> {
-        check(&limits)?;
+        check(&limits, &config.config.alpn_protocols)?;
         let Header::Protected {
             kind: PacketKind::Initial,
             dcid,
@@ -1808,6 +1811,27 @@ impl Connection {
     pub fn open(&mut self, direction: Direction) -> Result<Option<StreamId>, Error> {
         self.live()?;
         self.streams.open(direction)
+    }
+
+    pub(crate) const fn local_limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    pub(crate) const fn side(&self) -> Side {
+        match self.end {
+            End::Client { .. } => Side::Client,
+            End::Server { .. } => Side::Server,
+        }
+    }
+
+    pub(crate) fn send_room(&self, id: StreamId, reserve: usize) -> Result<Option<usize>, Error> {
+        self.live()?;
+        self.streams.send_room(id, reserve)
+    }
+
+    pub(crate) fn abort_stream(&mut self, stream: StreamId, code: u64) -> Result<(), Error> {
+        self.live()?;
+        self.streams.abort(stream, code)
     }
 
     /// Queues `data` without a copy. With `end`, the region ends the stream and can be empty.

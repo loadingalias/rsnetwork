@@ -224,13 +224,13 @@ impl fmt::Debug for Part<'_> {
 
 /// A partial integer. A complete integer in the current region takes the direct path.
 #[derive(Default)]
-struct Integer {
+pub(super) struct Integer {
     bytes: [u8; 8],
     used: usize,
 }
 
 impl Integer {
-    fn read(&mut self, input: &mut &[u8]) -> Option<u64> {
+    pub(super) fn read(&mut self, input: &mut &[u8]) -> Option<u64> {
         if self.used == 0 {
             if let Some((value, len)) = varint::read(input) {
                 *input = &input[len..];

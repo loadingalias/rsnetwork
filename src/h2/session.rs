@@ -223,7 +223,7 @@ impl Inflow {
                 Some(charge) if need <= bytes.capacity() => charge,
                 _ => {
                     let capacity = need.max(bytes.capacity().saturating_mul(2));
-                    let more = budget.reserve(capacity as u64).map_err(|_| overload())?;
+                    let more = message::lease_charge(capacity, budget).ok_or_else(overload)?;
                     bytes
                         .try_reserve_exact(capacity - bytes.len())
                         .map_err(|_| overload())?;
