@@ -109,6 +109,9 @@ const TLS_CLOSURE: &[&str] = &[
     "zeroize",
 ];
 
+/// The optional HTTP type conversions and their dependencies (N701).
+const HTTP_CLOSURE: &[&str] = &["http", "bytes", "itoa"];
+
 /// The crates that the Tokio binding adds to the core with all its features: Tokio with `rt`,
 /// `net`, `sync`, and `time`, socket2, and their dependencies (N107). None builds C. A new crate
 /// here needs the approval of the user.
@@ -326,16 +329,22 @@ impl Repo {
             ),
             ("rsnetwork", "the default build", None, &[TLS_CLOSURE][..]),
             (
+                "rsnetwork-tokio",
+                "the default build",
+                None,
+                &[TLS_CLOSURE, TOKIO_CLOSURE][..],
+            ),
+            (
                 "rsnetwork",
                 "a build with all features",
                 Some("--all-features"),
-                &[TLS_CLOSURE][..],
+                &[TLS_CLOSURE, HTTP_CLOSURE][..],
             ),
             (
                 "rsnetwork-tokio",
                 "a build with all features",
                 Some("--all-features"),
-                &[TLS_CLOSURE, TOKIO_CLOSURE][..],
+                &[TLS_CLOSURE, HTTP_CLOSURE, TOKIO_CLOSURE][..],
             ),
         ] {
             let mut args = vec![

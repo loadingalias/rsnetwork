@@ -158,6 +158,113 @@ impl Network {
     }
 }
 
+#[cfg(feature = "http")]
+#[test]
+fn http_conversion_mounts_a_handler_on_the_http3_request_stream() {
+    use rsnetwork::http::{Adapter, Response, Version as HttpVersion, header};
+    let mut n = Network::new(true, true);
+    let adapter = Adapter::new(
+        rsnetwork::h1::Limits {
+            head_bytes: 4096,
+            fields: 32,
+            name_bytes: 64,
+            value_bytes: 512,
+        },
+        &n.server.budget,
+    );
+    let id = n
+        .client
+        .http
+        .as_mut()
+        .unwrap()
+        .open(&mut n.client.quic)
+        .unwrap()
+        .unwrap();
+    n.client.headers(
+        id,
+        &[
+            field(b":method", b"RePoRt"),
+            field(b":scheme", b"https"),
+            field(b":authority", b"server.test"),
+            field(b":path", b"/a%2fb?"),
+            field(b"accept", b"one"),
+            field(b"accept", b"two"),
+        ],
+        true,
+    );
+    n.pump().unwrap();
+    let (stream, head) = n
+        .server
+        .events
+        .iter()
+        .find_map(|e| {
+            if let Event::Request(s, h) = e {
+                Some((*s, h))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let response = adapter
+        .handle(head, stream, |request| {
+            assert_eq!(*request.body(), id);
+            assert_eq!(request.version(), HttpVersion::HTTP_3);
+            assert_eq!(request.method().as_str(), "RePoRt");
+            assert_eq!(request.uri().to_string(), "https://server.test/a%2fb?");
+            assert_eq!(
+                request
+                    .headers()
+                    .get_all(header::ACCEPT)
+                    .iter()
+                    .map(header::HeaderValue::as_bytes)
+                    .collect::<Vec<_>>(),
+                [b"one", b"two"]
+            );
+            let native = adapter.native_request(&request, Some(0)).unwrap();
+            assert_eq!(native.head().target.as_bytes(), b"/a%2fb?");
+            assert_eq!(native.head().authority.as_bytes(), b"server.test");
+            Response::builder()
+                .status(207)
+                .header("set-cookie", "a=1")
+                .header("set-cookie", "b=2")
+                .body(())
+                .unwrap()
+        })
+        .unwrap();
+    n.server
+        .http
+        .as_mut()
+        .unwrap()
+        .respond_http(id, &response, true)
+        .unwrap();
+    n.pump().unwrap();
+    let head = n
+        .client
+        .events
+        .iter()
+        .find_map(|e| {
+            if let Event::Response(s, h) = e
+                && *s == id
+            {
+                Some(h)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let pointer = head.fields().next().unwrap().value().as_ptr();
+    let (response, allocations) = counting::allocations(|| adapter.response(head, ()).unwrap());
+    assert_eq!(allocations, 4);
+    assert_eq!(response.version(), HttpVersion::HTTP_3);
+    assert_eq!(response.status(), 207);
+    assert_eq!(response.headers()[header::SET_COOKIE].as_bytes().as_ptr(), pointer);
+    let native = adapter.native_response(&response, Some(0)).unwrap();
+    assert_eq!(
+        native.head().fields.iter().map(|f| f.value()).collect::<Vec<_>>(),
+        [b"a=1", b"b=2"]
+    );
+}
+
 #[test]
 fn early_hints_precede_the_final_response_and_goaway_drains_the_request() {
     let mut n = Network::new(true, true);

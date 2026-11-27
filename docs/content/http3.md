@@ -18,6 +18,7 @@ Reserve these streams for the engine. It can receive a request before the peerâ€
 ## Send and receive a message
 
 A client calls `open` for a request stream. A server receives its identifier in `Event::Request`.
+The optional `http` feature connects this event to an ecosystem handler. [Mount an HTTP-typed handler](http-conversions.md#mount-the-handler)
 Pass the pseudo-header fields first in `headers`. For example, an HTTPS GET uses `:method`, `:scheme`, `:authority`, and `:path`.
 Use `data` to admit a body region. Set the last frameâ€™s `end` flag, or call `finish` after the last frame advances.
 Each stream admits one pending frame. If that slot is full, drive the connection before retrying with the same input.

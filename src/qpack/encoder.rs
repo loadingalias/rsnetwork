@@ -165,18 +165,19 @@ impl Encoder {
         section: &mut WriteLoan<B>,
         instructions: &mut WriteLoan<C>,
     ) -> Result<Prefix, EncodeError> {
-        self.encode_with_credit(stream, lines, section, instructions, usize::MAX)
+        let needed = self.needed(lines.clone());
+        self.encode_with_credit(stream, lines, section, instructions, usize::MAX, needed)
     }
 
     pub(crate) fn encode_with_credit<'a, B: BufferMut, C: BufferMut>(
         &mut self,
         stream: u64,
-        lines: impl Iterator<Item = FieldLine<'a>> + Clone,
+        lines: impl Iterator<Item = FieldLine<'a>>,
         section: &mut WriteLoan<B>,
         instructions: &mut WriteLoan<C>,
         credit: usize,
+        needed: usize,
     ) -> Result<Prefix, EncodeError> {
-        let needed = self.needed(lines.clone());
         let available = free(section);
         if needed > available {
             return Err(EncodeError::Full(Full { needed, available }));

@@ -27,6 +27,11 @@ use tokio::task::{JoinError, JoinHandle, JoinSet};
 use crate::shared::{Shared, Waits};
 use crate::{Clock, Socket, Step, queued};
 
+#[cfg(feature = "http")]
+mod http;
+#[cfg(feature = "http")]
+pub use http::Incoming;
+
 /// The refusal of a call after the connection ended.
 const ENDED: Error = Error::new(Kind::Misuse, "the connection ended");
 
@@ -184,11 +189,7 @@ impl Exchange {
     /// Gives the next part of the request body as a view of its received region, with no copy,
     /// or its end with its outcome.
     pub async fn next(&mut self) -> Result<Part, Error> {
-        let stream = self.stream;
-        let part = self
-            .shared
-            .until(Waits::Stream(stream), |server, now| server.next(stream, now));
-        part.await?.ok_or(ENDED)
+        next_part(&self.shared, self.stream).await
     }
 
     /// Copies the next bytes of the request body into the free capacity of `region`, or gives
@@ -256,6 +257,13 @@ impl Exchange {
     pub fn export(&self, label: &[u8], context: &[u8], output: &mut [u8]) -> Result<(), ExportError> {
         self.shared.lock().socket.connection().export(label, context, output)
     }
+}
+
+async fn next_part(shared: &Shared<Core>, stream: Stream) -> Result<Part, Error> {
+    shared
+        .until(Waits::Stream(stream), |server, now| server.next(stream, now))
+        .await?
+        .ok_or(ENDED)
 }
 
 impl Drop for Exchange {

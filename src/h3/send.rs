@@ -214,7 +214,40 @@ impl Connection {
     /// Queues request or response fields, an informational response, or trailers in message order.
     /// A refusal leaves the message and QPACK encoder unchanged. A queued frame must advance before the next write.
     pub fn headers(&mut self, id: StreamId, fields: &[FieldLine<'_>], end: bool) -> Result<(), Error> {
-        let lines = fields.iter().copied();
+        self.header_lines(id, || fields.iter().copied(), end)
+    }
+
+    /// Queues a mounted handler's response head. Field bytes and sensitivity reach QPACK directly.
+    #[cfg(feature = "http")]
+    pub fn respond_http<B>(
+        &mut self,
+        id: StreamId,
+        response: &crate::http::Response<B>,
+        end: bool,
+    ) -> Result<(), Error> {
+        let code = response.status();
+        crate::value::Status::try_from(code)?;
+        let status = FieldLine {
+            name: b":status",
+            value: code.as_str().as_bytes(),
+            never_indexed: false,
+        };
+        let fields = || {
+            response.headers().iter().map(|(name, value)| FieldLine {
+                name: name.as_str().as_bytes(),
+                value: value.as_bytes(),
+                never_indexed: value.is_sensitive(),
+            })
+        };
+        self.header_lines(id, || core::iter::once(status).chain(fields()), end)
+    }
+
+    fn header_lines<'a, I: Iterator<Item = FieldLine<'a>>>(
+        &mut self,
+        id: StreamId,
+        lines: impl Fn() -> I,
+        end: bool,
+    ) -> Result<(), Error> {
         self.live()?;
         let i = self.index(id)?;
         let r = &self.requests[i];
@@ -224,7 +257,7 @@ impl Connection {
         let peer = self.peer.and_then(|s| s.field_section_bytes).unwrap_or(u64::MAX);
         let max = peer.min(self.limits.decoder.list_bytes as u64);
         let mut size = 0;
-        for line in lines.clone() {
+        for line in lines() {
             size = u64::saturating_add(size, 32)
                 .saturating_add(line.name.len() as u64)
                 .saturating_add(line.value.len() as u64);
@@ -236,7 +269,7 @@ impl Connection {
         let mut method = r.method;
         let next = match r.send {
             Phase::Head if self.side == Side::Client => {
-                let h = message::request_fields(lines.clone()).map_err(|_| bad())?;
+                let h = message::request_fields(lines()).map_err(|_| bad())?;
                 method = MethodKind::of(h.method);
                 Phase::Body(h.length())
             }
@@ -244,12 +277,12 @@ impl Connection {
                 if r.recv == Phase::Head {
                     return Err(bad());
                 }
-                let h = message::ResponseFields::check(lines.clone()).map_err(|_| bad())?;
+                let h = message::ResponseFields::check(lines()).map_err(|_| bad())?;
                 let status = h.status.code();
                 if (status < 200
                     || status == 204
                     || matches!(method, MethodKind::Connect) && (200..300).contains(&status))
-                    && fields.iter().any(|line| line.name == b"content-length")
+                    && lines().any(|line| line.name == b"content-length")
                 {
                     return Err(bad());
                 }
@@ -260,7 +293,7 @@ impl Connection {
                 }
             }
             Phase::Body(None | Some(0)) => {
-                message::check_trailers(lines.clone()).map_err(|_| bad())?;
+                message::check_trailers(lines()).map_err(|_| bad())?;
                 Phase::Trailers
             }
             _ => return Err(bad()),
@@ -268,7 +301,7 @@ impl Connection {
         if end {
             next.finish().map_err(|_| bad())?;
         }
-        let needed = self.encoder.needed(lines.clone());
+        let needed = self.encoder.needed(lines());
         let cap = PREFIX_ROOM.checked_add(needed).ok_or(ROOM)?;
         self.out.check(cap)?;
         let (mut bytes, charge) = message::region(cap, &self.budget).ok_or(ROOM)?;
@@ -279,7 +312,7 @@ impl Connection {
         let before = instructions.filled().len();
         let prefix = self
             .encoder
-            .encode_with_credit(id.get(), lines, &mut section, instructions, credit)
+            .encode_with_credit(id.get(), lines(), &mut section, instructions, credit, needed)
             .expect("the field section has the encoder's required capacity");
         let added = instructions.filled().len() - before;
         self.out.encoder_room -= added;

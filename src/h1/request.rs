@@ -248,7 +248,7 @@ impl fmt::Debug for RequestHead<'_> {
 #[derive(Clone)]
 pub struct RetainedRequest {
     /// A view of exactly the bytes of the head.
-    region: Lease,
+    pub(crate) region: Lease,
     layout: Layout,
 }
 

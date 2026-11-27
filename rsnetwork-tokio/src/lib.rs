@@ -108,6 +108,8 @@
 //! ```
 
 #![feature(allocator_ext)]
+// A Tokio task can move its body's read future between worker threads.
+#![cfg_attr(feature = "http", feature(return_type_notation))]
 
 mod blocking;
 pub mod client;

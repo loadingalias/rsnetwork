@@ -4,6 +4,9 @@
 //! response is not a delivered one, a shutdown drains the exchange in flight and refuses new work,
 //! the report keeps the first failure, and the linger after the last output is bounded.
 
+#[cfg(feature = "http")]
+mod counting;
+
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
@@ -619,6 +622,59 @@ fn a_request_that_waits_for_100_continue_gets_it_at_the_first_read_of_its_body()
     assert_matches!(
         server.read_into(stream, at(0), &mut region).unwrap(),
         Read::Done(Outcome::Complete(_))
+    );
+}
+
+#[cfg(feature = "http")]
+#[test]
+fn http_conversion_keeps_wire_targets_repeated_values_and_received_backing() {
+    use rsnetwork::http::{Adapter, OriginalTarget, Uri, header};
+    let adapter = Adapter::new(HEAD, &budget());
+    let mut server = plain();
+    give(
+        &mut server,
+        b"mIx-Verb /p%2f//?x=&x=%2F HTTP/1.1\r\nHost: a.test\r\nAccept: first\r\nACCEPT: \x81\r\n\r\n",
+    );
+    let (stream, head) = server.request(at(0)).unwrap().unwrap();
+    let value = head.fields().nth(1).unwrap().value();
+    let (request, allocs) = counting::allocations(|| adapter.request(&head, stream).unwrap());
+    assert_eq!(allocs, 4, "one shared owner, two map arrays, and one extra-value array");
+    assert_eq!(request.headers()[header::ACCEPT].as_bytes().as_ptr(), value.as_ptr());
+    drop(head);
+    assert!(request.extensions().get::<OriginalTarget>().is_none());
+    let native = adapter.native_request(&request, Some(0)).unwrap();
+    let head = native.head();
+    assert_eq!(head.method.as_bytes(), b"mIx-Verb");
+    assert_eq!(head.target.as_bytes(), b"/p%2f//?x=&x=%2F");
+    assert_eq!(head.authority.as_bytes(), b"a.test");
+    assert_eq!(
+        head.fields.iter().map(Field::value).collect::<Vec<_>>(),
+        [b"first".as_slice(), &[0x81]]
+    );
+
+    let mut server = plain();
+    give(
+        &mut server,
+        b"GET HTTP://Example.test HTTP/1.1\r\nHost: Example.test\r\n\r\n",
+    );
+    let (_, mut request) = server.handle_http(&adapter, at(0), |request| request).unwrap().unwrap();
+    assert_eq!(
+        request
+            .extensions()
+            .get::<OriginalTarget>()
+            .unwrap()
+            .target()
+            .as_bytes(),
+        b"HTTP://Example.test"
+    );
+    assert_eq!(
+        adapter.native_request(&request, None).unwrap().head().target.as_bytes(),
+        b"HTTP://Example.test"
+    );
+    *request.uri_mut() = Uri::from_static("http://EXAMPLE.test/replaced?");
+    assert_eq!(
+        adapter.native_request(&request, None).unwrap().head().target.as_bytes(),
+        b"http://EXAMPLE.test/replaced?"
     );
 }
 

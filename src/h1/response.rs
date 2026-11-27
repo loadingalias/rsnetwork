@@ -200,7 +200,7 @@ impl fmt::Debug for ResponseHead<'_> {
 #[derive(Clone)]
 pub struct RetainedResponse {
     /// A view of exactly the bytes of the head.
-    region: Lease,
+    pub(crate) region: Lease,
     layout: Layout,
 }
 

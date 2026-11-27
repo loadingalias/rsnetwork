@@ -68,7 +68,7 @@ impl AsRef<[u8]> for Owned {
 /// A received request head: its pseudo-header values and fields, in one charged region.
 #[derive(Clone)]
 pub(crate) struct Request {
-    bytes: Lease,
+    pub(crate) bytes: Lease,
     method: Span,
     /// The `:path`, or the `:authority` of a CONNECT request.
     target: Span,
@@ -113,7 +113,7 @@ impl Request {
 /// A received final response head.
 #[derive(Clone)]
 pub(crate) struct Response {
-    bytes: Lease,
+    pub(crate) bytes: Lease,
     status: Status,
     length: Option<u64>,
 }

@@ -9,6 +9,8 @@ the connection without discarding a response that the client has not read yet.
 The handler code is the same for each version. Over TLS, ALPN selects the version. Over TCP,
 `Limits::cleartext` selects it. HTTP/2 carries many streams at a time, and HTTP/1.1 carries one.
 
+The optional `http` feature accepts handlers that use Rust's ecosystem request and response types. [Mount an HTTP-typed handler](http-conversions.md)
+
 rsnetwork is in development and has no release. `Http` does no I/O. A binding, or your own event
 loop, moves the bytes of the socket: see [drive a connection from your own event loop](caller-driven.md).
 The engines under it are `h1::Server`, on the [HTTP/1.1 page](http1.md#serve-requests), and

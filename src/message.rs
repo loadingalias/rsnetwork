@@ -89,6 +89,14 @@ enum RequestForm {
 }
 
 impl RequestHead {
+    #[cfg(feature = "http")]
+    pub(crate) fn backing(&self) -> &crate::buffer::Lease {
+        match &self.0 {
+            RequestForm::H1(head) => &head.region,
+            RequestForm::Multiplexed(head, _) => &head.bytes,
+        }
+    }
+
     pub(crate) fn h1_form(head: RetainedRequest) -> Self {
         Self(RequestForm::H1(head))
     }
@@ -202,6 +210,14 @@ enum ResponseForm {
 }
 
 impl ResponseHead {
+    #[cfg(feature = "http")]
+    pub(crate) fn backing(&self) -> &crate::buffer::Lease {
+        match &self.0 {
+            ResponseForm::H1(head) => &head.region,
+            ResponseForm::Multiplexed(head, _) => &head.bytes,
+        }
+    }
+
     pub(crate) fn h1_form(head: RetainedResponse) -> Self {
         Self(ResponseForm::H1(head))
     }

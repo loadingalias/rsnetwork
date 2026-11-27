@@ -52,6 +52,8 @@ pub mod h2;
 pub mod h3;
 pub mod host;
 pub mod hpack;
+#[cfg(feature = "http")]
+pub mod http;
 mod link;
 pub mod message;
 pub mod priority;

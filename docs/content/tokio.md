@@ -32,6 +32,8 @@ as the monotonic clock of the target does. On Windows it goes on.
 
 ## Serve requests and send one
 
+For a handler that accepts `http::Request`, use the optional `http` feature. [Mount an HTTP-typed handler](http-conversions.md#mount-the-handler)
+
 A server answers each request with `hello`, and a client sends one request over loopback. The code
 runs in a function that returns `Result<(), Box<dyn std::error::Error>>`. The documentation of the
 crate `rsnetwork_tokio` runs the same example as a test.
