@@ -395,8 +395,11 @@ fn the_tokio_stagger_starts_ipv4_while_ipv6_waits_and_closes_the_losing_socket()
         assert!(starts[1].1.duration_since(before).unwrap() >= dial.delay);
         assert_eq!(winner.peer_addr().unwrap(), addresses[1]);
         assert_eq!(second.accept().await.unwrap().1, winner.local_addr().unwrap());
-        tokio::time::timeout(PATIENCE, loser.readable()).await.unwrap().unwrap();
-        assert_eq!(loser.try_read(&mut [0; 1]).unwrap(), 0);
+        let read = tokio::time::timeout(PATIENCE, loser.peek(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, 0);
         assert_eq!((op.remaining(), op.occupied(), mem.available()), (0, 0, mem.bound()));
     });
 }
