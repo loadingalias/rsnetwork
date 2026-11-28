@@ -45,7 +45,7 @@ fn parts(form: TargetForm<'_>) -> Parts<'_> {
 /// with no port, and an absolute form with no authority.
 #[test]
 fn a_target_has_one_of_the_four_forms_or_refuses() {
-    let accepted: [(&[u8], Parts<'_>); 13] = [
+    let accepted: [(&[u8], Parts<'_>); 14] = [
         // RFC 9112, sections 3.2.1 to 3.2.4.
         (b"/where?q=now", ("origin", None, None, b"/where", Some(b"q=now"))),
         (
@@ -85,6 +85,10 @@ fn a_target_has_one_of_the_four_forms_or_refuses() {
         (b"/a?", ("origin", None, None, b"/a", Some(b""))),
         (b"/a?b?c/d", ("origin", None, None, b"/a", Some(b"b?c/d"))),
         (
+            b"http://a?x%3Fy?z",
+            ("absolute", Some(b"http"), Some(b"a"), b"", Some(b"x%3Fy?z")),
+        ),
+        (
             b"/p:@!$&'()*+,;=-._~%20",
             ("origin", None, None, b"/p:@!$&'()*+,;=-._~%20", None),
         ),
@@ -103,7 +107,7 @@ fn a_target_has_one_of_the_four_forms_or_refuses() {
             ("authority", None, Some(b"[2001:db8::7]:443"), b"", None),
         ),
     ];
-    let refused: [&[u8]; 19] = [
+    let refused: [&[u8]; 22] = [
         b"",
         b"a/b",
         b"/a#frag",
@@ -112,6 +116,9 @@ fn a_target_has_one_of_the_four_forms_or_refuses() {
         b"/caf\xc3\xa9",
         b"/%zz",
         b"/%4",
+        b"/%4?0",
+        b"/ok?%?f",
+        b"http://a?x#fragment",
         b"**",
         b"http://user@www.example.org/",
         b"http:///path",
@@ -150,6 +157,18 @@ fn a_target_has_one_of_the_four_forms_or_refuses() {
         }
     });
     assert_eq!(count, 0);
+}
+
+/// Each literal octet of a path or query must belong to the grammar in RFC 3986, sections 3.3 and 3.4.
+#[test]
+fn the_path_and_query_refuse_each_forbidden_octet() {
+    let literals = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,;=:@/?";
+    for mut target in [*b"/aXz", *b"/?Xz"] {
+        for byte in u8::MIN..=u8::MAX {
+            target[2] = byte;
+            assert_eq!(Target::new(&target).is_ok(), literals.contains(&byte), "octet {byte}");
+        }
+    }
 }
 
 /// A method keeps its exact bytes, also an extension method. Its case has a meaning (RFC 9110,

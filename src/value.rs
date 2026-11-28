@@ -122,24 +122,35 @@ pub enum TargetForm<'a> {
     Asterisk,
 }
 
+/// The parts needed to check and route a target. The path and query still share one slice.
+pub(crate) enum TargetParts<'a> {
+    Origin,
+    Absolute {
+        scheme: Scheme<'a>,
+        authority: Authority<'a>,
+        path_query: &'a [u8],
+    },
+    Authority(Authority<'a>),
+    Asterisk,
+}
+
 impl<'a> Target<'a> {
     /// Checks a request target, or refuses it.
     pub fn new(bytes: &'a [u8]) -> Result<Self, InvalidValue> {
         Self::checked_form(bytes).map(|_| Self(bytes))
     }
 
-    pub(crate) fn checked_form(bytes: &'a [u8]) -> Result<TargetForm<'a>, InvalidValue> {
-        let form = Self(bytes).form();
+    pub(crate) fn checked_form(bytes: &'a [u8]) -> Result<TargetParts<'a>, InvalidValue> {
+        let form = Self(bytes).parts();
         let valid = match form {
-            TargetForm::Origin { path, query } => is_path(path) && query.is_none_or(is_query),
-            TargetForm::Absolute {
+            TargetParts::Origin => is_path_query(bytes),
+            TargetParts::Absolute {
                 scheme,
                 authority,
-                path,
-                query,
-            } => is_scheme(scheme.0) && is_authority(authority.0) && is_path(path) && query.is_none_or(is_query),
-            TargetForm::Authority(authority) => is_authority(authority.0) && authority.port().is_some(),
-            TargetForm::Asterisk => true,
+                path_query,
+            } => is_scheme(scheme.0) && is_authority(authority.0) && is_path_query(path_query),
+            TargetParts::Authority(authority) => is_authority(authority.0) && authority.port().is_some(),
+            TargetParts::Asterisk => true,
         };
         if valid { Ok(form) } else { Err(InvalidValue::Target) }
     }
@@ -151,13 +162,36 @@ impl<'a> Target<'a> {
 
     /// The form of the target, with its parts.
     pub fn form(&self) -> TargetForm<'a> {
-        let bytes = self.0;
-        if bytes == b"*" {
-            return TargetForm::Asterisk;
+        match self.parts() {
+            TargetParts::Origin => {
+                let (path, query) = split_query(self.0);
+                TargetForm::Origin { path, query }
+            }
+            TargetParts::Absolute {
+                scheme,
+                authority,
+                path_query,
+            } => {
+                let (path, query) = split_query(path_query);
+                TargetForm::Absolute {
+                    scheme,
+                    authority,
+                    path,
+                    query,
+                }
+            }
+            TargetParts::Authority(authority) => TargetForm::Authority(authority),
+            TargetParts::Asterisk => TargetForm::Asterisk,
         }
+    }
+
+    fn parts(&self) -> TargetParts<'a> {
+        let bytes = self.0;
         if bytes.first() == Some(&b'/') {
-            let (path, query) = split_query(bytes);
-            return TargetForm::Origin { path, query };
+            return TargetParts::Origin;
+        }
+        if bytes == b"*" {
+            return TargetParts::Asterisk;
         }
         if let Some((scheme, rest)) = bytes.split_once(|&byte| byte == b':')
             && let Some(rest) = rest.strip_prefix(b"//")
@@ -166,15 +200,13 @@ impl<'a> Target<'a> {
                 .iter()
                 .position(|&byte| byte == b'/' || byte == b'?')
                 .unwrap_or(rest.len());
-            let (path, query) = split_query(&rest[end..]);
-            return TargetForm::Absolute {
+            return TargetParts::Absolute {
                 scheme: Scheme(scheme),
                 authority: Authority(&rest[..end]),
-                path,
-                query,
+                path_query: &rest[end..],
             };
         }
-        TargetForm::Authority(Authority(bytes))
+        TargetParts::Authority(Authority(bytes))
     }
 }
 
@@ -204,27 +236,33 @@ fn split_query(bytes: &[u8]) -> (&[u8], Option<&[u8]>) {
     }
 }
 
-/// Whether `path` is empty, or `/` and segments (RFC 3986, section 3.3).
-fn is_path(path: &[u8]) -> bool {
-    matches!(path.first(), None | Some(b'/')) && is_uri_part(path, b":@/")
-}
-
-/// Whether `query` is a query (RFC 3986, section 3.4).
-fn is_query(query: &[u8]) -> bool {
-    is_uri_part(query, b":@/?")
-}
-
-/// Whether each byte of `bytes` is unreserved, a sub-delimiter, or in `extra`, and each `%` is
-/// before two hexadecimal digits (RFC 3986, section 2).
-fn is_uri_part(bytes: &[u8], extra: &[u8]) -> bool {
+/// The first `?` starts the query. Later `?` bytes are query data (RFC 3986, sections 3.3 and 3.4).
+fn is_path_query(bytes: &[u8]) -> bool {
+    static LITERAL: [bool; 256] = {
+        let mut allowed = [false; 256];
+        let mut byte = 0_u8;
+        while byte < 128 {
+            allowed[byte as usize] = byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'$' | b'&'..=b'/' | b':' | b';' | b'=' | b'?' | b'@' | b'_' | b'~'
+                );
+            byte += 1;
+        }
+        allowed
+    };
     let mut rest = bytes;
-    while let [byte, tail @ ..] = rest {
-        rest = match (byte, tail) {
-            (b'%', [high, low, tail @ ..]) if high.is_ascii_hexdigit() && low.is_ascii_hexdigit() => tail,
-            (b'%', _) => return false,
-            _ if byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(byte) || extra.contains(byte) => tail,
-            _ => return false,
-        };
+    while let Some((&byte, tail)) = rest.split_first() {
+        if LITERAL[usize::from(byte)] {
+            rest = tail;
+        } else if let (b'%', [high, low, next @ ..]) = (byte, tail)
+            && high.is_ascii_hexdigit()
+            && low.is_ascii_hexdigit()
+        {
+            rest = next;
+        } else {
+            return false;
+        }
     }
     true
 }
@@ -368,13 +406,11 @@ fn is_authority(bytes: &[u8]) -> bool {
     let (host, rest) = split_host(bytes);
     let host_ok = match host {
         [b'[', literal @ .., b']'] => parse::<Ipv6Addr>(literal).is_some(),
-        _ => {
-            !host.is_empty()
-                && host
-                    .iter()
-                    .all(|&byte| byte.is_ascii_alphanumeric() || b"-._".contains(&byte))
-                && (!ends_in_number(host) || parse::<Ipv4Addr>(host).is_some())
-        }
+        [] => false,
+        _ if ends_in_number(host) => parse::<Ipv4Addr>(host).is_some(),
+        _ => host
+            .iter()
+            .all(|&byte| byte.is_ascii_alphanumeric() || b"-._".contains(&byte)),
     };
     let port_ok = match rest {
         [] | [b':'] => true,

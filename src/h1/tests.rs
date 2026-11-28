@@ -272,6 +272,8 @@ fn each_syntax_defect_refuses() {
         (b"G(T /a HTTP/1.1\r\nHost: a\r\n\r\n", ParseError::Malformed),
         (b"GET /\x01a HTTP/1.1\r\nHost: a\r\n\r\n", ParseError::Malformed),
         (b"GET /a http/1.1\r\nHost: a\r\n\r\n", ParseError::Malformed),
+        (b"GET /aHTTP/1.1\r\nHost: a\r\n\r\n", ParseError::Malformed),
+        (b"GET /a HTTP/1.0 HTTP/2.0\r\nHost: a\r\n\r\n", ParseError::Malformed),
         (b"GET /a HTTP/1.2\r\nHost: a\r\n\r\n", ParseError::Version),
         (b"GET /a HTTP/2.0\r\nHost: a\r\n\r\n", ParseError::Version),
     ] {

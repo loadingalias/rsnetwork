@@ -7,7 +7,7 @@ use rstypes::buffer::{Buffer as _, Lease};
 use super::Framing;
 use super::head::{Coding, Facts, Limits, ParseError, Search, offset, parse_version, raw_line, scan, view_of};
 use crate::message::{Fields, Version};
-use crate::value::{Authority, Method, Target, TargetForm};
+use crate::value::{Authority, Method, Target, TargetParts};
 
 /// Parses HTTP/1.1 and HTTP/1.0 request heads in received bytes, with no copy and no allocation.
 ///
@@ -47,10 +47,13 @@ impl RequestParser {
 /// Checks the request through its empty line. The body can follow it in `input`.
 fn check<'a>(input: &'a [u8], limits: &Limits) -> Result<RequestHead<'a>, ParseError> {
     let (request_line, block) = raw_line(input).ok_or(ParseError::Malformed)?;
-    let mut parts = request_line.splitn(3, |&byte| byte == b' ');
-    let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next()) else {
+    // The final space and HTTP-version have a fixed width (RFC 9112, section 2.3).
+    let Some((method_target, [b' ', version @ ..])) = request_line.split_last_chunk::<9>() else {
         return Err(ParseError::Malformed);
     };
+    let (method, target) = method_target
+        .split_once(|&byte| byte == b' ')
+        .ok_or(ParseError::Malformed)?;
     let (Ok(method), Ok(form)) = (Method::new(method), Target::checked_form(target)) else {
         return Err(ParseError::Malformed);
     };
@@ -58,9 +61,9 @@ fn check<'a>(input: &'a [u8], limits: &Limits) -> Result<RequestHead<'a>, ParseE
     // Only CONNECT has the authority form, and only OPTIONS has the asterisk form (RFC 9112,
     // section 3.2). A CONNECT request has the authority form (RFC 9110, section 9.3.6).
     let form_ok = match form {
-        TargetForm::Authority(_) => method == Method::CONNECT,
-        TargetForm::Asterisk => method == Method::OPTIONS,
-        TargetForm::Origin { .. } | TargetForm::Absolute { .. } => method != Method::CONNECT,
+        TargetParts::Authority(_) => method == Method::CONNECT,
+        TargetParts::Asterisk => method == Method::OPTIONS,
+        TargetParts::Origin | TargetParts::Absolute { .. } => method != Method::CONNECT,
     };
     if !form_ok {
         return Err(ParseError::Malformed);
@@ -79,8 +82,8 @@ fn check<'a>(input: &'a [u8], limits: &Limits) -> Result<RequestHead<'a>, ParseE
         (None, _) => return Err(ParseError::Malformed),
     };
     let authority = match form {
-        TargetForm::Absolute { authority, .. } | TargetForm::Authority(authority) => Some(authority),
-        TargetForm::Origin { .. } | TargetForm::Asterisk => host,
+        TargetParts::Absolute { authority, .. } | TargetParts::Authority(authority) => Some(authority),
+        TargetParts::Origin | TargetParts::Asterisk => host,
     };
     let span = |part: &[u8]| (offset(head, part), offset(head, part) + part.len());
     Ok(RequestHead {

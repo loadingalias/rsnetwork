@@ -65,7 +65,8 @@ when their bytes are equal. Thus `get`, or a method that the core does not know,
 
 ## Request targets
 
-`Target::form()` gives a `TargetForm`, with the parts of the target as views of its bytes.
+Use `Target::as_bytes()` for the whole checked target. Call `Target::form()` to split it into borrowed parts.
+The first `?` separates the path from the query. A later `?` stays in the query, and `%3F` stays encoded.
 
 | Form | Example | Parts | Request |
 | --- | --- | --- | --- |
