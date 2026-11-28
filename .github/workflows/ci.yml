@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          packages=(build-essential ca-certificates curl)
+          packages=(build-essential ca-certificates curl musl-dev)
           dpkg -s "${packages[@]}" > /dev/null 2>&1 && exit 0
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends "${packages[@]}"
