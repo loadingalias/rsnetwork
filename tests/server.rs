@@ -320,19 +320,20 @@ fn a_reset_after_the_handler_finished_gives_a_partial_delivery_apart_from_the_fi
     }
     server.finish(stream, at(0)).unwrap();
     let mut whole = 0;
-    'send: while let Some(output) = server.output() {
-        let mut accepted = 0;
+    let prefix = 'send: loop {
+        let output = server.output().expect("the four written records have output");
+        let end = server.admit(output.id).unwrap();
+        let mut start = end - output.region.initialized() as u64;
         for record in records(output.region.bytes()) {
             if full_record(record) && whole == 2 {
-                server.ack(output.id, accepted + 100).unwrap();
-                break 'send;
+                break 'send start + 100;
             }
             whole += usize::from(full_record(record));
-            accepted += record.len();
+            start += record.len() as u64;
         }
-        server.ack(output.id, accepted).unwrap();
-    }
-    assert_eq!(whole, 2, "the transport accepted two full records of the body");
+    };
+    assert_matches!(server.delivery(stream), Some(Delivery::Sending { accepted: 0, .. }));
+    server.accept_through(prefix).unwrap();
     let accepted = 2 * RECORD as u64;
     assert_eq!(
         server.delivery(stream),
@@ -357,9 +358,28 @@ fn a_complete_delivery_needs_each_byte_of_the_response() {
     assert!(server.respond(stream, &ok(None), at(0)).unwrap());
     server.write(stream, &Lease::from(&b"hello"[..]), at(0)).unwrap();
     server.finish(stream, at(0)).unwrap();
-    let bytes = take(&mut server);
+    let mut bytes = Vec::new();
+    while let Some(output) = server.output() {
+        bytes.extend_from_slice(output.region.bytes());
+        assert_eq!(server.admit(output.id), Ok(bytes.len() as u64));
+    }
     assert!(bytes.ends_with(b"5\r\nhello\r\n0\r\n\r\n"));
-    // The chunk framing does not count as body bytes.
+    assert_matches!(
+        server.delivery(stream),
+        Some(Delivery::Sending {
+            finished: true,
+            accepted: 0
+        })
+    );
+    server.accept_through(bytes.len() as u64 - 1).unwrap();
+    assert_matches!(
+        server.delivery(stream),
+        Some(Delivery::Sending {
+            finished: true,
+            accepted: 5
+        })
+    );
+    server.accept_through(bytes.len() as u64).unwrap();
     assert_eq!(server.delivery(stream), Some(Delivery::Complete { accepted: 5 }));
 }
 

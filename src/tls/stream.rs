@@ -346,6 +346,14 @@ impl Io for Stream {
         self.connection.ack(id, accepted)
     }
 
+    fn admit(&mut self, id: ActionId) -> Result<u64, AckError> {
+        self.connection.admit(id)
+    }
+
+    fn accept_through(&mut self, end: u64) -> Result<(), AckError> {
+        self.connection.accept_through(end)
+    }
+
     fn outstanding(&self) -> Outstanding {
         self.connection.outstanding()
     }

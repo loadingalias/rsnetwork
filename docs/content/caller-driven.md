@@ -69,10 +69,9 @@ before it. Then drop the connection and close the socket.
 After `connection.reset()`, the output that waits can never go, so `release()` does not wait for
 it, and `outstanding()` reports it.
 
-To drop a connection before its release, for example at shutdown, call `connection.abandon()`. It
-reports the output that the socket has not accepted: its regions, its bytes, and the output that
-waits for its acknowledgement. The socket keeps its own view of that output until its terminal
-event.
+To drop a connection before release, call `connection.abandon()`. Its report gives the pending regions and bytes and the current offer ID.
+The totals include regions that an ordered driver owns. The report gives their counts in `admitted_regions` and `admitted_bytes`.
+The driver keeps its views until its final use. [Give output to an ordered driver](adapters.md#give-output-to-an-ordered-driver)
 
 ## Example
 

@@ -140,6 +140,14 @@ impl<E: Engine> Link<E> {
         each!(self, connection => connection.ack(id, accepted))
     }
 
+    pub(crate) fn admit(&mut self, id: ActionId) -> Result<u64, AckError> {
+        each!(self, connection => connection.admit(id))
+    }
+
+    pub(crate) fn accept_through(&mut self, end: u64) -> Result<(), AckError> {
+        each!(self, connection => connection.accept_through(end))
+    }
+
     pub(crate) fn outstanding(&self) -> Outstanding {
         each!(self, connection => connection.outstanding())
     }

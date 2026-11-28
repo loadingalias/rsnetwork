@@ -611,6 +611,14 @@ impl Io for Http1 {
         self.link.ack(id, accepted)
     }
 
+    fn admit(&mut self, id: ActionId) -> Result<u64, AckError> {
+        self.link.admit(id)
+    }
+
+    fn accept_through(&mut self, end: u64) -> Result<(), AckError> {
+        self.link.accept_through(end)
+    }
+
     fn outstanding(&self) -> Outstanding {
         self.link.outstanding()
     }

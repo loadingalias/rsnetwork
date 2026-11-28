@@ -15,9 +15,7 @@ An engine runs in drives. A drive is one bounded synchronous call. In each drive
    place, with no copy.
 2. The engine acknowledges the exact prefix that it consumed. Each byte after that prefix stays in
    the queue, at its address, for the next drive.
-3. The engine pushes its output regions into its `Outbound` queue. The host takes each `Output`,
-   gives its region to the transport, and acknowledges the exact number of bytes that the
-   transport accepted.
+3. The engine pushes its output regions into its `Outbound` queue. The host offers them in order and reports kernel acceptance.
 4. The drive gives a `Turn`: what the engine needs next, and its next deadline.
 
 A region is a `Lease` from `rsnetwork::buffer`. Each holder of a region keeps its own view of the
@@ -102,22 +100,28 @@ A `Received` is one received region with its facts:
 | Operation | Result |
 | --- | --- |
 | `Outbound::new(limit, &budget)` | A queue for at most `limit` regions, with their memory charged to `budget` and reserved. `Err` with `Kind::Overload`, and no allocation, if the budget or the memory refuses |
-| `push(region)` | Adds the region after the others. `Err(region)` gives it back when the queue is full. The queue drops an empty region |
+| `push(region)` | Adds the region after the others. It returns the region if the queue is full or the ending byte offset exceeds `u64`. The queue drops empty regions |
 | `limit()`, `free()` | The most regions that the queue holds, and the number that it can take now |
-| `submit()` | The next `Output`: an `ActionId` and a view of the bytes of the front region that the transport has not accepted. `None` while an output has no acknowledgement, or when the queue is empty |
+| `submit()` | Offers the next region in stream order. It returns `None` while an offer needs a result or when no region remains to offer |
 | `ack(id, accepted)` | Acknowledges that the transport accepted the first `accepted` bytes of output `id`. The next output gives the bytes after them, at the same address, with no copy |
+| `admit(id)` | Records that the driver took the whole offered region. Returns its ending byte offset and makes the next region available |
+| `accept_through(end)` | Records the kernel-accepted prefix from the start of this queue, in bytes. The prefix can cross several regions. Repeated or older offsets add no bytes |
+| `outstanding()` | Gives the total pending regions and bytes, the current offer ID, and the admitted regions and bytes within those totals |
 
 Give `ack(id, 0)` when the transport refused the submission or accepted no byte. The bytes stay
 in the queue for the next output.
 
-An acknowledgement that names no outstanding bytes refuses with an `AckError`, and the queue does
-not change:
+An invalid report returns an `AckError` and preserves the queue.
 
 | `AckError` | Cause |
 | --- | --- |
-| `Duplicate` | The output had its acknowledgement before |
-| `Unknown` | This queue did not give the identifier, for example because it is from the queue of another connection |
-| `TooLarge` | The acknowledgement names more bytes than the region has |
+| `Duplicate` | The host already reported the result of this offer |
+| `Unknown` | This queue has never issued the identifier. Use each identifier only on its own connection |
+| `TooLarge` | The count exceeds the offered region, or the reported prefix exceeds the last admitted byte |
+| `OutOfOrder` | A positive `ack` names an offer after a region that still awaits kernel acceptance |
+
+If your binding matches every `AckError` variant, add a branch for `OutOfOrder`.
+Report the earlier kernel progress before you acknowledge bytes from the later offer.
 
 ## The result of a drive
 

@@ -980,9 +980,17 @@ impl Io for Http {
     /// On HTTP/2, it counts the accepted bytes into the delivery of each stream.
     fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
         self.link.ack(id, accepted)?;
-        if let Protocol::H2(..) = self.link.engine_ref() {
-            self.h2_accepted();
-        }
+        self.h2_accepted();
+        Ok(())
+    }
+
+    fn admit(&mut self, id: ActionId) -> Result<u64, AckError> {
+        self.link.admit(id)
+    }
+
+    fn accept_through(&mut self, end: u64) -> Result<(), AckError> {
+        self.link.accept_through(end)?;
+        self.h2_accepted();
         Ok(())
     }
 

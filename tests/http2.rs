@@ -444,18 +444,23 @@ fn a_complete_delivery_needs_each_byte_and_a_reset_after_the_finish_makes_it_par
         })
     );
     let mut payload = 20_000;
-    while let Some(output) = pair.server.output() {
+    let prefix = loop {
+        let output = pair.server.output().expect("the server has three DATA frames");
         let len = output.region.initialized();
+        let end = pair.server.admit(output.id).unwrap();
         // A frame header has 9 bytes, and each DATA payload of the body has 16,384.
-        let accepted = if len == FRAME { len.min(payload) } else { len };
         if len == FRAME {
-            payload -= accepted;
+            if payload < len {
+                break end - (len - payload) as u64;
+            }
+            payload -= len;
         }
-        pair.server.ack(output.id, accepted).unwrap();
-        if accepted < len {
-            break;
-        }
-    }
+    };
+    assert_matches!(
+        pair.server.delivery(stream),
+        Some(Delivery::Sending { accepted: 0, .. })
+    );
+    pair.server.accept_through(prefix).unwrap();
     assert_eq!(
         pair.server.delivery(stream),
         Some(Delivery::Sending {

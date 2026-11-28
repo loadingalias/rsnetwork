@@ -52,7 +52,8 @@ with `use rsnetwork::host::Io as _;`.
 | --- | --- | --- |
 | Received bytes | `Io::receive(Received)`, `Io::end_input()`, `Io::reset()` | Any region: a buffer of the binding, a pool slot through `Lease::from_owner`, or a buffer that the kernel selected. The engine reads it in place, with no copy |
 | Received bytes into a region of the engine | `Io::region()`, then `Io::received(region, endpoint, capacity)` | `region()` lends the input region of the engine, or gives `None` when the engine has none. A TLS engine also gives `None` while a region of the host waits after a partial record, and while its full input region holds a record that waits for a place in the inbound queue. Receive into its capacity after its initialized bytes, and give it back. `received` also takes a writable region of the host. A TLS engine decrypts in place only in a writable region: see [receive forms](tls.md#receive-forms-and-their-copies) |
-| Output | `Io::output()`, `Io::ack(id, accepted)` | One output at a time. Give its region to the transport, and acknowledge the exact bytes that the transport accepted |
+| Direct socket output | `Io::output()`, `Io::ack(id, accepted)` | Write the region and report the exact byte count from the socket |
+| Ordered driver output | `Io::output()`, `Io::admit(id)`, `Io::accept_through(end)` | Give regions to the driver in order. Report the cumulative kernel-accepted byte count when it becomes available |
 | Output into a region of the host | `Io::output_region(region)`, `Io::take_output_region()` | A TLS connection seals its next records into a writable region that the host selects, for example a registered buffer, and gives it back as an output. A region with no record comes back with `take_output_region`. See [output regions of the host](tls.md#output-regions-of-the-host) |
 | Time | The `ClockDomain` of `Connection::new`, and an `Instant` at each drive | A monotonic clock. A host with no clock gives `None` |
 | Transport failure | `Io::reset()` | A reset or a failed write: no byte comes or goes after it. A body that did not end ends `Outcome::Reset(None)`, and `release()` does not wait for the output |
@@ -112,6 +113,23 @@ A completion host, for example io_uring, owns each buffer until its operation co
 - Submit a send of the region of an output. The transport keeps its own view of the region. At the
   completion, acknowledge the count that the send gives. To send from registered buffers, give a
   TLS connection one with `output_region` before the drive: its records are then in that buffer.
+
+### Give output to an ordered driver
+
+Use this path when the driver owns admitted regions and sends their bytes in stream order across short writes.
+
+1. Take the next region with `output()`. Give it to the driver within its byte and region limits.
+2. On admission, call `admit(id)`. Save the returned ending byte offset if you need to wait for that region.
+3. On refusal, call `ack(id, 0)`. Wait for capacity or return the driver's terminal error.
+4. Continue taking regions while the driver has room.
+5. When the kernel accepts bytes, call `accept_through(end)` with the total since the first output on the connection.
+6. On transport failure, report its final accepted prefix before calling `reset()`.
+
+For a new plain connection, a 40-byte head and a five-byte body have ending offsets 40 and 45.
+Reporting 42 counts two body bytes as delivered. Repeating 42 leaves three bytes outstanding.
+
+For TLS, report ciphertext offsets. The connection counts plaintext through complete accepted TLS records.
+A clean TLS close waits for kernel acceptance through `close_notify`. The driver retains each backing until its final use.
 
 ## Clients and servers
 

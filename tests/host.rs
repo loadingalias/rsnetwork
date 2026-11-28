@@ -298,9 +298,17 @@ fn a_connection_that_drops_before_its_release_reports_the_outstanding_output() {
     assert_eq!(server.wait(), Wait::Ended(Ok(())));
     assert_eq!(server.release(), None);
 
+    let first = server.output().unwrap();
+    let first_len = first.region.initialized() as u64;
+    assert_eq!(server.admit(first.id), Ok(first_len));
+    assert_eq!(server.release(), None);
     let submitted = server.output().unwrap();
     let outstanding = server.abandon();
     assert_eq!(outstanding.submitted, Some(submitted.id));
+    assert_eq!(
+        (outstanding.admitted_regions, outstanding.admitted_bytes),
+        (1, first_len)
+    );
     assert_eq!(outstanding.regions, 5);
     let head = b"HTTP/1.1 200 \r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n";
     assert_eq!(

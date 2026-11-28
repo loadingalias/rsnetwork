@@ -658,6 +658,9 @@ impl Http {
     /// Counts the bytes that the transport accepted into the delivery of each stream: each DATA
     /// frame that it accepted whole, and the accepted bytes of the payload of the next one.
     pub(super) fn h2_accepted(&mut self) {
+        if !matches!(self.link.engine_ref(), Protocol::H2(..)) {
+            return;
+        }
         let accepted = self.link.accepted().bytes;
         loop {
             let (session, _) = self.h2_parts();

@@ -7,11 +7,9 @@
 //! stays with its owner for the next drive. The engine keeps a received byte after the call only
 //! through a [`Lease`] view of its backing, never through a reference.
 //!
-//! Output goes through an [`Outbound`] queue. The host takes one [`Output`] at a time, gives its
-//! region to the transport, and acknowledges the exact number of bytes that the transport
-//! accepted. The queue keeps the bytes that the transport did not accept, at the same address,
-//! for the next output. An acknowledgement that names no outstanding bytes refuses and changes
-//! nothing.
+//! Output goes through an [`Outbound`] queue. A socket can acknowledge the bytes it accepted
+//! from one [`Output`]. An ordered driver can admit several outputs and later report the exact
+//! prefix the kernel accepted. In each case the queue retains the remaining bytes at their original address.
 //!
 //! Each holder of a region keeps its own view: the queue, the transport, and the engine. The
 //! backing stays alive and charged once while any view of it lives, and the last view releases it
@@ -257,7 +255,7 @@ pub struct ActionId(u64);
 /// One output action: a region to give to the transport.
 ///
 /// The region is a view of its own, so the transport can keep it until its terminal event, also
-/// after the queue drops its view. Acknowledge the action with [`Outbound::ack`].
+/// after the queue drops its view. Report the result with [`Outbound::ack`] or [`Outbound::admit`].
 pub struct Output {
     /// The identifier that the acknowledgement names.
     pub id: ActionId,
@@ -276,10 +274,9 @@ impl fmt::Debug for Output {
 
 /// The output regions of one engine that the transport has not accepted, in their order.
 ///
-/// The engine pushes each region. The host takes one [`Output`] at a time with
-/// [`submit`](Self::submit) and acknowledges it with [`ack`](Self::ack): the exact number of
-/// bytes that the transport accepted. The queue then keeps a view of the bytes that the transport
-/// did not accept, at the same address, and the next output gives them with no copy.
+/// The host takes each [`Output`] with [`submit`](Self::submit). A direct socket reports its
+/// accepted bytes with [`ack`](Self::ack). An ordered driver can take responsibility for the
+/// region with [`admit`](Self::admit) and report kernel progress with [`accept_through`](Self::accept_through).
 ///
 /// The queue holds at most the number of regions that [`new`](Self::new) sets, and it reserves
 /// their space there, charged to the caller's budget. Thus a push never allocates.
@@ -290,8 +287,12 @@ pub struct Outbound {
     _charge: Permit,
     /// The identifier of the next output.
     next: u64,
-    /// The output that has no acknowledgement yet, and the length of its region.
-    outstanding: Option<(ActionId, usize)>,
+    /// The current offer at index `admitted`, until the host accepts, refuses, or admits it.
+    outstanding: Option<ActionId>,
+    /// The number of leading regions that the driver owns and the kernel has not fully accepted.
+    admitted: usize,
+    /// The bytes in those regions that still await kernel acceptance.
+    admitted_bytes: u64,
     /// The bytes that the queue took, since it was made.
     pushed: u64,
     /// The bytes that the transport accepted, since the queue was made.
@@ -338,6 +339,8 @@ impl Outbound {
             _charge: charge,
             next: 0,
             outstanding: None,
+            admitted: 0,
+            admitted_bytes: 0,
             pushed: 0,
             accepted: Accepted::default(),
         })
@@ -353,22 +356,19 @@ impl Outbound {
         self.limit - self.regions.len()
     }
 
-    /// The output that the transport has not accepted: the regions that the queue holds, their
-    /// bytes, and the output that waits for its acknowledgement.
+    /// Reports all pending output, the current offer, and the portion that the driver already owns.
     pub fn outstanding(&self) -> Outstanding {
         Outstanding {
             regions: self.regions.len(),
-            bytes: self
-                .regions
-                .iter()
-                .map(|queued| queued.region.initialized() as u64)
-                .sum(),
-            submitted: self.outstanding.map(|(id, _)| id),
+            bytes: self.pushed - self.accepted.bytes,
+            submitted: self.outstanding,
+            admitted_regions: self.admitted,
+            admitted_bytes: self.admitted_bytes,
         }
     }
 
-    /// Adds a region after the others. Gives it back if the queue is full. An empty region has
-    /// nothing to send, so the queue drops it.
+    /// Adds a region after the others. Gives it back if the queue is full or the ending byte offset exceeds `u64`.
+    /// The queue drops empty regions.
     pub fn push(&mut self, region: Lease) -> Result<(), Lease> {
         self.queue(region, false)
     }
@@ -387,8 +387,11 @@ impl Outbound {
         if self.regions.len() >= self.limit {
             return Err(region);
         }
+        let Some(end) = self.pushed.checked_add(len as u64) else {
+            return Err(region);
+        };
         self.regions.push_back(Queued { region, payload });
-        self.pushed = self.pushed.strict_add(len as u64);
+        self.pushed = end;
         Ok(())
     }
 
@@ -408,17 +411,17 @@ impl Outbound {
         self.regions.front().is_some_and(|queued| queued.payload)
     }
 
-    /// Gives the next output: the bytes of the front region that the transport has not accepted.
+    /// Offers the next region in stream order. The driver already owns each region before it.
     ///
-    /// Gives `None` while an output has no acknowledgement, and when the queue is empty.
+    /// Gives `None` until the host reports the previous offer, or when no region remains to offer.
     pub fn submit(&mut self) -> Option<Output> {
         if self.outstanding.is_some() {
             return None;
         }
-        let region = self.regions.front()?.region.clone();
+        let region = self.regions.get(self.admitted)?.region.clone();
         let id = ActionId(self.next);
         self.next = self.next.checked_add(1)?;
-        self.outstanding = Some((id, region.initialized()));
+        self.outstanding = Some(id);
         Some(Output { id, region })
     }
 
@@ -426,28 +429,74 @@ impl Outbound {
     ///
     /// Give `0` when the transport accepted no byte, also when it refused the submission. The
     /// queue keeps a view of the bytes after the accepted ones for the next output. Refuses, and
-    /// changes nothing, if `id` has no outstanding output or if `accepted` is more than its bytes.
+    /// changes nothing, if the action is invalid or the count exceeds its bytes. A positive count
+    /// requires kernel acceptance of all earlier regions. A refusal can always return the current offer.
     pub fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
+        let len = self.offered_len(id)?;
+        if accepted > len {
+            return Err(AckError::TooLarge);
+        }
+        if accepted > 0 && self.admitted != 0 {
+            return Err(AckError::OutOfOrder);
+        }
+        self.consume(accepted as u64);
+        self.outstanding = None;
+        Ok(())
+    }
+
+    /// Records that the ordered driver took the whole offered region. Gives its ending byte offset.
+    ///
+    /// The host can now submit the next region. The queue retains the bytes until kernel acceptance.
+    pub fn admit(&mut self, id: ActionId) -> Result<u64, AckError> {
+        let len = self.offered_len(id)?;
+        self.admitted_bytes = self.admitted_bytes.strict_add(len as u64);
+        self.admitted += 1;
+        self.outstanding = None;
+        Ok(self.accepted.bytes.strict_add(self.admitted_bytes))
+    }
+
+    /// Records the total bytes the kernel accepted since the first output on this queue.
+    ///
+    /// The prefix can end inside a region. A repeated or older report adds no bytes.
+    /// A report past the last admitted byte refuses and leaves the queue intact.
+    pub fn accept_through(&mut self, end: u64) -> Result<(), AckError> {
+        let bytes = end.saturating_sub(self.accepted.bytes);
+        if bytes > self.admitted_bytes {
+            return Err(AckError::TooLarge);
+        }
+        let retired = self.consume(bytes);
+        self.admitted -= retired;
+        self.admitted_bytes -= bytes;
+        Ok(())
+    }
+
+    fn offered_len(&self, id: ActionId) -> Result<usize, AckError> {
         match self.outstanding {
-            Some((outstanding, len)) if outstanding == id => {
-                if accepted > len {
-                    return Err(AckError::TooLarge);
-                }
-                self.outstanding = None;
-                if let Some(front) = self.regions.front_mut() {
-                    self.accepted.add(accepted as u64, front.payload);
-                    match front.region.view(accepted..) {
-                        Some(rest) if rest.initialized() > 0 => front.region = rest,
-                        _ => {
-                            self.regions.pop_front();
-                        }
-                    }
-                }
-                Ok(())
-            }
+            Some(offered) if offered == id => Ok(self.regions[self.admitted].region.initialized()),
             _ if id.0 < self.next => Err(AckError::Duplicate),
             _ => Err(AckError::Unknown),
         }
+    }
+
+    /// Advances a checked prefix over at most the queue's region limit and returns the number of retired regions.
+    fn consume(&mut self, mut bytes: u64) -> usize {
+        let before = self.regions.len();
+        while bytes != 0 {
+            let front = self
+                .regions
+                .front_mut()
+                .expect("the accepted prefix fits the queued regions");
+            let len = front.region.initialized();
+            let take = len.min(usize::try_from(bytes).unwrap_or(usize::MAX));
+            self.accepted.add(take as u64, front.payload);
+            if take == len {
+                self.regions.pop_front();
+            } else {
+                front.region = front.region.view(take..).expect("the suffix is within the region");
+            }
+            bytes -= take as u64;
+        }
+        before - self.regions.len()
     }
 }
 
@@ -457,6 +506,7 @@ impl fmt::Debug for Outbound {
             .field("regions", &self.regions.len())
             .field("limit", &self.limit)
             .field("outstanding", &self.outstanding)
+            .field("admitted", &self.admitted)
             .finish_non_exhaustive()
     }
 }
@@ -468,8 +518,12 @@ pub struct Outstanding {
     pub regions: usize,
     /// The bytes of these regions.
     pub bytes: u64,
-    /// The output that waits for its acknowledgement. The transport holds its own view of it.
+    /// The current offer that awaits an acknowledgement or admission.
     pub submitted: Option<ActionId>,
+    /// The leading regions that the driver owns and the kernel has not fully accepted.
+    pub admitted_regions: usize,
+    /// The remaining bytes in those regions. The total in [`bytes`](Self::bytes) includes them.
+    pub admitted_bytes: u64,
 }
 
 impl Outstanding {
@@ -504,8 +558,10 @@ pub enum AckError {
     Duplicate,
     /// No action has this identifier: the queue did not give it.
     Unknown,
-    /// The acknowledgement names more bytes than the region has.
+    /// The byte count exceeds the available input region, output region, or admitted prefix.
     TooLarge,
+    /// The host reported accepted bytes after an earlier region that still awaits kernel acceptance.
+    OutOfOrder,
 }
 
 impl AckError {
@@ -514,7 +570,8 @@ impl AckError {
         match self {
             Self::Duplicate => "the action had its acknowledgement before",
             Self::Unknown => "no action has this identifier",
-            Self::TooLarge => "the acknowledgement names more bytes than the region has",
+            Self::TooLarge => "the acknowledgement exceeds the available bytes",
+            Self::OutOfOrder => "an earlier output still awaits kernel acceptance",
         }
     }
 }

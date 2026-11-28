@@ -79,6 +79,53 @@ fn an_acknowledgement_that_names_no_outstanding_bytes_refuses_and_changes_nothin
     assert!(outbound.submit().is_none(), "the queue is empty");
 }
 
+/// The driver can refuse a body while its head is in flight. Only the accepted prefix frees space.
+#[test]
+fn an_ordered_send_retains_its_regions_through_refusal_and_partial_kernel_acceptance() {
+    let mut queue = Outbound::new(NonZeroUsize::new(2).unwrap(), &budget()).unwrap();
+    queue.push(Lease::from(&b"HEAD"[..])).unwrap();
+    let body = Lease::from(b"abcdef".to_vec());
+    queue.push(body.clone()).unwrap();
+    let head = queue.submit().unwrap();
+    assert_eq!(head.region.bytes(), b"HEAD");
+    assert_eq!(queue.admit(head.id), Ok(4));
+    let offer = queue.submit().unwrap();
+    assert_eq!(queue.ack(offer.id, 1), Err(AckError::OutOfOrder));
+    queue.ack(offer.id, 0).unwrap();
+    assert_eq!(queue.admit(offer.id), Err(AckError::Duplicate));
+    assert_eq!(queue.accept_through(5), Err(AckError::TooLarge));
+    let last = queue
+        .push(Lease::from(&b"!"[..]))
+        .expect_err("both slots still hold bytes");
+
+    let retry = queue.submit().unwrap();
+    assert_eq!(retry.region.as_ptr(), body.as_ptr());
+    assert_eq!(retry.region.bytes(), b"abcdef");
+    assert_eq!(queue.admit(retry.id), Ok(10));
+    assert!(queue.submit().is_none());
+    queue.accept_through(2).unwrap();
+    assert_eq!(queue.free(), 0, "the kernel accepted only part of the head");
+    queue.accept_through(7).unwrap();
+    let remaining = queue.outstanding();
+    assert_eq!((remaining.regions, remaining.bytes), (1, 3));
+    assert_eq!((remaining.admitted_regions, remaining.admitted_bytes), (1, 3));
+    queue.accept_through(7).unwrap();
+    queue.accept_through(2).unwrap();
+    assert_eq!(queue.outstanding(), remaining);
+
+    queue.push(last).unwrap();
+    let offer = queue.submit().unwrap();
+    assert_eq!(offer.region.bytes(), b"!");
+    queue.accept_through(10).unwrap();
+    assert_eq!(
+        queue.admit(offer.id),
+        Ok(11),
+        "the offer survives retirement of the body"
+    );
+    queue.accept_through(11).unwrap();
+    assert!(queue.outstanding().is_empty());
+}
+
 /// A partial acceptance advances a stable offset: the next output is the rest of the same region,
 /// at its address, with no copy. A refused submission accepts no byte and leaves the same bytes.
 /// When a region has no byte left, the next output is the next region.

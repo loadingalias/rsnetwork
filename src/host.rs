@@ -307,11 +307,19 @@ pub trait Io: sealed::Sealed {
     /// example when the connection is idle.
     fn take_output_region(&mut self) -> Option<Backing>;
 
-    /// The next output to give to the transport. Acknowledge it with [`ack`](Self::ack).
+    /// The next region to give to the transport. Report each offer with [`ack`](Self::ack) or [`admit`](Self::admit).
     fn output(&mut self) -> Option<Output>;
 
     /// Acknowledges that the transport accepted the first `accepted` bytes of output `id`.
     fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError>;
+
+    /// Records driver ownership of this whole region and returns its ending byte offset.
+    /// The driver can now take the next output before the kernel accepts this one.
+    fn admit(&mut self, id: ActionId) -> Result<u64, AckError>;
+
+    /// Reports the total bytes the kernel accepted since the first output on this connection.
+    /// For TLS, report ciphertext bytes. The connection counts plaintext through complete records.
+    fn accept_through(&mut self, end: u64) -> Result<(), AckError>;
 
     /// The output that the transport has not accepted.
     fn outstanding(&self) -> Outstanding;
@@ -466,6 +474,14 @@ impl<E: Engine> Io for Connection<E> {
 
     fn ack(&mut self, id: ActionId, accepted: usize) -> Result<(), AckError> {
         self.outbound.ack(id, accepted)
+    }
+
+    fn admit(&mut self, id: ActionId) -> Result<u64, AckError> {
+        self.outbound.admit(id)
+    }
+
+    fn accept_through(&mut self, end: u64) -> Result<(), AckError> {
+        self.outbound.accept_through(end)
     }
 
     fn outstanding(&self) -> Outstanding {
