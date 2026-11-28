@@ -746,7 +746,7 @@ fn one_deadline_expires_in_the_body_after_the_second_family_connects() {
     use rsnetwork::capacity::Permit;
     use rsnetwork::client::Operation;
     use rsnetwork::client::establish::{Dial, Step};
-    use rsnetwork::host::Tcp;
+    use rsnetwork::host::{Next, Tcp};
     use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
 
@@ -785,7 +785,8 @@ fn one_deadline_expires_in_the_body_after_the_second_family_connects() {
     };
     drop(race);
     assert_eq!(started, [v6, v4]);
-    losing_peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let socket_timeout = Duration::from_secs(2);
+    losing_peer.set_read_timeout(Some(socket_timeout)).unwrap();
     assert_eq!(losing_peer.read(&mut [0; 1]).unwrap(), 0);
     assert_eq!(op.occupied(), 0);
     let pool = Pool::new(&mem, NonZeroU32::new(2).unwrap(), Layout::new::<[u8; 1024]>()).unwrap();
@@ -793,16 +794,35 @@ fn one_deadline_expires_in_the_body_after_the_second_family_connects() {
     let mut client = Http1::plain(LIMITS, clock(), &mem).unwrap();
     assert!(client.send(&get(), &op, at(290)).unwrap());
     tcp.pump(&mut client).unwrap();
-    serving_peer
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc")
-        .unwrap();
-    for _ in 0..64 {
-        tcp.pump(&mut client).unwrap();
-        if client.response(at(300)).unwrap().is_some() {
-            break;
+    let mut reply = [&b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\na"[..], b"bc"].into_iter();
+    let until = std::time::Instant::now() + socket_timeout;
+    let mut drive = |client: &mut Http1| {
+        let remaining = until.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "the loopback response did not arrive");
+        if let Next::Wait { read: true, .. } = tcp.pump(client).unwrap() {
+            if let Some(part) = reply.next() {
+                serving_peer.write_all(part).unwrap();
+            }
+            // Wait for the kernel to deliver bytes. Only the binding consumes them.
+            let socket = tcp.socket();
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(remaining)).unwrap();
+            assert_eq!(socket.peek(&mut [0]).unwrap(), 1);
+            socket.set_nonblocking(true).unwrap();
+        }
+    };
+    while client.response(at(300)).unwrap().is_none() {
+        drive(&mut client);
+    }
+    let mut bytes = Vec::new();
+    while bytes.len() < 3 {
+        match client.next(at(300)).unwrap() {
+            Some(Part::Data(data)) => bytes.extend_from_slice(data.bytes()),
+            None => drive(&mut client),
+            Some(Part::End(end)) => panic!("the response ended early with {end:?}"),
         }
     }
-    assert_matches!(client.next(at(300)).unwrap(), Some(Part::Data(d)) if d.bytes()==b"abc");
+    assert_eq!(bytes, b"abc");
     assert_matches!(client.next(at(499)).unwrap(), None);
     assert_matches!(client.next(at(500)),Err(e) if e.kind()==Kind::Deadline && e.reason()=="the deadline came before the end of the response");
     assert_eq!(client.delivered(), 3);
