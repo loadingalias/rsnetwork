@@ -7,7 +7,7 @@ use rstypes::buffer::{Buffer as _, Lease};
 
 use crate::drive::{Error, Kind};
 use crate::message::Version;
-use crate::value::{Field, Status, byte_position, decimal, field_text_len, is_token};
+use crate::value::{Field, Status, byte_position, decimal, field_text_len, is_tchar};
 
 /// The limits of one head, which the caller sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,21 +175,8 @@ pub(super) fn scan<'a>(mut rest: &'a [u8], limits: &Limits) -> Result<(Facts<'a>
         if count > limits.fields {
             return Err(ParseError::TooManyFields);
         }
-        let (text, end) = rest.split_at(field_text_len(rest));
-        let checked = end.strip_prefix(b"\r\n");
-        // An oversized field keeps its size error even when its text contains a forbidden byte.
-        let (line, next) = checked
-            .map(|next| (text, next))
-            .or_else(|| raw_line(rest))
-            .ok_or(ParseError::Malformed)?;
+        let (Field { name, value }, next) = field_line(rest, limits)?;
         rest = next;
-        let (name, value) = field_parts(line).ok_or(ParseError::Malformed)?;
-        if name.len() > limits.name_bytes || value.len() > limits.value_bytes {
-            return Err(ParseError::FieldTooLarge);
-        }
-        if checked.is_none() || !is_token(name) {
-            return Err(ParseError::Malformed);
-        }
         let named = |known: &[u8]| name.eq_ignore_ascii_case(known);
         if named(b"content-length") {
             if facts.length.is_some() {
@@ -247,10 +234,34 @@ pub(crate) fn next_field<'a>(block: &mut &'a [u8]) -> Option<Field<'a>> {
     })
 }
 
-/// Splits a field line at its first colon into the name and the value with no whitespace around it.
-fn field_parts(line: &[u8]) -> Option<(&[u8], &[u8])> {
-    let (name, value) = line.split_once(|&byte| byte == b':')?;
-    Some((name, trim_whitespace(value)))
+/// Checks the name up to the colon and the value up to CR LF.
+fn field_line<'a>(input: &'a [u8], limits: &Limits) -> Result<(Field<'a>, &'a [u8]), ParseError> {
+    let name_end = input
+        .iter()
+        .position(|&byte| !is_tchar(byte))
+        .ok_or(ParseError::Malformed)?;
+    let (name, tail) = input.split_at(name_end);
+    let checked = tail.strip_prefix(b":").and_then(|raw| {
+        let (value, end) = raw.split_at(field_text_len(raw));
+        Some((name, value, end.strip_prefix(b"\r\n")?))
+    });
+    // Even malformed text gets a size refusal when its complete field exceeds a limit.
+    let (name, value, next) = match checked {
+        Some(parts) => parts,
+        None => {
+            let (line, next) = raw_line(input).ok_or(ParseError::Malformed)?;
+            let (name, value) = line.split_once(|&byte| byte == b':').ok_or(ParseError::Malformed)?;
+            (name, value, next)
+        }
+    };
+    let value = trim_whitespace(value);
+    if name.len() > limits.name_bytes || value.len() > limits.value_bytes {
+        return Err(ParseError::FieldTooLarge);
+    }
+    if checked.is_none() || name.is_empty() {
+        return Err(ParseError::Malformed);
+    }
+    Ok((Field { name, value }, next))
 }
 
 /// Removes the spaces and HTABs at the start and at the end of `bytes`.

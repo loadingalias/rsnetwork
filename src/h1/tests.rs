@@ -157,22 +157,48 @@ fn a_line_end_at_any_offset_leaves_the_binary_body_intact() {
 
 /// A size refusal has the same status with a complete or partial receive. A bad line end refuses immediately.
 #[test]
-fn field_limits_keep_their_error_when_a_value_has_a_control_byte() {
-    let input = b"GET / HTTP/1.1\r\nHost: a\r\nX: ab\0c\r\n\r\n";
-    for split in 0..input.len() {
-        let mut parser = RequestParser::new(Limits {
-            value_bytes: 3,
-            ..LIMITS
-        });
-        assert_eq!(parser.parse(&input[..split]), Ok(None));
-        assert_eq!(parser.parse(input), Err(ParseError::FieldTooLarge));
-    }
-    let mut parser = RequestParser::new(Limits {
+fn field_limits_keep_their_error_when_a_name_or_value_is_malformed() {
+    let limits = Limits {
+        name_bytes: 4,
         value_bytes: 3,
         ..LIMITS
-    });
+    };
+    for input in [
+        &b"GET / HTTP/1.1\r\nHost: a\r\nX: ab\0c\r\n\r\n"[..],
+        b"GET / HTTP/1.1\r\nHost: a\r\nX Bad: v\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: a\r\nX Y: long\r\n\r\n",
+    ] {
+        for split in 0..input.len() {
+            let mut parser = RequestParser::new(limits);
+            assert_eq!(parser.parse(&input[..split]), Ok(None));
+            assert_eq!(parser.parse(input), Err(ParseError::FieldTooLarge));
+        }
+    }
     let malformed = b"GET / HTTP/1.1\r\nHost: a\r\nX: ab\0c\r\nY\n";
-    assert_eq!(parser.parse(malformed), Err(ParseError::Malformed));
+    assert_eq!(RequestParser::new(limits).parse(malformed), Err(ParseError::Malformed));
+}
+
+/// RFC 9110 section 5.6.2 gives the token alphabet. Only the first colon ends a field name.
+#[test]
+fn a_field_name_ends_at_the_first_colon_and_accepts_each_token_octet() {
+    let token = b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut wire = *b"GET / HTTP/1.1\r\nHost: a\r\nX?Y: v\r\n\r\n";
+    let at = wire.iter().position(|&byte| byte == b'?').unwrap();
+    for byte in u8::MIN..=u8::MAX {
+        wire[at] = byte;
+        let parsed = parser().parse(&wire);
+        if byte == b':' || token.contains(&byte) {
+            let field = parsed.unwrap().unwrap().fields().nth(1).unwrap();
+            let expected = if byte == b':' {
+                (&b"X"[..], &b"Y: v"[..])
+            } else {
+                (&wire[at - 1..=at + 1], &b"v"[..])
+            };
+            assert_eq!((field.name(), field.value()), expected, "octet {byte}");
+        } else {
+            assert_eq!(parsed, Err(ParseError::Malformed), "octet {byte}");
+        }
+    }
 }
 
 /// Framing that two parsers could read in two ways refuses. A request with such framing can
@@ -374,6 +400,9 @@ fn a_field_over_its_name_or_value_limit_refuses() {
 fn fields_keep_their_order_and_name_case_from_parse_to_write() {
     let input = b"GET / HTTP/1.1\r\nHost: a\r\nX-Tag: a\r\nx-tag: b\r\nX-TAG: c\r\n\r\n";
     let head = parser().parse(input).unwrap().unwrap();
+    let mut remaining = head.fields();
+    assert_eq!(remaining.nth(1).unwrap().value(), b"a");
+    assert_eq!(remaining.count(), 2);
     let fields: Vec<Field<'_>> = head.fields().collect();
     let mut out = WriteLoan::new(Vec::with_capacity(256));
     write_head(&mut out, Status::new(200).unwrap(), &fields, Framing::Length(0)).unwrap();

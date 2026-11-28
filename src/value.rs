@@ -499,8 +499,17 @@ pub(crate) fn is_token(bytes: &[u8]) -> bool {
 
 /// Whether `byte` is a character of a token (RFC 9110, section 5.6.2).
 pub(crate) fn is_tchar(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        || matches!(byte, b'!' | b'#'..=b'\'' | b'*' | b'+' | b'-' | b'.' | b'^'..=b'`' | b'|' | b'~')
+    static TOKEN: [bool; 256] = {
+        let mut allowed = [false; 256];
+        let mut ascii = 0_u8;
+        while ascii < 128 {
+            allowed[ascii as usize] = ascii.is_ascii_alphanumeric()
+                || matches!(ascii, b'!' | b'#'..=b'\'' | b'*' | b'+' | b'-' | b'.' | b'^'..=b'`' | b'|' | b'~');
+            ascii += 1;
+        }
+        allowed
+    };
+    TOKEN[usize::from(byte)]
 }
 
 /// The value of one or more decimal digits, if it fits in a `u64`.

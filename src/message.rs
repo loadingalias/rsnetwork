@@ -64,6 +64,14 @@ impl<'a> Iterator for Fields<'a> {
     fn next(&mut self) -> Option<Field<'a>> {
         h1::next_field(&mut self.block)
     }
+
+    fn count(self) -> usize {
+        // Each checked line has one LF. The count cannot exceed the length of the remaining block.
+        self.block
+            .iter()
+            .map(|&byte| usize::from(byte == b'\n'))
+            .fold(0, usize::wrapping_add)
+    }
 }
 
 impl fmt::Debug for Fields<'_> {
