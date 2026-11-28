@@ -49,6 +49,7 @@ httparse = "1.10.1"
 # The cross-boundary proof (tests/cross_boundary.rs) runs the parser on Tokio: a current-thread
 # runtime and TCP, with no other feature. Tokio has no TCP on WebAssembly.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 tokio = { version = "1.54.1", features = ["rt", "net"] }
 
 # The proof runs the parser on the io_uring driver of rsasync, from its Git

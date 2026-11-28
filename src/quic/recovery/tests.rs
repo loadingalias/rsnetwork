@@ -3,6 +3,9 @@
 
 use core::num::NonZeroU64;
 
+#[cfg(not(target_family = "wasm"))]
+mod kernels;
+
 use rstypes::capacity::Budget;
 use rstypes::time::{ClockDomain, Instant, Suspend};
 
