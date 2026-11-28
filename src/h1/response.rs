@@ -5,9 +5,9 @@ use core::fmt;
 use rstypes::buffer::{Buffer as _, Lease};
 
 use super::Framing;
-use super::head::{Coding, Facts, Limits, ParseError, Search, offset, parse_version, scan, split_head, view_of};
+use super::head::{Coding, Facts, Limits, ParseError, Search, offset, parse_version, raw_line, scan, view_of};
 use crate::message::{Fields, Version};
-use crate::value::{Method, Status};
+use crate::value::{Method, Status, field_text_len};
 
 /// Parses HTTP/1.1 and HTTP/1.0 response heads in received bytes, with no copy and no
 /// allocation.
@@ -35,16 +35,15 @@ impl ResponseParser {
     /// 2xx response to CONNECT starts a tunnel. Gives `Ok(None)` while the head is not complete,
     /// with the same rules as [`RequestParser::parse`](super::RequestParser::parse).
     pub fn parse<'a>(&mut self, input: &'a [u8], method: Method<'_>) -> Result<Option<ResponseHead<'a>>, ParseError> {
-        match self.search.head(input, self.limits.head_bytes)? {
-            Some(head) => check(head, &self.limits, method).map(Some),
-            None => Ok(None),
-        }
+        self.search.parse(input, self.limits.head_bytes, |window| {
+            check(window, &self.limits, method)
+        })
     }
 }
 
-/// Checks a complete head. `head` ends with its empty line, and each of its CRs is before an LF.
-fn check<'a>(head: &'a [u8], limits: &Limits, method: Method<'_>) -> Result<ResponseHead<'a>, ParseError> {
-    let (status_line, block) = split_head(head)?;
+/// Checks the response through its empty line. The body can follow it in `input`.
+fn check<'a>(input: &'a [u8], limits: &Limits, method: Method<'_>) -> Result<ResponseHead<'a>, ParseError> {
+    let (status_line, block) = raw_line(input).ok_or(ParseError::Malformed)?;
     // status-line = HTTP-version SP status-code SP [ reason-phrase ] (RFC 9112, section 4). The
     // parser also accepts no space after the status code, as sent by some servers.
     let (version, rest) = status_line.split_at_checked(8).ok_or(ParseError::Malformed)?;
@@ -66,18 +65,19 @@ fn check<'a>(head: &'a [u8], limits: &Limits, method: Method<'_>) -> Result<Resp
         _ => return Err(ParseError::Malformed),
     };
     // reason-phrase = 1*( HTAB / SP / VCHAR / obs-text )
-    if !reason.iter().all(|&byte| byte == b'\t' || byte >= b' ' && byte != 0x7f) {
+    if field_text_len(reason) != reason.len() {
         return Err(ParseError::Malformed);
     }
 
-    let facts = scan(block, limits)?;
+    let (facts, rest) = scan(block, limits)?;
+    let head = &input[..input.len() - rest.len()];
     let framing = framing(version, status, method, &facts)?;
     Ok(ResponseHead {
         bytes: head,
         layout: Layout {
             status,
             reason: (offset(head, reason), offset(head, reason) + reason.len()),
-            fields: offset(head, block),
+            fields: input.len() - block.len(),
             framing,
             version,
             persistent: !facts.close && framing != Framing::Close && (version == Version::Http11 || facts.keep_alive),

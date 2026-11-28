@@ -62,10 +62,7 @@ impl<'a> Iterator for Fields<'a> {
     type Item = Field<'a>;
 
     fn next(&mut self) -> Option<Field<'a>> {
-        let (line, rest) = h1::split_line(self.block)?;
-        self.block = rest;
-        let (name, value) = h1::field_parts(line)?;
-        Some(Field { name, value })
+        h1::next_field(&mut self.block)
     }
 }
 

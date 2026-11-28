@@ -7,7 +7,7 @@ use rstypes::buffer::{Buffer as _, Lease};
 
 use crate::drive::{Error, Kind};
 use crate::message::Version;
-use crate::value::{Field, Status, decimal};
+use crate::value::{Field, Status, byte_position, decimal, field_text_len, is_token};
 
 /// The limits of one head, which the caller sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +66,24 @@ impl Search {
         Self { searched: 0 }
     }
 
+    /// Parses a complete head directly. On a partial head, resume the line-end search on each arrival.
+    pub(super) fn parse<'a, T>(
+        &mut self,
+        input: &'a [u8],
+        limit: usize,
+        check: impl FnOnce(&'a [u8]) -> Result<T, ParseError>,
+    ) -> Result<Option<T>, ParseError> {
+        if self.searched == 0 {
+            let window = input.get(..limit).unwrap_or(input);
+            return match check(window) {
+                Ok(head) => Ok(Some(head)),
+                // Report grammar errors only after a full head. Line-end and size errors take precedence.
+                Err(error) => self.head(input, limit)?.map(|_| Err(error)).transpose(),
+            };
+        }
+        self.head(input, limit)?.map(check).transpose()
+    }
+
     /// Gives the complete head at the start of `input`, or `None` while it is not complete.
     ///
     /// Refuses a head that is longer than `limit` as soon as that many bytes have no end of the
@@ -86,29 +104,32 @@ impl Search {
     /// Finds the end of the head in `window`: the position after its empty line. Refuses a CR
     /// that is not before an LF, and an LF that is not after a CR.
     fn find_end(&mut self, window: &[u8]) -> Result<Option<usize>, ParseError> {
-        let start = self.searched.min(window.len());
-        let mut previous = start.checked_sub(1).and_then(|at| window.get(at)).copied();
-        for (at, &byte) in window.iter().enumerate().skip(start) {
-            if byte == b'\n' {
-                if previous != Some(b'\r') {
+        let mut rest = &window[self.searched.min(window.len())..];
+        while let Some((&byte, tail)) = rest.split_first() {
+            let at = window.len() - rest.len();
+            if window[..at].ends_with(b"\r") {
+                if byte != b'\n' {
                     return Err(ParseError::Malformed);
                 }
-                if window[..=at].ends_with(b"\r\n\r\n") {
+                if window[..at].ends_with(b"\r\n\r") {
                     return Ok(Some(at + 1));
                 }
-            } else if previous == Some(b'\r') {
+                rest = tail;
+            } else if byte == b'\n' {
                 return Err(ParseError::Malformed);
+            } else {
+                rest = &rest[byte_position(rest, |b| (b == b'\r') | (b == b'\n')).max(1)..];
             }
-            previous = Some(byte);
         }
         self.searched = window.len();
         Ok(None)
     }
 }
 
-/// Splits a complete head into its start line and its field lines, each with its CR LF.
-pub(super) fn split_head(head: &[u8]) -> Result<(&[u8], &[u8]), ParseError> {
-    split_line(head.trim_suffix(b"\r\n")).ok_or(ParseError::Malformed)
+/// Splits off a line at CR LF. Its caller checks the grammar of the line.
+pub(super) fn raw_line(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (line, rest) = bytes.split_once(|&byte| byte == b'\n')?;
+    Some((line.strip_suffix(b"\r")?, rest))
 }
 
 /// The transfer codings of a message.
@@ -140,45 +161,53 @@ pub(super) struct Facts<'a> {
     pub(super) expect_continue: bool,
 }
 
-/// Checks each field line of `block` within `limits`, and gives their facts.
+/// Checks the fields through the empty line. Gives their facts and the bytes after the head.
 ///
 /// Refuses a second Content-Length field, a length that is not a `u64`, and a second Host field.
-pub(super) fn scan<'a>(block: &'a [u8], limits: &Limits) -> Result<Facts<'a>, ParseError> {
+pub(super) fn scan<'a>(mut rest: &'a [u8], limits: &Limits) -> Result<(Facts<'a>, &'a [u8]), ParseError> {
     let mut facts = Facts::default();
     let mut count = 0_usize;
     // The codings of each Transfer-Encoding field line, as one list (RFC 9110, section 5.3).
     let (mut coded, mut codings, mut last) = (false, 0_usize, None);
     let (mut upgrade_option, mut upgrade_field) = (false, false);
-    let mut rest = block;
-    while let Some((line, next)) = split_line(rest) {
-        rest = next;
+    while !rest.starts_with(b"\r\n") {
         count += 1;
         if count > limits.fields {
             return Err(ParseError::TooManyFields);
         }
+        let (text, end) = rest.split_at(field_text_len(rest));
+        let checked = end.strip_prefix(b"\r\n");
+        // An oversized field keeps its size error even when its text contains a forbidden byte.
+        let (line, next) = checked
+            .map(|next| (text, next))
+            .or_else(|| raw_line(rest))
+            .ok_or(ParseError::Malformed)?;
+        rest = next;
         let (name, value) = field_parts(line).ok_or(ParseError::Malformed)?;
         if name.len() > limits.name_bytes || value.len() > limits.value_bytes {
             return Err(ParseError::FieldTooLarge);
         }
-        let field = Field::new(name, value).map_err(|_| ParseError::Malformed)?;
-        let named = |known: &[u8]| field.name.eq_ignore_ascii_case(known);
+        if checked.is_none() || !is_token(name) {
+            return Err(ParseError::Malformed);
+        }
+        let named = |known: &[u8]| name.eq_ignore_ascii_case(known);
         if named(b"content-length") {
             if facts.length.is_some() {
                 return Err(ParseError::Framing);
             }
-            facts.length = Some(decimal(field.value).ok_or(ParseError::Framing)?);
+            facts.length = Some(decimal(value).ok_or(ParseError::Framing)?);
         } else if named(b"transfer-encoding") {
             coded = true;
-            for coding in list(field.value) {
+            for coding in list(value) {
                 codings += 1;
                 last = Some(coding);
             }
         } else if named(b"host") {
-            if facts.host.replace(field.value).is_some() {
+            if facts.host.replace(value).is_some() {
                 return Err(ParseError::Malformed);
             }
         } else if named(b"connection") {
-            for option in list(field.value) {
+            for option in list(value) {
                 facts.close |= option.eq_ignore_ascii_case(b"close");
                 facts.keep_alive |= option.eq_ignore_ascii_case(b"keep-alive");
                 upgrade_option |= option.eq_ignore_ascii_case(b"upgrade");
@@ -186,7 +215,7 @@ pub(super) fn scan<'a>(block: &'a [u8], limits: &Limits) -> Result<Facts<'a>, Pa
         } else if named(b"upgrade") {
             upgrade_field = true;
         } else if named(b"expect") {
-            facts.expect_continue |= field.value.eq_ignore_ascii_case(b"100-continue");
+            facts.expect_continue |= value.eq_ignore_ascii_case(b"100-continue");
         }
     }
     facts.upgrade = upgrade_option && upgrade_field;
@@ -195,7 +224,7 @@ pub(super) fn scan<'a>(block: &'a [u8], limits: &Limits) -> Result<Facts<'a>, Pa
         Some(last) if last.eq_ignore_ascii_case(b"chunked") => Coding::ChunkedLast,
         _ => Coding::Other,
     });
-    Ok(facts)
+    Ok((facts, &rest[2..]))
 }
 
 /// The elements of a comma-separated list, with no whitespace around them and no empty element
@@ -207,14 +236,19 @@ fn list(value: &[u8]) -> impl Iterator<Item = &[u8]> {
         .filter(|element| !element.is_empty())
 }
 
-/// Splits the first line from `bytes` at its LF. The line has no CR LF.
-pub(crate) fn split_line(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
-    let (line, rest) = bytes.split_once(|&byte| byte == b'\n')?;
-    Some((line.trim_suffix(b"\r"), rest))
+/// Takes one field from a block that the protocol has already checked.
+pub(crate) fn next_field<'a>(block: &mut &'a [u8]) -> Option<Field<'a>> {
+    let (name, rest) = block.split_once(|&byte| byte == b':')?;
+    let (value, end) = rest.split_at(byte_position(rest, |b| b == b'\r'));
+    *block = end.strip_prefix(b"\r\n")?;
+    Some(Field {
+        name,
+        value: trim_whitespace(value),
+    })
 }
 
 /// Splits a field line at its first colon into the name and the value with no whitespace around it.
-pub(crate) fn field_parts(line: &[u8]) -> Option<(&[u8], &[u8])> {
+fn field_parts(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let (name, value) = line.split_once(|&byte| byte == b':')?;
     Some((name, trim_whitespace(value)))
 }

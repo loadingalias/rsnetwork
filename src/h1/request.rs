@@ -5,7 +5,7 @@ use core::fmt;
 use rstypes::buffer::{Buffer as _, Lease};
 
 use super::Framing;
-use super::head::{Coding, Facts, Limits, ParseError, Search, offset, parse_version, scan, split_head, view_of};
+use super::head::{Coding, Facts, Limits, ParseError, Search, offset, parse_version, raw_line, scan, view_of};
 use crate::message::{Fields, Version};
 use crate::value::{Authority, Method, Target, TargetForm};
 
@@ -39,27 +39,24 @@ impl RequestParser {
     /// Refuses a head that is longer than [`Limits::head_bytes`] as soon as that many bytes have
     /// no end of the head in them. A line end that is not CR LF refuses as soon as it arrives.
     pub fn parse<'a>(&mut self, input: &'a [u8]) -> Result<Option<RequestHead<'a>>, ParseError> {
-        match self.search.head(input, self.limits.head_bytes)? {
-            Some(head) => check(head, &self.limits).map(Some),
-            None => Ok(None),
-        }
+        self.search
+            .parse(input, self.limits.head_bytes, |window| check(window, &self.limits))
     }
 }
 
-/// Checks a complete head. `head` ends with its empty line, and each of its CRs is before an LF.
-fn check<'a>(head: &'a [u8], limits: &Limits) -> Result<RequestHead<'a>, ParseError> {
-    let (request_line, block) = split_head(head)?;
+/// Checks the request through its empty line. The body can follow it in `input`.
+fn check<'a>(input: &'a [u8], limits: &Limits) -> Result<RequestHead<'a>, ParseError> {
+    let (request_line, block) = raw_line(input).ok_or(ParseError::Malformed)?;
     let mut parts = request_line.splitn(3, |&byte| byte == b' ');
     let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next()) else {
         return Err(ParseError::Malformed);
     };
-    let (Ok(method), Ok(target)) = (Method::new(method), Target::new(target)) else {
+    let (Ok(method), Ok(form)) = (Method::new(method), Target::checked_form(target)) else {
         return Err(ParseError::Malformed);
     };
     let version = parse_version(version)?;
     // Only CONNECT has the authority form, and only OPTIONS has the asterisk form (RFC 9112,
     // section 3.2). A CONNECT request has the authority form (RFC 9110, section 9.3.6).
-    let form = target.form();
     let form_ok = match form {
         TargetForm::Authority(_) => method == Method::CONNECT,
         TargetForm::Asterisk => method == Method::OPTIONS,
@@ -69,7 +66,8 @@ fn check<'a>(head: &'a [u8], limits: &Limits) -> Result<RequestHead<'a>, ParseEr
         return Err(ParseError::Malformed);
     }
 
-    let facts = scan(block, limits)?;
+    let (facts, rest) = scan(block, limits)?;
+    let head = &input[..input.len() - rest.len()];
     let framing = framing(version, &facts)?;
     // The Host point. An HTTP/1.1 request has one Host field, and an HTTP/1.0 request has one or
     // none (RFC 9112, section 3.2, and appendix C.2). Its value is an authority. A target with an
@@ -89,8 +87,8 @@ fn check<'a>(head: &'a [u8], limits: &Limits) -> Result<RequestHead<'a>, ParseEr
         bytes: head,
         layout: Layout {
             method: method.as_bytes().len(),
-            target: span(target.as_bytes()),
-            fields: offset(head, block),
+            target: span(target),
+            fields: input.len() - block.len(),
             authority: authority.map(|authority| span(authority.as_bytes())),
             framing,
             version,

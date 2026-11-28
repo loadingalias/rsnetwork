@@ -125,8 +125,12 @@ pub enum TargetForm<'a> {
 impl<'a> Target<'a> {
     /// Checks a request target, or refuses it.
     pub fn new(bytes: &'a [u8]) -> Result<Self, InvalidValue> {
-        let target = Self(bytes);
-        let valid = match target.form() {
+        Self::checked_form(bytes).map(|_| Self(bytes))
+    }
+
+    pub(crate) fn checked_form(bytes: &'a [u8]) -> Result<TargetForm<'a>, InvalidValue> {
+        let form = Self(bytes).form();
+        let valid = match form {
             TargetForm::Origin { path, query } => is_path(path) && query.is_none_or(is_query),
             TargetForm::Absolute {
                 scheme,
@@ -137,7 +141,7 @@ impl<'a> Target<'a> {
             TargetForm::Authority(authority) => is_authority(authority.0) && authority.port().is_some(),
             TargetForm::Asterisk => true,
         };
-        if valid { Ok(target) } else { Err(InvalidValue::Target) }
+        if valid { Ok(form) } else { Err(InvalidValue::Target) }
     }
 
     /// The target, as bytes.
@@ -260,11 +264,7 @@ impl<'a> Field<'a> {
     /// Checks a field line, or refuses it.
     pub fn new(name: &'a [u8], value: &'a [u8]) -> Result<Self, InvalidValue> {
         let edge = |byte: Option<&u8>| matches!(byte, Some(b' ' | b'\t'));
-        let value_ok = !edge(value.first())
-            && !edge(value.last())
-            && value
-                .iter()
-                .all(|&byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f));
+        let value_ok = !edge(value.first()) && !edge(value.last()) && field_text_len(value) == value.len();
         if is_token(name) && value_ok {
             Ok(Self { name, value })
         } else {
@@ -373,7 +373,7 @@ fn is_authority(bytes: &[u8]) -> bool {
                 && host
                     .iter()
                     .all(|&byte| byte.is_ascii_alphanumeric() || b"-._".contains(&byte))
-                && (parse::<Ipv4Addr>(host).is_some() || !ends_in_number(host))
+                && (!ends_in_number(host) || parse::<Ipv4Addr>(host).is_some())
         }
     };
     let port_ok = match rest {
@@ -463,14 +463,44 @@ fn is_scheme(bytes: &[u8]) -> bool {
             .all(|&byte| byte.is_ascii_alphanumeric() || b"+-.".contains(&byte))
 }
 
+/// The leading field text, including spaces, tabs, and bytes above DEL (RFC 9110, section 5.5).
+pub(crate) fn field_text_len(bytes: &[u8]) -> usize {
+    byte_position(bytes, |byte| ((byte < b' ') & (byte != b'\t')) | (byte == 0x7f))
+}
+
+/// The position of the first matching byte, or the length if no byte matches.
+pub(crate) fn byte_position(bytes: &[u8], matches: impl Fn(u8) -> bool) -> usize {
+    let mut rest = bytes;
+    // Skip whole blocks before locating the first match. Keep one bit per byte in the last block.
+    while let Some((block, tail)) = rest.split_first_chunk::<64>() {
+        if block.iter().fold(false, |found, &byte| found | matches(byte)) {
+            break;
+        }
+        rest = tail;
+    }
+    while let Some((block, tail)) = rest.split_first_chunk::<16>() {
+        let mask = block
+            .iter()
+            .enumerate()
+            .fold(0_u16, |mask, (lane, &byte)| mask | (u16::from(matches(byte)) << lane));
+        if mask != 0 {
+            return bytes.len() - rest.len() + mask.trailing_zeros() as usize;
+        }
+        rest = tail;
+    }
+    let prefix = rest.iter().position(|&byte| matches(byte)).unwrap_or(rest.len());
+    bytes.len() - rest.len() + prefix
+}
+
 /// Whether `bytes` is a token: one or more of the characters of RFC 9110, section 5.6.2.
-fn is_token(bytes: &[u8]) -> bool {
+pub(crate) fn is_token(bytes: &[u8]) -> bool {
     !bytes.is_empty() && bytes.iter().all(|&byte| is_tchar(byte))
 }
 
 /// Whether `byte` is a character of a token (RFC 9110, section 5.6.2).
 pub(crate) fn is_tchar(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    byte.is_ascii_alphanumeric()
+        || matches!(byte, b'!' | b'#'..=b'\'' | b'*' | b'+' | b'-' | b'.' | b'^'..=b'`' | b'|' | b'~')
 }
 
 /// The value of one or more decimal digits, if it fits in a `u64`.

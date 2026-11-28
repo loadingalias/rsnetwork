@@ -322,3 +322,17 @@ fn a_field_refuses_bytes_that_change_its_line() {
     });
     assert_eq!(count, 0);
 }
+
+/// RFC 9110 section 5.5 permits HTAB, SP, visible ASCII, and obs-text inside a value.
+#[test]
+fn a_long_field_checks_every_octet_at_every_position() {
+    let mut value = [b'x'; 131];
+    for at in 1..value.len() - 1 {
+        for byte in u8::MIN..=u8::MAX {
+            value[at] = byte;
+            let allowed = matches!(byte, 9 | 32..=126 | 128..=255);
+            assert_eq!(Field::new(b"X", &value).is_ok(), allowed, "octet {byte} at {at}");
+        }
+        value[at] = b'x';
+    }
+}

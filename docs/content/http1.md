@@ -263,6 +263,10 @@ The engines use these parts, which are public for a host that needs only a part:
 | `write_head`, `write_request` | Write a response or a request head into the free capacity of a `WriteLoan`. A refusal writes nothing |
 | `begin_chunk`, `end_chunk`, `last_chunk` | Write the framing of a chunked body. `last_chunk` writes the trailers |
 
+A complete head in one receive needs no allocation. The parser checks each field value while it finds the line end.
+If `parse` returns `Ok(None)`, append more bytes and call the same parser with the full prefix.
+After success, `&input[head.consumed()..]` holds the body or the next message. A field iterator borrows the received bytes.
+
 ## Debug output
 
 The `Debug` output of a head, an event, an engine, a field, and an error contains no peer text,

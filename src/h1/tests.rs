@@ -128,6 +128,53 @@ fn a_head_over_its_limit_refuses_before_it_ends() {
     assert_eq!(limits(len, 4).parse(LENGTH_HEAD), Err(ParseError::TooManyFields));
 }
 
+/// A binary body starts at the empty line. A CR at the end of a receive waits for exactly one LF.
+#[test]
+fn a_line_end_at_any_offset_leaves_the_binary_body_intact() {
+    for padding in 0..=65 {
+        let mut wire = b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nX: ".to_vec();
+        wire.extend(core::iter::repeat_n(0xff, 64 + padding));
+        let field_end = wire.len();
+        wire.extend_from_slice(b"\r\n\r\n");
+        let body = b"\n\r\0\x7f";
+        wire.extend_from_slice(body);
+        for split in [0, field_end, field_end + 1, field_end + 3] {
+            let mut parser = parser();
+            assert_eq!(parser.parse(&wire[..split]), Ok(None));
+            let head = parser.parse(&wire).unwrap().unwrap();
+            assert_eq!(&wire[head.consumed()..], body);
+            assert_eq!(
+                head.fields().last().unwrap().value(),
+                &wire[field_end - 64 - padding..field_end]
+            );
+        }
+        let mut parser = parser();
+        assert_eq!(parser.parse(&wire[..=field_end]), Ok(None));
+        wire[field_end + 1] = b'X';
+        assert_eq!(parser.parse(&wire[..field_end + 2]), Err(ParseError::Malformed));
+    }
+}
+
+/// A size refusal has the same status with a complete or partial receive. A bad line end refuses immediately.
+#[test]
+fn field_limits_keep_their_error_when_a_value_has_a_control_byte() {
+    let input = b"GET / HTTP/1.1\r\nHost: a\r\nX: ab\0c\r\n\r\n";
+    for split in 0..input.len() {
+        let mut parser = RequestParser::new(Limits {
+            value_bytes: 3,
+            ..LIMITS
+        });
+        assert_eq!(parser.parse(&input[..split]), Ok(None));
+        assert_eq!(parser.parse(input), Err(ParseError::FieldTooLarge));
+    }
+    let mut parser = RequestParser::new(Limits {
+        value_bytes: 3,
+        ..LIMITS
+    });
+    let malformed = b"GET / HTTP/1.1\r\nHost: a\r\nX: ab\0c\r\nY\n";
+    assert_eq!(parser.parse(malformed), Err(ParseError::Malformed));
+}
+
 /// Framing that two parsers could read in two ways refuses. A request with such framing can
 /// smuggle a second request past a proxy (RFC 9112, section 11.2).
 #[test]

@@ -102,8 +102,8 @@ use crate::body::Body;
 
 pub use chunked::{ChunkDecoder, ChunkStep};
 pub use client::{Client, ClientEvent};
+pub(crate) use head::next_field;
 pub use head::{BodyLimits, Limits, ParseError};
-pub(crate) use head::{field_parts, split_line};
 pub use request::{RequestHead, RequestParser, RetainedRequest};
 pub use response::{ResponseHead, ResponseParser, RetainedResponse};
 pub use server::{HEAD_TIMEOUT, Server, ServerEvent};

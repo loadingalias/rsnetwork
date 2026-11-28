@@ -216,13 +216,12 @@ impl ChunkDecoder {
             [b'\r', ..] => return Err(ParseError::Framing),
             _ => match self.search.head(input, self.limits.trailer_bytes)? {
                 Some(section) => {
-                    let lines = section.len() - 2;
                     let limits = Limits {
                         head_bytes: self.limits.trailer_bytes,
                         fields: self.limits.trailer_fields,
                         ..self.fields
                     };
-                    let facts = scan(&section[..lines], &limits)?;
+                    let (facts, _) = scan(section, &limits)?;
                     // A sender must not send a framing field as a trailer field (RFC 9110,
                     // section 6.5.1). A peer that merges the trailers could frame by it.
                     if facts.length.is_some() || facts.coding.is_some() {
